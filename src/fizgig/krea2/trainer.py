@@ -419,6 +419,68 @@ class AdaptiveLR:
         self._snapshot(network, optimizer)
 
 
+def _build_bf16_master(raw_path: str, dit) -> dict:
+    """CPU bf16 copy of every fp8-patched block Linear — the source of truth for rotation.
+
+    Read straight from the RAW file (which is bf16 on disk) rather than dequantizing the GPU
+    copy: the GPU weights have already been through fp8, so dequantizing them would bake the
+    quantization error into the master and we'd fine-tune a degraded model.
+    """
+    import torch.nn as _nn
+    from safetensors.torch import load_file
+
+    wanted = set()
+    for bi, block in enumerate(dit.blocks):
+        for name, m in block.named_modules():
+            if isinstance(m, _nn.Linear) and hasattr(m, "scale_weight"):
+                wanted.add(f"blocks.{bi}.{name}.weight")
+
+    sd = load_file(raw_path)          # mmap'd; we copy out only the keys we need
+    master, missing = {}, []
+    for key in sorted(wanted):
+        t = sd.get(key)
+        if t is None:
+            missing.append(key)
+            continue
+        master[key] = t.to("cpu", dtype=torch.bfloat16).clone()
+    del sd
+    gc.collect()
+    total_gb = sum(v.numel() * v.element_size() for v in master.values()) / 1e9
+    logger.info("[ft-rotation] bf16 master: %d tensors, %.1f GB in CPU RAM%s",
+                len(master), total_gb,
+                f" ({len(missing)} keys missing from the RAW file — those stay frozen)" if missing else "")
+    if missing:
+        logger.warning("[ft-rotation] missing master keys, e.g. %s", missing[:3])
+    return master
+
+
+def _save_full_checkpoint(rotator, raw_path: str, path: str, extra_metadata=None):
+    """Write the fine-tuned model: the RAW checkpoint with trained block weights replaced.
+
+    Everything the rotator never touches (norms, embeddings, txtfusion, I/O layers) is copied
+    through from the original, so the result is a complete, loadable Krea 2 checkpoint.
+    """
+    from safetensors.torch import load_file, save_file
+
+    sd = load_file(raw_path)
+    trained = rotator.master_state_dict()
+    replaced = 0
+    for k, v in trained.items():
+        if k in sd:
+            sd[k] = v.to(torch.bfloat16)
+            replaced += 1
+    meta = {"fizgig_finetune": "krea2-rotation", "fizgig_trained_tensors": str(replaced)}
+    if extra_metadata:
+        meta.update({str(k): str(v) for k, v in extra_metadata.items()})
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    save_file(sd, path, metadata=meta)
+    size_gb = os.path.getsize(path) / 1e9
+    logger.info("[ft-rotation] saved full checkpoint (%d/%d tensors trained, %.1f GB) -> %s",
+                replaced, len(sd), size_gb, path)
+    del sd, trained
+    gc.collect()
+
+
 def _save_lora(network, path, network_dim, network_alpha, dtype, extra_metadata=None):
     metadata = {
         "ss_network_module": "fizgig.krea2 (lora_unet, all-Linear)",
@@ -819,6 +881,11 @@ def train_krea2(
     adaptive_lr: bool = False,
     adaptive_lr_min: float = 1e-5,
     adaptive_lr_max: float = 4e-4,
+    # Rotating-block FULL fine-tune (experimental). >0 trains that many DiT blocks at a
+    # time in bf16 while the rest stay fp8-frozen, rotating the window every N epochs.
+    # No LoRA is trained in this mode — the output is a full model checkpoint.
+    finetune_rotation: int = 0,
+    finetune_rotate_every: int = 1,
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
 ):
@@ -849,6 +916,30 @@ def train_krea2(
         sample_ae = load_vae(vae_path, input_channels=3, device="cpu", disable_mmap=True)
         sample_dir = os.path.join(output_dir, "sample")
 
+    ft_rotation = max(0, int(finetune_rotation or 0))
+    if ft_rotation:
+        # Rotation owns the block weights: it swaps them between fp8-frozen and bf16-trainable
+        # in place. Block swap moves whole blocks to CPU behind the offloader's back, and 4-bit
+        # keeps weights packed in _nf4_packed — neither survives that swap, so both are off.
+        if blocks_to_swap > 0:
+            logger.info("[ft-rotation] block swap is incompatible with rotation "
+                        "(rotation re-materializes block weights) — forcing blocks_to_swap=0.")
+            blocks_to_swap = 0
+        if quant_4bit:
+            logger.info("[ft-rotation] 4-bit base is incompatible with rotation "
+                        "(weights live packed in _nf4_packed) — using fp8 instead.")
+            quant_4bit = False
+        if not fp8_scaled:
+            logger.info("[ft-rotation] rotation needs the fp8-frozen base to fit — enabling fp8.")
+            fp8_scaled = True
+        if do_previews:
+            # Previews render the Turbo with a LoRA applied; in FT mode there is no LoRA and
+            # the trained weights live in the base itself. Sampling the fine-tuned model would
+            # mean loading a second full checkpoint — out of scope for now.
+            logger.info("[ft-rotation] in-training previews are disabled — evaluate saved "
+                        "checkpoints in ComfyUI instead.")
+            do_previews = False
+
     if quant_4bit and blocks_to_swap > 0:
         logger.info("[nf4] 4-bit base is incompatible with block swap (weights live in _nf4_packed) "
                     "— forcing blocks_to_swap=0.")
@@ -865,16 +956,60 @@ def train_krea2(
         dit.switch_block_swap_for_training()
     dit.train()
     network.train()
-    network.requires_grad_(True)
 
-    params = list(network.get_trainable_params())
-    try:
-        import bitsandbytes as bnb
-        optimizer = bnb.optim.AdamW8bit(params, lr=learning_rate)
-        logger.info("optimizer: AdamW8bit")
-    except Exception:
-        optimizer = torch.optim.AdamW(params, lr=learning_rate)
-        logger.info("optimizer: AdamW (bitsandbytes unavailable)")
+    rotator = rot_schedule = None
+    if ft_rotation:
+        from fizgig.krea2.rotation import RotationSchedule, BlockRotator
+        # The LoRA network stays created but frozen and zero-init, so it contributes nothing
+        # to the forward. We're training the base weights themselves.
+        network.requires_grad_(False)
+        master = _build_bf16_master(raw_path, dit)
+        rotator = BlockRotator(dit.blocks, master, key_prefix="blocks", device=device)
+        rot_schedule = RotationSchedule(len(dit.blocks), active=ft_rotation,
+                                        rotate_every=finetune_rotate_every)
+        logger.info("[ft-rotation] FULL FINE-TUNE — %s", rot_schedule.describe())
+        if rot_schedule.cycle_epochs > max_train_epochs:
+            logger.warning("[ft-rotation] a full cycle needs %d epochs but max_train_epochs=%d — "
+                           "blocks after window %d will NEVER train this run.",
+                           rot_schedule.cycle_epochs, max_train_epochs,
+                           max_train_epochs // finetune_rotate_every)
+        if adaptive_lr:
+            # The watcher reads epoch-to-epoch loss movement as signal. Rotation changes which
+            # weights are trainable at the boundary, so every rotation looks like a step change
+            # and would trigger spurious reductions/rollbacks. Off for now.
+            logger.info("[ft-rotation] adaptive LR disabled — rotation boundaries look like "
+                        "instability to the plateau watcher.")
+            adaptive_lr = False
+    else:
+        network.requires_grad_(True)
+
+    def _make_optimizer(params_):
+        """Adafactor first in rotation mode: its factored state is ~10x smaller than Adam's,
+        which is what keeps a full fine-tune inside 32 GB."""
+        if ft_rotation:
+            try:
+                from transformers.optimization import Adafactor
+                opt = Adafactor(params_, lr=learning_rate, scale_parameter=False,
+                                relative_step=False, warmup_init=False)
+                logger.info("optimizer: Adafactor (rotation)")
+                return opt
+            except Exception as e:
+                logger.warning("Adafactor unavailable (%s) — falling back to AdamW8bit", e)
+        try:
+            import bitsandbytes as bnb
+            opt = bnb.optim.AdamW8bit(params_, lr=learning_rate)
+            logger.info("optimizer: AdamW8bit")
+            return opt
+        except Exception:
+            logger.info("optimizer: AdamW (bitsandbytes unavailable)")
+            return torch.optim.AdamW(params_, lr=learning_rate)
+
+    if ft_rotation:
+        rotator.rotate_to(rot_schedule.active_at(0))
+        params = rotator.trainable_params()
+    else:
+        params = list(network.get_trainable_params())
+    optimizer = _make_optimizer(params)
 
     collator = _Krea2Collator(shared_epoch, group)
     loader = DataLoader(group, batch_size=1, shuffle=True, collate_fn=collator, num_workers=0)
@@ -919,36 +1054,40 @@ def train_krea2(
         logger.info(f"[grad_accum] {accum} micro-batches per optimizer step "
                     f"(effective batch {accum}); ~{max(1, steps_per_epoch // accum)} updates/epoch")
 
-    scheduler = None
-    if adaptive:
-        if lr_scheduler and lr_scheduler != "constant":
-            logger.info(f"[lr_scheduler] '{lr_scheduler}' ignored — adaptive LR is enabled and owns the LR.")
-    elif lr_scheduler and lr_scheduler != "constant":
+    _sched_total_steps = math.ceil(steps_per_epoch / accum) * max_train_epochs
+
+    def _rebuild_scheduler(opt, position: int):
+        """Build the configured schedule against `opt`, wound forward to `position`
+        optimizer-steps. Used at startup, on resume, and after every rotation (which
+        replaces the optimizer, so the old scheduler's parameter refs are dead)."""
+        if adaptive or not lr_scheduler or lr_scheduler == "constant":
+            return None
         from diffusers.optimization import get_scheduler
-        # Schedules count OPTIMIZER steps, not micro-batches.
-        total_steps = math.ceil(steps_per_epoch / accum) * max_train_epochs
         kwargs = {}
         if lr_scheduler == "cosine_with_restarts":
             kwargs["num_cycles"] = int(lr_scheduler_num_cycles)
         elif lr_scheduler == "polynomial":
             kwargs["power"] = float(lr_scheduler_power)
-        scheduler = get_scheduler(
-            lr_scheduler, optimizer,
-            num_warmup_steps=int(lr_warmup_steps or 0),
-            num_training_steps=total_steps,
-            **kwargs,
-        )
-        # Resume: these schedulers are pure functions of the step count, and global_step is
-        # already restored from the state dir — so re-deriving the position is exact and needs
-        # no extra persisted state. Setting last_epoch then stepping once lands the LR exactly
-        # where global_step calls to step() would have.
-        if global_step > 0:
-            # global_step counts micro-batches; the schedule's position is optimizer steps.
-            done_updates = global_step // accum
-            scheduler.last_epoch = done_updates - 1
-            scheduler.step()
+        s = get_scheduler(lr_scheduler, opt,
+                          num_warmup_steps=int(lr_warmup_steps or 0),
+                          num_training_steps=_sched_total_steps, **kwargs)
+        # These schedules are pure functions of the step count, so re-deriving the position
+        # is exact and needs no persisted state. Setting last_epoch then stepping once lands
+        # the LR exactly where `position` calls to step() would have.
+        if position > 0:
+            s.last_epoch = position - 1
+            s.step()
+        return s
+
+    scheduler = None
+    if adaptive:
+        if lr_scheduler and lr_scheduler != "constant":
+            logger.info(f"[lr_scheduler] '{lr_scheduler}' ignored — adaptive LR is enabled and owns the LR.")
+    elif lr_scheduler and lr_scheduler != "constant":
+        # global_step counts micro-batches; the schedule's position is optimizer steps.
+        scheduler = _rebuild_scheduler(optimizer, global_step // accum)
         logger.info(f"[lr_scheduler] {lr_scheduler} — warmup {int(lr_warmup_steps or 0)} / "
-                    f"{total_steps} total steps, start lr={optimizer.param_groups[0]['lr']:.3e}"
+                    f"{_sched_total_steps} total steps, start lr={optimizer.param_groups[0]['lr']:.3e}"
                     + (f" (resumed at step {global_step})" if global_step > 0 else ""))
     elif lr_warmup_steps:
         logger.info("[lr_scheduler] warmup steps ignored — LR scheduler is 'constant'.")
@@ -1099,6 +1238,19 @@ def train_krea2(
     pending_accum = 0  # micro-batches backward'd since the last optimizer step
     for epoch in range(start_epoch, max_train_epochs):
         shared_epoch.value = epoch + 1
+        if rotator is not None:
+            want = rot_schedule.active_at(epoch)
+            if want != rotator.active:
+                # New window: swap the blocks, then rebuild the optimizer. The old optimizer's
+                # state refers to tensors that no longer require grad, and Adam moments for the
+                # outgoing window are meaningless to the incoming one.
+                rotator.rotate_to(want)
+                optimizer = _make_optimizer(rotator.trainable_params())
+                if scheduler is not None:
+                    # Re-attach the schedule to the new optimizer at the current position.
+                    _pos = scheduler.last_epoch
+                    scheduler = _rebuild_scheduler(optimizer, _pos)
+                logger.info("[ft-rotation] epoch %d: training blocks %s", epoch + 1, want)
         for i, batch in enumerate(loader):
             # Excluded images (two failed AI recaptions, still stuck) are skipped ENTIRELY: no
             # forward, no gradient, and no loss recorded — avr_loss stops carrying their permanent
@@ -1172,8 +1324,12 @@ def train_krea2(
                                caption_ext=ar_caption_ext)
 
         if save_every_n_epochs and (epoch + 1) % save_every_n_epochs == 0 and (epoch + 1) < max_train_epochs:
-            _save_lora(network, os.path.join(output_dir, f"{output_name}-{epoch + 1:06d}.safetensors"),
-                       network_dim, network_alpha, dtype)
+            if rotator is not None:
+                _save_full_checkpoint(rotator, raw_path,
+                                      os.path.join(output_dir, f"{output_name}-{epoch + 1:06d}.safetensors"))
+            else:
+                _save_lora(network, os.path.join(output_dir, f"{output_name}-{epoch + 1:06d}.safetensors"),
+                           network_dim, network_alpha, dtype)
 
         if do_previews and (epoch + 1) % sample_every_n_epochs == 0:
             from safetensors.torch import load_file
@@ -1274,6 +1430,10 @@ def train_krea2(
     if context_lora_path:
         extra = {"ss_context_lora": os.path.basename(context_lora_path),
                  "ss_context_lora_strength": str(context_lora_strength)}
+    if rotator is not None:
+        _save_full_checkpoint(rotator, raw_path, out, extra_metadata=extra)
+        logger.info(f"saved fine-tuned checkpoint -> {out}")
+        return out
     _save_lora(network, out, network_dim, network_alpha, dtype, extra_metadata=extra)
     logger.info(f"saved final LoRA -> {out}")
     return out
