@@ -256,3 +256,103 @@ class BlockRotator:
                 out[f"{prefix}.{lname}.weight"] = (
                     lin.weight.detach().to("cpu", dtype=torch.bfloat16).clone())
         return out
+
+
+# ---------------------------------------------------------------------------
+# Rotation-aware block swap
+# ---------------------------------------------------------------------------
+
+class RotationOffloader:
+    """Keeps the trainable window pinned on GPU and streams every other block from CPU.
+
+    The stock offloader keeps a contiguous PREFIX of blocks resident and swaps the suffix,
+    pairing each eviction with a matching load so residency stays constant. Rotation needs
+    the opposite: an arbitrary resident set (the active window) that MOVES every rotation.
+    Rather than rework that pairing, this streams non-resident blocks just-in-time.
+
+    Implements the same small interface the DiT's forward expects, so it can be dropped in
+    as `dit.offloader` with no changes to model.py.
+
+    Gradient checkpointing recomputes a block's forward *inside* its backward, so blocks are
+    pulled back to the GPU on a backward PRE-hook (before the recompute) and evicted on the
+    post-hook — evicting on the forward pass alone would leave the recompute with weights on
+    the wrong device.
+    """
+
+    def __init__(self, blocks: nn.ModuleList, device: torch.device, resident: Iterable[int],
+                 debug: bool = False):
+        self.blocks = blocks
+        self.device = torch.device(device)
+        self.cpu = torch.device("cpu")
+        self.resident = set(int(i) for i in resident)
+        self.forward_only = False
+        self.debug = debug
+        self.moves = 0                      # instrumentation: transfers per step
+        self._handles = []
+        self._register_hooks()
+
+    # -- placement helpers -------------------------------------------------
+    def _to(self, idx: int, dev: torch.device):
+        from fizgig.krea2.offloading import weighs_to_device
+        weighs_to_device(self.blocks[idx], dev)
+        self.moves += 1
+
+    def _ensure_gpu(self, idx: int):
+        if idx in self.resident:
+            return
+        self._to(idx, self.device)
+
+    def _evict(self, idx: int):
+        if idx in self.resident:
+            return
+        self._to(idx, self.cpu)
+
+    # -- rotation ----------------------------------------------------------
+    def set_resident(self, resident: Iterable[int]):
+        """Re-pin after a rotation: the incoming window goes to GPU and stays, the outgoing
+        window rejoins the streamed pool."""
+        new = set(int(i) for i in resident)
+        for idx in sorted(new - self.resident):
+            self._to(idx, self.device)
+        for idx in sorted(self.resident - new):
+            self._to(idx, self.cpu)
+        self.resident = new
+        logger.info("[rotation-swap] resident blocks now %s (others stream from CPU)", sorted(new))
+
+    # -- interface the DiT forward calls -----------------------------------
+    def prepare_block_devices_before_forward(self, blocks):
+        for i in range(len(blocks)):
+            self._to(i, self.device if i in self.resident else self.cpu)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+            torch.cuda.empty_cache()
+
+    def wait_for_block(self, index: int):
+        self._ensure_gpu(index)
+
+    def submit_move_blocks_forward(self, blocks, index: int):
+        # In training the block is needed again for its backward, but holding it would defeat
+        # the point — the backward pre-hook fetches it back.
+        self._evict(index)
+
+    def set_forward_only(self, forward_only: bool):
+        self.forward_only = bool(forward_only)
+
+    # -- backward ----------------------------------------------------------
+    def _register_hooks(self):
+        for i, block in enumerate(self.blocks):
+            def pre_hook(module, grad_output, _i=i):
+                self._ensure_gpu(_i)
+                return None
+
+            def post_hook(module, grad_input, grad_output, _i=i):
+                self._evict(_i)
+                return None
+
+            self._handles.append(block.register_full_backward_pre_hook(pre_hook))
+            self._handles.append(block.register_full_backward_hook(post_hook))
+
+    def remove(self):
+        for h in self._handles:
+            h.remove()
+        self._handles.clear()

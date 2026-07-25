@@ -928,14 +928,19 @@ def train_krea2(
         sample_dir = os.path.join(output_dir, "sample")
 
     ft_rotation = max(0, int(finetune_rotation or 0))
+    ft_stream_frozen = False
     if ft_rotation:
         # Rotation owns the block weights: it swaps them between fp8-frozen and bf16-trainable
         # in place. Block swap moves whole blocks to CPU behind the offloader's back, and 4-bit
         # keeps weights packed in _nf4_packed — neither survives that swap, so both are off.
         if blocks_to_swap > 0:
-            logger.info("[ft-rotation] block swap is incompatible with rotation "
-                        "(rotation re-materializes block weights) — forcing blocks_to_swap=0.")
+            # Rotation brings its own swap policy (RotationOffloader): the trainable window is
+            # pinned and every other block streams. The stock offloader can't express that —
+            # it keeps a fixed contiguous prefix resident.
+            logger.info("[ft-rotation] using rotation-aware block swap instead of the "
+                        "fixed-prefix offloader (--blocks_to_swap value ignored).")
             blocks_to_swap = 0
+            ft_stream_frozen = True
         if quant_4bit:
             logger.info("[ft-rotation] 4-bit base is incompatible with rotation "
                         "(weights live packed in _nf4_packed) — using fp8 instead.")
@@ -980,6 +985,17 @@ def train_krea2(
             rotator.activate_always("txtfusion", dit.txtfusion)
         rot_schedule = RotationSchedule(len(dit.blocks), active=ft_rotation,
                                         rotate_every=finetune_rotate_every)
+        if ft_stream_frozen:
+            from fizgig.krea2.rotation import RotationOffloader
+            # Injected as the DiT's offloader: the forward already calls wait_for_block /
+            # submit_move_blocks_forward whenever blocks_to_swap is truthy, so no model change.
+            # Window 0 here; the epoch loop re-pins to the correct window on the first
+            # iteration (and on resume, since want != rotator.active triggers a rotation).
+            dit.offloader = RotationOffloader(dit.blocks, torch.device(device),
+                                              rot_schedule.active_at(0))
+            dit.blocks_to_swap = 1
+            logger.info("[ft-rotation] streaming frozen blocks from CPU — only the trainable "
+                        "window stays resident.")
         logger.info("[ft-rotation] FULL FINE-TUNE — %s", rot_schedule.describe())
         if rot_schedule.cycle_epochs > max_train_epochs:
             logger.warning("[ft-rotation] a full cycle needs %d epochs but max_train_epochs=%d — "
@@ -1303,6 +1319,10 @@ def train_krea2(
                 # New window: swap the blocks, then rebuild the optimizer. The old optimizer's
                 # state refers to tensors that no longer require grad, and Adam moments for the
                 # outgoing window are meaningless to the incoming one.
+                if ft_stream_frozen:
+                    # Pin the incoming window BEFORE the weight swap: activate() reads from the
+                    # master onto the GPU, and the outgoing window must rejoin the stream pool.
+                    dit.offloader.set_resident(want)
                 rotator.rotate_to(want)
                 _new_params = rotator.trainable_params()
                 if fused_backward:
