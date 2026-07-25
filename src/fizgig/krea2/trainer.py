@@ -209,7 +209,8 @@ def _save_training_state(output_dir, output_name, network, optimizer, *, epoch, 
     state_dir = os.path.join(output_dir, f"{output_name}-{epoch:06d}-state")
     os.makedirs(state_dir, exist_ok=True)
     _save_lora(network, os.path.join(state_dir, "lora.safetensors"), network_dim, network_alpha, dtype)
-    torch.save(optimizer.state_dict(), os.path.join(state_dir, "optimizer.pt"))
+    if optimizer is not None:   # None under fused backward (per-parameter optimizers)
+        torch.save(optimizer.state_dict(), os.path.join(state_dir, "optimizer.pt"))
     rng = {"torch": torch.get_rng_state()}
     if torch.cuda.is_available():
         rng["cuda"] = torch.cuda.get_rng_state_all()
@@ -893,6 +894,9 @@ def train_krea2(
     # No LoRA is trained in this mode — the output is a full model checkpoint.
     finetune_rotation: int = 0,
     finetune_rotate_every: int = 1,
+    # Step each parameter's optimizer inside backward and free its grad immediately, so the
+    # whole active window's gradients never coexist. Saves roughly the gradient footprint.
+    finetune_fused_backward: bool = False,
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
 ):
@@ -992,7 +996,7 @@ def train_krea2(
     else:
         network.requires_grad_(True)
 
-    def _make_optimizer(params_):
+    def _make_optimizer(params_, quiet: bool = False):
         """Adafactor first in rotation mode: its factored state is ~10x smaller than Adam's,
         which is what keeps a full fine-tune inside 32 GB."""
         if ft_rotation:
@@ -1000,25 +1004,68 @@ def train_krea2(
                 from transformers.optimization import Adafactor
                 opt = Adafactor(params_, lr=learning_rate, scale_parameter=False,
                                 relative_step=False, warmup_init=False)
-                logger.info("optimizer: Adafactor (rotation)")
+                if not quiet:
+                    logger.info("optimizer: Adafactor (rotation)")
                 return opt
             except Exception as e:
-                logger.warning("Adafactor unavailable (%s) — falling back to AdamW8bit", e)
+                if not quiet:
+                    logger.warning("Adafactor unavailable (%s) — falling back to AdamW8bit", e)
         try:
             import bitsandbytes as bnb
             opt = bnb.optim.AdamW8bit(params_, lr=learning_rate)
-            logger.info("optimizer: AdamW8bit")
+            if not quiet:
+                logger.info("optimizer: AdamW8bit")
             return opt
         except Exception:
-            logger.info("optimizer: AdamW (bitsandbytes unavailable)")
+            if not quiet:
+                logger.info("optimizer: AdamW (bitsandbytes unavailable)")
             return torch.optim.AdamW(params_, lr=learning_rate)
+
+    # ---- optimizer-in-backward (fused) ----
+    # Normally every active parameter's gradient exists simultaneously at the peak of backward.
+    # With this on, each parameter's optimizer steps the moment its grad is ready and the grad
+    # is dropped, so only one parameter's gradient is live at a time.
+    fused_backward = bool(finetune_fused_backward and ft_rotation)
+    _fused = {"opts": {}, "handles": []}
+    if finetune_fused_backward and not ft_rotation:
+        logger.info("[fused-backward] only applies to rotation fine-tuning — ignored.")
+    if fused_backward:
+        if int(gradient_accumulation_steps or 1) > 1:
+            logger.info("[fused-backward] incompatible with gradient accumulation (grads are "
+                        "consumed and freed per parameter) — forcing accumulation to 1.")
+        if max_grad_norm > 0:
+            logger.info("[fused-backward] global grad-norm clipping needs all grads at once — "
+                        "clipping is disabled in this mode.")
+
+    def _attach_fused(params_):
+        """One single-parameter optimizer per tensor, stepped from its grad hook."""
+        for h in _fused["handles"]:
+            h.remove()
+        _fused["handles"].clear()
+        _fused["opts"].clear()
+        for p in params_:
+            _fused["opts"][p] = _make_optimizer([p], quiet=True)
+
+        def _hook(param):
+            opt = _fused["opts"].get(param)
+            if opt is not None:
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+
+        for p in params_:
+            _fused["handles"].append(p.register_post_accumulate_grad_hook(_hook))
+        logger.info("[fused-backward] %d per-parameter optimizers attached", len(params_))
 
     if ft_rotation:
         rotator.rotate_to(rot_schedule.active_at(0))
         params = rotator.trainable_params()
     else:
         params = list(network.get_trainable_params())
-    optimizer = _make_optimizer(params)
+    if fused_backward:
+        _attach_fused(params)
+        optimizer = None            # stepping happens in the backward hooks
+    else:
+        optimizer = _make_optimizer(params)
 
     collator = _Krea2Collator(shared_epoch, group)
     loader = DataLoader(group, batch_size=1, shuffle=True, collate_fn=collator, num_workers=0)
@@ -1058,7 +1105,10 @@ def train_krea2(
     # Mutually exclusive with adaptive LR by design: both write optimizer.param_groups[*]["lr"],
     # so a live scheduler would stomp the watcher's epoch decisions every step. Adaptive wins
     # (same rule as Klein, whose GUI also forces "constant" when adaptive is on).
-    accum = max(1, int(gradient_accumulation_steps or 1))
+    accum_requested = max(1, int(gradient_accumulation_steps or 1))
+    # Fused backward consumes and frees each grad as it lands, so there is nothing
+    # left to accumulate across micro-batches.
+    accum = 1 if fused_backward else accum_requested
     if accum > 1:
         logger.info(f"[grad_accum] {accum} micro-batches per optimizer step "
                     f"(effective batch {accum}); ~{max(1, steps_per_epoch // accum)} updates/epoch")
@@ -1254,8 +1304,15 @@ def train_krea2(
                 # state refers to tensors that no longer require grad, and Adam moments for the
                 # outgoing window are meaningless to the incoming one.
                 rotator.rotate_to(want)
-                optimizer = _make_optimizer(rotator.trainable_params())
-                if scheduler is not None:
+                _new_params = rotator.trainable_params()
+                if fused_backward:
+                    # Hooks and per-parameter optimizers belong to the OLD window's tensors —
+                    # rebuild them or the incoming blocks would never step.
+                    _attach_fused(_new_params)
+                else:
+                    optimizer = _make_optimizer(_new_params)
+                params = _new_params
+                if scheduler is not None and not fused_backward:
                     # Re-attach the schedule to the new optimizer at the current position.
                     _pos = scheduler.last_epoch
                     scheduler = _rebuild_scheduler(optimizer, _pos)
@@ -1280,7 +1337,10 @@ def train_krea2(
             _scaled = loss * step_mult if step_mult != 1.0 else loss
             (_scaled / accum if accum > 1 else _scaled).backward()
             pending_accum += 1
-            if pending_accum >= accum:
+            if fused_backward:
+                # The per-parameter hooks already stepped and freed each grad during backward.
+                pending_accum = 0
+            elif pending_accum >= accum:
                 # Gradient clipping to match the musubi reference (max_grad_norm default 1.0). 0 disables.
                 if max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
@@ -1302,7 +1362,7 @@ def train_krea2(
         # Flush a partial accumulation group at the epoch boundary: the epoch-end work (adaptive
         # LR decisions, rollback snapshot, state save) must see a settled optimizer, and leftover
         # grads must not leak into the next epoch.
-        if pending_accum > 0:
+        if pending_accum > 0 and not fused_backward:
             if max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
             optimizer.step()
@@ -1311,7 +1371,7 @@ def train_krea2(
             optimizer.zero_grad(set_to_none=True)
             pending_accum = 0
         logger.info(f"epoch {epoch + 1}/{max_train_epochs}  avr_loss={loss_recorder.moving_average:.4f}  step={global_step}"
-                    + (f"  lr={optimizer.param_groups[0]['lr']:.3e}" if scheduler is not None else ""))
+                    + (f"  lr={optimizer.param_groups[0]['lr']:.3e}" if (scheduler is not None and optimizer is not None) else ""))
 
         # Adaptive LR: epoch-boundary plateau tracker (before save/preview so they reflect the
         # post-adjustment state). Uses the smoothed avr_loss as the signal, like Klein.
