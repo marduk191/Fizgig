@@ -476,10 +476,24 @@ def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False):
 
         # Apply patch if it's a Linear layer with FP8 scale
         if isinstance(module, nn.Linear) and has_scale:
-            # register the scale_weight as a buffer to load the state_dict
-            # module.register_buffer("scale_weight", torch.tensor(1.0, dtype=module.weight.dtype))
+            # Register scale_weight as a buffer for load_state_dict to fill.
+            #
+            # Create it on the weight's DEVICE and in a COMPUTE dtype, not the weight's
+            # own dtype: by this point module.weight is already fp8, and the dequant
+            # forward does `weight.to(scale_weight.dtype) * scale_weight`. Inheriting the
+            # fp8 dtype makes that multiply fp8*fp8 ("mul_cuda not implemented for
+            # Float8_e4m3fn"), and defaulting to CPU makes it a cross-device multiply.
+            # The usual flow hides both because load_state_dict(assign=True) replaces the
+            # buffer wholesale — but any path that patches without a subsequent assigning
+            # load (e.g. re-freezing a block after fine-tuning it) would hit them.
             scale_shape = scale_shape_info[name]
-            module.register_buffer("scale_weight", torch.ones(scale_shape, dtype=module.weight.dtype))
+            scale_dtype = module.weight.dtype
+            if scale_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                scale_dtype = torch.bfloat16
+            module.register_buffer(
+                "scale_weight",
+                torch.ones(scale_shape, dtype=scale_dtype, device=module.weight.device),
+            )
 
             # Create a new forward method with the patched version.
             def new_forward(self, x):

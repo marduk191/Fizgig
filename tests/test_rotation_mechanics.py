@@ -65,14 +65,17 @@ for bi, blk in enumerate(blocks):
 
 holder = nn.Module(); holder.blocks = blocks
 apply_fp8_monkey_patch(holder, opt_sd)
+# The patch must leave scale_weight usable WITHOUT an assigning load_state_dict:
+# on the weight's device and in a compute dtype (fp8*fp8 would not even multiply).
+for blk in blocks:
+    for lin in (blk.attn, blk.mlp):
+        assert lin.scale_weight.device.type == torch.device(DEV).type, "scale buffer on wrong device"
+        assert lin.scale_weight.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2), \
+            "scale buffer inherited the fp8 weight dtype"
 for bi, blk in enumerate(blocks):
     for lname, lin in [("attn", blk.attn), ("mlp", blk.mlp)]:
-        # Assign (not copy_): register_buffer makes these on CPU and inherits the *fp8*
-        # weight dtype, whereas the real loader replaces them via load_state_dict(assign=True)
-        # with the file's scale in a compute dtype. Mirror that here.
-        shape = lin.scale_weight.shape
-        lin.scale_weight = (opt_sd[f"blocks.{bi}.{lname}.scale_weight"]
-                            .to(DEV, torch.bfloat16).reshape(shape))
+        lin.scale_weight.copy_(opt_sd[f"blocks.{bi}.{lname}.scale_weight"]
+                               .reshape(lin.scale_weight.shape))
 
 x = torch.randn(2, D, device=DEV, dtype=torch.bfloat16)
 def fwd(t):
