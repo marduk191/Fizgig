@@ -926,9 +926,18 @@ def train_krea2(
         raise RuntimeError("No training items — run the krea2 cache scripts first.")
     logger.info(f"Krea 2 training: {group.num_train_items} items, {max_train_epochs} epochs")
 
+    ft_rotation = max(0, int(finetune_rotation or 0))
+    ft_stream_frozen = False
+
     # Preview setup: pre-encode prompts (frees the 8GB encoder) + load the VAE BEFORE the RAW DiT,
-    # so the encoder never coexists with the resident base.
+    # so the encoder never coexists with the resident base. Skipped entirely under a full
+    # fine-tune: previews apply a LoRA to the Turbo and there is no LoRA here, so loading the
+    # encoder and VAE would be pure waste (it used to happen, then get discarded).
     do_previews = bool(sample_every_n_epochs and sample_prompts and turbo_path and vae_path and te_path)
+    if do_previews and ft_rotation:
+        logger.info("[ft-rotation] in-training previews are disabled — evaluate saved "
+                    "checkpoints in ComfyUI instead.")
+        do_previews = False
     encoded_prompts = sample_ae = sample_dir = None
     if do_previews:
         from fizgig.krea2.vae_loader import load_vae
@@ -938,8 +947,6 @@ def train_krea2(
         sample_ae = load_vae(vae_path, input_channels=3, device="cpu", disable_mmap=True)
         sample_dir = os.path.join(output_dir, "sample")
 
-    ft_rotation = max(0, int(finetune_rotation or 0))
-    ft_stream_frozen = False
     if ft_rotation:
         # Rotation owns the block weights: it swaps them between fp8-frozen and bf16-trainable
         # in place. Block swap moves whole blocks to CPU behind the offloader's back, and 4-bit
@@ -959,13 +966,6 @@ def train_krea2(
         if not fp8_scaled:
             logger.info("[ft-rotation] rotation needs the fp8-frozen base to fit — enabling fp8.")
             fp8_scaled = True
-        if do_previews:
-            # Previews render the Turbo with a LoRA applied; in FT mode there is no LoRA and
-            # the trained weights live in the base itself. Sampling the fine-tuned model would
-            # mean loading a second full checkpoint — out of scope for now.
-            logger.info("[ft-rotation] in-training previews are disabled — evaluate saved "
-                        "checkpoints in ComfyUI instead.")
-            do_previews = False
 
     if quant_4bit and blocks_to_swap > 0:
         logger.info("[nf4] 4-bit base is incompatible with block swap (weights live in _nf4_packed) "
