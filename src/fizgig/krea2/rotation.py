@@ -19,6 +19,7 @@ we're trying to learn.
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Iterable, List, Optional, Sequence
 
 import torch
@@ -280,7 +281,7 @@ class RotationOffloader:
     """
 
     def __init__(self, blocks: nn.ModuleList, device: torch.device, resident: Iterable[int],
-                 debug: bool = False):
+                 debug: bool = False, prefetch: bool = True):
         self.blocks = blocks
         self.device = torch.device(device)
         self.cpu = torch.device("cpu")
@@ -289,6 +290,13 @@ class RotationOffloader:
         self.debug = debug
         self.moves = 0                      # instrumentation: transfers per step
         self._handles = []
+        # Async plumbing: one worker thread issuing copies on a dedicated CUDA stream, so a
+        # block's transfer overlaps the previous block's compute instead of stalling on it.
+        self.cuda = self.device.type == "cuda" and torch.cuda.is_available()
+        self.prefetch = bool(prefetch and self.cuda)
+        self._pool = ThreadPoolExecutor(max_workers=1) if self.prefetch else None
+        self._stream = torch.cuda.Stream(device=self.device) if self.prefetch else None
+        self._futures = {}                  # block idx -> Future[cuda.Event | None]
         self._register_hooks()
 
     # -- placement helpers -------------------------------------------------
@@ -297,20 +305,71 @@ class RotationOffloader:
         weighs_to_device(self.blocks[idx], dev)
         self.moves += 1
 
+    def _move_task(self, idx: int, dev: torch.device, after):
+        """Runs on the worker thread, issuing the copy on the transfer stream."""
+        torch.cuda.set_device(self.device.index if self.device.index is not None
+                              else torch.cuda.current_device())
+        with torch.cuda.stream(self._stream):
+            if after is not None:
+                # Don't yank weights out from under kernels that are still queued.
+                self._stream.wait_event(after)
+            self._to(idx, dev)
+            ev = torch.cuda.Event()
+            ev.record(self._stream)
+        return ev
+
+    def _submit(self, idx: int, dev: torch.device, after=None):
+        # Track the DIRECTION, not just that something is in flight: an in-flight eviction
+        # must never be mistaken for a completed load (that race put weights on CPU while the
+        # forward was still running, and only showed up as a device mismatch deep in fp8).
+        pending = self._futures.get(idx)
+        if pending is not None:
+            if pending[0] == dev:
+                return                  # same direction already queued
+            self._await(idx)            # opposite direction: settle it first
+        self._futures[idx] = (dev, self._pool.submit(self._move_task, idx, dev, after))
+
+    def _await(self, idx: int):
+        """Settle any in-flight move for `idx`. Returns the device it moved to, or None."""
+        pending = self._futures.pop(idx, None)
+        if pending is None:
+            return None
+        dev, fut = pending
+        ev = fut.result()
+        if ev is not None:
+            torch.cuda.current_stream().wait_event(ev)
+        return dev
+
     def _ensure_gpu(self, idx: int):
         if idx in self.resident:
             return
+        landed = self._await(idx)
+        if landed is not None and landed.type == self.device.type:
+            return                      # a prefetch already put it on the GPU
         self._to(idx, self.device)
 
     def _evict(self, idx: int):
         if idx in self.resident:
             return
-        self._to(idx, self.cpu)
+        if self.prefetch:
+            # Queue the eviction behind the compute that just used this block.
+            done = torch.cuda.Event()
+            done.record(torch.cuda.current_stream())
+            self._submit(idx, self.cpu, after=done)
+        else:
+            self._to(idx, self.cpu)
+
+    def _prefetch_next(self, idx: int):
+        if not self.prefetch or idx < 0 or idx >= len(self.blocks) or idx in self.resident:
+            return
+        self._submit(idx, self.device)
 
     # -- rotation ----------------------------------------------------------
     def set_resident(self, resident: Iterable[int]):
         """Re-pin after a rotation: the incoming window goes to GPU and stays, the outgoing
         window rejoins the streamed pool."""
+        for idx in list(self._futures):     # settle everything before re-planning
+            self._await(idx)
         new = set(int(i) for i in resident)
         for idx in sorted(new - self.resident):
             self._to(idx, self.device)
@@ -321,18 +380,21 @@ class RotationOffloader:
 
     # -- interface the DiT forward calls -----------------------------------
     def prepare_block_devices_before_forward(self, blocks):
+        for idx in list(self._futures):
+            self._await(idx)
         for i in range(len(blocks)):
             self._to(i, self.device if i in self.resident else self.cpu)
-        if self.device.type == "cuda":
+        if self.cuda:
             torch.cuda.synchronize(self.device)
             torch.cuda.empty_cache()
+        # Warm the first streamed block so step 0 isn't a stall.
+        self._prefetch_next(0 if 0 not in self.resident else 1)
 
     def wait_for_block(self, index: int):
         self._ensure_gpu(index)
+        self._prefetch_next(index + 1)      # overlap the next load with this block's compute
 
     def submit_move_blocks_forward(self, blocks, index: int):
-        # In training the block is needed again for its backward, but holding it would defeat
-        # the point — the backward pre-hook fetches it back.
         self._evict(index)
 
     def set_forward_only(self, forward_only: bool):
@@ -343,6 +405,7 @@ class RotationOffloader:
         for i, block in enumerate(self.blocks):
             def pre_hook(module, grad_output, _i=i):
                 self._ensure_gpu(_i)
+                self._prefetch_next(_i - 1)   # backward walks blocks in reverse
                 return None
 
             def post_hook(module, grad_input, grad_output, _i=i):
@@ -353,6 +416,10 @@ class RotationOffloader:
             self._handles.append(block.register_full_backward_hook(post_hook))
 
     def remove(self):
+        for idx in list(self._futures):
+            self._await(idx)
         for h in self._handles:
             h.remove()
         self._handles.clear()
+        if self._pool is not None:
+            self._pool.shutdown(wait=True)
