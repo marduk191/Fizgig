@@ -2616,6 +2616,68 @@ class LoRATrainerGUI:
                   foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
         self._krea2_losswatch_hint.grid(row=24, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
 
+        # --- Full fine-tune (rotating windows) — Krea 2 only, experimental branch.
+        # Trains the BASE MODEL directly instead of a LoRA, a window of weights at a time so
+        # a 12.9B full fine-tune fits a consumer card. Output is a full checkpoint.
+        self.krea2_finetune_var = tk.BooleanVar(value=bool(self.settings.get("KREA2_FINETUNE", False)))
+        self._krea2_ft_cb = ttk.Checkbutton(
+            training_content,
+            text="⚗ Fine-tune the BASE MODEL instead of training a LoRA (experimental)",
+            variable=self.krea2_finetune_var,
+            command=lambda: self._apply_krea2_ft_visibility(),
+        )
+        self._krea2_ft_cb.grid(row=25, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(10, 0))
+
+        self._krea2_ft_frame = ttk.Frame(training_content)
+        self._krea2_ft_frame.grid(row=26, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(2, 0))
+        ttk.Label(self._krea2_ft_frame, text="Window:").pack(side=tk.LEFT, padx=(16, 4))
+        self.krea2_ft_mode_var = tk.StringVar(
+            value=str(self.settings.get("KREA2_FT_MODE", "component")))
+        _ftm = ttk.Combobox(self._krea2_ft_frame, textvariable=self.krea2_ft_mode_var,
+                            values=["component", "block"], state="readonly", width=11)
+        _ftm.pack(side=tk.LEFT)
+        _ftm.bind("<<ComboboxSelected>>", lambda e: self._apply_krea2_ft_visibility())
+        ToolTip(_ftm, "component (recommended): attention, then each MLP matrix, across ALL 28 blocks — "
+                      "every window trains the model's full depth, so a concept is learned by every "
+                      "layer at once. 4 windows per cycle.  |  "
+                      "block: contiguous slices of blocks. Fewer windows, but each trains only part "
+                      "of the depth at a time.")
+        self._krea2_ft_blocks_lbl = ttk.Label(self._krea2_ft_frame, text="Blocks/window:")
+        self._krea2_ft_blocks_lbl.pack(side=tk.LEFT, padx=(14, 4))
+        self.krea2_ft_blocks_var = tk.StringVar(value=str(self.settings.get("KREA2_FT_BLOCKS", "14")))
+        self._krea2_ft_blocks_cb = ttk.Combobox(self._krea2_ft_frame, textvariable=self.krea2_ft_blocks_var,
+                                                values=["4", "8", "12", "14", "18"], state="readonly", width=4)
+        self._krea2_ft_blocks_cb.pack(side=tk.LEFT)
+        ToolTip(self._krea2_ft_blocks_cb, "How many of the 28 blocks train at once (block mode). "
+                                          "Measured on a 32 GB card: 4 -> 24.8 GB, 8 -> 24.2 GB, "
+                                          "14 -> 27.5 GB, 18 -> 29.5 GB. More blocks = fewer windows "
+                                          "= each block gets a bigger share of the run.")
+        ttk.Label(self._krea2_ft_frame, text="Rotate every:").pack(side=tk.LEFT, padx=(14, 4))
+        self.krea2_ft_every_var = tk.StringVar(value=str(self.settings.get("KREA2_FT_EVERY", "1")))
+        ttk.Combobox(self._krea2_ft_frame, textvariable=self.krea2_ft_every_var,
+                     values=["1", "2", "3", "5"], state="readonly", width=4).pack(side=tk.LEFT)
+        ttk.Label(self._krea2_ft_frame, text="epoch(s)").pack(side=tk.LEFT, padx=(4, 0))
+
+        self.krea2_ft_fused_var = tk.BooleanVar(value=bool(self.settings.get("KREA2_FT_FUSED", True)))
+        self._krea2_ft_fused_cb = ttk.Checkbutton(
+            training_content,
+            text="Free each gradient as it lands (saves ~5 GB; disables gradient clipping)",
+            variable=self.krea2_ft_fused_var,
+        )
+        self._krea2_ft_fused_cb.grid(row=27, column=0, columnspan=2, sticky=tk.W, padx=(21, 5), pady=(2, 0))
+
+        self._krea2_ft_hint = ttk.Label(training_content,
+                  text="Trains the base model's own weights, not an adapter — no rank bottleneck, so concepts "
+                       "don't compete for the same directions. Only part of the model is trainable at a time and "
+                       "the window rotates, which is what makes a 12.9B fine-tune fit; a full cycle is 4 epochs in "
+                       "component mode, so run at least that many or some weights never train (the console warns "
+                       "you). Use a LOW learning rate — 1e-5 or below; LoRA rates will wreck a base model. "
+                       "Network Rank/Alpha are ignored. Adaptive LR and in-training previews are turned off "
+                       "automatically. EACH SAVE IS A FULL ~26 GB CHECKPOINT: leave 'Save every N epochs' at 0 "
+                       "unless you have the disk for it. Test the result in ComfyUI as a normal Krea 2 model.",
+                  foreground="#E67E22", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
+        self._krea2_ft_hint.grid(row=28, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 6))
+
         # === Optimizer Section (Collapsed by default) ===
         optimizer_section = CollapsibleFrame(outer,"Optimizer", default_expanded=False)
         optimizer_section.pack(fill=tk.X, padx=36, pady=(0, 16))
@@ -3297,6 +3359,11 @@ class LoRATrainerGUI:
         _grab("krea2_per_image_lr_var", "KREA2_PER_IMAGE_LR")
         _grab("krea2_auto_recaption_var", "KREA2_AUTO_RECAPTION")
         _grab("krea2_warmup_look_var", "KREA2_WARMUP_LOOK")
+        _grab("krea2_finetune_var", "KREA2_FINETUNE")
+        _grab("krea2_ft_mode_var", "KREA2_FT_MODE")
+        _grab("krea2_ft_blocks_var", "KREA2_FT_BLOCKS")
+        _grab("krea2_ft_every_var", "KREA2_FT_EVERY")
+        _grab("krea2_ft_fused_var", "KREA2_FT_FUSED")
         _grab("grad_checkpoint_var", "GRADIENT_CHECKPOINTING")
         _grab("fp8_text_encoder_var", "FP8_TEXT_ENCODER")
         _grab("adaptive_lr_var", "ADAPTIVE_LR")
@@ -3592,6 +3659,22 @@ class LoRATrainerGUI:
         except Exception:
             pass
 
+    def _apply_krea2_ft_visibility(self):
+        """Show the fine-tune knobs only when base-model fine-tuning is on, and the
+        blocks-per-window picker only in block mode (component windows are fixed)."""
+        if not hasattr(self, "_krea2_ft_frame"):
+            return
+        on = bool(self.krea2_finetune_var.get())
+        for w in (self._krea2_ft_frame, self._krea2_ft_fused_cb, self._krea2_ft_hint):
+            self._set_widget_visible(w, on)
+        block_mode = str(self.krea2_ft_mode_var.get()) == "block"
+        if on and block_mode:
+            self._krea2_ft_blocks_lbl.pack(side=tk.LEFT, padx=(14, 4))
+            self._krea2_ft_blocks_cb.pack(side=tk.LEFT)
+        else:
+            self._krea2_ft_blocks_lbl.pack_forget()
+            self._krea2_ft_blocks_cb.pack_forget()
+
     def _apply_training_arch_visibility(self, is_krea2: bool):
         """Hide Training-tab controls not yet wired into the Krea 2 native trainer; re-show for Klein.
 
@@ -3638,8 +3721,14 @@ class LoRATrainerGUI:
         # wired into krea2_train for now — hide them under Klein.
         for w in (self._krea2_losswatch_frame, self._krea2_perimglr_cb,
                   self._krea2_autorecap_cb, self._krea2_warmuplook_cb,
-                  self._krea2_losswatch_hint):
+                  self._krea2_losswatch_hint, self._krea2_ft_cb):
             self._set_widget_visible(w, is_krea2)
+        # The FT sub-controls are gated by the checkbox as well as by the family.
+        if is_krea2:
+            self._apply_krea2_ft_visibility()
+        else:
+            for w in (self._krea2_ft_frame, self._krea2_ft_fused_cb, self._krea2_ft_hint):
+                self._set_widget_visible(w, False)
 
         # Custom block picker: always hidden under Krea 2; under Klein, let the Model-Area
         # dropdown decide (only shown when the preset is "Custom").
@@ -17072,6 +17161,22 @@ class LoRATrainerGUI:
             cmd.append("--per_image_lr")
         if self.krea2_warmup_look_var.get():
             cmd.append("--warmup_look_outliers")
+        # Full base-model fine-tune (experimental): rotating trainable windows, full checkpoint out.
+        if self.settings.get("KREA2_FINETUNE"):
+            mode = str(self.settings.get("KREA2_FT_MODE", "component"))
+            try:
+                nblocks = int(str(self.settings.get("KREA2_FT_BLOCKS", "14")))
+            except ValueError:
+                nblocks = 14
+            try:
+                every = int(str(self.settings.get("KREA2_FT_EVERY", "1")))
+            except ValueError:
+                every = 1
+            cmd += ["--finetune_rotation", str(max(1, nblocks)),
+                    "--finetune_rotation_mode", mode,
+                    "--finetune_rotate_every", str(max(1, every))]
+            if self.settings.get("KREA2_FT_FUSED", True):
+                cmd.append("--finetune_fused_backward")
         if self.krea2_auto_recaption_var.get():
             cmd.append("--auto_recaption")
             # Trigger word from the Captions tab — appended (', <trigger>') to AI captions if set.
