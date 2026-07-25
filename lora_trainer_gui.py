@@ -2673,8 +2673,10 @@ class LoRATrainerGUI:
                        "component mode, so run at least that many or some weights never train (the console warns "
                        "you). Use a LOW learning rate — 1e-5 or below; LoRA rates will wreck a base model. "
                        "Network Rank/Alpha are ignored. Adaptive LR and in-training previews are turned off "
-                       "automatically. EACH SAVE IS A FULL ~26 GB CHECKPOINT: leave 'Save every N epochs' at 0 "
-                       "unless you have the disk for it. Checkpoints are written to the Output Directory above "
+                       "automatically, so there are no in-training previews — judge the saved checkpoints in "
+                       "ComfyUI. EACH SAVE IS A FULL ~26 GB CHECKPOINT; saving every 4 epochs lands one per "
+                       "full cycle, when every component has had the same number of passes and checkpoints "
+                       "compare like-for-like (~260 GB over a 40-epoch run). Checkpoints are written to the Output Directory above "
                        "(the usual LoRA folder) — point it somewhere with room, e.g. your ComfyUI models/unet. "
                        "Test the result in ComfyUI as a normal Krea 2 model.",
                   foreground="#E67E22", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
@@ -3666,8 +3668,14 @@ class LoRATrainerGUI:
     # on this branch; the LR especially — LoRA rates (1e-4+) destroy a base model.
     KREA2_FT_DEFAULTS = {
         "LEARNING_RATE": "1e-5",
-        "MAX_TRAIN_EPOCHS": "8",          # 2 full 4-window cycles, so every window trains evenly
-        "SAVE_EVERY_N_EPOCHS": "0",       # each save is a full ~26 GB checkpoint
+        "MAX_TRAIN_EPOCHS": "40",         # 10 full 4-window cycles — an overnight run you can
+                                          # scrub through; nobody has tuned this recipe on a
+                                          # diffusion DiT, so compare checkpoints to find where
+                                          # it peaks rather than trusting the number
+        "SAVE_EVERY_N_EPOCHS": "4",       # one per full cycle: every component has had the same
+                                          # number of passes, so checkpoints are comparable
+                                          # like-for-like. ~26 GB each -> 10 files / ~260 GB
+                                          # over a 40-epoch run
         "GRADIENT_ACCUMULATION": "1",     # fused backward consumes grads as they land
         "MAX_GRAD_NORM": "0",             # global clipping is impossible under fused backward
     }
