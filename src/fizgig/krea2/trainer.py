@@ -434,6 +434,13 @@ def _build_bf16_master(raw_path: str, dit) -> dict:
         for name, m in block.named_modules():
             if isinstance(m, _nn.Linear) and hasattr(m, "scale_weight"):
                 wanted.add(f"blocks.{bi}.{name}.weight")
+    # txtfusion sits outside dit.blocks, so rotation never reaches it — but it's the stack
+    # that fuses the text embeddings, so it's held always-on rather than left frozen.
+    txtf = getattr(dit, "txtfusion", None)
+    if txtf is not None:
+        for name, m in txtf.named_modules():
+            if isinstance(m, _nn.Linear) and hasattr(m, "scale_weight"):
+                wanted.add(f"txtfusion.{name}.weight")
 
     sd = load_file(raw_path)          # mmap'd; we copy out only the keys we need
     master, missing = {}, []
@@ -965,6 +972,8 @@ def train_krea2(
         network.requires_grad_(False)
         master = _build_bf16_master(raw_path, dit)
         rotator = BlockRotator(dit.blocks, master, key_prefix="blocks", device=device)
+        if getattr(dit, "txtfusion", None) is not None:
+            rotator.activate_always("txtfusion", dit.txtfusion)
         rot_schedule = RotationSchedule(len(dit.blocks), active=ft_rotation,
                                         rotate_every=finetune_rotate_every)
         logger.info("[ft-rotation] FULL FINE-TUNE — %s", rot_schedule.describe())

@@ -80,6 +80,15 @@ def _linears_with_scale(module: nn.Module) -> List[tuple]:
     return out
 
 
+def _all_linears(module: nn.Module) -> List[tuple]:
+    """(qualified_name, linear) for every Linear, quantized or not.
+
+    Needed for always-on modules: the training fp8 pass only targets "blocks." and excludes
+    txtfusion, so those Linears are plain bf16 and have no scale_weight to filter on.
+    """
+    return [(n, m) for n, m in module.named_modules() if isinstance(m, nn.Linear)]
+
+
 class BlockRotator:
     """Swaps DiT blocks between fp8-frozen and bf16-trainable, in place.
 
@@ -100,9 +109,46 @@ class BlockRotator:
         self.block_size = block_size
         self.active: List[int] = []
         self._patched_forward = {}      # id(linear) -> bound fp8 forward, for restore
+        # (key_prefix, module) pairs held trainable for the WHOLE run, never rotated out.
+        self.always: List[tuple] = []
 
     def _key(self, block_idx: int, linear_name: str) -> str:
         return f"{self.key_prefix}.{block_idx}.{linear_name}.weight"
+
+    # ---- always-on modules (e.g. txtfusion) ----
+    def activate_always(self, prefix: str, module: nn.Module) -> int:
+        """Make every patched Linear under `module` trainable for the entire run.
+
+        txtfusion lives outside dit.blocks, so rotation would never reach it — yet it's the
+        stack that fuses the text embeddings, i.e. where prompt-to-concept binding is shaped.
+        Leaving it frozen would cap exactly the behaviour a fine-tune is usually after. It's
+        small (a 3072-wide text path vs the 6144-wide main blocks) so holding it trainable
+        throughout costs little.
+        """
+        n_swapped = n_direct = 0
+        for lname, lin in _all_linears(module):
+            key = f"{prefix}.{lname}.weight"
+            if hasattr(lin, "scale_weight"):
+                # fp8-quantized: same swap as a rotating block, sourced from the master.
+                w = self.master.get(key)
+                if w is None:
+                    logger.warning("[rotation] no master weight for %s — leaving frozen", key)
+                    continue
+                self._patched_forward[id(lin)] = lin.__dict__.pop("forward", None)
+                lin.weight = nn.Parameter(w.to(self.device, dtype=torch.bfloat16), requires_grad=True)
+                n_swapped += 1
+            else:
+                # Already bf16 — the training fp8 pass targets "blocks." and excludes
+                # txtfusion, so these are the real weights and just need unfreezing.
+                lin.weight.requires_grad_(True)
+                n_direct += 1
+            if lin.bias is not None:
+                lin.bias.requires_grad_(True)
+        self.always.append((prefix, module))
+        logger.info("[rotation] always-on: %s (%d Linears trainable for the whole run"
+                    "%s)", prefix, n_swapped + n_direct,
+                    f"; {n_swapped} de-quantized, {n_direct} already bf16" if n_swapped else "")
+        return n_swapped + n_direct
 
     # ---- activation: fp8 (frozen) -> bf16 (trainable) ----
     def activate(self, block_ids: Iterable[int]) -> int:
@@ -180,19 +226,33 @@ class BlockRotator:
             self.activate(sorted(want - cur))
 
     def trainable_params(self) -> List[nn.Parameter]:
+        """Active-window params PLUS the always-on modules. Rebuilt each rotation, so the
+        always-on params must be re-included every time or they'd silently stop updating."""
         params = []
         for bi in self.active:
             for p in self.blocks[bi].parameters():
                 if p.requires_grad:
                     params.append(p)
+        seen = {id(p) for p in params}
+        for _prefix, module in self.always:
+            for p in module.parameters():
+                if p.requires_grad and id(p) not in seen:
+                    params.append(p)
+                    seen.add(id(p))
         return params
 
     def master_state_dict(self) -> Dict[str, torch.Tensor]:
-        """The bf16 master, with any currently-active blocks flushed into it."""
+        """The bf16 master, with currently-active blocks and always-on modules flushed in."""
         out = dict(self.master)
         for bi in self.active:
             for lname, lin in _linears_with_scale(self.blocks[bi]):
                 key = self._key(bi, lname)
                 if key in out:
                     out[key] = lin.weight.detach().to("cpu", dtype=torch.bfloat16).clone()
+        for prefix, module in self.always:
+            # Export unconditionally: unquantized always-on Linears were never in the master
+            # (they live on the GPU in bf16 from the start), but they HAVE been trained.
+            for lname, lin in _all_linears(module):
+                out[f"{prefix}.{lname}.weight"] = (
+                    lin.weight.detach().to("cpu", dtype=torch.bfloat16).clone())
         return out
