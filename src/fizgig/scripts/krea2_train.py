@@ -86,7 +86,10 @@ def setup_parser() -> argparse.ArgumentParser:
                    help="LR warm-up (x0.4->x1.0 over first epochs) for Look Filter outlier images "
                         "(reads <dataset>/fizgig_look_scores.json from the Image Prep Look Filter)")
     p.add_argument("--trigger_word", default=None,
-                   help="Trigger word appended (', <trigger>') to auto-generated captions")
+                   help="Trigger word added to auto-generated captions")
+    p.add_argument("--trigger_position", default="start", choices=["start", "end"],
+                   help="Where the trigger goes in auto-generated captions. start (default) matches "
+                        "the Captions tab and suits a real-name trigger; end is a weaker claim")
     return p
 
 
@@ -134,6 +137,7 @@ def main():
         auto_recaption=args.auto_recaption,
         warmup_look_outliers=args.warmup_look_outliers,
         trigger_word=args.trigger_word,
+        trigger_position=args.trigger_position,
     )
 
 

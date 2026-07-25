@@ -555,7 +555,8 @@ def _read_sample_override(output_dir):
 
 
 def _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_swap, loss_watch, epoch,
-                           *, auto_recaption=False, trigger_word=None, recaptioned=None,
+                           *, auto_recaption=False, trigger_word=None, trigger_position="start",
+                           recaptioned=None,
                            image_dir=None, caption_ext=".txt"):
     """Live caption repair (Problem Images window). Consume <output_dir>/loss_log/caption_updates.json
     ({item_key: new_caption}), re-encode each caption with Qwen3-VL, and OVERWRITE the item's
@@ -565,7 +566,7 @@ def _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_sw
 
     auto_recaption: additionally re-caption CONFIRMED-STUCK images with the same Qwen3-VL (it's a
     full VLM with a real LM head — the captioner ships inside the training stack), appending
-    ", <trigger_word>" when one is set. Max TWO attempts per image per run (`recaptioned` is a
+    "<trigger_word>, " (leading) when one is set. Max TWO attempts per image per run (`recaptioned` is a
     {key: attempts} dict): attempt 1 = standard caption; if the image re-confirms stuck after its
     history reset (~5-6 epochs later, i.e. the first caption demonstrably failed), attempt 2 =
     exhaustive-detail caption; after that it's permanently human-review. A manual edit already
@@ -661,15 +662,19 @@ def _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_sw
         from fizgig.krea2.embedder import generate_caption
         encoder = load_krea2_text_encoder(te_path, dtype=torch.bfloat16, device=device)
 
-        # Auto-recaption: the SAME loaded VLM describes what's actually in the stuck image;
-        # trigger word (if any) is appended at the END — per the conditional-trigger doctrine,
-        # a trailing token is a far weaker identity claim than a leading one. Attempt 2 (the
-        # first caption demonstrably failed) goes exhaustive-detail.
+        # Auto-recaption: the SAME loaded VLM describes what's actually in the stuck image.
+        # The trigger goes FIRST by default, matching what the Captions tab writes — a dataset
+        # must not end up with the trigger leading on some images and trailing on others.
+        # Leading is also the right call when the trigger is a real name (base-model
+        # fine-tuning): the name is the subject, not an afterthought. trigger_position="end"
+        # restores the weaker trailing claim, which suits a conditional trigger on a LoRA.
+        # Attempt 2 (the first caption demonstrably failed) goes exhaustive-detail.
         for k, img_path, attempt in auto_todo:
             try:
                 cap = generate_caption(encoder, img_path, detailed=(attempt >= 2))
                 if trigger_word:
-                    cap = f"{cap}, {trigger_word}"
+                    cap = (f"{cap}, {trigger_word}" if str(trigger_position) == "end"
+                           else f"{trigger_word}, {cap}")
                 cap_path = os.path.join(image_dir, os.path.basename(k) + caption_ext)
                 try:
                     with open(cap_path, "w", encoding="utf-8") as f:
@@ -892,6 +897,9 @@ def train_krea2(
     # Rotating-block FULL fine-tune (experimental). >0 trains that many DiT blocks at a
     # time in bf16 while the rest stay fp8-frozen, rotating the window every N epochs.
     # No LoRA is trained in this mode — the output is a full model checkpoint.
+    # Where the trigger word lands in auto-generated captions: "start" (matches the
+    # Captions tab, and right for a real-name trigger) or "end" (weaker claim).
+    trigger_position: str = "start",
     finetune_rotation: int = 0,
     finetune_rotate_every: int = 1,
     # "block" = contiguous depth slices; "component" = attn across ALL blocks, then
@@ -1419,6 +1427,7 @@ def train_krea2(
         _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_swap,
                                loss_watch, epoch + 1,
                                auto_recaption=auto_recaption, trigger_word=trigger_word,
+                               trigger_position=trigger_position,
                                recaptioned=recaptioned, image_dir=ar_image_dir,
                                caption_ext=ar_caption_ext)
 
