@@ -18,6 +18,7 @@ we're trying to learn.
 
 from __future__ import annotations
 
+import gc
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Iterable, List, Optional, Sequence
@@ -38,7 +39,8 @@ class RotationSchedule:
     """
 
     def __init__(self, n_blocks: int, active: int = 4, rotate_every: int = 1,
-                 order: Optional[Sequence[int]] = None):
+                 order: Optional[Sequence[int]] = None, mode: str = "block",
+                 components: Sequence[str] = ("attn", "mlp.gate", "mlp.up", "mlp.down")):
         if n_blocks <= 0:
             raise ValueError("n_blocks must be positive")
         self.n_blocks = int(n_blocks)
@@ -47,9 +49,22 @@ class RotationSchedule:
         self.order = list(order) if order is not None else list(range(self.n_blocks))
         if sorted(self.order) != list(range(self.n_blocks)):
             raise ValueError("order must be a permutation of range(n_blocks)")
+        # Default components are balanced by parameter count: a block is 30% attention and
+        # 70% MLP, so a naive ("attn", "mlp") split makes the MLP window 2.3x the attention
+        # one — big enough to OOM. Splitting the MLP into its three matrices gives four
+        # windows of <=30% each.
+        # "block": windows are contiguous slices of blocks (depth-split).
+        # "component": windows are sub-block components spanning EVERY block — attention
+        # across the whole model, then MLP. Roughly the same VRAM (attention is about half
+        # a block) but each window sees the model's full depth, so a concept is learned by
+        # every layer at once instead of by one depth slice at a time.
+        self.mode = "component" if str(mode).startswith("comp") else "block"
+        self.components = list(components)
 
     @property
     def n_windows(self) -> int:
+        if self.mode == "component":
+            return len(self.components)
         return (self.n_blocks + self.active - 1) // self.active
 
     @property
@@ -61,12 +76,19 @@ class RotationSchedule:
         """0-based window index for a 0-based epoch (wraps after a full cycle)."""
         return (int(epoch) // self.rotate_every) % self.n_windows
 
-    def active_at(self, epoch: int) -> List[int]:
+    def active_at(self, epoch: int):
+        """Block indices (block mode) or component name prefixes (component mode)."""
         w = self.window_at(epoch)
+        if self.mode == "component":
+            return [self.components[w]]
         start = w * self.active
         return sorted(self.order[start:start + self.active])
 
     def describe(self) -> str:
+        if self.mode == "component":
+            return (f"component windows {self.components} across all {self.n_blocks} blocks, "
+                    f"rotating every {self.rotate_every} epoch(s) — {self.n_windows} windows, "
+                    f"{self.cycle_epochs} epochs per full cycle (every window spans full depth)")
         return (f"{self.active} of {self.n_blocks} blocks per window, rotating every "
                 f"{self.rotate_every} epoch(s) — {self.n_windows} windows, "
                 f"{self.cycle_epochs} epochs per full cycle")
@@ -151,90 +173,115 @@ class BlockRotator:
                     f"; {n_swapped} de-quantized, {n_direct} already bf16" if n_swapped else "")
         return n_swapped + n_direct
 
+    # ---- targets ----
+    def _targets(self, spec) -> List[tuple]:
+        """(key, linear) pairs for a window spec.
+
+        spec is either block indices (block mode) or component name prefixes such as
+        "attn"/"mlp" (component mode), in which case the window spans EVERY block.
+        """
+        out = []
+        if spec and isinstance(spec[0], str):
+            for bi, block in enumerate(self.blocks):
+                for lname, lin in _linears_with_scale(block):
+                    if any(lname.startswith(c) for c in spec):
+                        out.append((self._key(bi, lname), lin))
+        else:
+            for bi in spec:
+                for lname, lin in _linears_with_scale(self.blocks[bi]):
+                    out.append((self._key(bi, lname), lin))
+        return out
+
     # ---- activation: fp8 (frozen) -> bf16 (trainable) ----
-    def activate(self, block_ids: Iterable[int]) -> int:
+    def _activate_targets(self, targets) -> int:
         n = 0
-        for bi in block_ids:
-            block = self.blocks[bi]
-            for lname, lin in _linears_with_scale(block):
-                key = self._key(bi, lname)
-                w = self.master.get(key)
-                if w is None:
-                    logger.warning("[rotation] no master weight for %s — leaving frozen", key)
-                    continue
-                # Stash the fp8 forward so deactivate() can put it back verbatim.
-                self._patched_forward[id(lin)] = lin.__dict__.pop("forward", None)
-                lin.weight = nn.Parameter(w.to(self.device, dtype=torch.bfloat16),
-                                          requires_grad=True)
-                if lin.bias is not None:
-                    lin.bias = nn.Parameter(lin.bias.detach().to(torch.bfloat16),
-                                            requires_grad=True)
-                n += 1
-        self.active = sorted(set(self.active) | set(block_ids))
-        logger.info("[rotation] activated blocks %s (%d Linears now trainable)",
-                    sorted(block_ids), n)
+        for key, lin in targets:
+            w = self.master.get(key)
+            if w is None:
+                logger.warning("[rotation] no master weight for %s — leaving frozen", key)
+                continue
+            # Stash the fp8 forward so deactivate() can put it back verbatim.
+            self._patched_forward[id(lin)] = lin.__dict__.pop("forward", None)
+            lin.weight = nn.Parameter(w.to(self.device, dtype=torch.bfloat16), requires_grad=True)
+            if lin.bias is not None:
+                lin.bias = nn.Parameter(lin.bias.detach().to(torch.bfloat16), requires_grad=True)
+            n += 1
         return n
 
-    # ---- deactivation: write back to master, re-quantize to fp8 ----
-    def deactivate(self, block_ids: Iterable[int]) -> int:
+    def _deactivate_targets(self, targets) -> int:
         from fizgig.krea2.fp8_optimization_utils import (
             calculate_fp8_maxval, quantize_weight, fp8_linear_forward_patch,
         )
         max_value = calculate_fp8_maxval(4, 3)
         min_value = -max_value
         n = 0
-        for bi in block_ids:
-            block = self.blocks[bi]
-            for lname, lin in _linears_with_scale(block):
-                key = self._key(bi, lname)
-                if key not in self.master:
-                    continue
-                trained = lin.weight.detach()
-                # Master is the source of truth — save BEFORE the lossy re-quantize.
-                self.master[key] = trained.to("cpu", dtype=torch.bfloat16).clone()
-                q, scale = quantize_weight(key, trained.float(), self.fp8_dtype,
-                                           max_value, min_value,
-                                           quantization_mode=self.quantization_mode,
-                                           block_size=self.block_size)
-                lin.weight = nn.Parameter(q.to(self.device), requires_grad=False)
-                sw = scale.to(self.device, dtype=lin.scale_weight.dtype).reshape(
-                    lin.scale_weight.shape)
-                lin.scale_weight.copy_(sw)
-                if lin.bias is not None:
-                    lin.bias.requires_grad_(False)
-                saved = self._patched_forward.pop(id(lin), None)
-                if saved is not None:
-                    lin.forward = saved
-                else:   # rebind a fresh fp8 forward
-                    def _fwd(self_, x, _p=fp8_linear_forward_patch):
-                        return _p(self_, x, False, None)
-                    lin.forward = _fwd.__get__(lin, type(lin))
-                n += 1
-        self.active = [b for b in self.active if b not in set(block_ids)]
-        logger.info("[rotation] deactivated blocks %s (%d Linears re-quantized)",
-                    sorted(block_ids), n)
+        for key, lin in targets:
+            if key not in self.master:
+                continue
+            trained = lin.weight.detach()
+            # Master is the source of truth — save BEFORE the lossy re-quantize.
+            self.master[key] = trained.to("cpu", dtype=torch.bfloat16).clone()
+            q, scale = quantize_weight(key, trained.float(), self.fp8_dtype,
+                                       max_value, min_value,
+                                       quantization_mode=self.quantization_mode,
+                                       block_size=self.block_size)
+            lin.weight = nn.Parameter(q.to(self.device), requires_grad=False)
+            sw = scale.to(self.device, dtype=lin.scale_weight.dtype).reshape(lin.scale_weight.shape)
+            lin.scale_weight.copy_(sw)
+            if lin.bias is not None:
+                lin.bias.requires_grad_(False)
+            saved = self._patched_forward.pop(id(lin), None)
+            if saved is not None:
+                lin.forward = saved
+            else:
+                def _fwd(self_, x, _p=fp8_linear_forward_patch):
+                    return _p(self_, x, False, None)
+                lin.forward = _fwd.__get__(lin, type(lin))
+            n += 1
         return n
 
-    def rotate_to(self, block_ids: Sequence[int]) -> None:
-        """Make exactly `block_ids` trainable, deactivating whatever else is active."""
-        want = set(block_ids)
-        cur = set(self.active)
-        if want == cur:
+    def activate(self, spec) -> int:
+        spec = list(spec)
+        n = self._activate_targets(self._targets(spec))
+        # Keep self.active in step — trainable_params() and master_state_dict() read it.
+        merged = list(self.active) + [x for x in spec if x not in self.active]
+        self.active = sorted(merged) if merged and not isinstance(merged[0], str) else merged
+        logger.info("[rotation] activated %s (%d Linears now trainable)", spec, n)
+        return n
+
+    def deactivate(self, spec) -> int:
+        spec = list(spec)
+        n = self._deactivate_targets(self._targets(spec))
+        self.active = [x for x in self.active if x not in spec]
+        logger.info("[rotation] deactivated %s (%d Linears re-quantized)", spec, n)
+        return n
+
+    def rotate_to(self, spec) -> None:
+        """Make exactly `spec` trainable, deactivating whatever else is active."""
+        spec = list(spec)
+        if spec == list(self.active):
             return
-        if cur - want:
-            self.deactivate(sorted(cur - want))
-        if want - cur:
-            self.activate(sorted(want - cur))
+        if self.active:
+            self._deactivate_targets(self._targets(list(self.active)))
+            # Hand the freed blocks back before allocating the next window: without this the
+            # old window's bf16 tensors sit in the allocator's reserve and the new window
+            # OOMs against its own predecessor.
+            if torch.cuda.is_available():
+                gc.collect()
+                torch.cuda.empty_cache()
+        self._activate_targets(self._targets(spec))
+        self.active = spec
+        logger.info("[rotation] window -> %s", spec)
 
     def trainable_params(self) -> List[nn.Parameter]:
         """Active-window params PLUS the always-on modules. Rebuilt each rotation, so the
         always-on params must be re-included every time or they'd silently stop updating."""
-        params = []
-        for bi in self.active:
-            for p in self.blocks[bi].parameters():
-                if p.requires_grad:
+        params, seen = [], set()
+        for _key, lin in self._targets(list(self.active)):
+            for p in (lin.weight, lin.bias):
+                if p is not None and p.requires_grad and id(p) not in seen:
                     params.append(p)
-        seen = {id(p) for p in params}
+                    seen.add(id(p))
         for _prefix, module in self.always:
             for p in module.parameters():
                 if p.requires_grad and id(p) not in seen:
@@ -245,11 +292,9 @@ class BlockRotator:
     def master_state_dict(self) -> Dict[str, torch.Tensor]:
         """The bf16 master, with currently-active blocks and always-on modules flushed in."""
         out = dict(self.master)
-        for bi in self.active:
-            for lname, lin in _linears_with_scale(self.blocks[bi]):
-                key = self._key(bi, lname)
-                if key in out:
-                    out[key] = lin.weight.detach().to("cpu", dtype=torch.bfloat16).clone()
+        for key, lin in self._targets(list(self.active)):
+            if key in out:
+                out[key] = lin.weight.detach().to("cpu", dtype=torch.bfloat16).clone()
         for prefix, module in self.always:
             # Export unconditionally: unquantized always-on Linears were never in the master
             # (they live on the GPU in bf16 from the start), but they HAVE been trained.

@@ -59,6 +59,9 @@ def setup_parser() -> argparse.ArgumentParser:
                         "Output is a full model checkpoint, not a LoRA.")
     p.add_argument("--finetune_rotate_every", type=int, default=1,
                    help="Epochs per rotation window (a full cycle = ceil(28/N) x this)")
+    p.add_argument("--finetune_rotation_mode", default="block", choices=["block", "component"],
+                   help="block = contiguous depth slices; component = attention across ALL "
+                        "blocks then MLP (same VRAM, each window spans full depth)")
     p.add_argument("--finetune_fused_backward", action="store_true",
                    help="Step each parameter inside backward and free its grad immediately "
                         "(rotation FT only) — cuts the gradient footprint, disables clipping")
@@ -118,6 +121,7 @@ def main():
         adaptive_lr_min=args.adaptive_lr_min, adaptive_lr_max=args.adaptive_lr_max,
         finetune_rotation=args.finetune_rotation,
         finetune_rotate_every=args.finetune_rotate_every,
+        finetune_rotation_mode=args.finetune_rotation_mode,
         finetune_fused_backward=args.finetune_fused_backward,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         max_grad_norm=args.max_grad_norm,

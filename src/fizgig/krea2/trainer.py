@@ -894,6 +894,9 @@ def train_krea2(
     # No LoRA is trained in this mode — the output is a full model checkpoint.
     finetune_rotation: int = 0,
     finetune_rotate_every: int = 1,
+    # "block" = contiguous depth slices; "component" = attn across ALL blocks, then
+    # mlp — same VRAM, but every window spans the model's full depth.
+    finetune_rotation_mode: str = "block",
     # Step each parameter's optimizer inside backward and free its grad immediately, so the
     # whole active window's gradients never coexist. Saves roughly the gradient footprint.
     finetune_fused_backward: bool = False,
@@ -984,7 +987,14 @@ def train_krea2(
         if getattr(dit, "txtfusion", None) is not None:
             rotator.activate_always("txtfusion", dit.txtfusion)
         rot_schedule = RotationSchedule(len(dit.blocks), active=ft_rotation,
-                                        rotate_every=finetune_rotate_every)
+                                        rotate_every=finetune_rotate_every,
+                                        mode=finetune_rotation_mode)
+        if rot_schedule.mode == "component" and ft_stream_frozen:
+            # Every block holds trainable Linears in component mode, so nothing can be
+            # streamed out — there is no frozen block left to evict.
+            logger.info("[ft-rotation] component mode trains part of every block — "
+                        "block streaming disabled.")
+            ft_stream_frozen = False
         if ft_stream_frozen:
             from fizgig.krea2.rotation import RotationOffloader
             # Injected as the DiT's offloader: the forward already calls wait_for_block /
