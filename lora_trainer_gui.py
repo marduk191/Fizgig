@@ -2624,7 +2624,7 @@ class LoRATrainerGUI:
             training_content,
             text="⚗ Fine-tune the BASE MODEL instead of training a LoRA (experimental)",
             variable=self.krea2_finetune_var,
-            command=lambda: self._apply_krea2_ft_visibility(),
+            command=lambda: self._on_krea2_ft_toggle(),
         )
         self._krea2_ft_cb.grid(row=25, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(10, 0))
 
@@ -3658,6 +3658,57 @@ class LoRATrainerGUI:
                 sec.pack_forget()
         except Exception:
             pass
+
+    # Recommended base-model fine-tune setup. Applied when the checkbox is ticked so the
+    # whole recipe comes as one decision instead of six. Values come from the measured runs
+    # on this branch; the LR especially — LoRA rates (1e-4+) destroy a base model.
+    KREA2_FT_DEFAULTS = {
+        "LEARNING_RATE": "1e-5",
+        "MAX_TRAIN_EPOCHS": "8",          # 2 full 4-window cycles, so every window trains evenly
+        "SAVE_EVERY_N_EPOCHS": "0",       # each save is a full ~26 GB checkpoint
+        "GRADIENT_ACCUMULATION": "1",     # fused backward consumes grads as they land
+        "MAX_GRAD_NORM": "0",             # global clipping is impossible under fused backward
+    }
+
+    def _on_krea2_ft_toggle(self):
+        """User ticked/unticked base-model fine-tuning. Only push the recipe on the way ON,
+        so re-showing the tab never stomps values the user has since tuned."""
+        self._apply_krea2_ft_visibility()
+        if bool(self.krea2_finetune_var.get()):
+            self._apply_krea2_ft_defaults()
+
+    def _apply_krea2_ft_defaults(self):
+        """Set the whole fine-tune recipe in one go, and say what changed."""
+        changed = []
+        for key, val in self.KREA2_FT_DEFAULTS.items():
+            entry = self.entries.get(key)
+            if entry is None:
+                continue
+            try:
+                before = entry.get()
+                if str(before).strip() == val:
+                    continue
+                entry.delete(0, tk.END)
+                entry.insert(0, val)
+                changed.append(f"{key.replace('_', ' ').title()}: {before} -> {val}")
+            except Exception:
+                pass
+        if getattr(self, "adaptive_lr_var", None) is not None and self.adaptive_lr_var.get():
+            # The trainer disables it anyway (rotation boundaries read as instability) —
+            # better it reads OFF here than silently ignored.
+            self.adaptive_lr_var.set(False)
+            try:
+                self._on_adaptive_lr_toggle()
+            except Exception:
+                pass
+            changed.append("Adaptive LR: on -> off (incompatible with rotation)")
+        if getattr(self, "lr_scheduler_var", None) is not None and self.lr_scheduler_var.get() != "constant":
+            was = self.lr_scheduler_var.get()
+            self.lr_scheduler_var.set("constant")
+            changed.append(f"LR Scheduler: {was} -> constant")
+        if changed:
+            self.update_console("[fine-tune] applied the recommended base-model setup:\n  "
+                                + "\n  ".join(changed) + "\n")
 
     def _apply_krea2_ft_visibility(self):
         """Show the fine-tune knobs only when base-model fine-tuning is on, and the
