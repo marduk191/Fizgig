@@ -17223,20 +17223,23 @@ class LoRATrainerGUI:
         if self.krea2_warmup_look_var.get():
             cmd.append("--warmup_look_outliers")
         # Full base-model fine-tune (experimental): rotating trainable windows, full checkpoint out.
-        if self.settings.get("KREA2_FINETUNE"):
-            mode = str(self.settings.get("KREA2_FT_MODE", "component"))
+        # Read the Tk vars DIRECTLY, like every other krea2 toggle here — self.settings is only
+        # refreshed when a preset is collected, so reading it made this silently never fire and
+        # the run trained a LoRA instead.
+        if bool(self.krea2_finetune_var.get()):
+            mode = str(self.krea2_ft_mode_var.get() or "component")
             try:
-                nblocks = int(str(self.settings.get("KREA2_FT_BLOCKS", "14")))
+                nblocks = int(str(self.krea2_ft_blocks_var.get()))
             except ValueError:
                 nblocks = 14
             try:
-                every = int(str(self.settings.get("KREA2_FT_EVERY", "1")))
+                every = int(str(self.krea2_ft_every_var.get()))
             except ValueError:
                 every = 1
             cmd += ["--finetune_rotation", str(max(1, nblocks)),
                     "--finetune_rotation_mode", mode,
                     "--finetune_rotate_every", str(max(1, every))]
-            if self.settings.get("KREA2_FT_FUSED", True):
+            if bool(self.krea2_ft_fused_var.get()):
                 cmd.append("--finetune_fused_backward")
         if self.krea2_auto_recaption_var.get():
             cmd.append("--auto_recaption")
