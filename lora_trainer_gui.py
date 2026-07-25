@@ -2674,7 +2674,9 @@ class LoRATrainerGUI:
                        "you). Use a LOW learning rate — 1e-5 or below; LoRA rates will wreck a base model. "
                        "Network Rank/Alpha are ignored. Adaptive LR and in-training previews are turned off "
                        "automatically. EACH SAVE IS A FULL ~26 GB CHECKPOINT: leave 'Save every N epochs' at 0 "
-                       "unless you have the disk for it. Test the result in ComfyUI as a normal Krea 2 model.",
+                       "unless you have the disk for it. Checkpoints are written to the Output Directory above "
+                       "(the usual LoRA folder) — point it somewhere with room, e.g. your ComfyUI models/unet. "
+                       "Test the result in ComfyUI as a normal Krea 2 model.",
                   foreground="#E67E22", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
         self._krea2_ft_hint.grid(row=28, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 6))
 
