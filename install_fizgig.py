@@ -285,6 +285,56 @@ def print_summary():
     print("\n" + "=" * 60)
 
 
+def check_msvc_build_tools():
+    """Windows: detect the MSVC C++ Build Tools torch.compile's inductor needs.
+
+    triton installs via requirements.txt, but inductor also compiles host-side C++ —
+    without MSVC, Compile Blocks silently runs eager (a console note at training time).
+    The MS download site is ambiguous, so print the EXACT installer link and the one
+    workload to tick. Informational only; training works fine without."""
+    if os.name != "nt":
+        print("  Not Windows — torch.compile uses the system toolchain, nothing to check.")
+        return
+    import glob as _glob
+    vswhere = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                           "Microsoft Visual Studio", "Installer", "vswhere.exe")
+    found = False
+    if os.path.exists(vswhere):
+        try:
+            out = subprocess.run(
+                [vswhere, "-latest", "-products", "*",
+                 "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                 "-property", "installationPath"],
+                capture_output=True, text=True, timeout=30)
+            found = bool(out.stdout.strip())
+        except Exception:
+            pass
+    if not found:
+        # Fallback sweep for cl.exe in the standard install roots (covers odd setups).
+        for root in (r"C:\Program Files\Microsoft Visual Studio",
+                     r"C:\Program Files (x86)\Microsoft Visual Studio"):
+            if _glob.glob(os.path.join(root, "*", "*", "VC", "Tools", "MSVC", "*",
+                                       "bin", "Hostx64", "x64", "cl.exe")):
+                found = True
+                break
+    if found:
+        print("  MSVC C++ Build Tools found — torch.compile speedups are available.")
+        return
+    print("  OPTIONAL: MSVC C++ Build Tools not detected.")
+    print("  The torch.compile training speedup needs them; everything else works without.")
+    print()
+    print("  Direct download (exact installer, no hunting on the MS site):")
+    print("    https://aka.ms/vs/17/release/vs_BuildTools.exe")
+    print('  During install, tick the "Desktop development with C++" workload.')
+    print()
+    print("  Or install unattended from a terminal:")
+    print('    winget install Microsoft.VisualStudio.2022.BuildTools --override '
+          '"--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --passive"')
+    print()
+    print("  Install it any time — no need to re-run this installer. The next training run")
+    print("  detects it automatically.")
+
+
 def main():
     print_header("Fizgig Installer — Klein 9B & Krea 2 LoRA Workbench")
     print(f"Installation directory: {SCRIPT_DIR}")
@@ -316,6 +366,11 @@ def main():
     print_step(6, "Creating launcher scripts")
     if not create_launcher_scripts():
         sys.exit(1)
+
+    # Step 7: MSVC C++ Build Tools check (torch.compile's inductor backend needs them on
+    # Windows; triton itself comes from requirements.txt). Informational — never fails.
+    print_step(7, "Checking for MSVC C++ Build Tools (torch.compile)")
+    check_msvc_build_tools()
 
     # Print summary
     print_summary()

@@ -14,8 +14,12 @@ prefs.json
 last_used.json
 .last_used.json
 
-# User presets (session-specific)
+# User presets (per-machine, never repo content). The BUILT-IN presets live in code
+# (BUILT_IN_PRESETS / KREA2_BUILT_IN_PRESETS in lora_trainer_gui.py), so nothing here
+# needs shipping — only the folders themselves, kept alive by their .gitkeep.
 presets/.last_train_settings.json
+presets/**/*.json
+!presets/**/.gitkeep
 
 # Dataset TOMLs (auto-generated)
 dataset/*
@@ -52,3 +56,8 @@ anchor_images/
 .DS_Store
 Thumbs.db
 nul
+
+# Benchmark scratch (bench_train.py writes LoRAs + results here)
+_bench_out/
+bench_results.json
+repair_studio_last_preview.log

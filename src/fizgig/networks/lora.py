@@ -748,7 +748,11 @@ class LoRANetwork(torch.nn.Module):
                             original_name = (name + "." if name else "") + child_name
                             lora_name = f"{pfx}.{original_name}".replace(".", "_")
 
-                            # exclude/include filter
+                            # exclude/include filter.
+                            # - exclude_patterns drop matching modules.
+                            # - include_patterns, when present, RESTRICT training to matching
+                            #   modules (this is what the GUI's "Model Area to Train" relies on).
+                            # - a module matching both is kept (include overrides exclude).
                             excluded = False
                             for pattern in exclude_re_patterns:
                                 if pattern.fullmatch(original_name):
@@ -759,7 +763,7 @@ class LoRANetwork(torch.nn.Module):
                                 if pattern.fullmatch(original_name):
                                     included = True
                                     break
-                            if excluded and not included:
+                            if not included and (excluded or include_re_patterns):
                                 if verbose:
                                     logger.info(f"exclude: {original_name}")
                                 continue
@@ -810,6 +814,14 @@ class LoRANetwork(torch.nn.Module):
         # create LoRA for U-Net / DiT
         self.unet_loras: List[Union[LoRAModule, LoRAInfModule]]
         self.unet_loras, skipped_un = create_modules(True, prefix, unet, target_replace_modules)
+
+        # A block-targeted network that matched nothing must fail loudly: training would
+        # otherwise run to completion and save a LoRA containing no weights.
+        if include_re_patterns and unet is not None and len(self.unet_loras) == 0:
+            raise ValueError(
+                f"include_patterns matched no modules — nothing would train. "
+                f"Patterns: {[p.pattern for p in include_re_patterns]}"
+            )
 
         logger.info(f"create LoRA for U-Net/DiT: {len(self.unet_loras)} modules.")
         if verbose:
@@ -1384,17 +1396,27 @@ def _convert_diffusers_flux_lora(weights_sd: Dict[str, torch.Tensor]) -> Dict[st
         fused_down = torch.cat(downs, dim=0)
 
         # All Q/K/V lora_up: (out_dim, rank) each → build block-diagonal
-        # so each slot's output lands in the right slice of the fused output
-        n_slots = len(ups)
-        ranks = [u.shape[1] for u in ups]
-        out_dims = [u.shape[0] for u in ups]
+        # so each slot's output lands in the right slice of the fused output.
+        # Each slot's own alpha/rank scale is baked into its columns here, and the
+        # fused module ships alpha = total_rank (scale 1.0) — so a source exporting
+        # e.g. alpha = rank/2 (OneTrainer, ai-toolkit) keeps its true strength
+        # instead of being inflated to scale 1.0.
+        slot_ups = [(s, slots[s]["lora_up.weight"]) for s in sorted_slots
+                    if "lora_up.weight" in slots[s]]
+        ranks = [u.shape[1] for _, u in slot_ups]
+        out_dims = [u.shape[0] for _, u in slot_ups]
         total_rank = sum(ranks)
         total_out = sum(out_dims)
 
-        fused_up = torch.zeros(total_out, total_rank, dtype=ups[0].dtype)
+        fused_up = torch.zeros(total_out, total_rank, dtype=slot_ups[0][1].dtype)
         r_offset = 0
         o_offset = 0
-        for i, up in enumerate(ups):
+        for i, (s, up) in enumerate(slot_ups):
+            alpha_t = slots[s].get("alpha")
+            # PEFT convention when alpha is absent: alpha = rank → scale 1.0
+            slot_scale = (float(alpha_t) / ranks[i]) if alpha_t is not None else 1.0
+            if slot_scale != 1.0:
+                up = (up.to(torch.float32) * slot_scale).to(up.dtype)
             fused_up[o_offset:o_offset + out_dims[i], r_offset:r_offset + ranks[i]] = up
             r_offset += ranks[i]
             o_offset += out_dims[i]

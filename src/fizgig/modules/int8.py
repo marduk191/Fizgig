@@ -14,11 +14,13 @@ That means:
 => INT8 stacks with inference block swap for free, *provided quantization runs before
 `enable_block_swap`* (so the staging buffers are allocated int8-shaped).
 
-The weight is stored **pre-transposed** as (K, N) int8 so the forward's `torch._int_mm(x, W)` needs no
-per-call transpose/contiguous copy (that copy would eat the speedup). Consequence: for an int8 module
-`.weight.shape` is (in, out) — reversed from the usual (out, in). Nothing here reads it (in/out_features
-are separate attributes, LoRA builds from its own dims, the offloader is shape-agnostic), and this is a
-frozen inference base that's never saved, so the reversed shape is inert. Activations are quantized
+Weight layout — measured, and NOT what intuition suggests
+---------------------------------------------------------
+The weight is stored in the natural `(N, K)` orientation and passed to `_int_mm` as `W.t()`.
+That transpose is a **free view**, and the column-major layout it presents is what the int8
+tensor cores actually want. Storing it "pre-transposed" as (K, N) to avoid the transpose — which
+this module used to do — is 3.4x SLOWER (0.452 ms vs 0.131 ms at 6144x6144 on a 5090), and made
+the whole INT8 path only 1.02x faster than plain bf16, i.e. pointless. Activations are quantized
 dynamically per-token each forward; the matmul is `torch._int_mm` (int8 x int8 -> int32), then dequant.
 
 Why int8: on Blackwell the int8 tensor cores are ~1.4-1.8x faster than fp8 at the matmul level, and
@@ -36,19 +38,20 @@ _INT8_TARGET_DEFAULT = ("blocks.",)
 
 def int8_linear_forward_patch(self: nn.Linear, x: torch.Tensor) -> torch.Tensor:
     """Per-token dynamic int8 activation quant -> int8 matmul -> dequant. Symmetric (no zero point).
-    `self.weight.data` is the (K, N) int8 weight ready for `_int_mm`; `self._int8_wscale` is (1, N)."""
+    `self.weight.data` is the (N, K) int8 weight — passed as `.t()`, a free view in the layout the
+    int8 tensor cores want; `self._int8_wscale` is (1, N)."""
     orig_shape = x.shape
     x2d = x.reshape(-1, orig_shape[-1])
     a_scale = x2d.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127.0     # (M, 1)
     a_i8 = (x2d / a_scale).round_().clamp_(-127, 127).to(torch.int8)
-    w_i8 = self.weight.data                                                    # (K, N) int8
+    w_i8 = self.weight.data                                                    # (N, K) int8
     try:
-        acc = torch._int_mm(a_i8, w_i8)                                        # (M, N) int32
+        acc = torch._int_mm(a_i8, w_i8.t())                                    # (M, N) int32
     except Exception:
         # Shape-constraint edge case (tiny M / odd alignment): fall back to a bf16 matmul from the
         # dequantized int8 weight so a preview never crashes on an unusual resolution.
-        w = w_i8.to(torch.float32) * self._int8_wscale                        # (K, N) fp32
-        out = (x2d.to(torch.float32) @ w).to(x.dtype)
+        w = w_i8.to(torch.float32) * self._int8_wscale.reshape(-1, 1)         # (N, K) fp32
+        out = (x2d.to(torch.float32) @ w.t()).to(x.dtype)
         if self.bias is not None:
             out = out + self.bias
         return out.reshape(*orig_shape[:-1], -1)
@@ -83,12 +86,12 @@ def apply_int8_quantization(
         w_scale = w_bf16.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127.0     # (N, 1)
         w_i8 = (w_bf16 / w_scale).round_().clamp_(-127, 127).to(torch.int8)           # (N, K)
 
-        # Store the int8 weight PRE-TRANSPOSED (K, N) in .weight.data (see module docstring) so the
-        # offloader streams it and the forward needs no transpose. Scale is a buffer (moves with .to,
-        # stays on GPU during a block swap — tiny). requires_grad must be cleared FIRST — a grad-
-        # requiring Parameter can't hold an int8 .data.
+        # Keep the natural (N, K) orientation in .weight.data: the offloader still streams it, the
+        # shape stays meaningful, and the forward's `.t()` is a free view in the layout the int8
+        # tensor cores want (see module docstring — the "pre-transposed" variant is 3.4x slower).
+        # requires_grad must be cleared FIRST — a grad-requiring Parameter can't hold an int8 .data.
         module.weight.requires_grad_(False)
-        module.weight.data = w_i8.t().contiguous()                                   # (K, N) int8
+        module.weight.data = w_i8.contiguous()                                       # (N, K) int8
         module.register_buffer("_int8_wscale", w_scale.reshape(1, -1).to(torch.float32), persistent=False)
         module._is_int8 = True
         module.forward = int8_linear_forward_patch.__get__(module, type(module))

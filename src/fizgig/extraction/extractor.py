@@ -176,6 +176,10 @@ class LoRAExtractor:
             else:
                 continue
 
+            # Documented CLI flag, previously silent on this path (honoured only by
+            # --blocks custom on the activation path). The delta is linear in it.
+            if config.source_multiplier != 1.0:
+                W = W * config.source_multiplier
             source_weights[mod_name] = W
 
         logger.info(f"Pure weight SVD (rank {config.target_rank}) on {len(source_weights)} modules")
@@ -276,6 +280,12 @@ class LoRAExtractor:
                 pipeline._lora_network.set_module_enabled_by_pattern(pattern, True)
         else:
             pipeline.enable_blocks(config.include_blocks)
+            # enable_blocks resets every module multiplier to its category preset —
+            # re-apply the documented source multiplier ON TOP (it was silently ignored
+            # on this path; only --blocks custom honoured it).
+            if config.source_multiplier != 1.0:
+                for lora in pipeline._lora_network.unet_loras:
+                    lora.multiplier *= config.source_multiplier
         num_enabled = sum(1 for lora in pipeline._lora_network.unet_loras if lora.enabled)
         logger.info(f"Enabled {num_enabled} LoRA modules for extraction")
 

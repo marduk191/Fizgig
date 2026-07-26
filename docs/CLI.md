@@ -87,7 +87,9 @@ The two model families share the dataset format and most of the workflow, but no
 | Gradient accumulation | ✅ | ✅ |
 | Block targeting (`include_patterns`) / Model Area | ✅ Klein only | ❌ (no Krea 2 block map yet) |
 | Timestep range (`--min/max_timestep`) | ✅ Klein only | ❌ (fixed `krea2_shift` recipe) |
-| Optimizer choice | ✅ Klein only | ❌ (AdamW8bit hardcoded) |
+| Optimizer choice (`--optimizer_type`) | ✅ | ✅ |
+| INT8 W8A8 base (`--quant_int8`) | ❌ | ✅ Krea 2 only |
+| torch.compile speedup | ✅ (`--compile` + flags) | ✅ (`--compile_blocks auto`, on by default when it pays) |
 | Weight-only extraction (rank reduction, `--samples 0`) | ✅ | ✅ |
 | Profiling | ✅ full activation profile | ✅ weight-only (`--krea2`) |
 | Activation-weighted (specialized) extraction | ✅ Klein only | ❌ (needs the Klein pipeline) |
@@ -242,7 +244,7 @@ Checkpoints land as `output_loras/my_subject/my_subject-000001.safetensors` (epo
 **Learning rate**
 
 - `--learning_rate` — the trainer's raw default is a placeholder; always pass one. GUI presets use 1e-4 (rank 16 identity) to 4e-4 (rank 4 style/details).
-- `--adaptive_lr` — the bi-directional plateau tracker: probes LR up on steady descent, cuts it (with weight rollback) on plateau or instability. When active it takes over from `--lr_scheduler`. Bounds via `--adaptive_lr_min` (floor — 5e-5 for single-subject sets, 1e-4 for noisy multi-subject sets) and `--adaptive_lr_max` (4e-4 is the empirical ceiling). A starting LR below the floor is clamped up to it.
+- `--adaptive_lr` — the bi-directional plateau tracker: probes LR up on steady descent, cuts it (with weight rollback) on plateau or instability. When active it takes over from `--lr_scheduler`. Bounds via `--adaptive_lr_min` (floor — 5e-5 for single-subject sets, 1e-4 for noisy multi-subject sets; the rank-4/8 Identity presets ship 2e-4) and `--adaptive_lr_max` (4e-4 is the empirical ceiling). **`--learning_rate` is ignored while adaptive is on**: the run starts at the geometric midpoint of the Min/Max window (1e-4 & 4e-4 → 2e-4) and the watcher owns the LR from there. Resumed runs keep their mid-flight LR.
 - Without adaptive LR, the usual `--lr_scheduler` options exist (`constant`, `cosine`, `constant_with_warmup`, ...) with `--lr_warmup_steps` / `--lr_decay_steps`.
 
 **Batching**
@@ -338,7 +340,9 @@ The Krea 2 parser is small enough to know in full: run `krea2_train.py --help`. 
 
 - `--no_fp8` — train the base in bf16 instead of dynamic fp8 (needs a lot more VRAM; fp8 is the validated default).
 - `--quantize_4bit` — NF4 4-bit frozen base, ~5.6 GB DiT residency, fits 10-12 GB cards (block swap forced off).
-- `--blocks_to_swap` — see [VRAM guidance](#vram-guidance-block-swap). `--preview_blocks_to_swap` is the separate, forward-only swap for the preview Turbo.
+- `--quant_int8 bf16` — INT8 W8A8 frozen base: ~18.6 GB, so it needs a 24 GB card, and in exchange it is both the fastest option measured (0.637 s/it vs NF4's 0.709 on an RTX 5090) and ~7× more accurate than NF4 in forward error, since 8 bits beat 4. `bf16` keeps gradients exact; `int8` quantises the backward too — faster again, lossier. The GUI picks this automatically when there is free VRAM for it; on the CLI it is opt-in. Mutually exclusive with `--quantize_4bit`. Block swap is force-zeroed under INT8 (the staged quantise makes the model fully resident anyway).
+- `--compile_blocks auto|on|off` — torch.compile the transformer blocks: roughly **2× faster steady-state steps** on the INT8 path after a one-off warm-up (~90 s + a pause on each new latent shape). `auto` (default) weighs the warm-up against the run length and only compiles when it pays. Needs triton (installs with requirements; `triton-windows` on Windows) and, on Windows, the MSVC C++ Build Tools — direct installer: https://aka.ms/vs/17/release/vs_BuildTools.exe ("Desktop development with C++" workload). Missing either → a console note and the run continues uncompiled.
+- `--blocks_to_swap` — see [VRAM guidance](#vram-guidance-block-swap). `--preview_blocks_to_swap` is the separate, forward-only swap for the preview Turbo. **Swapping is the slow path** (4.4× the time, 4× the CPU): quantise first, and only swap when even NF4 will not fit.
 
 **The per-image loss watch** (any of these enables the watcher)
 
@@ -358,7 +362,14 @@ Persistent artifacts: exclusions are stored in `<image_directory>/fizgig_exclude
 - `--gradient_accumulation_steps N` — accumulate over N micro-batches per optimizer step (effective batch = N). The loss is averaged over the group, and a partial group is flushed at the epoch boundary. Per-image LR still applies per image.
 - `--max_grad_norm` — gradient clipping (default 1.0, matching the reference recipe; 0 disables).
 
-**Not in the Krea 2 parser (by design):** optimizer choice (AdamW8bit hardcoded), timestep sampling (fixed `krea2_shift` recipe), block targeting (no Krea 2 block map yet), gradient checkpointing (always on). What's absent is deliberate, not missing.
+**Optimizer**
+
+- `--optimizer_type` — `adamw8bit` (default, the validated recipe), `adamw` (fp32 state, CUDA-fused where available), `pagedadamw8bit`, `ademamix8bit`, `pagedademamix8bit`, `lion8bit`. Anything else is taken as a full `module.path.ClassName`, so an optimizer Fizgig has never heard of works without a release. The list the CLI actually offers on your machine is in `--help` — entries whose package is missing are filtered out. (`adafactor`, `prodigy` and `came` were removed: they manage their own learning rate, which conflicts with Adaptive LR and produced real failures; reach them via the module-path form if you know what you're doing.)
+- `--optimizer_args` — extra kwargs, e.g. `--optimizer_args "weight_decay=0.01 betas=0.9,0.99"`. Values are parsed as Python literals.
+
+Two warnings worth internalising before you reach for the dropdown. **Learning rates do not transfer between families:** Lion applies the *sign* of the update and wants roughly a tenth of an AdamW LR. Fizgig logs a warning when the LR looks wrong for the family, but it will not override you. And **saving optimizer memory buys you little here** — a LoRA's state is tens of MB against a 13–19 GB base, so the reason to change optimizer is update *behaviour*, not VRAM. If a run fails to construct the optimizer it falls back to plain AdamW and says so in the log; the choice is recorded in the output LoRA as `ss_optimizer`.
+
+**Not in the Krea 2 parser (by design):** timestep sampling (fixed `krea2_shift` recipe), block targeting (no Krea 2 block map yet), gradient checkpointing (always on). What's absent is deliberate, not missing.
 
 ---
 
@@ -378,7 +389,7 @@ Recognized: `--w` width, `--h` height, `--d` seed, `--s` steps, `--g` guidance (
 
 Pass `--sample_dit <distilled>` to render previews on the Distilled model (4-step, fast) instead of the training Base; `--sample_blocks_to_swap` gives the sample model its own swap setting.
 
-**Krea 2** prompt files are plain prompts only; geometry and seed come from `--sample_width` / `--sample_height` / `--sample_seed`, and previews always render on the fp8 Turbo (`--turbo_dit`, 8-step). `--sample_ref_image` enables the Qwen3-VL vision path (generate driven by a reference picture; works even with an empty prompt file).
+**Krea 2** prompt files are plain prompts only; geometry and seed come from `--sample_width` / `--sample_height` / `--sample_seed`, and previews render on the fp8 Turbo (`--turbo_dit`; `--sample_steps`, default 8). `--sample_cfg_scale` above 1 enables CFG on the previews — pair it with `--sample_negative` for a real uncond (with CFG at 1.0 a negative is ignored, with a log note). `--sample_at_first` renders an epoch-0 preview (base + zero-init LoRA) before training, and works even with `--sample_every_n_epochs 0`. `--sample_ref_image` enables the Qwen3-VL vision path (generate driven by a reference picture; works even with an empty prompt file). `--metadata_title/author/description/license/tags` are recorded in the saved LoRA as `modelspec.*` keys.
 
 Samples are written to `<output_dir>/sample/` with the epoch number in the filename. Prefer ~1024×1024 — sub-1024 previews degrade anatomy and undersell the checkpoint.
 

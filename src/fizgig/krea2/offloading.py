@@ -467,9 +467,18 @@ class ModelOffloader(Offloader):
 
         self.forward_only = forward_only
 
+    def remove_hooks(self):
+        """Detach backward hooks NOW, not at GC. A replaced offloader's stale hooks
+        otherwise fire alongside the new ones on the next backward — double-swapping
+        blocks and stranding base weights on CPU ('mat2 is on cpu')."""
+        if getattr(self, "supports_backward", False):
+            for handle in getattr(self, "remove_handles", []):
+                handle.remove()
+            self.remove_handles = []
+
     def __del__(self):
         if self.supports_backward:
-            for handle in self.remove_handles:
+            for handle in getattr(self, "remove_handles", []):
                 handle.remove()
 
     def create_backward_hook(self, blocks: list[nn.Module], block_index: int) -> Optional[callable]:
@@ -911,6 +920,13 @@ class LoRAStreamOffloader:
     def set_forward_only(self, forward_only: bool):
         self.copier.sync()
         self.forward_only = forward_only
+
+    def remove_hooks(self):
+        """Detach backward hooks NOW, not at GC (see ModelOffloader.remove_hooks)."""
+        if getattr(self, "supports_backward", False):
+            for handle in getattr(self, "remove_handles", []):
+                handle.remove()
+            self.remove_handles = []
 
     def __del__(self):
         if getattr(self, "supports_backward", False):

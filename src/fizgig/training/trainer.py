@@ -465,8 +465,14 @@ class KleinTrainer:
             f"mode={args.compile_mode}, dynamic={compile_dynamic}, fullgraph={args.compile_fullgraph}"
         )
 
-        if args.compile_cache_size_limit is not None:
-            torch._dynamo.config.cache_size_limit = args.compile_cache_size_limit
+        # Same two pre-compile fixes Krea 2 has: raise the recompile ceilings + sympy Mod
+        # patch (default cache limit of 8 meant a bucketed dataset silently dropped to
+        # permanent eager), and settle the SDPA backend global so its lazy first-use probe
+        # never executes inside a compiled block.
+        from fizgig.modules.compile_util import init_compile
+        init_compile(args.compile_cache_size_limit if args.compile_cache_size_limit is not None else 8192)
+        from fizgig.modules import sdpa as _sdpa_mod
+        _sdpa_mod.prime()
 
         for blocks in target_blocks:
             for i, block in enumerate(blocks):
@@ -543,8 +549,15 @@ class KleinTrainer:
         optimizer_kwargs = {}
         if args.optimizer_args is not None and len(args.optimizer_args) > 0:
             for arg in args.optimizer_args:
-                key, value = arg.split("=")
-                value = ast.literal_eval(value)
+                if "=" not in arg:
+                    raise ValueError(f"--optimizer_args entry {arg!r} is not key=value")
+                # maxsplit=1 (values may contain '='); non-literals like name=cosine or
+                # growth_rate=inf stay strings instead of killing the run after caching.
+                key, value = arg.split("=", 1)
+                try:
+                    value = ast.literal_eval(value)
+                except (ValueError, SyntaxError):
+                    pass
                 optimizer_kwargs[key] = value
 
         lr = args.learning_rate
@@ -561,32 +574,6 @@ class KleinTrainer:
                 logger.info(f"Using 8-bit AdamW optimizer | {optimizer_kwargs}")
                 optimizer_class = bnb.optim.AdamW8bit
                 optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
-
-        elif optimizer_type == "adafactor":
-            if "relative_step" not in optimizer_kwargs:
-                optimizer_kwargs["relative_step"] = True
-            if not optimizer_kwargs["relative_step"] and optimizer_kwargs.get("warmup_init", False):
-                logger.info("Setting relative_step=True because warmup_init=True")
-                optimizer_kwargs["relative_step"] = True
-            logger.info(f"Using Adafactor optimizer | {optimizer_kwargs}")
-
-            if optimizer_kwargs["relative_step"]:
-                logger.info("relative_step is true")
-                if lr != 0.0:
-                    logger.warning("learning rate will be used as initial_lr")
-                args.learning_rate = None
-                if args.lr_scheduler != "adafactor":
-                    logger.info("Using adafactor_scheduler")
-                args.lr_scheduler = f"adafactor:{lr}"
-                lr = None
-            else:
-                if args.max_grad_norm != 0.0:
-                    logger.warning("max_grad_norm is set — clip_grad_norm will be enabled")
-                if args.lr_scheduler != "constant_with_warmup":
-                    logger.warning("constant_with_warmup is recommended for Adafactor")
-
-            optimizer_class = transformers.optimization.Adafactor
-            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
         elif optimizer_type == "adamw":
             logger.info(f"Using AdamW optimizer | {optimizer_kwargs}")
@@ -605,7 +592,15 @@ class KleinTrainer:
                 optimizer_module = importlib.import_module(".".join(values[:-1]))
                 case_sensitive_optimizer_type = values[-1]
 
-            optimizer_class = getattr(optimizer_module, case_sensitive_optimizer_type)
+            try:
+                optimizer_class = getattr(optimizer_module, case_sensitive_optimizer_type)
+            except AttributeError:
+                raise ValueError(
+                    f"Unknown optimizer {args.optimizer_type!r}. Use adamw, adamw8bit, or a "
+                    f"full module.path.ClassName (e.g. bitsandbytes.optim.AdEMAMix8bit). "
+                    f"(adafactor/prodigy/came were removed — they manage their own LR and "
+                    f"conflict with Adaptive LR.)"
+                ) from None
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
         optimizer_name = optimizer_class.__module__ + "." + optimizer_class.__name__
@@ -685,13 +680,6 @@ class KleinTrainer:
                 lr_scheduler_type = values[-1]
             lr_scheduler_class = getattr(lr_scheduler_module, lr_scheduler_type)
             return lr_scheduler_class(optimizer, **lr_scheduler_kwargs)
-
-        if name.startswith("adafactor"):
-            assert type(optimizer) == transformers.optimization.Adafactor, (
-                "adafactor scheduler must be used with Adafactor optimizer"
-            )
-            initial_lr = float(name.split(":")[1])
-            return wrap_check_needless_num_warmup_steps(transformers.optimization.AdafactorSchedule(optimizer, initial_lr))
 
         if name.lower() == "rex":
             return RexLR(
@@ -958,7 +946,16 @@ class KleinTrainer:
             )
             t_min = args.min_timestep if args.min_timestep is not None else 0
             t_max = args.max_timestep if args.max_timestep is not None else 1000
-            indices = (u * (t_max - t_min) + t_min).long()
+            # min/max are timestep VALUES (0-1000), same as every other sampling mode.
+            # The schedule is DESCENDING (timesteps[i] ~= 1000 - i), so convert the value
+            # window to an index window first. Previously min/max were used directly as
+            # indices, which selected the OPPOSITE end of the schedule (e.g. 0-400 picked
+            # timesteps 1000-600). For the default full range this is identical to the
+            # old behaviour, including the u-density orientation.
+            n = noise_scheduler.timesteps.shape[0]
+            lo_idx = n - t_max   # index of the highest requested timestep
+            hi_idx = n - t_min   # index of the lowest requested timestep
+            indices = (u * (hi_idx - lo_idx) + lo_idx).long().clamp(0, n - 1)
 
             timesteps = noise_scheduler.timesteps[indices].to(device=device)
 
@@ -1996,7 +1993,11 @@ class KleinTrainer:
         net_kwargs = {}
         if args.network_args is not None:
             for net_arg in args.network_args:
-                key, value = net_arg.split("=")
+                if "=" not in net_arg:
+                    raise ValueError(f"--network_args entry {net_arg!r} is not key=value")
+                # maxsplit=1: values may legitimately contain '=' — the old unbounded
+                # split raised 'too many values to unpack'.
+                key, value = net_arg.split("=", 1)
                 net_kwargs[key] = value
 
         if args.dim_from_weights:
@@ -2260,7 +2261,12 @@ class KleinTrainer:
             _m = _re.search(r'-(\d{6})-state', _resume_basename)
             if _m:
                 epoch_to_start = int(_m.group(1))
-                global_step = epoch_to_start * len(train_dataloader)
+                # global_step counts OPTIMIZER steps (incremented on sync_gradients), and
+                # max_train_steps is in the same unit — seeding from raw micro-batches
+                # inflated it by the accumulation factor, so a resumed run with accum >= 2
+                # hit `global_step >= max_train_steps` immediately and trained nothing
+                # while still writing checkpoints and samples.
+                global_step = epoch_to_start * num_update_steps_per_epoch
                 accelerator.print(
                     f"[resume] resuming from epoch {epoch_to_start}, global_step {global_step}"
                 )
@@ -2335,7 +2341,12 @@ class KleinTrainer:
             accelerator.print(f"[resume] skipping initial sample (starting at epoch {epoch_to_start + 1})")
         elif should_sample_images(args, global_step, epoch=0):
             optimizer_eval_fn()
-            self.sample_images(accelerator, args, 0, global_step, vae, transformer, sample_parameters, dit_dtype)
+            # A preview failure must never end a training run (Krea 2 already degrades here).
+            try:
+                self.sample_images(accelerator, args, 0, global_step, vae, transformer, sample_parameters, dit_dtype)
+            except Exception:
+                logger.warning("sample generation failed — training continues, previews skipped "
+                               "this round", exc_info=True)
             optimizer_train_fn()
         if len(accelerator.trackers) > 0:
             accelerator.log({}, step=0)
@@ -2364,16 +2375,32 @@ class KleinTrainer:
         # the first stability-triggered rollback (training is now in a delicate regime).
         if args.adaptive_lr:
             _initial_lr = optimizer.param_groups[0]["lr"]
-            # The Min LR floor is authoritative over the LR box: starting below the declared
-            # floor is contradictory, so the start is clamped UP to the floor.
-            if _initial_lr < args.adaptive_lr_min:
+            # Adafactor with relative_step manages its own LR and stores None in the param
+            # groups — there is nothing for the watcher to adjust, and `None < float` was
+            # a TypeError before step 1. Disable adaptive cleanly instead of crashing.
+            if _initial_lr is None:
                 accelerator.print(
-                    f"[adaptive_lr] starting LR {_initial_lr:.3e} is below the Min LR floor — "
-                    f"raising start to {args.adaptive_lr_min:.3e} (the floor overrides the LR box)"
+                    "[adaptive_lr] DISABLED — the optimizer manages its own learning rate "
+                    "(Adafactor relative_step stores lr=None), so there is no LR for the "
+                    "watcher to adjust. Training continues without adaptive LR."
                 )
+                args.adaptive_lr = False
+        if args.adaptive_lr:
+            # The Learning Rate box is IGNORED while adaptive is on: the run starts at the
+            # GEOMETRIC MIDPOINT of the Min/Max window and the watcher owns the LR from
+            # there (probe up / ratchet down). Two knobs, not three — the old behaviour
+            # (box = start, floor-clamped) silently made the box authoritative.
+            # Resumed runs keep their restored LR: the watcher was mid-flight.
+            if not args.resume:
+                _mid = math.sqrt(args.adaptive_lr_min * args.adaptive_lr_max)
+                if abs(_initial_lr - _mid) > 1e-12:
+                    accelerator.print(
+                        f"[adaptive_lr] starting LR set to {_mid:.3e} — the geometric midpoint "
+                        f"of Min/Max (the Learning Rate box is ignored while adaptive is on)"
+                    )
                 for _g in optimizer.param_groups:
-                    _g["lr"] = args.adaptive_lr_min
-                _initial_lr = args.adaptive_lr_min
+                    _g["lr"] = _mid
+                _initial_lr = _mid
             accelerator.print(
                 f"[adaptive_lr] ENABLED — starting_lr={_initial_lr:.3e} "
                 f"min_lr={args.adaptive_lr_min:.3e} max_lr={args.adaptive_lr_max:.3e} "
@@ -2458,6 +2485,18 @@ class KleinTrainer:
 
             for step, batch in enumerate(train_dataloader):
                 _perf_t0 = _time.perf_counter() if _perf_diag else 0.0
+                # Warm-up reassurance: the first two epochs start slowly (first-sight kernel
+                # planning, cuBLAS picks, allocator/cache warm-up) — a crawling bar looks
+                # like a hang, so repeat a gentle note every ~30 s while it lasts.
+                if epoch < 2:
+                    _wu_now = _time.time()
+                    if _wu_now - getattr(self, "_warmup_note_last", 0.0) > 30.0:
+                        self._warmup_note_last = _wu_now
+                        accelerator.print(
+                            "[warm-up] Warm-up phase — the first two epochs start slowly while "
+                            "the GPU plans kernels and fills its caches. Nothing is stuck; full "
+                            "speed arrives from epoch 3."
+                        )
                 latents = batch["latents"]
 
                 with accelerator.accumulate(training_model):
@@ -2810,7 +2849,13 @@ class KleinTrainer:
                             except Exception as _e:
                                 accelerator.print(f"[adaptive_lr] sidecar save failed: {_e}")
 
-            self.sample_images(accelerator, args, epoch + 1, global_step, vae, transformer, sample_parameters, dit_dtype)
+            # A preview failure must never end a run that might be hours in (Krea 2 already
+            # degrades gracefully here) — the checkpoint for this epoch is already saved.
+            try:
+                self.sample_images(accelerator, args, epoch + 1, global_step, vae, transformer, sample_parameters, dit_dtype)
+            except Exception:
+                logger.warning("sample generation failed at epoch %d — training continues, "
+                               "previews skipped this round", epoch + 1, exc_info=True)
             optimizer_train_fn()
 
             # Graceful pause — after save_state + sample_images for this epoch are complete, exit cleanly
@@ -2819,6 +2864,12 @@ class KleinTrainer:
                     f"[pause] requested via {args.pause_flag_path}. State saved at "
                     f"{args.output_name}-{epoch + 1:06d}-state. Exiting cleanly to free GPU memory."
                 )
+                # Consume the flag HERE: relying on the GUI to remove it left it armed
+                # after a window close / crash, truncating the next run to one epoch.
+                try:
+                    os.remove(args.pause_flag_path)
+                except OSError:
+                    pass
                 import sys as _sys; _sys.stdout.flush()
                 _sys.exit(0)
 
@@ -3001,7 +3052,7 @@ def setup_parser() -> argparse.ArgumentParser:
 
     # ---- Optimizer ----
     parser.add_argument("--optimizer_type", type=str, default="",
-                        help="Optimizer: AdamW, AdamW8bit, Adafactor, or full.module.path.ClassName")
+                        help="Optimizer: AdamW, AdamW8bit, or full.module.path.ClassName")
     parser.add_argument("--optimizer_args", type=str, default=None, nargs="*")
     parser.add_argument("--learning_rate", type=float, default=2.0e-6)
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm (0 = no clipping)")
@@ -3009,7 +3060,7 @@ def setup_parser() -> argparse.ArgumentParser:
     # ---- LR Scheduler ----
     parser.add_argument("--lr_scheduler", type=str, default="constant",
                         help="LR scheduler: linear, cosine, cosine_with_restarts, polynomial, constant, "
-                             "constant_with_warmup, adafactor, rex")
+                             "constant_with_warmup, rex")
     parser.add_argument("--lr_warmup_steps", type=int_or_float, default=0)
     parser.add_argument("--lr_decay_steps", type=int_or_float, default=0)
     parser.add_argument("--lr_scheduler_num_cycles", type=int, default=1)

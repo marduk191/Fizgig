@@ -254,8 +254,13 @@ def save_repaired_lora(
 
         has_p = mod_name in modules_p
         has_d = mod_name in modules_d
-        p_on = bs.primary_enabled and has_p
-        d_on = bs.donor_enabled and has_d
+        # A zero-strength side contributes nothing — treat it as off. donor_enabled
+        # defaults True with donor_strength 0.0, so merely LOADING a donor used to
+        # rank-concatenate every shared block with an all-zero donor half (~2x the file
+        # in dead weights) and write all-zero donor-only modules, before the user
+        # touched a single slider.
+        p_on = bs.primary_enabled and has_p and abs(float(bs.primary_strength)) > 1e-9
+        d_on = bs.donor_enabled and has_d and abs(float(bs.donor_strength)) > 1e-9
 
         if not p_on and not d_on:
             dropped_blocks.add(block_id)
@@ -326,6 +331,20 @@ def save_repaired_lora(
             sd_out[f"{mod_name}.lora_down.weight"] = down
             sd_out[f"{mod_name}.alpha"] = torch.tensor(float(rank))
             rescaled_blocks.add(block_id)
+
+    # The metadata was copied wholesale from the primary — scrub what no longer describes
+    # THIS file: content hashes (every repaired LoRA inherited the SOURCE's hash) and
+    # ss_network_dim/alpha, which Fizgig's own Profiler reads and which a donor blend
+    # changes per-block. Report the actual max rank; per-module alpha == rank (scale 1.0).
+    for _stale in ("sshs_model_hash", "sshs_legacy_hash", "modelspec.hash_sha256"):
+        metadata.pop(_stale, None)
+    try:
+        _ranks = [int(t.shape[0]) for k, t in sd_out.items() if k.endswith(".lora_down.weight")]
+        if _ranks:
+            metadata["ss_network_dim"] = str(max(_ranks))
+            metadata["ss_network_alpha"] = str(float(max(_ranks)))
+    except Exception:
+        pass
 
     # Record slider config + donor reference in metadata.
     try:

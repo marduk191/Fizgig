@@ -12,6 +12,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from fizgig.krea2.trainer import train_krea2
+from fizgig.training.optimizers import available_optimizers
 
 logging.basicConfig(level=logging.INFO)
 
@@ -30,6 +31,9 @@ def setup_parser() -> argparse.ArgumentParser:
     p.add_argument("--no_fp8", action="store_true", help="Train the base in bf16 instead of dynamic fp8")
     p.add_argument("--quantize_4bit", action="store_true",
                    help="QLoRA-style 4-bit (NF4) frozen base — ~5.6 GB DiT, fits 10-12 GB cards (no block swap)")
+    p.add_argument("--quant_int8", default="", choices=["", "bf16", "int8"],
+                   help="EXPERIMENTAL INT8 W8A8 frozen base. 'bf16' = int8 forward with exact "
+                        "bf16 gradients; 'int8' = both quantised (faster, lossier)")
     p.add_argument("--blocks_to_swap", type=int, default=0)
     p.add_argument("--discrete_flow_shift", type=float, default=2.5)
     p.add_argument("--seed", type=int, default=42)
@@ -41,8 +45,21 @@ def setup_parser() -> argparse.ArgumentParser:
     p.add_argument("--sample_every_n_epochs", type=int, default=0)
     p.add_argument("--sample_width", type=int, default=512)
     p.add_argument("--sample_height", type=int, default=512)
+    p.add_argument("--sample_steps", type=int, default=8, help="Preview denoising steps (Turbo default 8)")
+    p.add_argument("--sample_cfg_scale", type=float, default=1.0,
+                   help=">1 enables CFG on the Turbo previews (pair with --sample_negative)")
+    p.add_argument("--sample_negative", default=None,
+                   help="Negative prompt for previews — only used when --sample_cfg_scale > 1")
+    p.add_argument("--sample_at_first", action="store_true",
+                   help="Render an epoch-0 preview before training starts")
     p.add_argument("--sample_seed", type=int, default=42, help="Seed for in-training preview samples")
     p.add_argument("--sample_ref_image", default=None, help="Reference image (Qwen3-VL vision path)")
+    # Output metadata (recorded in the saved LoRA)
+    p.add_argument("--metadata_title", default=None)
+    p.add_argument("--metadata_author", default=None)
+    p.add_argument("--metadata_description", default=None)
+    p.add_argument("--metadata_license", default=None)
+    p.add_argument("--metadata_tags", default=None)
     p.add_argument("--preview_blocks_to_swap", type=int, default=0,
                    help="Forward-only block swap on the preview Turbo (fits smaller cards)")
     p.add_argument("--preview_int8", action="store_true",
@@ -68,6 +85,17 @@ def setup_parser() -> argparse.ArgumentParser:
     p.add_argument("--gradient_accumulation_steps", type=int, default=1,
                    help="Accumulate grads over N micro-batches per optimizer step (effective batch = N)")
     p.add_argument("--max_grad_norm", type=float, default=1.0, help="Gradient clipping norm (0 disables)")
+    p.add_argument("--optimizer_type", default="adamw8bit",
+                   help="Optimizer family, or a full module.path.ClassName. Available here: "
+                        + ", ".join(available_optimizers()))
+    p.add_argument("--optimizer_args", default="",
+                   help='Extra optimizer kwargs, e.g. "weight_decay=0.01 betas=0.9,0.99"')
+    p.add_argument("--compile_blocks", default="auto", choices=["auto", "on", "off"],
+                   help="torch.compile the transformer blocks. 'auto' (default) enables it only "
+                        "when the run is long enough to repay its ~90 s warm-up and the VRAM fits "
+                        "— roughly 600+ steps on INT8, 1200+ on NF4. Measured 2.0x per step on "
+                        "INT8 (0.59 -> 0.29) and 1.28x on NF4 (0.71 -> 0.56). Needs triton and, on "
+                        "Windows, MSVC; never used under block swap")
     p.add_argument("--lr_scheduler", default="constant",
                    choices=["constant", "constant_with_warmup", "cosine", "cosine_with_restarts",
                             "linear", "polynomial"],
@@ -109,13 +137,18 @@ def main():
         network_dim=args.network_dim, network_alpha=args.network_alpha,
         learning_rate=args.learning_rate, max_train_epochs=args.max_train_epochs,
         save_every_n_epochs=args.save_every_n_epochs, fp8_scaled=not args.no_fp8,
-        quant_4bit=args.quantize_4bit,
+        quant_4bit=args.quantize_4bit, quant_int8=args.quant_int8,
         blocks_to_swap=args.blocks_to_swap, shift=args.discrete_flow_shift, seed=args.seed,
         sample_prompts=prompts, turbo_path=args.turbo_dit, vae_path=args.vae, te_path=args.text_encoder,
         sample_every_n_epochs=args.sample_every_n_epochs,
         sample_width=args.sample_width, sample_height=args.sample_height,
+        sample_steps=args.sample_steps, sample_cfg_scale=args.sample_cfg_scale,
+        sample_negative=args.sample_negative, sample_at_first=args.sample_at_first,
         sample_seed=args.sample_seed,
         sample_ref_image=args.sample_ref_image,
+        metadata_title=args.metadata_title, metadata_author=args.metadata_author,
+        metadata_description=args.metadata_description,
+        metadata_license=args.metadata_license, metadata_tags=args.metadata_tags,
         preview_blocks_to_swap=args.preview_blocks_to_swap,
         preview_int8=args.preview_int8,
         resume_state_dir=args.resume,
@@ -128,6 +161,8 @@ def main():
         finetune_fused_backward=args.finetune_fused_backward,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         max_grad_norm=args.max_grad_norm,
+        optimizer_type=args.optimizer_type, optimizer_args=args.optimizer_args,
+        compile_blocks=args.compile_blocks,
         lr_scheduler=args.lr_scheduler, lr_warmup_steps=args.lr_warmup_steps,
         lr_decay_steps=args.lr_decay_steps,
         lr_scheduler_num_cycles=args.lr_scheduler_num_cycles,

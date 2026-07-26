@@ -3,6 +3,8 @@
 # Modified for Fizgig. See THIRD_PARTY_NOTICES.md.
 
 from dataclasses import dataclass
+import logging
+import os
 import torch
 from typing import Optional, Union
 
@@ -29,6 +31,21 @@ except ImportError:
     xops = None
 
 
+# Sequence lengths are rounded up to a multiple of this before attention, so a bucketed dataset
+# presents a few distinct shapes rather than one per caption length. 1 disables the rounding
+# (exact trim, the old behaviour). See AttentionParams.__post_init__.
+# Guarded parse: this module is imported by the model, both trainers and the GUI — a typo'd
+# env var used to surface as a bare ValueError traceback at app start that never named it.
+try:
+    _TRIM_MULTIPLE = int(os.environ.get("FIZGIG_ATTN_TRIM_MULTIPLE", "64") or 64)
+except ValueError:
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "FIZGIG_ATTN_TRIM_MULTIPLE=%r is not an integer — using the default 64",
+        os.environ.get("FIZGIG_ATTN_TRIM_MULTIPLE"))
+    _TRIM_MULTIPLE = 64
+
+
 @dataclass
 class AttentionParams:
     attn_mode: Optional[str] = None
@@ -38,6 +55,47 @@ class AttentionParams:
     seqlens: Optional[torch.Tensor] = None
     cu_seqlens: Optional[torch.Tensor] = None
     max_seqlen: Optional[int] = None
+
+    def __post_init__(self):
+        # Every sequence the same length means attention can trim to it instead of attending over
+        # padding. Deciding that requires reading a CUDA tensor on the CPU, so it is resolved here,
+        # once per forward, rather than inside each of the 28 blocks. None = do not trim.
+        #
+        # FIZGIG_ATTN_TRIM=0 keeps the padded length and passes the key-padding mask instead.
+        # Slower in raw compute (more tokens attend), but it is what makes SHAPES STABLE: the DiT
+        # pads the sequence to a multiple of 256 explicitly to keep kernel shapes stable, and
+        # trimming undoes that — on a 36-image set it turns 4 distinct shapes into 30, because the
+        # trimmed length includes each caption's own token count. That matters to any backend that
+        # plans or compiles per shape (cuDNN, torch.compile), so it needs to be measurable.
+        self.uniform_seqlen = None
+        self.uniform_exact = True     # False -> the trimmed window still contains padding
+        if (self.seqlens is not None and self.attention_mask is not None and not self.split_attn
+                and os.environ.get("FIZGIG_ATTN_TRIM", "1") != "0"
+                and self.attn_mode not in ("flash", "sageattn")):
+            if bool(torch.all(self.seqlens == self.seqlens[0])):
+                valid = int(self.seqlens[0])
+                # Round the trim length UP to a multiple, so sequence lengths land in a handful
+                # of buckets instead of taking a distinct value per caption. Trimming to the
+                # exact valid length sounds optimal and is not: the length carries each caption's
+                # own token count, which turned 36 images into 30 distinct shapes and made every
+                # shape-planning backend (cuDNN, torch.compile) pay a first-sight cost it could
+                # never amortize. At x64 that is 10 shapes for +3.6% tokens.
+                q = _TRIM_MULTIPLE
+                if q > 1 and self.max_seqlen:
+                    rounded = min(((valid + q - 1) // q) * q, int(self.max_seqlen))
+                    self.uniform_exact = rounded == valid
+                    self.uniform_seqlen = rounded
+                else:
+                    self.uniform_seqlen = valid
+        # Tell the backend chooser which shape this forward will ACTUALLY attend — including
+        # when trim is disabled (FIZGIG_ATTN_TRIM=0, which the docs recommend to help cuDNN)
+        # or the batch is ragged: both attend the padded length. Recording only inside the
+        # trim branch meant those runs recorded nothing and the cuDNN auto-switch could
+        # never fire.
+        if self.attention_mask is not None:
+            attended = self.uniform_seqlen or (int(self.max_seqlen) if self.max_seqlen else None)
+            if attended:
+                _note_shape(attended)
 
     @staticmethod
     def create_attention_params(attn_mode: Optional[str], split_attn: bool) -> "AttentionParams":
@@ -81,6 +139,15 @@ class AttentionParams:
             return AttentionParams(attn_mode, split_attn, img_len, attention_mask, seqlens, cu_seqlens, max_seqlen)
 
 
+# Backend choice (cuDNN for inference, PyTorch's default while training) lives in
+# fizgig.modules.sdpa so every attention site in the app makes the same decision — this one,
+# Klein's DiT, and both VAEs. See that module for the measurements behind it.
+from fizgig.modules.sdpa import note_shape as _note_shape  # noqa: E402
+from fizgig.modules.sdpa import sdpa_backend_ctx as _sdpa_backend_ctx
+
+logger = logging.getLogger(__name__)
+
+
 def attention(
     qkv_or_q: Union[torch.Tensor, list],
     k: Optional[torch.Tensor] = None,
@@ -116,7 +183,9 @@ def attention(
     if attn_params is None:
         attn_params = AttentionParams.create_attention_params("torch", False)
 
-    # GQA: q may carry more heads than k/v (e.g. Krea 2 = 48 query / 12 kv heads). flash and
+    # GQA: q may carry more heads than k/v (e.g. Krea 2 = 48 query / 12 kv heads). Expanding
+    # k/v stays the right call even on cuDNN — measured 0.128 ms (expand) vs 0.138 ms
+    # (enable_gqa) at seq 1024, and enable_gqa on the DEFAULT backend is 1.802 ms. flash and
     # sageattn group heads natively inside the kernel (verified), so they ignore this. For the
     # torch (SDPA) path we expand k/v to q's head count below instead of passing enable_gqa=True,
     # because enable_gqa forces SDPA onto the slow math kernel (~7x slower than the fused kernels
@@ -124,24 +193,27 @@ def attention(
     # fused (flash / mem-efficient) kernels gain native GQA support. (q/k/v here are [B, L, H, D].)
     enable_gqa = q.shape[-2] != k.shape[-2]
 
-    # If split attn is False, attention mask is provided and all sequence lengths are same, we can trim the sequence
+    # When every sequence is the same length, attend over that length instead of the padded
+    # maximum. Whether that applies is decided once, in AttentionParams.__post_init__ — it needs
+    # to read a CUDA tensor on the CPU, and doing that here meant a device sync inside every one
+    # of the 28 blocks (56 with gradient checkpointing's recompute), plus a hard graph break that
+    # is why compiling the blocks lost end to end while the same block compiled 1.37x faster in
+    # isolation. flash/sageattn handle masks efficiently themselves and are excluded there.
     seqlen_trimmed = False
-    # Trim if all seqlens are the same, for attention modes other than flash or sageattn (which can handle masks efficiently)
-    if (
-        not attn_params.split_attn
-        and attn_params.attention_mask is not None
-        and attn_params.seqlens is not None
-        and (attn_params.attn_mode != "flash" and attn_params.attn_mode != "sageattn")
-    ):
-        if torch.all(attn_params.seqlens == attn_params.seqlens[0]):
-            seqlen = attn_params.seqlens[0].item()
-            q = q[:, :seqlen]
-            k = k[:, :seqlen]
-            v = v[:, :seqlen]
-            max_seqlen = attn_params.max_seqlen
-            attn_params = AttentionParams.create_attention_params(attn_params.attn_mode, False)  # do not in-place modify
-            attn_params.max_seqlen = max_seqlen  # keep max_seqlen for padding
-            seqlen_trimmed = True
+    seqlen = attn_params.uniform_seqlen
+    if seqlen is not None:
+        q = q[:, :seqlen]
+        k = k[:, :seqlen]
+        v = v[:, :seqlen]
+        max_seqlen = attn_params.max_seqlen
+        # The window is rounded up to a multiple, so unless it landed exactly on the valid length
+        # it still contains padding — which must stay masked or those tokens join the attention.
+        # The mask is [B, 1, 1, S] for the torch path, so it slices on the last axis.
+        kept_mask = None if attn_params.uniform_exact else attn_params.attention_mask[..., :seqlen]
+        attn_params = AttentionParams.create_attention_params(attn_params.attn_mode, False)  # do not in-place modify
+        attn_params.attention_mask = kept_mask
+        attn_params.max_seqlen = max_seqlen  # keep max_seqlen for padding
+        seqlen_trimmed = True
 
     # Determine tensor layout based on attention implementation
     if attn_params.attn_mode == "torch" or (
@@ -179,7 +251,8 @@ def attention(
                     g = qi.shape[1] // ki.shape[1]  # [B, H, L, D] -> heads at dim 1
                     ki = ki.repeat_interleave(g, dim=1)
                     vi = vi.repeat_interleave(g, dim=1)
-                x_i = torch.nn.functional.scaled_dot_product_attention(qi, ki, vi, dropout_p=drop_rate)
+                with _sdpa_backend_ctx():
+                    x_i = torch.nn.functional.scaled_dot_product_attention(qi, ki, vi, dropout_p=drop_rate)
                 q[i] = None
                 k[i] = None
                 v[i] = None
@@ -192,7 +265,9 @@ def attention(
                 g = q.shape[1] // k.shape[1]  # [B, H, L, D] -> heads at dim 1
                 k = k.repeat_interleave(g, dim=1)
                 v = v.repeat_interleave(g, dim=1)
-            x = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=attn_params.attention_mask, dropout_p=drop_rate)
+            with _sdpa_backend_ctx():
+                x = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_params.attention_mask, dropout_p=drop_rate)
             q, k, v = None, None, None
 
     elif attn_params.attn_mode == "xformers":

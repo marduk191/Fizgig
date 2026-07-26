@@ -307,9 +307,10 @@ ARCHITECTURES = {
         "is_distilled": False,
         "supports_weighting_scheme": False,
         "supports_discrete_flow_shift": False,
-        # Sample generation: previews render on the fp8 Turbo (8-step, CFG-free).
+        # Sample generation: previews render on the fp8 Turbo (8-step; CFG optional —
+        # raise Sample CFG Scale above 1 with a negative prompt for guided previews).
         "supports_samples": True,
-        "sample_cfg_default": None,
+        "sample_cfg_default": 1.0,
         "sample_flow_shift_default": None,
         "sample_steps_default": 8,
         "sample_width_default": 1024,
@@ -349,14 +350,14 @@ BUILT_IN_PRESETS = {
     "✨ Identity (rank 4, single subject)": {
         "NETWORK_DIM": 4, "NETWORK_ALPHA": 4, "LEARNING_RATE": 4e-4,
         "MAX_TRAIN_EPOCHS": 15, "SAVE_EVERY_N_EPOCHS": 1, "SEED": 42,
-        "ADAPTIVE_LR": True, "ADAPTIVE_LR_MIN": "1e-4", "ADAPTIVE_LR_MAX": "4e-4",
+        "ADAPTIVE_LR": True, "ADAPTIVE_LR_MIN": "2e-4", "ADAPTIVE_LR_MAX": "4e-4",
         "TARGET_LAYERS": "Identity", "MIN_TIMESTEP": "", "MAX_TIMESTEP": "",
         "OPTIMIZER_TYPE": "adamw8bit",
     },
     "✨ Identity (rank 8, harder dataset)": {
         "NETWORK_DIM": 8, "NETWORK_ALPHA": 8, "LEARNING_RATE": 4e-4,
         "MAX_TRAIN_EPOCHS": 20, "SAVE_EVERY_N_EPOCHS": 1, "SEED": 42,
-        "ADAPTIVE_LR": True, "ADAPTIVE_LR_MIN": "1e-4", "ADAPTIVE_LR_MAX": "4e-4",
+        "ADAPTIVE_LR": True, "ADAPTIVE_LR_MIN": "2e-4", "ADAPTIVE_LR_MAX": "4e-4",
         "TARGET_LAYERS": "Identity", "MIN_TIMESTEP": "", "MAX_TIMESTEP": "",
         "OPTIMIZER_TYPE": "adamw8bit",
     },
@@ -451,10 +452,16 @@ def load_last_used():
 
 
 def save_last_used(data):
-    """Save last-used folder paths to config file"""
+    """Save last-used folder paths to config file.
+
+    Atomic (tmp + os.replace): this file is rewritten on every traced-var edit, and its
+    reader falls back to defaults on a JSONDecodeError — so a crash mid-write used to
+    silently blank the remembered paths, and the next auto-save persisted the blanks."""
     try:
-        with open(LAST_USED_FILE, 'w', encoding='utf-8') as f:
+        tmp = LAST_USED_FILE + ".tmp"
+        with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2)
+        os.replace(tmp, LAST_USED_FILE)
     except Exception:
         pass
 
@@ -629,8 +636,13 @@ def save_prefs(prefs: dict) -> None:
         else:
             to_save[key] = value
     try:
-        with open(PREFS_FILE, 'w', encoding='utf-8') as f:
+        # Atomic: a truncated prefs.json silently blanked every model path (the reader
+        # swallows JSONDecodeError and falls back to defaults, then the next auto-save
+        # persisted the blanks).
+        tmp = PREFS_FILE + ".tmp"
+        with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(to_save, f, indent=2)
+        os.replace(tmp, PREFS_FILE)
     except Exception:
         pass
 
@@ -665,6 +677,7 @@ PRESETS = {
         "FP8": True,
         "SCALED": True,  # BF16 model, use fp8_scaled for memory efficiency
         "QUANT_4BIT": False,  # 4-bit NF4 base (low-VRAM); supersedes fp8 when on
+        "COMPILE_BLOCKS": "auto",  # torch.compile the DiT blocks (krea2): auto | on | off
         "GRADIENT_CHECKPOINTING": True,  # ON by default — needed to fit 9B on most cards
     },
 }
@@ -677,6 +690,14 @@ class LoRATrainerGUI:
         master.geometry("1360x1124")  # wide enough that the IDLE/BUSY light clears the last tab ("Preferences"); +100 height for the bottom status bar
         master.minsize(1180, 900)  # keeps the tab row clear of the status light + tab content not cut off
         master.configure(bg=BG_COLOR)
+        # Closing the window must not orphan a training subprocess: Tk's default destroy
+        # exits the interpreter but the trainer runs in its own process (no job object on
+        # Windows) — it SURVIVED, holding 14-20 GB of VRAM and still writing checkpoints,
+        # stoppable only via Task Manager. Confirm, then taskkill the tree via stop_training.
+        try:
+            master.protocol("WM_DELETE_WINDOW", self._on_app_close)
+        except Exception:
+            pass
 
         # Window/taskbar icon
         icon_path = os.path.join(os.path.dirname(__file__), "icon.png")
@@ -855,7 +876,8 @@ class LoRATrainerGUI:
             "FP8": True,  # Default FP8 setting (--fp8_base)
             "SCALED": True,  # Default Scaled setting (--fp8_scaled, recommended with fp8_base)
             "QUANT_4BIT": False,  # 4-bit NF4 base (low-VRAM); supersedes fp8 when on
-            "GRADIENT_CHECKPOINTING": True,  # ON by default — recompute activations to fit 9B on most cards
+            "COMPILE_BLOCKS": "auto",  # torch.compile the DiT blocks (krea2): auto | on | off
+                "GRADIENT_CHECKPOINTING": True,  # ON by default — recompute activations to fit 9B on most cards
             "FP8_TEXT_ENCODER": True,  # FP8 for text encoder (T5/LLM)
             "KREA2_LOSS_WATCH": False,   # per-image loss tracking + stuck-image detection (krea2)
             "KREA2_PER_IMAGE_LR": False,  # per-image adaptive LR (throttle stuck images) — experimental
@@ -889,7 +911,16 @@ class LoRATrainerGUI:
         if self.last_used.get("lora_output_dir"):
             self.settings["LORA_OUTPUT_DIR"] = self.last_used["lora_output_dir"]
 
-        self.optimizer_types = ["adamw", "adamw8bit", "adafactor", "bitsandbytes.optim.AdEMAMix8bit", "bitsandbytes.optim.PagedAdEMAMix8bit"]
+        # Klein's trainer resolves these itself (name-or-module-path). Krea 2 goes through
+        # fizgig.training.optimizers, which offers a different set — filtered to what's actually
+        # installed — so the dropdown is re-populated when the Base Model selector changes.
+        self.optimizer_types = ["adamw", "adamw8bit", "bitsandbytes.optim.AdEMAMix8bit", "bitsandbytes.optim.PagedAdEMAMix8bit"]
+        try:
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+            from fizgig.training.optimizers import available_optimizers
+            self.krea2_optimizer_types = available_optimizers()
+        except Exception:
+            self.krea2_optimizer_types = ["adamw8bit", "adamw"]
 
         self.setup_styles()
 
@@ -2071,7 +2102,12 @@ class LoRATrainerGUI:
             elif key == "OPTIMIZER_TYPE":
                 var = tk.StringVar(value=self.settings[key])
                 self.entries[key] = ttk.Combobox(parent, textvariable=var, values=self.optimizer_types, state="readonly", width=38)
-                self.entries[key].current(self.optimizer_types.index(self.settings[key]))
+                # Saved settings may carry a name that's no longer offered (e.g. the removed
+                # adafactor/prodigy/came) — fall back to the default instead of crashing.
+                if self.settings[key] in self.optimizer_types:
+                    self.entries[key].current(self.optimizer_types.index(self.settings[key]))
+                else:
+                    self.entries[key].set("adamw8bit")
             elif key == "LR_SCHEDULER":
                 lr_scheduler_options = ["constant", "constant_with_warmup", "cosine", "cosine_with_restarts", "linear", "polynomial"]
                 self.lr_scheduler_var = tk.StringVar(value=self.settings["LR_SCHEDULER"])
@@ -2422,7 +2458,7 @@ class LoRATrainerGUI:
         adaptive_frame.grid(row=3, column=0, columnspan=2, sticky=tk.W, padx=(20, 5), pady=(0, 2))
         self._adaptive_frame = adaptive_frame
         ttk.Label(adaptive_frame, text="Min LR:").pack(side=tk.LEFT, padx=(0, 4))
-        self.entries["ADAPTIVE_LR_MIN"] = ttk.Combobox(adaptive_frame, width=28, values=["1e-5", "5e-5", "1e-4", "2e-4 - likely too high", "3e-4 - low-rank only"], state="readonly")
+        self.entries["ADAPTIVE_LR_MIN"] = ttk.Combobox(adaptive_frame, width=28, values=["1e-5", "5e-5", "1e-4", "2e-4 - rank 4/8 only", "3e-4 - low-rank only"], state="readonly")
         self.entries["ADAPTIVE_LR_MIN"].set("1e-5")
         self.entries["ADAPTIVE_LR_MIN"].pack(side=tk.LEFT, padx=(0, 12))
         ttk.Label(adaptive_frame, text="Max LR:").pack(side=tk.LEFT, padx=(0, 4))
@@ -2432,9 +2468,11 @@ class LoRATrainerGUI:
         self._adaptive_reset_btn = ttk.Button(adaptive_frame, text="Reset Defaults", command=self._reset_adaptive_lr_defaults)
         self._adaptive_reset_btn.pack(side=tk.LEFT, padx=(4, 0))
         self._adaptive_desc_label = ttk.Label(training_content,
-                  text="When on, starting LR = Learning Rate field. Probes UP on steady loss descent; reduces DOWN "
-                       "on loss plateau, heavy gradient clipping, or runaway weight-norm growth (with a rollback to "
-                       "the previous epoch's weights on stability events).",
+                  text="When on, the Learning Rate box is IGNORED (greyed out) — the run starts at the geometric "
+                       "midpoint of Min/Max (e.g. 1e-4 & 4e-4 → 2e-4) and the watcher owns the LR from there: "
+                       "probes UP on steady loss descent; reduces DOWN on loss plateau, heavy gradient clipping, "
+                       "or runaway weight-norm growth (with a rollback to the previous epoch's weights on "
+                       "stability events).",
                   foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
         self._adaptive_desc_label.grid(row=4, column=0, columnspan=2, sticky=tk.W, padx=(20, 5), pady=(0, 6))
         self._on_adaptive_lr_toggle()  # sync initial enabled/disabled state
@@ -2570,11 +2608,12 @@ class LoRATrainerGUI:
         self.krea2_loss_watch_var = tk.BooleanVar(value=bool(self.settings.get("KREA2_LOSS_WATCH", False)))
         self._krea2_losswatch_frame = ttk.Frame(training_content)
         self._krea2_losswatch_frame.grid(row=20, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(8, 0))
-        ttk.Checkbutton(
+        self._krea2_detect_cb = ttk.Checkbutton(
             self._krea2_losswatch_frame,
             text="Detect problem images (per-image loss tracking)",
             variable=self.krea2_loss_watch_var,
-        ).pack(side=tk.LEFT)
+        )
+        self._krea2_detect_cb.pack(side=tk.LEFT)
         ttk.Button(self._krea2_losswatch_frame, text="👁 View Problem Images",
                    command=self._open_problem_images_window).pack(side=tk.LEFT, padx=(12, 0))
         self.krea2_per_image_lr_var = tk.BooleanVar(value=bool(self.settings.get("KREA2_PER_IMAGE_LR", False)))
@@ -2598,6 +2637,23 @@ class LoRATrainerGUI:
             variable=self.krea2_warmup_look_var,
         )
         self._krea2_warmuplook_cb.grid(row=23, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(2, 0))
+        # All four features attribute a step's loss to ONE image — a batch-mean isn't a
+        # per-image signal, so they grey out whenever Batch Size > 1 (note shown instead).
+        self._krea2_perimage_batch_note = tk.Label(
+            training_content,
+            text="Per-image features need Batch Size 1 (Dataset section) — a batch-mean loss "
+                 "isn't a per-image signal, so these are disabled at the current batch size.",
+            font=(FONT_FAMILY, 8, "italic"), fg=COLORS["text_muted"], bg=COLORS["bg_surface"],
+            wraplength=680, justify=tk.LEFT)
+        self._krea2_perimage_batch_note.grid(row=24, column=0, columnspan=2, sticky=tk.W,
+                                             padx=5, pady=(2, 0))
+        self._krea2_perimage_batch_note.grid_remove()
+        try:
+            self.dataset_batch_size_var.trace_add(
+                "write", lambda *_a: self._refresh_perimage_toggle_state())
+        except Exception:
+            pass
+        self._refresh_perimage_toggle_state()
         self._krea2_losswatch_hint = ttk.Label(training_content,
                   text="Tracks each image's loss (normalized for the random noise level) across epochs. Detection "
                        "flags images that stay hard without improving — usually mislabeled/off-concept data — in the "
@@ -2860,25 +2916,40 @@ class LoRATrainerGUI:
         self.fp8_text_encoder_check = ttk.Checkbutton(memory_content, text="Enable FP8 T5/LLM", variable=self.fp8_text_encoder_var, style="Surface.TCheckbutton")
         self.fp8_text_encoder_check.grid(row=4, column=1, sticky=tk.W, padx=5, pady=4)
 
-        # 4-bit (NF4) base — low-VRAM mode
+        # 4-bit (NF4) base — Auto / On / Off. quant_4bit_var stays the BooleanVar every
+        # downstream consumer reads; the mode combobox derives it. "Auto" hands the choice
+        # to the launch-time memory strategy (Krea 2 + Blocks Swap on Auto picks
+        # INT8/NF4/fp8 from free VRAM; Klein has no NF4 auto, so Auto = off there).
         self._quant_4bit_label = tk.Label(memory_content, text="4-bit Base:", font=(FONT_FAMILY, 10),
                  fg=COLORS["text_secondary"], bg=COLORS["bg_surface"])
         self._quant_4bit_label.grid(row=5, column=0, sticky=tk.W, padx=(12, 8), pady=4)
-        self.quant_4bit_var = tk.BooleanVar(value=self.settings.get("QUANT_4BIT", False))
-        self.quant_4bit_check = ttk.Checkbutton(
-            memory_content, text="Quantize base to 4-bit NF4 (low VRAM)",
-            variable=self.quant_4bit_var, command=self._on_quant_4bit_toggle,
-            style="Surface.TCheckbutton")
-        self.quant_4bit_check.grid(row=5, column=1, sticky=tk.W, padx=5, pady=4)
+        self.quant_4bit_var = tk.BooleanVar(value=False)
+        _q4_mode = str(self.settings.get("QUANT_4BIT_MODE", "") or
+                       ("On" if self.settings.get("QUANT_4BIT", False) else "Auto"))
+        if _q4_mode not in ("Auto", "On", "Off"):
+            _q4_mode = "Auto"
+        self.quant_4bit_mode_var = tk.StringVar(value=_q4_mode)
+        _q4_row = ttk.Frame(memory_content)
+        _q4_row.grid(row=5, column=1, sticky=tk.W, padx=5, pady=4)
+        self.quant_4bit_check = ttk.Combobox(
+            _q4_row, textvariable=self.quant_4bit_mode_var,
+            values=["Auto", "On", "Off"], state="readonly", width=6)
+        self.quant_4bit_check.pack(side=tk.LEFT)
+        self.quant_4bit_check.bind("<<ComboboxSelected>>",
+                                   lambda e: self._on_quant_4bit_mode_changed())
+        tk.Label(_q4_row, text="NF4 quantized base (low VRAM)",
+                 font=(FONT_FAMILY, 10), fg=COLORS["text_secondary"],
+                 bg=COLORS["bg_surface"]).pack(side=tk.LEFT, padx=(8, 0))
         self._quant_4bit_hint = tk.Label(memory_content,
-                 text="Halves DiT VRAM (~9.6 → ~5.6 GB) so a full 9B LoRA trains on 10–12 GB cards — "
-                      "a LoRA trained on a frozen 4-bit base (QLoRA-style). This is for cards that can't fit "
-                      "fp8 training (~14 GB); 16 GB+ should use fp8. Forces block swap off, and supersedes the "
-                      "FP8 Base options. Slight quality trade vs fp8 — always check the output LoRA in ComfyUI.",
+                 text="Auto (recommended): with Blocks Swap on Auto, the launch-time strategy picks the best "
+                      "of INT8 / NF4 4-bit / fp8 from your FREE VRAM (Krea 2; Klein has no NF4 auto). "
+                      "On forces the NF4 base — halves DiT VRAM (~9.6 → ~5.6 GB) for 10–12 GB cards, forces "
+                      "block swap off, supersedes FP8 Base; slight quality trade — check the LoRA in ComfyUI. "
+                      "Off never uses NF4 even if the strategy would pick it.",
                  font=(FONT_FAMILY, 8, "italic"), fg=COLORS["text_muted"], bg=COLORS["bg_surface"],
                  wraplength=600, justify=tk.LEFT)
         self._quant_4bit_hint.grid(row=6, column=1, sticky=tk.W, padx=5, pady=(0, 4))
-        self._on_quant_4bit_toggle()  # sync initial enabled/disabled state
+        self._on_quant_4bit_mode_changed()  # derive the boolean + sync dependent locks
 
         # Gradient checkpointing — trades compute for VRAM.
         self._grad_checkpoint_label = tk.Label(memory_content, text="Grad Checkpoint:", font=(FONT_FAMILY, 10),
@@ -2898,10 +2969,36 @@ class LoRATrainerGUI:
                  font=(FONT_FAMILY, 8, "italic"), fg=COLORS["text_muted"], bg=COLORS["bg_surface"],
                  wraplength=600, justify=tk.LEFT)
         self._grad_checkpoint_hint.grid(row=8, column=1, sticky=tk.W, padx=5, pady=(0, 4))
+        # torch.compile (Krea 2 only — hidden under Klein by _apply_training_arch_visibility).
+        self._compile_blocks_label = tk.Label(memory_content, text="Compile Blocks:", font=(FONT_FAMILY, 10),
+                 fg=COLORS["text_secondary"], bg=COLORS["bg_surface"])
+        self._compile_blocks_label.grid(row=9, column=0, sticky=tk.W, padx=(12, 8), pady=4)
+        # Auto / On / Off rather than a checkbox: compile is a long-run win and a short-run loss,
+        # so the right default is a judgement the trainer makes from the actual run length, the
+        # same way Blocks Swap defaults to "Auto (detect from GPU)".
+        self.compile_blocks_var = tk.StringVar(value=str(self.settings.get("COMPILE_BLOCKS", "auto")).capitalize())
+        self.compile_blocks_check = ttk.Combobox(
+            memory_content, textvariable=self.compile_blocks_var, state="readonly", width=36,
+            values=["Auto", "On", "Off"])
+        self.compile_blocks_check.grid(row=9, column=1, sticky=tk.W, padx=5, pady=4)
+        self._compile_blocks_hint = tk.Label(memory_content,
+                 text="Auto (recommended) turns torch.compile on only when this run is long enough to repay it. "
+                      "It fuses the per-matmul quantise/dequantise work that bounds the INT8 and NF4 paths — "
+                      "2.0× per step on INT8 (0.59 → 0.29 s/step, matching OneTrainer) and 1.28× on "
+                      "NF4 (0.71 → 0.56) — but costs a ~90 s compile pause first, so a short run is SLOWER "
+                      "overall. Break-even is around 600 steps on INT8, 1200 on NF4. NF4 + compile still fits a 16 GB "
+                      "card (verified under a 13.5 GB cap); INT8 + compile needs ~24 GB. Requires Triton and, on "
+                      "Windows, a C++ compiler (VS Build Tools) — both located automatically. Never used with "
+                      "Blocks Swap, since swapping moves weights and compiled graphs assume they stay put.",
+                 font=(FONT_FAMILY, 8, "italic"), fg=COLORS["text_muted"], bg=COLORS["bg_surface"],
+                 wraplength=600, justify=tk.LEFT)
+        self._compile_blocks_hint.grid(row=10, column=1, sticky=tk.W, padx=5, pady=(0, 4))
+
         # Re-sync now that the GC checkbox exists: the earlier _on_quant_4bit_toggle
         # call ran before it was created, so this applies the NF4→force-GC-on lock
         # when a saved config has 4-bit already enabled.
         self._on_quant_4bit_toggle()
+
 
         # === Timestep & Noise Schedule Section (Collapsed by default) ===
         timestep_section = CollapsibleFrame(outer,"Timestep & Noise Schedule", default_expanded=False)
@@ -2937,7 +3034,9 @@ class LoRATrainerGUI:
         ts_sampling_label.grid(row=ts_row, column=0, sticky=tk.W, padx=(12, 8), pady=4)
 
         self.ts_sampling_var = tk.StringVar(value=self.settings["TIMESTEP_SAMPLING"])
-        ts_sampling_options = ["sigma", "uniform", "sigmoid", "shift", "flux_shift", "flux2_shift", "qwen_shift", "logsnr"]
+        # Must mirror the trainer's argparse choices exactly — "qwen_shift" was offered here
+        # but rejected by the trainer at launch; "qinglong_flux" existed but wasn't offered.
+        ts_sampling_options = ["sigma", "uniform", "sigmoid", "shift", "flux_shift", "flux2_shift", "logsnr", "qinglong_flux"]
         self.ts_sampling_combo = ttk.Combobox(ts_content, textvariable=self.ts_sampling_var,
                                                values=ts_sampling_options, state="readonly", width=20)
         self.ts_sampling_combo.grid(row=ts_row, column=1, sticky=tk.W, padx=5, pady=4)
@@ -3174,6 +3273,12 @@ class LoRATrainerGUI:
         if show_message:
             messagebox.showinfo("Preset Loaded", f"Loaded recommended preset for {arch}")
 
+    # Comboboxes whose values feed directly into the launch command: a saved value the
+    # current family doesn't offer (cross-family last-train leak, withdrawn LR floors,
+    # removed optimizers) must NOT be .set() onto them — readonly Comboboxes accept any
+    # value without complaint, and the bad name then dies (or misbehaves) at launch.
+    _STRICT_COMBO_KEYS = {"OPTIMIZER_TYPE", "ADAPTIVE_LR_MIN", "ADAPTIVE_LR_MAX", "LR_SCHEDULER"}
+
     def _apply_preset_values(self, preset):
         """Apply preset values to the UI (shared by load_default_preset and load_custom_preset)"""
         for key, value in preset.items():
@@ -3183,13 +3288,18 @@ class LoRATrainerGUI:
                     value = str(value)
                     try:
                         # A saved plain value (e.g. "2e-4") should select its labeled combobox
-                        # entry ("2e-4 - likely too high") so the warning suffix still shows.
+                        # entry ("2e-4 - rank 4/8 only") so the warning suffix still shows.
                         opts = entry.cget("values") or ()
                         if value not in opts:
                             for opt in opts:
                                 if str(opt).split(" ")[0] == value.split(" ")[0]:
                                     value = str(opt)
                                     break
+                        if value not in opts and key in self._STRICT_COMBO_KEYS:
+                            self.update_console(
+                                f"[preset] {key}: saved value {value!r} isn't offered here — "
+                                f"keeping {entry.get()!r}\n")
+                            continue
                     except tk.TclError:
                         pass
                     entry.set(value)
@@ -3205,9 +3315,18 @@ class LoRATrainerGUI:
                         # Unknown widget type — skip rather than crash
                         pass
 
-        # Update timestep settings from preset
+        # Update timestep settings from preset. Validate against what the trainer accepts —
+        # old presets can carry values a past version offered (e.g. "qwen_shift", which
+        # argparse rejects at launch).
         if "TIMESTEP_SAMPLING" in preset:
-            self.ts_sampling_var.set(preset["TIMESTEP_SAMPLING"])
+            _ts_val = str(preset["TIMESTEP_SAMPLING"])
+            _ts_ok = ("sigma", "uniform", "sigmoid", "shift", "flux_shift", "flux2_shift",
+                      "logsnr", "qinglong_flux")
+            if _ts_val in _ts_ok:
+                self.ts_sampling_var.set(_ts_val)
+            else:
+                self.update_console(f"[preset] TIMESTEP_SAMPLING {_ts_val!r} isn't supported — "
+                                    f"keeping {self.ts_sampling_var.get()!r}\n")
         if "WEIGHTING_SCHEME" in preset:
             self.weighting_scheme_var.set(preset["WEIGHTING_SCHEME"])
         if "PRESERVE_DISTRIBUTION" in preset:
@@ -3224,13 +3343,18 @@ class LoRATrainerGUI:
         if "SCALED" in preset:
             self.scaled_var.set(preset["SCALED"])
 
-        # 4-bit (NF4) base checkbox — lives on a dedicated var (not in self.entries), so the generic
-        # loop above never restores it. Set it explicitly and re-run its toggle to re-apply the
-        # dependent locks (block swap off + force-GC-on) that _on_quant_4bit_toggle owns.
-        if "QUANT_4BIT" in preset and hasattr(self, 'quant_4bit_var'):
-            self.quant_4bit_var.set(bool(preset["QUANT_4BIT"]))
-            if hasattr(self, '_on_quant_4bit_toggle'):
-                self._on_quant_4bit_toggle()
+        # 4-bit (NF4) base — dedicated mode var (not in self.entries), so the generic loop
+        # never restores it. New presets carry QUANT_4BIT_MODE (Auto/On/Off); legacy ones
+        # carry the old boolean, which maps to an explicit On/Off.
+        if hasattr(self, 'quant_4bit_mode_var'):
+            if "QUANT_4BIT_MODE" in preset:
+                _m = str(preset["QUANT_4BIT_MODE"])
+                if _m in ("Auto", "On", "Off"):
+                    self.quant_4bit_mode_var.set(_m)
+                    self._on_quant_4bit_mode_changed()
+            elif "QUANT_4BIT" in preset:
+                self.quant_4bit_mode_var.set("On" if bool(preset["QUANT_4BIT"]) else "Off")
+                self._on_quant_4bit_mode_changed()
 
         # Per-image loss watch toggles (krea2) — dedicated vars, same not-in-self.entries situation.
         if "KREA2_LOSS_WATCH" in preset and hasattr(self, 'krea2_loss_watch_var'):
@@ -3262,6 +3386,17 @@ class LoRATrainerGUI:
             self.training_preset_var.set(mapped if mapped in valid else "Full Model")
             if hasattr(self, '_on_training_preset_changed'):
                 self._on_training_preset_changed()
+                # _on_training_preset_changed auto-fills MIN/MAX_TIMESTEP from the Model
+                # Area — which just overwrote the values the generic loop restored from
+                # the preset. The preset's explicit values are the user's saved choice:
+                # put them back.
+                for _ts_key in ("MIN_TIMESTEP", "MAX_TIMESTEP"):
+                    if _ts_key in preset and _ts_key in self.entries:
+                        try:
+                            self.entries[_ts_key].delete(0, tk.END)
+                            self.entries[_ts_key].insert(0, str(preset[_ts_key]))
+                        except Exception:
+                            pass
         if "FP8_TEXT_ENCODER" in preset:
             self.fp8_text_encoder_var.set(preset["FP8_TEXT_ENCODER"])
         if "ENABLE_BUCKET" in preset:
@@ -3290,6 +3425,8 @@ class LoRATrainerGUI:
 
     def _save_last_train_settings(self):
         """Snapshot current settings just before launching training, so 'Load Last Train' can restore them."""
+        if _persist_disabled():
+            return   # headless tests must never overwrite the real .last_train_settings.json
         try:
             os.makedirs(PRESETS_DIR, exist_ok=True)
             snapshot = self._collect_preset_values()
@@ -3317,11 +3454,15 @@ class LoRATrainerGUI:
 
     # Keys in self.entries that belong to OTHER tabs — skipped when collecting
     # a training-tab preset. Everything else in self.entries is fair game.
+    # RESUME_TRAINING is run-specific state, not a preset knob: capturing it baked an
+    # absolute state-dir path into every saved preset (and Load Last Train), silently
+    # turning future runs into resumes of an old checkpoint.
     _NON_TRAINING_ENTRY_KEYS = {
         "SAMPLE_ENABLED", "SAMPLE_WIDTH", "SAMPLE_HEIGHT", "SAMPLE_STEPS",
         "SAMPLE_SEED", "SAMPLE_EVERY_N_EPOCHS", "SAMPLE_EVERY_N_STEPS",
         "SAMPLE_AT_FIRST", "SAMPLE_FLOW_SHIFT",
         "SAMPLE_NEGATIVE", "SAMPLE_CFG_SCALE",
+        "RESUME_TRAINING",
     }
 
     def _collect_preset_values(self):
@@ -3359,6 +3500,8 @@ class LoRATrainerGUI:
         _grab("fp8_var", "FP8")
         _grab("scaled_var", "SCALED")
         _grab("quant_4bit_var", "QUANT_4BIT")
+        _grab("quant_4bit_mode_var", "QUANT_4BIT_MODE")
+        _grab("compile_blocks_var", "COMPILE_BLOCKS")
         _grab("krea2_loss_watch_var", "KREA2_LOSS_WATCH")
         _grab("krea2_per_image_lr_var", "KREA2_PER_IMAGE_LR")
         _grab("krea2_auto_recaption_var", "KREA2_AUTO_RECAPTION")
@@ -3552,49 +3695,81 @@ class LoRATrainerGUI:
         else:
             self.fp8_text_encoder_check.config(text="Enable FP8 Text Encoder")
 
-        # Update blocks swap max (enforce limit)
+        # Update blocks swap max (enforce limit). "Auto" is left ALONE: resolving it here
+        # ran the auto strategy (a GPU probe that can flip the 4-bit toggle) as a side
+        # effect of a bounds check, and writing the resolved number into the combobox
+        # silently turned an auto choice into a permanent manual one. Auto strategies
+        # already return in-range values; only explicit numbers need clamping.
         try:
-            current_blocks = self._parse_blocks_swap()
-            if current_blocks > config["blocks_swap_max"]:
-                self.entries["BLOCKS_SWAP"].delete(0, tk.END)
-                self.entries["BLOCKS_SWAP"].insert(0, str(config["blocks_swap_max"]))
+            _raw_swap = self.entries["BLOCKS_SWAP"].get().strip()
+            if not _raw_swap.lower().startswith("auto"):
+                current_blocks = self._parse_blocks_swap()
+                if current_blocks > config["blocks_swap_max"]:
+                    self.entries["BLOCKS_SWAP"].delete(0, tk.END)
+                    self.entries["BLOCKS_SWAP"].insert(0, str(config["blocks_swap_max"]))
         except ValueError:
             pass
 
-        # Update timestep section for architecture
+        # Update timestep section for architecture.
+        # Values are only touched when the ARCHITECTURE actually changed: several callers
+        # use this method as a pure visibility refresh, and unconditionally resetting the
+        # section wiped the user's timestep settings on every call. On a real switch, the
+        # outgoing family's values are stashed and restored when the user switches back.
         if hasattr(self, 'ts_sampling_var'):
-            # Set timestep sampling to architecture default
-            timestep_sampling = config.get("timestep_sampling", "shift")
-            self.ts_sampling_var.set(timestep_sampling)
+            _prev_arch = getattr(self, "_ts_defaults_arch", None)
+            if _prev_arch != arch:
+                if not hasattr(self, "_arch_ts_stash"):
+                    self._arch_ts_stash = {}
+                if _prev_arch is not None:
+                    self._arch_ts_stash[_prev_arch] = {
+                        "sampling": self.ts_sampling_var.get(),
+                        "shift": self.entries["DISCRETE_FLOW_SHIFT"].get(),
+                        "min_ts": self.entries["MIN_TIMESTEP"].get(),
+                        "max_ts": self.entries["MAX_TIMESTEP"].get(),
+                        "preserve": self.preserve_dist_var.get(),
+                        "weighting": self.weighting_scheme_var.get(),
+                    }
+                stash = self._arch_ts_stash.get(arch)
+                if stash is not None:
+                    # Returning to a family the user already configured — restore, don't reset.
+                    self.ts_sampling_var.set(stash["sampling"])
+                    self.entries["DISCRETE_FLOW_SHIFT"].config(state="normal")
+                    self.entries["DISCRETE_FLOW_SHIFT"].delete(0, tk.END)
+                    self.entries["DISCRETE_FLOW_SHIFT"].insert(0, stash["shift"])
+                    self.entries["MIN_TIMESTEP"].delete(0, tk.END)
+                    self.entries["MIN_TIMESTEP"].insert(0, stash["min_ts"])
+                    self.entries["MAX_TIMESTEP"].delete(0, tk.END)
+                    self.entries["MAX_TIMESTEP"].insert(0, stash["max_ts"])
+                    self.preserve_dist_var.set(stash["preserve"])
+                    self.weighting_scheme_var.set(stash["weighting"])
+                else:
+                    # First visit to this family — apply its defaults.
+                    self.ts_sampling_var.set(config.get("timestep_sampling", "shift"))
+                    default_shift = config.get("discrete_flow_shift")
+                    if default_shift is not None:
+                        self.entries["DISCRETE_FLOW_SHIFT"].config(state="normal")
+                        self.entries["DISCRETE_FLOW_SHIFT"].delete(0, tk.END)
+                        self.entries["DISCRETE_FLOW_SHIFT"].insert(0, str(default_shift))
+                    min_ts = config.get("min_timestep")
+                    max_ts = config.get("max_timestep")
+                    self.entries["MIN_TIMESTEP"].delete(0, tk.END)
+                    self.entries["MAX_TIMESTEP"].delete(0, tk.END)
+                    if min_ts is not None:
+                        self.entries["MIN_TIMESTEP"].insert(0, str(min_ts))
+                    if max_ts is not None:
+                        self.entries["MAX_TIMESTEP"].insert(0, str(max_ts))
+                    self.preserve_dist_var.set(config.get("preserve_distribution_shape", False))
+                self._ts_defaults_arch = arch
 
-            # Discrete Flow Shift
+            # Enable/disable states are pure display — refresh them on every call.
             supports_shift = config.get("supports_discrete_flow_shift", True)
             if supports_shift:
                 self.entries["DISCRETE_FLOW_SHIFT"].config(state="normal")
                 self.ts_flow_shift_label.config(fg=COLORS["text_secondary"])
-                # Set architecture default
-                default_shift = config.get("discrete_flow_shift")
-                if default_shift is not None:
-                    self.entries["DISCRETE_FLOW_SHIFT"].delete(0, tk.END)
-                    self.entries["DISCRETE_FLOW_SHIFT"].insert(0, str(default_shift))
             else:
                 self.entries["DISCRETE_FLOW_SHIFT"].config(state="disabled")
                 self.ts_flow_shift_label.config(fg=COLORS["text_muted"])
 
-            # Min/Max Timestep defaults from architecture
-            min_ts = config.get("min_timestep")
-            max_ts = config.get("max_timestep")
-            self.entries["MIN_TIMESTEP"].delete(0, tk.END)
-            self.entries["MAX_TIMESTEP"].delete(0, tk.END)
-            if min_ts is not None:
-                self.entries["MIN_TIMESTEP"].insert(0, str(min_ts))
-            if max_ts is not None:
-                self.entries["MAX_TIMESTEP"].insert(0, str(max_ts))
-
-            # Preserve distribution
-            self.preserve_dist_var.set(config.get("preserve_distribution_shape", False))
-
-            # Weighting scheme
             supports_weighting = config.get("supports_weighting_scheme", True)
             if supports_weighting:
                 self.ts_weighting_combo.config(state="readonly")
@@ -3690,6 +3865,17 @@ class LoRATrainerGUI:
     def _apply_krea2_ft_defaults(self):
         """Set the whole fine-tune recipe in one go, and say what changed."""
         changed = []
+        # Adaptive LR goes off FIRST: the trainer disables it anyway (rotation boundaries read
+        # as instability), and while it's on the Learning Rate box is greyed out — writing the
+        # recipe's 1e-5 into a disabled Entry silently does nothing, which left fine-tune runs
+        # starting at a LoRA-grade LR.
+        if getattr(self, "adaptive_lr_var", None) is not None and self.adaptive_lr_var.get():
+            self.adaptive_lr_var.set(False)
+            try:
+                self._on_adaptive_lr_toggle()
+            except Exception:
+                pass
+            changed.append("Adaptive LR: on -> off (incompatible with rotation)")
         for key, val in self.KREA2_FT_DEFAULTS.items():
             entry = self.entries.get(key)
             if entry is None:
@@ -3698,20 +3884,18 @@ class LoRATrainerGUI:
                 before = entry.get()
                 if str(before).strip() == val:
                     continue
+                # Belt and braces: a disabled Entry rejects delete/insert, so re-enable it for
+                # the write and put its state back.
+                _was = str(entry.cget("state"))
+                if _was == "disabled":
+                    entry.config(state="normal")
                 entry.delete(0, tk.END)
                 entry.insert(0, val)
+                if _was == "disabled":
+                    entry.config(state=_was)
                 changed.append(f"{key.replace('_', ' ').title()}: {before} -> {val}")
             except Exception:
                 pass
-        if getattr(self, "adaptive_lr_var", None) is not None and self.adaptive_lr_var.get():
-            # The trainer disables it anyway (rotation boundaries read as instability) —
-            # better it reads OFF here than silently ignored.
-            self.adaptive_lr_var.set(False)
-            try:
-                self._on_adaptive_lr_toggle()
-            except Exception:
-                pass
-            changed.append("Adaptive LR: on -> off (incompatible with rotation)")
         if getattr(self, "lr_scheduler_var", None) is not None and self.lr_scheduler_var.get() != "constant":
             was = self.lr_scheduler_var.get()
             self.lr_scheduler_var.set("constant")
@@ -3736,13 +3920,25 @@ class LoRATrainerGUI:
             self._krea2_ft_blocks_lbl.pack_forget()
             self._krea2_ft_blocks_cb.pack_forget()
 
+    def _refresh_optimizer_choices(self, is_krea2: bool):
+        """Point the Optimizer Type dropdown at the selected family's catalog."""
+        combo = self.entries.get("OPTIMIZER_TYPE")
+        if combo is None:
+            return
+        choices = self.krea2_optimizer_types if is_krea2 else self.optimizer_types
+        combo["values"] = choices
+        if combo.get() not in choices:
+            combo.set("adamw8bit" if "adamw8bit" in choices else choices[0])
+
     def _apply_training_arch_visibility(self, is_krea2: bool):
         """Hide Training-tab controls not yet wired into the Krea 2 native trainer; re-show for Klein.
 
         Deferred-for-Krea-2 feature groups (re-enable by removing from these lists as they land):
           • Model Area to Train (dropdown + desc + Custom panel) — no Krea 2 block map yet
-          • Optimizer Type / Args / Network Dropout             — krea2 hardcodes AdamW8bit
-            (the Optimizer SECTION itself is shown: Gradient Accumulation + Max Grad Norm are wired)
+          • Network Dropout                                     — not implemented for krea2
+            (the rest of the Optimizer section is wired: Type, Args, Gradient Accumulation,
+             Max Grad Norm. The Type dropdown re-populates per family — see
+             _refresh_optimizer_choices — because the two resolve names differently.)
           • LR Decay steps                                      — Klein-only warmup_stable_decay
           • Timestep & Noise section                            — krea2 uses a fixed shift schedule
           • FP8 Scaled (in Memory & FP8)                        — krea2's fp8 path is always scaled
@@ -3768,21 +3964,26 @@ class LoRATrainerGUI:
             # LR Decay steps: Klein-only (warmup_stable_decay). LR Scheduler + Warmup ARE wired
             # for krea2 (--lr_scheduler / --lr_warmup_steps) so they stay visible.
             self._lr_decay_label, self.entries.get("LR_DECAY_STEPS"),
-            # Optimizer section is shown under Krea 2 for Gradient Accumulation + Max Grad Norm
-            # (both wired); the rest of its fields have no krea2 equivalent — AdamW8bit is
-            # hardcoded and network dropout isn't implemented — so hide those individually.
-            self.labels.get("OPTIMIZER_TYPE"), self.entries.get("OPTIMIZER_TYPE"),
-            self.labels.get("OPTIMIZER_ARGS"), self.entries.get("OPTIMIZER_ARGS"),
+            # Optimizer Type / Args are wired for BOTH now (krea2 -> --optimizer_type /
+            # --optimizer_args); only network dropout has no krea2 equivalent.
             self.labels.get("NETWORK_DROPOUT"), self.entries.get("NETWORK_DROPOUT"),
         ]
         for w in widgets:
             self._set_widget_visible(w, not is_krea2)
 
+        # The two families resolve optimizer names differently, so the dropdown's contents follow
+        # the selector. A name valid for one may not exist in the other (Klein takes module paths;
+        # krea2 takes catalog names), so fall back to the shared default rather than carrying a
+        # value across that the trainer would then have to reject.
+        self._refresh_optimizer_choices(is_krea2)
+
         # Krea 2-ONLY controls (inverse of the above): the per-image loss watch toggles are only
         # wired into krea2_train for now — hide them under Klein.
         for w in (self._krea2_losswatch_frame, self._krea2_perimglr_cb,
                   self._krea2_autorecap_cb, self._krea2_warmuplook_cb,
-                  self._krea2_losswatch_hint, self._krea2_ft_cb):
+                  self._krea2_losswatch_hint, self._krea2_ft_cb,
+                  # torch.compile is wired into krea2_train only.
+                  self._compile_blocks_label, self.compile_blocks_check, self._compile_blocks_hint):
             self._set_widget_visible(w, is_krea2)
         # The FT sub-controls are gated by the checkbox as well as by the family.
         if is_krea2:
@@ -4163,9 +4364,14 @@ class LoRATrainerGUI:
             if key in queued_keys:
                 ui["badge"].config(text="  ✏ fix queued", fg="#F1C40F")
             elif key in applied_info:
-                _ai = applied_info[key].get("auto")
-                _att = int(applied_info[key].get("attempt", 1) or 1)
-                _ep = applied_info[key].get("epoch", "?")
+                # Ledger entries are per-fix history lists (older files carry a single dict);
+                # the badge shows the LATEST fix.
+                _entry = applied_info[key]
+                if isinstance(_entry, list):
+                    _entry = _entry[-1] if _entry else {}
+                _ai = _entry.get("auto")
+                _att = int(_entry.get("attempt", 1) or 1)
+                _ep = _entry.get("epoch", "?")
                 if _ai and _att >= 2:
                     _txt = f"  🤖 AI re-captioned ×2 (detailed) @ epoch {_ep} — last chance"
                 elif _ai:
@@ -4338,16 +4544,28 @@ class LoRATrainerGUI:
     # ── Timestep section helpers ────────────────────────────────────────
 
     def _on_adaptive_lr_toggle(self):
-        """Enable/disable the Min/Max LR dropdowns based on the Adaptive LR checkbox."""
+        """Enable/disable the Min/Max LR dropdowns based on the Adaptive LR checkbox,
+        and grey out the Learning Rate box — it is IGNORED while adaptive is on (the run
+        starts at the geometric midpoint of Min/Max; the watcher owns the LR from there)."""
         if not hasattr(self, 'entries') or "ADAPTIVE_LR_MIN" not in self.entries:
             return
+        on = self.adaptive_lr_var.get()
         # Comboboxes: "readonly" when enabled (dropdown active, no free typing), "disabled" when not
-        combo_state = "readonly" if self.adaptive_lr_var.get() else "disabled"
-        btn_state = "normal" if self.adaptive_lr_var.get() else "disabled"
+        combo_state = "readonly" if on else "disabled"
+        btn_state = "normal" if on else "disabled"
         self.entries["ADAPTIVE_LR_MIN"].config(state=combo_state)
         self.entries["ADAPTIVE_LR_MAX"].config(state=combo_state)
         if hasattr(self, '_adaptive_reset_btn'):
             self._adaptive_reset_btn.config(state=btn_state)
+        # The LR box is the inverse: live when adaptive is OFF, greyed when ON.
+        try:
+            if "LEARNING_RATE" in self.entries:
+                self.entries["LEARNING_RATE"].config(state="disabled" if on else "normal")
+            if hasattr(self, "labels") and "LEARNING_RATE" in self.labels:
+                self.labels["LEARNING_RATE"].config(
+                    fg=COLORS["text_muted"] if on else COLORS["text_secondary"])
+        except Exception:
+            pass
 
     def _parse_blocks_swap(self) -> int:
         """Extract integer from the BLOCKS_SWAP combobox value.
@@ -4357,10 +4575,82 @@ class LoRATrainerGUI:
         if raw.lower().startswith("auto"):
             cfg = ARCHITECTURES.get(self.architecture_var.get(), {})
             if cfg.get("is_krea2"):
-                return self._auto_krea2_blocks_swap()
+                return self._auto_krea2_strategy()
             return self._auto_training_blocks_swap()
+        # Explicit swap value: any INT8 pick from a PREVIOUS auto pass must not leak into
+        # this launch (stale --quant_int8 alongside --blocks_to_swap N OOM'd small cards).
+        self._auto_quant_int8 = ""
         m = _re.match(r'\d+', raw)
         return int(m.group()) if m else 0
+
+    def _auto_krea2_strategy(self) -> int:
+        """Choose Krea 2 quantisation AND swap together, then return the swap count.
+
+        Picking a swap count from VRAM alone produced the worst possible outcome on 16 GB
+        cards: fp8 doesn't fit, so it swapped 20 of 28 blocks every step. Measured on a 5090
+        (Krea 2, 36 imgs @ 0.25 MP, batch 1):
+
+            fp8, no swap   0.85 s/it   20.1 GB   12.5% CPU
+            fp8, swap 20   3.09 s/it   12.3 GB   49.9% CPU
+            NF4, no swap   0.70 s/it   13.8 GB   14.0% CPU
+
+        NF4 is both faster and smaller, so it leads. Only touches the 4-bit toggle when the
+        user has left block swap on Auto — an explicit swap choice is left alone.
+        """
+        try:
+            import sys as _sys, os as _os
+            _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "src"))
+            from fizgig.utils.capabilities import detect, recommend_krea2_strategy
+        except Exception:
+            self._auto_quant_int8 = ""   # no strategy ran — a stale INT8 pick must not leak
+            return self._auto_krea2_blocks_swap()
+
+        try:
+            caps = detect()
+            # Budget for THIS run's shape — batch size is the largest term (+2.4 GB/image);
+            # a single-constant budget let batch 2 sail through the check and OOM.
+            try:
+                _mp = float(self.dataset_megapixels_var.get().strip() or 0.25)
+            except (ValueError, AttributeError):
+                _mp = 0.25
+            try:
+                _bs = int(str(self.dataset_batch_size_var.get()).strip() or 1)
+            except (ValueError, AttributeError):
+                _bs = 1
+            try:
+                _rk = int(self.entries["NETWORK_DIM"].get().strip() or 32)
+            except (ValueError, KeyError, AttributeError):
+                _rk = 32
+            plan = recommend_krea2_strategy(caps=caps, mp=_mp, batch=_bs, rank=_rk)
+        except Exception:
+            self._auto_quant_int8 = ""   # no strategy ran — a stale INT8 pick must not leak
+            return self._auto_krea2_blocks_swap()
+
+        try:
+            self.update_console(f"[auto] {caps.summary()}\n[auto] {plan.reason}\n")
+        except Exception:
+            pass
+        # INT8 has no GUI toggle (it is newer than the 4-bit control) — carry it on the
+        # instance so the krea2 command builder can pass --quant_int8.
+        self._auto_quant_int8 = getattr(plan, "quant_int8", "") or ""
+        # The plan only drives the NF4 flag when the user left the 4-bit control on Auto —
+        # an explicit On/Off is their call and the strategy must not override it.
+        _q4_auto = (not hasattr(self, "quant_4bit_mode_var")
+                    or self.quant_4bit_mode_var.get() == "Auto")
+        if (_q4_auto and hasattr(self, "quant_4bit_var")
+                and bool(self.quant_4bit_var.get()) != plan.quant_4bit):
+            self.quant_4bit_var.set(plan.quant_4bit)
+            try:
+                self._on_quant_4bit_toggle()
+            except Exception:
+                pass
+            try:
+                self.update_console(
+                    f"[auto] 4-bit NF4 base turned {'ON' if plan.quant_4bit else 'OFF'} "
+                    "(block swap is on Auto — set it explicitly to control this yourself)\n")
+            except Exception:
+                pass
+        return int(plan.blocks_to_swap)
 
     def _auto_krea2_blocks_swap(self) -> int:
         """Pick Krea 2 training block swap from GPU VRAM. Krea 2's RAW DiT is ~14 GB in fp8,
@@ -4623,13 +4913,65 @@ class LoRATrainerGUI:
             self.scaled_check.config(state=tk.DISABLED)
             self.scaled_var.set(False)
 
+    def _refresh_perimage_toggle_state(self, *args):
+        """Grey out the four per-image watch toggles whenever Batch Size > 1.
+
+        Every per-image feature (detection, per-image LR, auto-recaption, look warm-up)
+        rests on attributing one step's loss to one image; the trainer already disables
+        the LR side loudly at batch > 1, but the tickboxes stayed live and looked like
+        they'd work. Values are preserved — dropping batch back to 1 re-enables them."""
+        try:
+            bs = int(str(self.dataset_batch_size_var.get()).strip() or 1)
+        except (ValueError, AttributeError):
+            bs = 1
+        state = tk.DISABLED if bs > 1 else tk.NORMAL
+        for cb in (getattr(self, "_krea2_detect_cb", None),
+                   getattr(self, "_krea2_perimglr_cb", None),
+                   getattr(self, "_krea2_autorecap_cb", None),
+                   getattr(self, "_krea2_warmuplook_cb", None)):
+            if cb is not None:
+                try:
+                    cb.configure(state=state)
+                except Exception:
+                    pass
+        note = getattr(self, "_krea2_perimage_batch_note", None)
+        if note is not None:
+            try:
+                if bs > 1:
+                    note.grid()
+                else:
+                    note.grid_remove()
+            except Exception:
+                pass
+
+    def _on_quant_4bit_mode_changed(self):
+        """Derive quant_4bit_var from the Auto/On/Off mode. Auto rests at False — the
+        launch-time strategy sets it (Krea 2 + Blocks Swap on Auto) and only in Auto mode."""
+        mode = self.quant_4bit_mode_var.get()
+        self.quant_4bit_var.set(mode == "On")
+        self._on_quant_4bit_toggle()
+
     def _on_quant_4bit_toggle(self):
         """4-bit (NF4) base forces block swap off (NF4 weights live in
         module._nf4_packed, not .weight, so they can't be swapped) and supersedes
         the fp8 Base options. Grey those controls while it's on."""
         on = self.quant_4bit_var.get()
         try:
-            self.entries["BLOCKS_SWAP"].configure(state="disabled" if on else "normal")
+            # Show what will actually run: the trainer forces swap to 0 under 4-bit, but
+            # the greyed-out box kept displaying the old count. Remember the user's value
+            # and restore it when 4-bit is toggled off.
+            if on:
+                _cur = self.entries["BLOCKS_SWAP"].get()
+                if _cur != "0":
+                    self._blocks_swap_before_4bit = _cur
+                    self.entries["BLOCKS_SWAP"].set("0")
+                self.entries["BLOCKS_SWAP"].configure(state="disabled")
+            else:
+                self.entries["BLOCKS_SWAP"].configure(state="normal")
+                _prev = getattr(self, "_blocks_swap_before_4bit", None)
+                if _prev is not None and self.entries["BLOCKS_SWAP"].get() == "0":
+                    self.entries["BLOCKS_SWAP"].set(_prev)
+                    self._blocks_swap_before_4bit = None
         except Exception:
             pass
         for chk in (getattr(self, "fp8_check", None), getattr(self, "scaled_check", None)):
@@ -5523,7 +5865,18 @@ class LoRATrainerGUI:
         widget.configure(state="disabled")
 
     def update_caption_log(self, text):
-        """Update the caption log (preserves user scroll position)."""
+        """Update the caption log (preserves user scroll position).
+
+        Thread-safe: several captioning/translation workers call this directly from their
+        threads (fifteen call sites — some marshalled via after(), some not). Touching Tk
+        widgets + pumping update_idletasks from a worker thread is the classic Tkinter
+        hang, so marshal here, once, for every caller."""
+        if threading.current_thread() is not threading.main_thread():
+            try:
+                self.master.after(0, lambda t=text: self.update_caption_log(t))
+            except Exception:
+                pass   # window closed mid-caption — drop the line rather than crash the worker
+            return
         self._append_global_log(text)
         self._smart_text_insert(self.caption_log, text)
         self.master.update_idletasks()
@@ -5556,7 +5909,10 @@ class LoRATrainerGUI:
                     content = f.read()
 
                 if pattern.search(content):
-                    new_content = pattern.sub(replace_text, content)
+                    # Replacement via a function so re NEVER parses it as a template: a
+                    # Windows path typed into the box used to write real newlines/tabs
+                    # into captions (\n, \t), and \1 raised "invalid group reference".
+                    new_content = pattern.sub(lambda _m: replace_text, content)
                     results.append({
                         'file': txt_file,
                         'old': content,
@@ -5623,7 +5979,11 @@ class LoRATrainerGUI:
     def generate_captions(self):
         """Generate caption files for all images in the selected folder"""
         folder = self.image_folder_var.get()
-        caption_text = self.caption_text_var.get()
+        # Read the WIDGET-BOUND trigger var. caption_text_var is an orphan StringVar no
+        # widget binds (default: the literal placeholder "trigger_word") — reading it here
+        # wrote the word "trigger_word" into every caption file regardless of what the
+        # user typed in the visible Trigger Word box.
+        caption_text = self.caption_trigger_var.get().strip()
         overwrite = self.overwrite_captions_var.get()
 
         if not folder:
@@ -5635,7 +5995,7 @@ class LoRATrainerGUI:
             return
 
         if not caption_text:
-            messagebox.showerror("Error", "Please enter caption text.")
+            messagebox.showerror("Error", "Please enter a trigger word in the Trigger Word box first.")
             return
 
         # Supported image extensions
@@ -5856,7 +6216,10 @@ class LoRATrainerGUI:
         self.cache_sample_model_label = ttk.Label(freq_card, text="Cache sample model in RAM:")
         self.cache_sample_model_label.grid(
             row=4, column=0, sticky=tk.W, padx=(0, 10), pady=(8, 0))
-        self.cache_sample_model_var = tk.StringVar(value=self.settings.get("CACHE_SAMPLE_MODEL", "auto"))
+        # Allow-list on restore: a saved value outside auto/on/off lands in the readonly
+        # combobox without complaint otherwise.
+        _csm = str(self.settings.get("CACHE_SAMPLE_MODEL", "auto"))
+        self.cache_sample_model_var = tk.StringVar(value=_csm if _csm in ("auto", "on", "off") else "auto")
         self.cache_sample_model_combo = ttk.Combobox(freq_card, textvariable=self.cache_sample_model_var,
                      values=["auto", "on", "off"], state="readonly", width=8)
         self.cache_sample_model_combo.grid(row=4, column=1, sticky=tk.W, pady=(8, 0))
@@ -6049,17 +6412,43 @@ class LoRATrainerGUI:
             self.sample_enabled_check.grid()
             self.sample_settings_frame.grid()
 
-            # Update default values for this architecture
-            if config.get("sample_cfg_default") is not None:
-                self.sample_cfg_scale_var.set(str(config["sample_cfg_default"]))
-            if config.get("sample_flow_shift_default") is not None:
-                self.sample_flow_shift_var.set(str(config["sample_flow_shift_default"]))
-            if config.get("sample_steps_default") is not None:
-                self.sample_steps_var.set(str(config["sample_steps_default"]))
-            if config.get("sample_width_default") is not None:
-                self.sample_width_var.set(str(config["sample_width_default"]))
-            if config.get("sample_height_default") is not None:
-                self.sample_height_var.set(str(config["sample_height_default"]))
+            # Apply this architecture's sample defaults ONLY when the architecture actually
+            # changed. This method fires on every Base Model combobox event — including
+            # re-picking the same family — and unconditionally overwriting CFG/flow-shift/
+            # steps/width/height silently reverted the user's preview config (e.g. a
+            # 1024x1024 preview back to 768x768). On a real switch, the outgoing family's
+            # values are stashed and restored when the user switches back.
+            _prev = getattr(self, "_sample_defaults_arch", None)
+            if _prev != arch:
+                if not hasattr(self, "_arch_sample_stash"):
+                    self._arch_sample_stash = {}
+                if _prev is not None:
+                    self._arch_sample_stash[_prev] = {
+                        "cfg": self.sample_cfg_scale_var.get(),
+                        "shift": self.sample_flow_shift_var.get(),
+                        "steps": self.sample_steps_var.get(),
+                        "w": self.sample_width_var.get(),
+                        "h": self.sample_height_var.get(),
+                    }
+                stash = self._arch_sample_stash.get(arch)
+                if stash is not None:
+                    self.sample_cfg_scale_var.set(stash["cfg"])
+                    self.sample_flow_shift_var.set(stash["shift"])
+                    self.sample_steps_var.set(stash["steps"])
+                    self.sample_width_var.set(stash["w"])
+                    self.sample_height_var.set(stash["h"])
+                else:
+                    if config.get("sample_cfg_default") is not None:
+                        self.sample_cfg_scale_var.set(str(config["sample_cfg_default"]))
+                    if config.get("sample_flow_shift_default") is not None:
+                        self.sample_flow_shift_var.set(str(config["sample_flow_shift_default"]))
+                    if config.get("sample_steps_default") is not None:
+                        self.sample_steps_var.set(str(config["sample_steps_default"]))
+                    if config.get("sample_width_default") is not None:
+                        self.sample_width_var.set(str(config["sample_width_default"]))
+                    if config.get("sample_height_default") is not None:
+                        self.sample_height_var.set(str(config["sample_height_default"]))
+                self._sample_defaults_arch = arch
 
             # Enable/disable flow shift based on architecture
             if config.get("sample_flow_shift_default") is None:
@@ -7136,9 +7525,18 @@ class LoRATrainerGUI:
         try:
             if output_dir and os.path.isdir(output_dir):
                 import re as _re_ck
+                # Key on THIS run's name, not epoch alone: in a reused output folder
+                # (which the gallery supports) the last file listdir returned used to win,
+                # serving another run's checkpoint from the Download button.
+                _run_name = str(self.settings.get("LORA_NAME", "") or "").strip()
+                if _run_name:
+                    _ck_pat = _re_ck.compile(
+                        r'^' + _re_ck.escape(_run_name) + r'-(\d{6})\.safetensors$')
+                else:
+                    _ck_pat = _re_ck.compile(r'-(\d{6})\.safetensors$')
                 for f in os.listdir(output_dir):
                     if f.endswith(".safetensors"):
-                        m = _re_ck.search(r'-(\d{6})\.safetensors$', f)
+                        m = _ck_pat.search(f)
                         if m:
                             lora_map[str(int(m.group(1)))] = f
                 # The final LoRA is {LORA_NAME}.safetensors (no epoch suffix) — surface it as a
@@ -7172,13 +7570,16 @@ class LoRATrainerGUI:
                 with open(gallery_path, 'r', encoding='utf-8') as f:
                     html = f.read()
 
-                # Find and replace the embedded JSON
+                # Find and replace the embedded JSON. The replacement goes through a
+                # FUNCTION, never the template parser: json.dumps escapes non-ASCII as
+                # \uXXXX (one Chinese character in a sample filename), which re's template
+                # parser rejects as "bad escape \u" — swallowed below, so the fallback
+                # data silently stopped updating.
                 import re
                 new_json = json.dumps(images)
-                # Replace content between the script tags
                 pattern = r'(<script id="files-data" type="application/json">).*?(</script>)'
-                replacement = rf'\1{new_json}\2'
-                new_html = re.sub(pattern, replacement, html, flags=re.DOTALL)
+                new_html = re.sub(pattern, lambda m: m.group(1) + new_json + m.group(2),
+                                  html, flags=re.DOTALL)
 
                 if new_html != html:
                     with open(gallery_path, 'w', encoding='utf-8') as f:
@@ -8093,7 +8494,12 @@ class LoRATrainerGUI:
                 "Ctrl-click in the file dialog to select three. Three baselines average out "
                 "the angle/expression/lighting bias any single photo carries.")
             return
-        self._ff_baselines = list(paths)
+        # normpath BOTH here and in the scan's file list: filedialog returns forward
+        # slashes while the scan builds candidates with os.path.join (backslashes on
+        # Windows), so every `p in self._ff_baselines` test was False — baselines were
+        # never badged, embedded twice, and could be auto-suggested and MOVED OUT of the
+        # dataset by "Move Marked".
+        self._ff_baselines = [os.path.normpath(p) for p in paths]
         for slot, p in zip(self._ff_base_slots, paths):
             try:
                 with Image.open(p) as im:
@@ -8143,8 +8549,10 @@ class LoRATrainerGUI:
         if len(self._ff_baselines) != 3 or not all(os.path.exists(b) for b in self._ff_baselines):
             messagebox.showwarning("Look Filter", "Choose 3 baseline images first.")
             return
+        # normpath to match self._ff_baselines (see the baseline picker) — the folder string
+        # itself can carry forward slashes from a file dialog.
         files = sorted(
-            os.path.join(folder, f) for f in os.listdir(folder)
+            os.path.normpath(os.path.join(folder, f)) for f in os.listdir(folder)
             if os.path.isfile(os.path.join(folder, f))
             and os.path.splitext(f)[1].lower() in self._FF_EXTS)
         if not files:
@@ -8394,6 +8802,47 @@ class LoRATrainerGUI:
     # region Image Prep Helpers
 
     IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
+
+    @staticmethod
+    def _atomic_png_save(img, output_path):
+        """Write the PNG to a temp file then os.replace into place. In-place mode saves
+        straight over the original — a crash, full disk or End Task mid-write used to
+        truncate the source photo beyond recovery."""
+        tmp = output_path + ".fizgig-tmp"
+        try:
+            img.save(tmp, "PNG")
+            os.replace(tmp, output_path)
+        except Exception:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _safe_output_path(self, filepath, output_path):
+        """Never overwrite a DIFFERENT existing file.
+
+        Every prep mode writes `<stem>.png`, so a folder holding photo.jpg AND an
+        unrelated photo.png would have the .jpg's output destroy the .png (and
+        _handle_original then deletes the .jpg — one photo gone, silently).
+        In-place re-save of the same file is fine; a genuine collision gets a
+        `_2`/`_3`... suffix instead, with a log line."""
+        if not os.path.exists(output_path):
+            return output_path
+        try:
+            if os.path.samefile(filepath, output_path):
+                return output_path  # in-place re-save of itself
+        except OSError:
+            pass
+        stem, ext = os.path.splitext(output_path)
+        n = 2
+        candidate = f"{stem}_{n}{ext}"
+        while os.path.exists(candidate):
+            n += 1
+            candidate = f"{stem}_{n}{ext}"
+        self._log(f"Name collision: {os.path.basename(output_path)} already exists — "
+                  f"writing {os.path.basename(candidate)} instead\n")
+        return candidate
 
     def _handle_original(self, filepath, output_path, output_folder, replace_originals):
         """Handle the original file: delete if replacing, move to subfolder if preserving."""
@@ -8718,7 +9167,8 @@ class LoRATrainerGUI:
                     img.close()
                     continue
 
-                img.save(output_path, "PNG")
+                output_path = self._safe_output_path(filepath, output_path)
+                self._atomic_png_save(img, output_path)
                 size_info = f"{original_size[0]}x{original_size[1]} -> {w}x{h}" if resized else f"{w}x{h}"
                 self._log(f"Converted: {filename} [{size_info}]\n")
                 converted += 1
@@ -8776,7 +9226,8 @@ class LoRATrainerGUI:
                     img.close()
                     continue
 
-                img.save(output_path, "PNG")
+                output_path = self._safe_output_path(filepath, output_path)
+                self._atomic_png_save(img, output_path)
                 size_info = f"{original_size[0]}x{original_size[1]} -> {w}x{h}" if (resized or cropped) else f"{w}x{h}"
                 self._log(f"Converted: {filename} [{size_info}]{crop_info}\n")
                 converted += 1
@@ -8856,7 +9307,8 @@ class LoRATrainerGUI:
                     resized_img.close()
                     continue
 
-                resized_img.save(output_path, "PNG")
+                output_path = self._safe_output_path(filepath, output_path)
+                self._atomic_png_save(resized_img, output_path)
                 size_info = f"{original_size[0]}x{original_size[1]} -> {w}x{h}" if resized else f"{w}x{h}"
                 self._log(f"Converted: {filename} [{size_info}]\n")
                 converted += 1
@@ -9307,6 +9759,10 @@ class LoRATrainerGUI:
             return False
 
     def _explorer_load_lora(self):
+        # Never tear down an engine a worker thread is mid-forward through (hard-hangs the app).
+        if getattr(self, "_explorer_generating", False):
+            messagebox.showinfo("Busy", "A preview is still rendering — wait for it to finish.")
+            return
         path = self.explorer_lora_var.get().strip()
         if not path or not os.path.exists(path):
             messagebox.showerror("Error", "Pick a valid LoRA file first.")
@@ -9378,6 +9834,20 @@ class LoRATrainerGUI:
         """Generate baseline image then 4 variants in a background thread."""
         if self._explorer_generating or self._explorer_engine is None:
             return
+        # Parse the free-text fields BEFORE setting the busy flag: a ValueError from a bad
+        # Seed/Resolution used to fire inside the Tk callback with the flag already set —
+        # never cleared — and the flag disables every other notebook tab, locking the whole
+        # app to this tab until restart.
+        try:
+            _seed = int(self.explorer_seed_var.get() or 42)
+            _res = int(self.explorer_res_var.get() or 512)
+        except ValueError:
+            messagebox.showerror(
+                "Invalid value",
+                f"Seed and Resolution must be whole numbers.\n\n"
+                f"Seed: {self.explorer_seed_var.get()!r}  "
+                f"Resolution: {self.explorer_res_var.get()!r}")
+            return
         self._explorer_generating = True
         self._explorer_roll_btn.configure(state="disabled")
         self._explorer_progress_var.set("Generating baseline...")
@@ -9386,8 +9856,8 @@ class LoRATrainerGUI:
         # Sync prompt/seed/res into baseline state
         state = self._explorer_baseline_state
         state.prompt = self.explorer_prompt_var.get()
-        state.seed = int(self.explorer_seed_var.get() or 42)
-        res = int(self.explorer_res_var.get() or 512)
+        state.seed = _seed
+        res = _res
         state.preview_width = res
         state.preview_height = res
         self._explorer_sync_ref_into(state)
@@ -10014,6 +10484,9 @@ class LoRATrainerGUI:
 
     def _unload_explorer_models(self):
         """Unload Explorer pipeline when leaving the tab."""
+        # Internal guard (all call sites): resetting under a live CUDA worker hard-hangs.
+        if getattr(self, "_explorer_generating", False):
+            return
         if self._explorer_engine is not None and self._explorer_engine.pipeline is not None:
             try:
                 self._explorer_engine.reset()
@@ -10285,7 +10758,15 @@ class LoRATrainerGUI:
 
         # Skip timestep auto-fill for Custom (user-driven)
         if preset == "Custom":
+            self._last_area_applied = preset
             return
+
+        # Only rewrite MIN/MAX when the Model Area actually CHANGED. This handler is also
+        # invoked as a visibility refresh (arch switches, tab builds) — unconditionally
+        # auto-filling wiped the user's hand-set timesteps on every one of those calls.
+        if getattr(self, "_last_area_applied", None) == preset:
+            return
+        self._last_area_applied = preset
 
         # Auto-fill MIN/MAX_TIMESTEP entries
         min_entry = self.entries.get("MIN_TIMESTEP")
@@ -10469,20 +10950,27 @@ class LoRATrainerGUI:
         if not output_name.endswith(".safetensors"):
             output_name += ".safetensors"
 
-        prompt = self.extract_prompt_var.get().strip()
-        if not prompt:
-            messagebox.showerror("Error", "Please enter a prompt (trigger word recommended).")
-            return
+        # Fast (weight-only, samples=0) presets run entirely from the safetensors file:
+        # no pipeline is loaded, so don't demand a DiT/VAE/TE or a prompt they never use
+        # (the CLI already worked without them).
+        try:
+            _samples = int(self.extract_samples_var.get().strip() or 0)
+        except (ValueError, AttributeError):
+            _samples = 0
 
-        # Get paths from prefs
+        prompt = self.extract_prompt_var.get().strip()
         dit_path = self.prefs_vars["distilled_dit"].get()
         vae_path = self.prefs_vars["vae"].get()
         te_path = self.prefs_vars["text_encoder"].get()
 
-        for path, name in [(dit_path, "DiT"), (vae_path, "VAE"), (te_path, "Text Encoder")]:
-            if not path or not os.path.exists(path):
-                messagebox.showerror("Error", f"{name} not found:\n{path}\n\nCheck Preferences tab.")
+        if _samples > 0:
+            if not prompt:
+                messagebox.showerror("Error", "Please enter a prompt (trigger word recommended).")
                 return
+            for path, name in [(dit_path, "DiT"), (vae_path, "VAE"), (te_path, "Text Encoder")]:
+                if not path or not os.path.exists(path):
+                    messagebox.showerror("Error", f"{name} not found:\n{path}\n\nCheck Preferences tab.")
+                    return
 
         # Build block list from preset (or custom individual blocks)
         preset = self.extract_preset_var.get()
@@ -10506,6 +10994,14 @@ class LoRATrainerGUI:
         output_dir = self.prefs_vars["lora_output_dir"].get()
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, output_name)
+        # Never silently overwrite: the name is built from source+preset+rank only, so two
+        # different Custom selections at the same rank land on the same filename.
+        if os.path.exists(output_path):
+            _stem, _ext = os.path.splitext(output_path)
+            _n = 2
+            while os.path.exists(f"{_stem}_{_n}{_ext}"):
+                _n += 1
+            output_path = f"{_stem}_{_n}{_ext}"
 
         # Disable button, clear log
         self.extract_run_btn.configure(state="disabled")
@@ -10597,6 +11093,19 @@ class LoRATrainerGUI:
 
             if pipeline is not None:
                 pipeline.unload_models()
+
+            # A valid-but-empty artifact is a failure, not a success: a Details preset on a
+            # Style LoRA used to produce a ~340-byte tensorless file and "Extraction
+            # complete! Layers extracted: 0".
+            if result.num_layers_extracted == 0:
+                try:
+                    os.remove(result.output_path)
+                except OSError:
+                    pass
+                raise RuntimeError(
+                    f"Extraction produced 0 layers — the selected blocks ({blocks}) don't "
+                    f"exist in this LoRA. Run it through the Profiler to see which blocks "
+                    f"it actually trains, then pick a matching preset.")
 
             summary = f"\nExtraction complete!\n"
             summary += f"  Output: {result.output_path}\n"
@@ -10697,6 +11206,13 @@ class LoRATrainerGUI:
         output_dir = self.prefs_vars["lora_output_dir"].get()
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, output_name)
+        # Never silently overwrite (same rule as the Klein path).
+        if os.path.exists(output_path):
+            _stem, _ext = os.path.splitext(output_path)
+            _n = 2
+            while os.path.exists(f"{_stem}_{_n}{_ext}"):
+                _n += 1
+            output_path = f"{_stem}_{_n}{_ext}"
 
         self.extract_run_btn.configure(state="disabled")
         self.extract_open_btn.configure(state="disabled")
@@ -10741,6 +11257,15 @@ class LoRATrainerGUI:
             self.master.after(0, lambda: self._extract_log(
                 f"Krea 2 weight-only SVD (all blocks), rank={rank}\n"))
             result = LoRAExtractor.extract_weight_only(config, progress_callback=progress)
+
+            # Empty artifact = failure, not success (same rule as the Klein worker).
+            if result.num_layers_extracted == 0:
+                try:
+                    os.remove(result.output_path)
+                except OSError:
+                    pass
+                raise RuntimeError("Extraction produced 0 layers — the source file contains "
+                                   "no LoRA modules this extractor recognises.")
 
             summary = (f"\nExtraction complete!\n"
                        f"  Output: {result.output_path}\n"
@@ -12026,8 +12551,18 @@ class LoRATrainerGUI:
         if getattr(self, "_repair_master_mutating", False):
             return
         target = self.repair_master_target_var.get()
+        # Only touch blocks the target LoRA actually contains: disabled Scales don't block
+        # DoubleVar.set(), so bulk-setting greyed-out absent rows committed phantom
+        # strengths into saved presets and ss_repair_studio_config — values that become
+        # real when that preset is later applied to a full-model LoRA.
+        present = None
+        eng = getattr(self, "repair_engine", None)
+        if eng is not None:
+            present = (getattr(eng, "primary_block_ids", None) if target == "primary"
+                       else getattr(eng, "donor_block_ids", None))
         affected = [bid for bid in self.repair_block_vars
-                    if self._repair_category_for_block(bid) == category]
+                    if self._repair_category_for_block(bid) == category
+                    and (present is None or bid in present)]
         if not affected:
             return
         # Bulk-set: each per-block strength trace will update state, but we
@@ -15640,6 +16175,9 @@ class LoRATrainerGUI:
         Load again is seamless.  The engine is fully reset so the next load
         rebuilds the pipeline from scratch.
         """
+        # Internal guard (all call sites): resetting under a live CUDA worker hard-hangs.
+        if getattr(self, "_repair_preview_in_flight", False):
+            return
         if self.repair_engine is not None and self.repair_engine.pipeline is not None:
             try:
                 self.repair_engine.reset()
@@ -15725,6 +16263,10 @@ class LoRATrainerGUI:
             self.explorer_status_var.set("Loading from Repair Studio...")
             self.master.update_idletasks()
             if self._explorer_engine.primary_network is not None:
+                if getattr(self, "_explorer_generating", False):
+                    messagebox.showinfo("Busy", "The Explorer is mid-render — try again when "
+                                        "the current preview finishes.")
+                    return
                 self._explorer_engine.reset()
                 self._explorer_engine = None
                 if not self._explorer_ensure_engine():
@@ -15769,6 +16311,11 @@ class LoRATrainerGUI:
             messagebox.showerror("Error", f"Failed to load in Explorer:\n{traceback.format_exc()}")
 
     def _reset_repair_session(self):
+        # Never tear down the engine while a preview worker is mid-forward through it.
+        if getattr(self, "_repair_preview_in_flight", False):
+            messagebox.showinfo("Busy", "A preview is still rendering — wait for it to finish "
+                                "before resetting the session.")
+            return
         # Close pop-out preview window if open
         if self._repair_popout_window is not None:
             try:
@@ -16272,7 +16819,19 @@ class LoRATrainerGUI:
         if "CUDA out of memory" in line or "OutOfMemoryError" in line:
             if not getattr(self, "_oom_warning_shown", False):
                 self._oom_warning_shown = True
-                current_swap = self._parse_blocks_swap()
+                # Read state WITHOUT side effects: _parse_blocks_swap() on "Auto" runs the
+                # auto strategy (GPU probe + can flip the 4-bit toggle) — it mutated the
+                # training config as a side effect of reporting an error, and did so BEFORE
+                # reading the nf4 flag it then tested, hiding the Krea 2 advice. Mid-run the
+                # probe is meaningless anyway (the trainer holds the VRAM).
+                _raw_swap = self.entries["BLOCKS_SWAP"].get().strip()
+                if _raw_swap.lower().startswith("auto"):
+                    current_swap, _swap_disp = 0, "Auto"
+                else:
+                    import re as _re
+                    _m = _re.match(r"\d+", _raw_swap)
+                    current_swap = int(_m.group()) if _m else 0
+                    _swap_disp = str(current_swap)
                 nf4_on = getattr(self, "quant_4bit_var", None) and self.quant_4bit_var.get()
                 if self._is_krea2_arch() and not nf4_on:
                     messagebox.showwarning("Out of Memory",
@@ -16286,7 +16845,7 @@ class LoRATrainerGUI:
                 else:
                     messagebox.showwarning("Out of Memory",
                         f"CUDA ran out of memory during training.\n\n"
-                        f"Current Block Swap: {current_swap}\n\n"
+                        f"Current Block Swap: {_swap_disp}\n\n"
                         f"Try increasing Block Swap on the Training tab "
                         f"(Memory & FP8 section) to move more blocks to CPU. "
                         f"If set to Auto, switch to a manual value like "
@@ -16323,6 +16882,36 @@ class LoRATrainerGUI:
         # Get current architecture config
         arch = self.architecture_var.get()
         config = ARCHITECTURES.get(arch, ARCHITECTURES["Flux 2 Klein Base 9B"])
+
+        # Free-text numeric fields: a bare int()/float() further down the launch path used
+        # to raise inside a Tk callback — swallowed to stderr, invisible under the windowed
+        # launcher, and the Start button just "did nothing forever". Validate them HERE with
+        # a message naming the field. Batch Size 0/blank was the sharpest: it reached
+        # math.ceil(len(bucket)/batch_size) deep in the dataloader minutes after launch.
+        def _check_num(label, raw, cast, minimum=None):
+            raw = str(raw).strip()
+            try:
+                v = cast(raw)
+            except (TypeError, ValueError):
+                errors.append(f"{label} must be a number (got {raw!r})")
+                return
+            if minimum is not None and v < minimum:
+                errors.append(f"{label} must be at least {minimum} (got {raw})")
+
+        # Learning Rate box is ignored (and greyed) while Adaptive LR is on — don't let a
+        # stale value in a disabled box block Start.
+        if not (hasattr(self, 'adaptive_lr_var') and self.adaptive_lr_var.get()):
+            _check_num("Learning Rate", self.entries["LEARNING_RATE"].get(), float, 0)
+        _check_num("Network Dim (Rank)", self.entries["NETWORK_DIM"].get(), int, 1)
+        _check_num("Network Alpha", self.entries["NETWORK_ALPHA"].get(), float, 0)
+        _check_num("Max Train Epochs", self.entries["MAX_TRAIN_EPOCHS"].get(), int, 1)
+        _check_num("Save Every N Epochs", self.entries["SAVE_EVERY_N_EPOCHS"].get(), int, 1)
+        _check_num("Seed", self.entries["SEED"].get(), int)
+        _check_num("LoRA+ LR Ratio", self.entries["LORA_LR_RATIO"].get(), int, 1)
+        _check_num("Gradient Accumulation", self.entries["GRADIENT_ACCUMULATION"].get(), int, 1)
+        _check_num("Max Grad Norm", self.entries["MAX_GRAD_NORM"].get(), float, 0)
+        _check_num("Network Dropout", self.entries["NETWORK_DROPOUT"].get(), float, 0)
+        _check_num("Batch Size (Dataset)", self.dataset_batch_size_var.get(), int, 1)
 
         # Check required paths exist (sources: prefs_vars for model paths, hidden var for dataset)
         dataset_config = self._get_path("DATASET_CONFIG")
@@ -16382,26 +16971,25 @@ class LoRATrainerGUI:
                 elif not os.path.exists(clip_model):
                     errors.append(f"CLIP model file does not exist: {clip_model}")
 
-        # Validate numeric fields
-        try:
-            lr = float(self.entries["LEARNING_RATE"].get())
-            if lr <= 0:
-                errors.append("Learning rate must be positive")
-            # When adaptive LR is enabled, starting LR must not exceed max LR (both archs).
-            if hasattr(self, 'adaptive_lr_var') and self.adaptive_lr_var.get():
-                try:
-                    max_lr_str = self.entries["ADAPTIVE_LR_MAX"].get().split(" ")[0]
-                    min_lr_str = self.entries["ADAPTIVE_LR_MIN"].get().split(" ")[0]
-                    max_lr_val = float(max_lr_str)
-                    min_lr_val = float(min_lr_str)
-                    if lr > max_lr_val:
-                        errors.append(f"Starting Learning Rate ({lr}) exceeds Adaptive Max LR ({max_lr_str}). Lower Learning Rate or raise Max LR.")
-                    if min_lr_val >= max_lr_val:
-                        errors.append(f"Adaptive Min LR ({min_lr_str}) must be lower than Max LR ({max_lr_str}).")
-                except (ValueError, KeyError):
-                    errors.append("Adaptive Min/Max LR must be valid numbers.")
-        except ValueError:
-            errors.append("Learning rate must be a valid number")
+        # Validate numeric fields. With Adaptive LR on, the Learning Rate box is IGNORED
+        # (the run starts at the geometric midpoint of Min/Max), so only Min < Max matters
+        # — the old "starting LR exceeds Max" check no longer applies.
+        _adaptive_on = hasattr(self, 'adaptive_lr_var') and self.adaptive_lr_var.get()
+        if _adaptive_on:
+            try:
+                max_lr_str = self.entries["ADAPTIVE_LR_MAX"].get().split(" ")[0]
+                min_lr_str = self.entries["ADAPTIVE_LR_MIN"].get().split(" ")[0]
+                if float(min_lr_str) >= float(max_lr_str):
+                    errors.append(f"Adaptive Min LR ({min_lr_str}) must be lower than Max LR ({max_lr_str}).")
+            except (ValueError, KeyError):
+                errors.append("Adaptive Min/Max LR must be valid numbers.")
+        else:
+            try:
+                lr = float(self.entries["LEARNING_RATE"].get())
+                if lr <= 0:
+                    errors.append("Learning rate must be positive")
+            except ValueError:
+                errors.append("Learning rate must be a valid number")
 
         # Context LoRA validation (supported by both Klein and Krea 2).
         ctx_path = self.entries.get("CONTEXT_LORA_PATH").get().strip() if "CONTEXT_LORA_PATH" in self.entries else ""
@@ -16551,9 +17139,35 @@ class LoRATrainerGUI:
 
     def start_training(self):
         """Start training with sequential cache process execution"""
+        # Re-entrancy guard: the Start button stays enabled during a run, so a double-click
+        # (or Start during caching) overwrote current_process and ORPHANED the first launch —
+        # stop_training only ever kills the current one, and both runs wrote the same
+        # checkpoints while the second's fresh-run wipe deleted the first's watch files.
+        _proc = getattr(self, "current_process", None)
+        try:
+            if _proc is not None and _proc.poll() is None:
+                messagebox.showinfo(
+                    "Already Running",
+                    "A training/caching run is already active.\n\n"
+                    "Stop it (or let it finish) before starting another."
+                )
+                return
+        except Exception:
+            pass
+
         # Validate inputs before starting
         if not self.validate_inputs():
             return
+
+        # Clear a stale pause sentinel from a previous session (window close / crash after
+        # Pause left it on disk; the trainer would read it at epoch 1 and exit "cleanly").
+        try:
+            _stale_flag = self._pause_flag_path()
+            if os.path.exists(_stale_flag) and getattr(self, "training_state", "idle") != "paused":
+                os.remove(_stale_flag)
+                self.update_console("[pause] removed stale .pause_requested from a previous session\n")
+        except Exception:
+            pass
 
         # Reset OOM warning flag for this run
         self._oom_warning_shown = False
@@ -16632,10 +17246,20 @@ class LoRATrainerGUI:
         # Update settings from entries
         # Path keys read via _get_path() (sourced from prefs_vars or hidden _dataset_config_var)
         # since the Model Paths section is no longer visible on the Training tab.
+        # With Adaptive LR on the Learning Rate box is ignored (the trainer starts at the
+        # geometric midpoint of Min/Max) — a stale value in the disabled box must not crash
+        # collection, so fall back to a harmless placeholder the trainer will override.
+        try:
+            _lr_val = float(self.entries["LEARNING_RATE"].get())
+        except ValueError:
+            if hasattr(self, 'adaptive_lr_var') and self.adaptive_lr_var.get():
+                _lr_val = 1e-4  # ignored by the trainer under adaptive
+            else:
+                raise
         self.settings.update({
             "ARCHITECTURE": arch,
             "MODEL_TYPE": self.entries["MODEL_TYPE"].get() if config["uses_model_type"] else "",
-            "LEARNING_RATE": float(self.entries["LEARNING_RATE"].get()),
+            "LEARNING_RATE": _lr_val,
             "LORA_LR_RATIO": int(self.entries["LORA_LR_RATIO"].get()),
             "NETWORK_DIM": int(self.entries["NETWORK_DIM"].get()),
             "NETWORK_ALPHA": float(self.entries["NETWORK_ALPHA"].get()),
@@ -16688,6 +17312,7 @@ class LoRATrainerGUI:
             "FP8": self.fp8_var.get(),
             "SCALED": self.scaled_var.get(),
             "QUANT_4BIT": self.quant_4bit_var.get(),
+            "COMPILE_BLOCKS": self.compile_blocks_var.get(),
             "GRADIENT_CHECKPOINTING": self.grad_checkpoint_var.get(),
             "FP8_TEXT_ENCODER": self.fp8_text_encoder_var.get(),
             "ENABLE_BUCKET": self.dataset_enable_bucket_var.get(),
@@ -16798,9 +17423,11 @@ class LoRATrainerGUI:
             "--network_module", config["network_module"],
             "--network_dim", str(self.settings["NETWORK_DIM"]),
             "--network_alpha", str(self.settings["NETWORK_ALPHA"]),
-            "--network_args", f"loraplus_lr_ratio={self.settings['LORA_LR_RATIO']}",
             "--timestep_sampling", self.settings["TIMESTEP_SAMPLING"],
         ])
+        # --network_args is nargs="*": a SECOND occurrence would REPLACE the first, so all
+        # network args must be emitted as one occurrence (loraplus + include_patterns below).
+        network_args_tokens = [f"loraplus_lr_ratio={self.settings['LORA_LR_RATIO']}"]
 
         # Gradient checkpointing — on by default (recomputes activations in backward
         # to fit a 9B LoRA on most cards). Off trades ~20-30% faster steps for much
@@ -16829,13 +17456,23 @@ class LoRATrainerGUI:
         elif preset == "Custom":
             patterns = self._build_custom_training_patterns()
             if patterns is None:
-                print("[Warning] Training Preset is Custom but no blocks are selected — training full model.")
+                # Visible warning — print() went to stdout only, invisible under the
+                # windowed launcher, and the run silently trained the full model.
+                self.update_console("[Warning] Model Area is Custom but no blocks are "
+                                    "selected — training the FULL model.\n")
+                messagebox.showwarning(
+                    "Custom blocks empty",
+                    "Model Area to Train is set to Custom but no blocks are ticked.\n\n"
+                    "This run will train the FULL model. Tick blocks (or pick a preset) "
+                    "if you wanted block targeting.")
         # "Full Model" → patterns stays None (train everything)
 
         if patterns:
             # Escape backslashes for the shell-parsed network_args value
             quoted = ",".join(f'"{p.replace(chr(92), chr(92) * 2)}"' for p in patterns)
-            command.extend(["--network_args", f"include_patterns=[{quoted}]"])
+            network_args_tokens.append(f"include_patterns=[{quoted}]")
+        # Single --network_args occurrence carrying every token (see note above).
+        command.extend(["--network_args"] + network_args_tokens)
 
         # Discrete flow shift (not for Flux 2 which uses flux2_shift automatic)
         if config.get("supports_discrete_flow_shift", True):
@@ -16869,7 +17506,10 @@ class LoRATrainerGUI:
 
         # Optional parameters
         if self.settings["OPTIMIZER_ARGS"]:
-            command.extend(["--optimizer_args", self.settings["OPTIMIZER_ARGS"]])
+            # Klein's --optimizer_args is nargs='*' (one token per key=value). Passing the
+            # whole box as ONE token made the trainer's key=value split fail with more than
+            # one argument.
+            command.extend(["--optimizer_args"] + self.settings["OPTIMIZER_ARGS"].split())
 
         # Gradient accumulation (effective batch = batch × this)
         gradient_accum = self.settings.get("GRADIENT_ACCUMULATION", 1)
@@ -16986,13 +17626,14 @@ class LoRATrainerGUI:
             prompt_file = self.generate_sample_prompt_file()
             command.extend(["--sample_prompts", prompt_file])
 
-            # Frequency settings
-            every_n_epochs = self.sample_every_n_epochs_var.get()
-            if every_n_epochs and int(every_n_epochs) > 0:
+            # Frequency settings. Non-numeric text used to raise a bare ValueError out of
+            # the command builder — treat it as "not set" instead.
+            every_n_epochs = self.sample_every_n_epochs_var.get().strip()
+            if every_n_epochs.isdigit() and int(every_n_epochs) > 0:
                 command.extend(["--sample_every_n_epochs", every_n_epochs])
 
-            every_n_steps = self.sample_every_n_steps_var.get()
-            if every_n_steps and int(every_n_steps) > 0:
+            every_n_steps = self.sample_every_n_steps_var.get().strip()
+            if every_n_steps.isdigit() and int(every_n_steps) > 0:
                 command.extend(["--sample_every_n_steps", every_n_steps])
 
             if self.sample_at_first_var.get():
@@ -17172,7 +17813,7 @@ class LoRATrainerGUI:
             ctx_strength = (self.settings.get("CONTEXT_LORA_STRENGTH") or "1.0").strip() or "1.0"
             cmd += ["--context_lora_path", ctx_path, "--context_lora_strength", ctx_strength]
         # Adaptive LR — bi-directional plateau tracker (model-agnostic). Min/Max combo values
-        # can carry a trailing note (e.g. "2e-4 - likely too high"); take the leading token.
+        # can carry a trailing note (e.g. "2e-4 - rank 4/8 only"); take the leading token.
         if self.settings.get("ADAPTIVE_LR"):
             min_lr = str(self.settings.get("ADAPTIVE_LR_MIN", "1e-5")).split(" ")[0]
             max_lr = str(self.settings.get("ADAPTIVE_LR_MAX", "4e-4")).split(" ")[0]
@@ -17205,22 +17846,63 @@ class LoRATrainerGUI:
                     cmd += ["--max_grad_norm", str(float(_mgn))]
             except ValueError:
                 pass
+        # Optimizer family + free-form kwargs. Sent whenever set: the trainer's own default is
+        # adamw8bit, so passing it explicitly is harmless and keeps the launched command a full
+        # record of what the run actually used.
+        _opt = str(self.settings.get("OPTIMIZER_TYPE", "") or "").strip()
+        if _opt:
+            cmd += ["--optimizer_type", _opt]
+        _opt_args = str(self.settings.get("OPTIMIZER_ARGS", "") or "").strip()
+        if _opt_args:
+            cmd += ["--optimizer_args", _opt_args]
+        _cb = str(self.settings.get("COMPILE_BLOCKS", "auto") or "auto").lower()
+        if _cb in ("auto", "on", "off"):
+            cmd += ["--compile_blocks", _cb]
+        # Output metadata (Other Options → Metadata) — previously visible but never wired
+        # for Krea 2; now recorded in the saved LoRA.
+        for _mkey, _mflag in (("METADATA_TITLE", "--metadata_title"),
+                              ("METADATA_AUTHOR", "--metadata_author"),
+                              ("METADATA_DESCRIPTION", "--metadata_description"),
+                              ("METADATA_LICENSE", "--metadata_license"),
+                              ("METADATA_TAGS", "--metadata_tags")):
+            _mval = str(self.settings.get(_mkey, "") or "").strip()
+            if _mval:
+                cmd += [_mflag, _mval]
         # Base weight optimization. 4-bit NF4 supersedes fp8 (mutually exclusive): it quantizes the
         # frozen base to ~5.6 GB so a full LoRA trains on a 10-12 GB card with NO block swap (the
         # trainer forces blocks_to_swap=0 under 4-bit). Otherwise fp8 Base (the default) unless the
         # user unchecked it (bf16, 26 GB — big-card / heavy-swap only).
+        # Explicit user choices FIRST — the auto branch used to be tested before them, so
+        # unticking "FP8 Base" (an explicit bf16 request) did nothing when auto had chosen
+        # INT8.
+        _auto_i8 = getattr(self, "_auto_quant_int8", "")
         if self.settings.get("QUANT_4BIT", False):
             cmd.append("--quantize_4bit")
         elif not self.settings.get("FP8", True):
             cmd.append("--no_fp8")
+        elif _auto_i8:
+            # Chosen by the auto strategy when there is VRAM for it: faster than NF4 and ~7x
+            # more accurate, with exact gradients.
+            cmd += ["--quant_int8", _auto_i8]
 
         # Per-image loss watch: detection logs/reports stuck images (Problem Images window);
         # per-image LR also throttles them (the trainer runs detection when either flag is on).
-        if self.krea2_loss_watch_var.get():
+        # All four need Batch Size 1 (a batch-mean isn't a per-image signal) — the GUI greys
+        # the toggles at batch > 1, and the flags are skipped here to match, with a note.
+        try:
+            _watch_bs = int(str(self.dataset_batch_size_var.get()).strip() or 1)
+        except (ValueError, AttributeError):
+            _watch_bs = 1
+        _watch_ok = _watch_bs <= 1
+        if not _watch_ok and (self.krea2_loss_watch_var.get() or self.krea2_per_image_lr_var.get()
+                              or self.krea2_warmup_look_var.get() or self.krea2_auto_recaption_var.get()):
+            self.update_console("[loss-watch] per-image features skipped — Batch Size is "
+                                f"{_watch_bs}; they need Batch Size 1.\n")
+        if _watch_ok and self.krea2_loss_watch_var.get():
             cmd.append("--log_per_image_loss")
-        if self.krea2_per_image_lr_var.get():
+        if _watch_ok and self.krea2_per_image_lr_var.get():
             cmd.append("--per_image_lr")
-        if self.krea2_warmup_look_var.get():
+        if _watch_ok and self.krea2_warmup_look_var.get():
             cmd.append("--warmup_look_outliers")
         # Full base-model fine-tune (experimental): rotating trainable windows, full checkpoint out.
         # Read the Tk vars DIRECTLY, like every other krea2 toggle here — self.settings is only
@@ -17241,15 +17923,26 @@ class LoRATrainerGUI:
                     "--finetune_rotate_every", str(max(1, every))]
             if bool(self.krea2_ft_fused_var.get()):
                 cmd.append("--finetune_fused_backward")
-        if self.krea2_auto_recaption_var.get():
+        if _watch_ok and self.krea2_auto_recaption_var.get():
             cmd.append("--auto_recaption")
-            # Trigger word from the Captions tab — appended (', <trigger>') to AI captions if set.
-            # The field DEFAULTS to the literal placeholder "trigger_word"; an untouched box must
-            # count as empty or AI captions end with ", trigger_word" (found the fun way).
-            trig = (self.caption_text_var.get().strip()
-                    if hasattr(self, "caption_text_var") else "")
+            # Trigger word from the Captions tab — appended (', <trigger>') to AI captions if
+            # set. Reads the WIDGET-BOUND var (caption_text_var is an orphan that never
+            # carried what the user typed). The placeholder guard stays in case an old
+            # last_used.json seeded the literal "trigger_word".
+            trig = (self.caption_trigger_var.get().strip()
+                    if hasattr(self, "caption_trigger_var") else "")
             if trig and trig.lower() != "trigger_word":
                 cmd += ["--trigger_word", trig]
+        # Caption repair (manual edits from the Problem Images window AND auto-recaption)
+        # re-encodes with the Qwen3-VL text encoder. --text_encoder used to be emitted only
+        # inside the samples block, so with previews off the trainer had no TE path and every
+        # caption fix bailed for the whole run, re-queueing forever. Emit it whenever any
+        # watch toggle is on (a duplicate in the samples block is harmless — same value).
+        if (self.krea2_loss_watch_var.get() or self.krea2_per_image_lr_var.get()
+                or self.krea2_warmup_look_var.get() or self.krea2_auto_recaption_var.get()):
+            _te = self._krea2_pref("krea2_text_encoder")
+            if _te:
+                cmd += ["--text_encoder", _te]
 
         # In-training previews: render the fp8 Turbo with the live LoRA. Resolution +
         # frequency come from the Samples tab; previews land in <output_dir>/sample, which
@@ -17258,12 +17951,20 @@ class LoRATrainerGUI:
             prompt_file = self._write_krea2_sample_prompts()
             every = self.sample_every_n_epochs_var.get().strip()
             every_n = int(every) if every.isdigit() else 0
+            # Krea 2 previews are per-EPOCH only. A steps-only config used to skip the
+            # whole sample block in silence — say so instead.
+            _steps_only = self.sample_every_n_steps_var.get().strip()
+            if every_n <= 0 and _steps_only.isdigit() and int(_steps_only) > 0:
+                self.update_console("[samples] Krea 2 previews are per-epoch — 'Every N Steps' "
+                                    "has no effect. Set 'Every N Epochs' to enable previews.\n")
             ref_img = (getattr(self, "sample_ref_image_var", None).get().strip()
                        if getattr(self, "sample_ref_image_var", None) else "")
             ref_img = ref_img if (ref_img and os.path.exists(ref_img)) else ""
+            _at_first = bool(getattr(self, "sample_at_first_var", None)
+                             and self.sample_at_first_var.get())
             # Samples fire if there's a prompt OR a reference (ref-only = 'generate from this
-            # picture' via the Qwen3-VL vision path).
-            if (prompt_file or ref_img) and every_n > 0:
+            # picture' via the Qwen3-VL vision path). Sample-at-Start alone also counts.
+            if (prompt_file or ref_img) and (every_n > 0 or _at_first):
                 width = (self.sample_width_var.get().strip() or "1024")
                 height = (self.sample_height_var.get().strip() or "1024")
                 # Sample seed from the Samples tab (0 is a valid seed — don't let it fall through to
@@ -17284,6 +17985,23 @@ class LoRATrainerGUI:
                     # VRAM profile so previews fit the card — mirrors Klein's Distilled sample swap.
                     "--preview_blocks_to_swap", str(self._auto_krea2_inference_blocks_swap()),
                 ]
+                # Steps / CFG / Negative / Sample-at-Start — previously visible on the Samples
+                # tab but never wired into krea2_train.
+                _st = self.sample_steps_var.get().strip()
+                if _st.isdigit() and int(_st) > 0:
+                    cmd += ["--sample_steps", _st]
+                try:
+                    _cfg = float(self.sample_cfg_scale_var.get().strip() or 1.0)
+                except (ValueError, AttributeError):
+                    _cfg = 1.0
+                if _cfg > 0 and abs(_cfg - 1.0) > 1e-9:
+                    cmd += ["--sample_cfg_scale", str(_cfg)]
+                _negp = (self.sample_negative_var.get().strip()
+                         if getattr(self, "sample_negative_var", None) else "")
+                if _negp and _cfg > 1.0:
+                    cmd += ["--sample_negative", _negp]
+                if _at_first:
+                    cmd.append("--sample_at_first")
                 # INT8 fast preview matmul — same app-wide 'INT8 fast inference' toggle as the workbench.
                 if self._get_inference_int8():
                     cmd.append("--preview_int8")
@@ -17411,6 +18129,17 @@ class LoRATrainerGUI:
                 )
         else:
             self.training_state = "idle"
+        # A finished run must never leave its resume path armed: the next "fresh" Start
+        # would silently continue the old LoRA from its saved state (restored optimizer/
+        # RNG/scheduler) under a new output name, and skip re-caching a changed dataset.
+        # The Resume button re-injects the right path itself when the user wants it.
+        try:
+            _entry = self.entries.get("RESUME_TRAINING")
+            if _entry is not None and _entry.get().strip():
+                _entry.delete(0, tk.END)
+            self.settings["RESUME_TRAINING"] = ""
+        except Exception:
+            pass
         self._refresh_training_buttons()
 
     def _resume_training(self):
@@ -17464,6 +18193,31 @@ class LoRATrainerGUI:
         except Exception:
             pass
 
+    def _on_app_close(self):
+        """WM_DELETE_WINDOW: never orphan a live training subprocess on window close."""
+        proc = getattr(self, "current_process", None)
+        try:
+            running = proc is not None and proc.poll() is None
+        except Exception:
+            running = False
+        if running:
+            if not messagebox.askyesno(
+                "Training in progress",
+                "A training run is active.\n\n"
+                "Close Fizgig and STOP the training run?\n\n"
+                "(To keep training, click No — or use Pause Training first for a clean, "
+                "resumable exit.)"
+            ):
+                return
+            try:
+                self.stop_training()
+            except Exception:
+                pass
+        try:
+            self.master.destroy()
+        except Exception:
+            pass
+
     def stop_training(self):
         """Stop the current running process"""
         # Stop samples watcher
@@ -17498,148 +18252,8 @@ class LoRATrainerGUI:
         else:
             self.update_console("No active process to stop\n")
 
-    def save_settings(self):
-        """Save all settings, including conversion settings, to a JSON file"""
-        if _persist_disabled():
-            return
-        current_settings = {}
-        for key, entry in self.entries.items():
-            if isinstance(entry, ttk.Combobox):
-                current_settings[key] = entry.get()
-            elif isinstance(entry, tk.BooleanVar):
-                current_settings[key] = entry.get()
-            else:
-                current_settings[key] = entry.get()
-        current_settings["ARCHITECTURE"] = self.architecture_var.get()
-        current_settings["PRESERVE_DISTRIBUTION"] = self.preserve_dist_var.get()
-        current_settings["ADAPTIVE_LR"] = self.adaptive_lr_var.get()
-        current_settings["BILINGUAL_SKIP_EXISTING"] = self.skip_bilingual_var.get()
-        current_settings["FP8"] = self.fp8_var.get()
-        current_settings["SCALED"] = self.scaled_var.get()
-        current_settings["QUANT_4BIT"] = self.quant_4bit_var.get()
-        current_settings["GRADIENT_CHECKPOINTING"] = self.grad_checkpoint_var.get()
-        current_settings["FP8_TEXT_ENCODER"] = self.fp8_text_encoder_var.get()
-        current_settings["ENABLE_BUCKET"] = self.dataset_enable_bucket_var.get()
-        current_settings["BUCKET_NO_UPSCALE"] = self.dataset_no_upscale_var.get()
-        current_settings["ENABLE_CACHE"] = self.enable_cache_var.get()
-
-        # Training preset + custom block selections
-        if hasattr(self, 'training_preset_var'):
-            current_settings["TARGET_LAYERS"] = self.training_preset_var.get()
-        if hasattr(self, 'training_block_vars'):
-            current_settings["TRAINING_CUSTOM_BLOCKS"] = {
-                k: v.get() for k, v in self.training_block_vars.items()
-            }
-
-        # Save sample settings
-        current_settings["SAMPLE_PROMPT"] = self.sample_prompt_text.get("1.0", tk.END).strip()
-
-        # Save caption settings
-        current_settings["CAPTION_TRIGGER_WORD"] = self.caption_trigger_var.get()
-        current_settings["CAPTION_MODEL"] = self.caption_model_var.get()
-        current_settings["CAPTION_TASK"] = self.caption_task_var.get()
-        current_settings["CAPTION_MAX_TOKENS"] = self.caption_max_tokens_var.get()
-
-        file_path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")])
-        if file_path:
-            with open(file_path, "w") as f:
-                json.dump(current_settings, f, indent=4)
-
-    def load_settings(self):
-        """Load settings from a JSON file, including conversion settings"""
-        file_path = filedialog.askopenfilename(filetypes=[("JSON files", "*.json")])
-        if file_path:
-            with open(file_path, "r") as f:
-                loaded_settings = json.load(f)
-
-            # Load architecture first to update UI
-            if "ARCHITECTURE" in loaded_settings:
-                self.architecture_var.set(loaded_settings["ARCHITECTURE"])
-                self.update_ui_for_architecture()
-
-            for key, value in loaded_settings.items():
-                if key in self.entries:
-                    if isinstance(self.entries[key], ttk.Combobox):
-                        self.entries[key].set(value)
-                    elif isinstance(self.entries[key], tk.BooleanVar):
-                        self.entries[key].set(value)
-                    else:
-                        self.entries[key].delete(0, tk.END)
-                        self.entries[key].insert(0, value)
-            if "FP8" in loaded_settings:
-                self.fp8_var.set(loaded_settings["FP8"])
-            if "SCALED" in loaded_settings:
-                self.scaled_var.set(loaded_settings["SCALED"])
-            if "FP8_TEXT_ENCODER" in loaded_settings:
-                self.fp8_text_encoder_var.set(loaded_settings["FP8_TEXT_ENCODER"])
-            if "GRADIENT_CHECKPOINTING" in loaded_settings and hasattr(self, "grad_checkpoint_var"):
-                self.grad_checkpoint_var.set(loaded_settings["GRADIENT_CHECKPOINTING"])
-            if "ENABLE_BUCKET" in loaded_settings:
-                self.dataset_enable_bucket_var.set(loaded_settings["ENABLE_BUCKET"])
-            if "BUCKET_NO_UPSCALE" in loaded_settings:
-                self.dataset_no_upscale_var.set(loaded_settings["BUCKET_NO_UPSCALE"])
-            if "ENABLE_CACHE" in loaded_settings:
-                self.enable_cache_var.set(loaded_settings["ENABLE_CACHE"])
-
-            # Load sample settings
-            if "SAMPLE_PROMPT" in loaded_settings:
-                self.sample_prompt_text.delete("1.0", tk.END)
-                self.sample_prompt_text.insert("1.0", loaded_settings["SAMPLE_PROMPT"])
-
-            # Load caption settings
-            if "CAPTION_TRIGGER_WORD" in loaded_settings:
-                self.caption_trigger_var.set(loaded_settings["CAPTION_TRIGGER_WORD"])
-            if "CAPTION_MODEL" in loaded_settings:
-                self.caption_model_var.set(loaded_settings["CAPTION_MODEL"])
-            if "CAPTION_TASK" in loaded_settings:
-                self.caption_task_var.set(loaded_settings["CAPTION_TASK"])
-            if "CAPTION_MAX_TOKENS" in loaded_settings:
-                self.caption_max_tokens_var.set(loaded_settings["CAPTION_MAX_TOKENS"])
-
-            # Load timestep boolean settings
-            if "PRESERVE_DISTRIBUTION" in loaded_settings:
-                self.preserve_dist_var.set(loaded_settings["PRESERVE_DISTRIBUTION"])
-            if "ADAPTIVE_LR" in loaded_settings:
-                self.adaptive_lr_var.set(bool(loaded_settings["ADAPTIVE_LR"]))
-                self._on_adaptive_lr_toggle()
-            if "BILINGUAL_SKIP_EXISTING" in loaded_settings:
-                self.skip_bilingual_var.set(bool(loaded_settings["BILINGUAL_SKIP_EXISTING"]))
-
-            # Back-compat: old settings JSONs stored model paths under Training-tab keys.
-            # Route them into the prefs_vars (the new source of truth) so users don't lose paths on upgrade.
-            for old_key, pref_key in (("VAE_MODEL", "vae"), ("DIT_MODEL", "base_dit"),
-                                       ("TEXT_ENCODER", "text_encoder"), ("LORA_OUTPUT_DIR", "lora_output_dir")):
-                if old_key in loaded_settings and pref_key in self.prefs_vars:
-                    self.prefs_vars[pref_key].set(loaded_settings[old_key])
-            if "DATASET_CONFIG" in loaded_settings and hasattr(self, "_dataset_config_var"):
-                self._dataset_config_var.set(loaded_settings["DATASET_CONFIG"])
-
-            # Training preset + custom blocks (with back-compat for old names)
-            if "TARGET_LAYERS" in loaded_settings and hasattr(self, 'training_preset_var'):
-                raw = loaded_settings["TARGET_LAYERS"]
-                legacy_map = {
-                    "All Layers": "Full Model",
-                    "Identity Blocks": "Identity",
-                    "Style+Composition Blocks": "Style+Composition",
-                    "Details Blocks": "Details",
-                }
-                mapped = legacy_map.get(raw, raw)
-                valid = ("Full Model", "Identity", "Style", "Style+Composition", "Details", "Custom")
-                self.training_preset_var.set(mapped if mapped in valid else "Full Model")
-                self._on_training_preset_changed()
-            if "TRAINING_CUSTOM_BLOCKS" in loaded_settings and hasattr(self, 'training_block_vars'):
-                saved_blocks = loaded_settings["TRAINING_CUSTOM_BLOCKS"]
-                for k, v in saved_blocks.items():
-                    if k in self.training_block_vars:
-                        self.training_block_vars[k].set(bool(v))
-
-            self.toggle_scaled()  # Update Scaled checkbox state based on FP8
-            if hasattr(self, 'ts_sampling_var'):
-                self._on_timestep_sampling_changed()
-                self._on_weighting_scheme_changed()
-                self._update_noise_range_label()
-            if hasattr(self, 'sample_settings_frame'):
-                self.update_samples_ui_for_architecture()
+    # (save_settings/load_settings removed: 160 lines of dead code with no
+    #  callers, duplicating the preset system with a 4-key save/load asymmetry.)
 
 if __name__ == "__main__":
     # Set unique app ID so Windows taskbar shows our icon, not Python's

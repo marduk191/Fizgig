@@ -657,17 +657,21 @@ class KleinDiT(nn.Module):
 
     def move_to_device_except_swap_blocks(self, device: torch.device):
         # assume model is on cpu. do not move blocks to device to reduce temporary memory usage
+        # try/finally: an OOM inside .to() must not leave the model holding the empty
+        # placeholder ModuleLists permanently (a silent lobotomy — every later forward
+        # would run with zero transformer blocks).
         if self.blocks_to_swap:
             save_double_blocks = self.double_blocks
             save_single_blocks = self.single_blocks
             self.double_blocks = nn.ModuleList()
             self.single_blocks = nn.ModuleList()
 
-        self.to(device)
-
-        if self.blocks_to_swap:
-            self.double_blocks = save_double_blocks
-            self.single_blocks = save_single_blocks
+        try:
+            self.to(device)
+        finally:
+            if self.blocks_to_swap:
+                self.double_blocks = save_double_blocks
+                self.single_blocks = save_single_blocks
 
     def prepare_block_swap_before_forward(self):
         if self.blocks_to_swap is None or self.blocks_to_swap == 0:

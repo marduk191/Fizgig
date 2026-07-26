@@ -380,6 +380,14 @@ class SingleStreamDiT(nn.Module):
         # inference, not the full-GPU forward pass, so the offloading port can come later.
         from fizgig.krea2.offloading import create_offloader
 
+        # Detach any previous offloader's backward hooks before replacing it — same
+        # guard Klein has. enable_block_swap can run more than once (e.g. around
+        # previews); a replaced offloader's stale hooks otherwise fire alongside the
+        # new ones on the next backward -> "mat2 is on cpu" / exploding loss.
+        _off = getattr(self, "offloader", None)
+        if _off is not None and hasattr(_off, "remove_hooks"):
+            _off.remove_hooks()
+
         self.blocks_to_swap = num_blocks
         num_main_blocks = len(self.blocks)
         assert num_blocks <= num_main_blocks - 2, f"Cannot swap more than {num_main_blocks - 2} blocks. Requested {num_blocks}."
@@ -391,12 +399,16 @@ class SingleStreamDiT(nn.Module):
 
     def move_to_device_except_swap_blocks(self, device: torch.device):
         # Assume the model is on CPU; keep the swap blocks on CPU to reduce peak memory.
+        # try/finally: an OOM inside .to() must not leave the model holding the empty
+        # placeholder ModuleList permanently (silent lobotomy — zero blocks thereafter).
         if self.blocks_to_swap:
             saved_blocks = self.blocks
             self.blocks = nn.ModuleList()
-        self.to(device)
-        if self.blocks_to_swap:
-            self.blocks = saved_blocks
+        try:
+            self.to(device)
+        finally:
+            if self.blocks_to_swap:
+                self.blocks = saved_blocks
 
     def prepare_block_swap_before_forward(self):
         if not self.blocks_to_swap:
@@ -430,8 +442,16 @@ class SingleStreamDiT(nn.Module):
         imglen = img.shape[1]
         txtmask = mask[:, imglen:]  # (B, txt_len) bool
 
-        # Text fusion is a self-attention over text tokens only (img_len=0). The per-layer
-        # blocks see every token (no mask); the refiner masks padding via txtmask.
+        # Text fusion is a self-attention over text tokens only (img_len=0), in two stages that
+        # attend along DIFFERENT axes. The per-layer blocks flatten to (b*seq, layers, dim) and
+        # attend across the encoder's layer stack for each token — the text length is their BATCH,
+        # not their sequence — which is why a key-padding mask does not apply to them and they get
+        # `nomask`. The refiner attends the text sequence itself and does mask padding.
+        #
+        # Do NOT assume text padding is therefore inert here: padding the text up to a multiple
+        # (to cut the distinct-shape count) measurably changed the output for short captions,
+        # ~2% relative, while the equivalent padding of the COMBINED sequence is bit-exact. That
+        # is unexplained and the change was reverted — see docs/PERF_ROADMAP.md.
         txt_attn_params_nomask = AttentionParams.create_attention_params_from_mask(self.attn_mode, self.split_attn, 0, None)
         txt_attn_params = AttentionParams.create_attention_params_from_mask(self.attn_mode, self.split_attn, 0, txtmask)
         context = self.txtfusion(context, txt_attn_params_nomask, txt_attn_params)
@@ -460,7 +480,11 @@ class SingleStreamDiT(nn.Module):
             if self.blocks_to_swap:
                 self.offloader.wait_for_block(index)
 
-            if self.gradient_checkpointing and self.training:
+            if getattr(block, "_handles_checkpointing", False):
+                # torch.compile wraps blocks in a module that checkpoints itself, so the recompute
+                # is captured inside the compiled graph. Checkpointing again here would nest it.
+                combined = block(combined, tvec, freqs, attn_params)
+            elif self.gradient_checkpointing and self.training:
                 combined = torch.utils.checkpoint.checkpoint(block, combined, tvec, freqs, attn_params, use_reentrant=False)
             else:
                 combined = block(combined, tvec, freqs, attn_params)

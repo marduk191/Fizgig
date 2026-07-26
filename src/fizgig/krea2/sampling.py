@@ -41,6 +41,30 @@ def gather_valid_text(txt, mask):
     """
     valid = [txt[i][mask[i]] for i in range(txt.shape[0])]  # list of (n_i, L, D)
     max_len = max(v.shape[0] for v in valid)
+    # Round the padded length up to a multiple, so a dataset's captions produce a handful of
+    # distinct sequence lengths instead of one per caption. Every shape-planning backend pays a
+    # one-time cost per distinct length — ~0.55 s each on cuDNN, and FLAT in shape size, so a
+    # 17-token text shape costs as much to plan as a 1100-token image+text one.
+    #
+    # Round the padded length up to a multiple, so a dataset's captions produce a handful of
+    # distinct sequence lengths instead of one per caption. Shape-planning backends pay a one-time
+    # cost per distinct length — ~0.55 s each on cuDNN, and FLAT in shape size, so a 17-token text
+    # shape costs as much to plan as a 1100-token image+text one. On a 36-image set this takes the
+    # count from 36 shapes to 12, and cuDNN's payback from ~70 epochs to ~23.
+    #
+    # KNOWN PERTURBATION, deliberately accepted. This is NOT numerically inert on the real 12.9B
+    # model: short captions (<= ~30 tokens) shift by ~5e-03 relative on a bf16 base, ~2e-02 under
+    # INT8. Longer captions are unaffected. What it is not: masking (padding the COMBINED sequence
+    # instead is bit-exact), and not INT8 (bf16 shows it too; INT8 only amplifies). The cause is
+    # genuinely unknown — the lead is the text-fusion stage, whose per-layer blocks carry the text
+    # length in their BATCH dimension, so padding changes their reduction order and 28 blocks
+    # compound it. That is a hypothesis, not a finding.
+    #
+    # Accepted because ~5e-03 is the scale of ordinary bf16 step noise and training is stochastic
+    # anyway. Set FIZGIG_ATTN_TRIM_MULTIPLE=1 for the old exact-length behaviour.
+    from fizgig.krea2.attention import _TRIM_MULTIPLE
+    if _TRIM_MULTIPLE > 1:
+        max_len = ((max_len + _TRIM_MULTIPLE - 1) // _TRIM_MULTIPLE) * _TRIM_MULTIPLE
     out = txt.new_zeros(txt.shape[0], max_len, txt.shape[2], txt.shape[3])
     newmask = torch.zeros(txt.shape[0], max_len, device=txt.device, dtype=torch.bool)
     for i, v in enumerate(valid):

@@ -524,12 +524,22 @@ def _try_fp8_scaled_mm_train(self: nn.Linear, x):
     K = x.shape[-1]
     N = self.weight.shape[0]
     M = x.numel() // K if K else 0
-    if K % 16 or N % 16 or M % 16 or M == 0:
+    # Only K and N must be 16-aligned (_scaled_mm constrains mat2) — M is free. The old
+    # `M % 16` guard sent every ragged-token-count Linear down the dequant path, which is
+    # SLOWER than bf16; relaxing it measured 1.89x at M=4173. M==0 stays (empty input).
+    if K % 16 or N % 16 or M == 0:
         _diag("DEQUANT", M)
         return None  # alignment is input-dependent — never cached
 
     if decision == "scaled_mm":
-        out = _FP8ScaledMMLinear.apply(x, self.weight, sw)
+        # Same RuntimeError insurance as the probe below: the cached decision was made at
+        # one M, and M varies per call now that it isn't part of the guard.
+        try:
+            out = _FP8ScaledMMLinear.apply(x, self.weight, sw)
+        except RuntimeError:
+            self._fp8_train_decision = "dequant"
+            _diag("DEQUANT", M)
+            return None
         if self.bias is not None:
             out = out + self.bias.to(out.dtype)
         _diag("SCALED", M)

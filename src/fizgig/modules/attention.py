@@ -8,6 +8,8 @@ from typing import Optional, Union
 
 import torch
 
+from fizgig.modules.sdpa import sdpa_backend_ctx
+
 try:
     import flash_attn
     from flash_attn.flash_attn_interface import flash_attn_varlen_func, flash_attn_func
@@ -37,6 +39,14 @@ class AttentionParams:
     seqlens: Optional[torch.Tensor] = None
     cu_seqlens: Optional[torch.Tensor] = None
     max_seqlen: Optional[int] = None
+
+    def __post_init__(self):
+        # See the trim block in attention(): resolved once here, not once per block.
+        self.uniform_seqlen = None
+        if (self.seqlens is not None and self.attention_mask is not None and not self.split_attn
+                and self.attn_mode not in ("flash", "sageattn")):
+            if bool(torch.all(self.seqlens == self.seqlens[0])):
+                self.uniform_seqlen = int(self.seqlens[0])
 
     @staticmethod
     def create(attn_mode: Optional[str], split_attn: bool) -> "AttentionParams":
@@ -110,23 +120,20 @@ def attention(
     if attn_params is None:
         attn_params = AttentionParams.create("torch", False)
 
-    # Trim sequence if all lengths are equal (optimization for non-flash/sage modes)
+    # Trim to the common sequence length when every sequence has one, instead of attending over
+    # padding. Whether that applies is decided once in AttentionParams.__post_init__: it has to
+    # read a CUDA tensor on the CPU, and doing it here cost a device sync inside every block of
+    # every forward. flash/sageattn handle masks efficiently themselves and are excluded.
     seqlen_trimmed = False
-    if (
-        not attn_params.split_attn
-        and attn_params.attention_mask is not None
-        and attn_params.seqlens is not None
-        and (attn_params.attn_mode != "flash" and attn_params.attn_mode != "sageattn")
-    ):
-        if torch.all(attn_params.seqlens == attn_params.seqlens[0]):
-            seqlen = attn_params.seqlens[0].item()
-            q = q[:, :seqlen]
-            k = k[:, :seqlen]
-            v = v[:, :seqlen]
-            max_seqlen = attn_params.max_seqlen
-            attn_params = AttentionParams.create(attn_params.attn_mode, False)
-            attn_params.max_seqlen = max_seqlen
-            seqlen_trimmed = True
+    seqlen = attn_params.uniform_seqlen
+    if seqlen is not None:
+        q = q[:, :seqlen]
+        k = k[:, :seqlen]
+        v = v[:, :seqlen]
+        max_seqlen = attn_params.max_seqlen
+        attn_params = AttentionParams.create(attn_params.attn_mode, False)
+        attn_params.max_seqlen = max_seqlen
+        seqlen_trimmed = True
 
     # Layout depends on backend
     if attn_params.attn_mode == "torch" or (
@@ -155,18 +162,24 @@ def attention(
     # --- Backend dispatch ---
 
     if attn_params.attn_mode == "torch":
+        # cuDNN's kernel for inference, PyTorch's own choice while training — one shared
+        # decision, see fizgig.modules.sdpa for the measurements. Klein's previews (Repair
+        # Studio, Explorer, profiler, sampling) hold one resolution for a whole render, which
+        # is the case cuDNN wins; bucketed training is the case it loses.
         if attn_params.split_attn:
             x = []
             for i in range(len(q)):
-                x_i = torch.nn.functional.scaled_dot_product_attention(q[i], k[i], v[i], dropout_p=drop_rate)
+                with sdpa_backend_ctx():
+                    x_i = torch.nn.functional.scaled_dot_product_attention(q[i], k[i], v[i], dropout_p=drop_rate)
                 q[i], k[i], v[i] = None, None, None
                 x.append(pad_fn(x_i, attn_params.max_seqlen))
             x = torch.cat(x, dim=0)
             q, k, v = None, None, None
         else:
-            x = torch.nn.functional.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_params.attention_mask, dropout_p=drop_rate
-            )
+            with sdpa_backend_ctx():
+                x = torch.nn.functional.scaled_dot_product_attention(
+                    q, k, v, attn_mask=attn_params.attention_mask, dropout_p=drop_rate
+                )
             q, k, v = None, None, None
 
     elif attn_params.attn_mode == "xformers":
