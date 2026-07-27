@@ -340,15 +340,68 @@ fine-tune it was meant to replace. Recorded here so it is not re-derived.
 1. ~~**SVD the delta into a LoRA.**~~ **Answered** -- see above. It survives, and at rank 64 it is
    perceptually perfect. Extraction should become a first-class step: a GUI button that takes the
    run's final checkpoint and emits the LoRA directly, rather than sending users to a ComfyUI node.
-2. **Regularisation-images support** in the GUI (second dataset block + ratio).
-3. **ReLoRA** -- train a rank-16 LoRA, merge it into the bf16 master, reset, repeat, accumulating
+2. ~~**Regularisation-images support** in the GUI.~~ **Done** — optional folder + fixed LR
+   multiplier beside the fine-tune toggles, written as a second `is_reg` dataset block so the
+   cache scripts pick it up unchanged. Fine-tune only; a LoRA update is rank-bounded and cannot
+   drift the general representation the way this can.
+3. **VRAM sweep — what actually fits a 4090 and a 16 GB card.** *(next up)* Nothing measured fits
+   either: the lowest config on record is 24.2 GB (8 blocks resident) against ~22.4 GB usable on a
+   4090 and ~14.5 GB on a 16 GB card. Run each candidate ~30 steps and read
+   `torch.cuda.max_memory_allocated()` — no full run, no checkpoints. Candidates: block mode at 4
+   and 8 resident with streaming on (the 24 GB targets), 2 and 4 resident with streaming to find
+   the floor, and component mode with streaming since that is the quality-preferred window shape.
+
+   Worth doing rather than reasoning about: the analytic model (fp8 base + bf16 window + factored
+   optimizer state + checkpointed activations) lands ~20 GB for component mode, which measures
+   30.1 — a 10 GB gap that says something substantial is unmodelled. The measured table is also
+   **non-monotonic** (4 blocks resident = 24.8 GB, 8 blocks = 24.2 GB), which is backwards for
+   weights and suggests activations or fragmentation dominate. Extrapolating from either would be
+   a guess.
+
+   Structural note that does hold: **16 GB is unreachable without streaming.** The frozen base
+   alone is ~11.3 GB of fp8 blocks plus ~0.6 GB of bf16 norms/embeddings/IO before any trainable
+   weight or activation exists.
+
+4. **txtfusion-only window mode** (`--finetune_rotation_mode txtfusion`) — freeze all 28 blocks,
+   train only the text-fusion stack, to bind a *name* to a concept the model can already render
+   (the motivating case: a named pose, e.g. a YMCA letter shape, letting the frozen model assemble
+   the body from its own knowledge of body positions).
+
+   **Cheap, and possibly the small-card answer.** txtfusion is **343 M params — 2.7 % of the
+   model** (two 172 M stacks: `layerwise_blocks` + `refiner_blocks`). Frozen blocks stay fp8
+   (~11.3 GB), trainable weights are 0.64 GB bf16, Adafactor state is negligible. With no large
+   bf16 rotation window, this is by far the lightest mode and is the most likely to fit 16 GB —
+   pairs naturally with the sweep above.
+
+   **Half-wired already:** txtfusion is *always* trainable during rotation
+   (`rotator.activate_always`) because it sits outside `dit.blocks`. What is missing is a mode that
+   trains only it — `RotationSchedule` clamps to at least one block window.
+
+   **The idea is a higher-capacity textual inversion:** TI optimises one embedding vector, this
+   optimises the whole text→conditioning transform. The text encoder stays frozen, so a rare token
+   keeps a fixed embedding and txtfusion learns the mapping — cleaner than TI, which fights both at
+   once.
+
+   **Risks, in order:**
+   - **Damage is global and permanent.** txtfusion processes *every* prompt. A block LoRA can be
+     switched off and a token embedding only fires on its token; this cannot. Overfitting degrades
+     text understanding for everything. Regularisation images move from optional to near-mandatory.
+   - **343 M params against ~20 images is a lot of capacity** — expect to want a lower LR and fewer
+     epochs than a full fine-tune, or it encodes image detail rather than a clean concept.
+   - **Unknown whether pose is expressible there at all.** Pose is spatial; if assembling the shape
+     needs computation in the main blocks, conditioning alone will not reach it. Krea 2's block
+     roles are unmapped, so this *is* the experiment.
+
+   Caption everything except the concept in detail, so the token has nothing else to absorb.
+
+5. **ReLoRA** -- train a rank-16 LoRA, merge it into the bf16 master, reset, repeat, accumulating
    effective rank at LoRA memory cost. Still the only untested route to smaller cards, but the
    evidence above lowers its odds: each cycle's *search* stays rank-constrained, and the good
    directions took ~40 epochs of unconstrained trajectory to form. If tried, expect it to need a
    long full-rank warmup -- which is the memory cost it was meant to avoid.
-4. **Make the loss watch rotation-aware** — compare residuals against the same window position
+6. **Make the loss watch rotation-aware** — compare residuals against the same window position
    rather than the previous epoch. Only if the cyclic noise proves to matter.
-5. **Guard `--resume`** in fine-tune mode.
+7. **Guard `--resume`** in fine-tune mode.
 
 ---
 
