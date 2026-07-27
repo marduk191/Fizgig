@@ -61,3 +61,6 @@ nul
 _bench_out/
 bench_results.json
 repair_studio_last_preview.log
+
+# Checkpoint-to-LoRA utility state (per-machine)
+.diff_to_lora.json
