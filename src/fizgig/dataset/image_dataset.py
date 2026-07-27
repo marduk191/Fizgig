@@ -574,6 +574,7 @@ class ImageDataset(torch.utils.data.Dataset):
         cache_directory: Optional[str] = None,
         debug_dataset: bool = False,
         architecture: str = ARCHITECTURE_KLEIN_9B,
+        is_reg: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -588,6 +589,9 @@ class ImageDataset(torch.utils.data.Dataset):
         self.cache_directory = cache_directory
         self.debug_dataset = debug_dataset
         self.architecture = architecture
+        # Regularisation set: a prior anchor, not a subject. The trainer trains it at a fixed
+        # reduced LR and keeps the per-image loss watch off it.
+        self.is_reg = is_reg
 
         self.seed: Optional[int] = None
         self.current_epoch = 0

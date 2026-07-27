@@ -2746,6 +2746,36 @@ class LoRATrainerGUI:
                 "frozen base predicts. Whether that costs output quality is NOT established — "
                 "compare checkpoints before trusting it on a real run.")
 
+        # Optional regularisation set. Real photos, not model output: anchoring to the model's
+        # own samples distils its artifacts back in, and a full fine-tune moves every weight so
+        # there is nothing bounding the drift. Trained at a fixed low LR so it tethers the prior
+        # rather than teaching a new one.
+        self._krea2_reg_frame = ttk.Frame(training_content)
+        self._krea2_reg_frame.grid(row=29, column=0, columnspan=2, sticky=tk.W, padx=(21, 5), pady=(6, 0))
+        ttk.Label(self._krea2_reg_frame, text="Regularisation images (optional):").pack(side=tk.LEFT)
+        self.krea2_reg_dir_var = tk.StringVar(value=str(self.settings.get("KREA2_REG_DIR", "")))
+        _regent = ttk.Entry(self._krea2_reg_frame, textvariable=self.krea2_reg_dir_var, width=40)
+        _regent.pack(side=tk.LEFT, padx=(6, 4))
+        ttk.Button(self._krea2_reg_frame, text="Browse", width=8,
+                   command=self._browse_krea2_reg_dir).pack(side=tk.LEFT)
+        ttk.Label(self._krea2_reg_frame, text="LR ×").pack(side=tk.LEFT, padx=(14, 2))
+        self.krea2_reg_mult_var = tk.StringVar(value=str(self.settings.get("KREA2_REG_MULT", "0.2")))
+        ttk.Combobox(self._krea2_reg_frame, textvariable=self.krea2_reg_mult_var,
+                     values=["0.05", "0.1", "0.2", "0.3", "0.5"],
+                     state="normal", width=5).pack(side=tk.LEFT)
+        ToolTip(_regent,
+                "A folder of ordinary photos of the broader class — men, women, people — with "
+                "normal detailed captions. Leave empty to train without one.\n\n"
+                "Why real photos and not model output: generated regularisation images anchor "
+                "the model to its own artifacts, and a full fine-tune moves every weight, so "
+                "there is nothing bounding that drift. Real photos are an external reference.\n\n"
+                "They train at the LR multiplier beside this box — a nudge, not a lesson, so "
+                "they tether the model's prior instead of replacing it. 0.1-0.3 is the intended "
+                "range. They are also exempt from the per-image loss watch, which would "
+                "otherwise flag them as stuck for sitting flat, which is exactly their job.\n\n"
+                "Captions matter: anything you leave unsaid gets attributed to the class word "
+                "itself. Caption them as you would any training image.")
+
         self._krea2_ft_hint = ttk.Label(training_content,
                   text="Trains the base model's own weights, not an adapter — no rank bottleneck, so concepts "
                        "don't compete for the same directions. Only part of the model is trainable at a time and "
@@ -2760,7 +2790,7 @@ class LoRATrainerGUI:
                        "(the usual LoRA folder) — point it somewhere with room, e.g. your ComfyUI models/unet. "
                        "Test the result in ComfyUI as a normal Krea 2 model.",
                   foreground="#E67E22", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
-        self._krea2_ft_hint.grid(row=29, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 6))
+        self._krea2_ft_hint.grid(row=30, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 6))
 
         # === Optimizer Section (Collapsed by default) ===
         optimizer_section = CollapsibleFrame(outer,"Optimizer", default_expanded=False)
@@ -3532,6 +3562,8 @@ class LoRATrainerGUI:
         _grab("krea2_warmup_look_var", "KREA2_WARMUP_LOOK")
         _grab("krea2_finetune_var", "KREA2_FINETUNE")
         _grab("krea2_fast_ft_var", "KREA2_FAST_FT")
+        _grab("krea2_reg_dir_var", "KREA2_REG_DIR")
+        _grab("krea2_reg_mult_var", "KREA2_REG_MULT")
         _grab("krea2_ft_mode_var", "KREA2_FT_MODE")
         _grab("krea2_ft_blocks_var", "KREA2_FT_BLOCKS")
         _grab("krea2_ft_every_var", "KREA2_FT_EVERY")
@@ -3929,14 +3961,23 @@ class LoRATrainerGUI:
             self.update_console("[fine-tune] applied the recommended base-model setup:\n  "
                                 + "\n  ".join(changed) + "\n")
 
+    def _browse_krea2_reg_dir(self):
+        """Pick the optional regularisation image folder (Krea 2 fine-tune)."""
+        from tkinter import filedialog
+        d = filedialog.askdirectory(title="Regularisation images (optional)",
+                                    initialdir=self.krea2_reg_dir_var.get() or None)
+        if d:
+            self.krea2_reg_dir_var.set(d)
+            self.auto_save_dataset_config_silent()   # the TOML carries the reg block
+
     def _apply_krea2_ft_visibility(self):
         """Show the fine-tune knobs only when base-model fine-tuning is on, and the
         blocks-per-window picker only in block mode (component windows are fixed)."""
         if not hasattr(self, "_krea2_ft_frame"):
             return
         on = bool(self.krea2_finetune_var.get())
-        for w in (self._krea2_ft_frame, self._krea2_ft_fused_cb,
-                  self._krea2_fast_ft_cb, self._krea2_ft_hint):
+        for w in (self._krea2_ft_frame, self._krea2_ft_fused_cb, self._krea2_fast_ft_cb,
+                  self._krea2_reg_frame, self._krea2_ft_hint):
             self._set_widget_visible(w, on)
         block_mode = str(self.krea2_ft_mode_var.get()) == "block"
         if on and block_mode:
@@ -16782,6 +16823,27 @@ class LoRATrainerGUI:
                 except ValueError:
                     pass
 
+            # Optional regularisation set (Krea 2 fine-tune): a second dataset block marked
+            # is_reg, so the cache scripts pick it up for free and the trainer can find its
+            # items. Only written when a folder is set — no folder, no block, nothing changes.
+            reg_dir = (self.krea2_reg_dir_var.get().strip().replace("\\", "/")
+                       if hasattr(self, "krea2_reg_dir_var") else "")
+            if reg_dir and os.path.isdir(reg_dir) and not is_jsonl and not is_video:
+                toml_lines.append("")
+                toml_lines.append("[[datasets]]")
+                toml_lines.append(f'image_directory = "{reg_dir}"')
+                _reg_cache = self.prefs_vars["cache_dir"].get().strip() if "cache_dir" in self.prefs_vars else ""
+                if _reg_cache:
+                    # Its own subfolder for the same reason the subject set gets one: the
+                    # trainer globs the cache dir, so a shared folder mixes the two sets.
+                    import hashlib
+                    _rh = hashlib.sha1(reg_dir.lower().rstrip("/").encode("utf-8")).hexdigest()[:8]
+                    _rn = "".join(c if (c.isalnum() or c in "-_") else "_"
+                                  for c in os.path.basename(reg_dir.rstrip("/\\"))) or "reg"
+                    _reg_cache = os.path.join(_reg_cache, f"reg-{_rn}-{_rh}")
+                    toml_lines.append(f'cache_directory = "{_reg_cache.replace(chr(92), "/")}"')
+                toml_lines.append("is_reg = true")
+
             toml_content = "\n".join(toml_lines) + "\n"
 
             # Save to file (silently overwrite if exists)
@@ -17951,6 +18013,13 @@ class LoRATrainerGUI:
                 cmd.append("--finetune_fused_backward")
             if bool(self.krea2_fast_ft_var.get()):
                 cmd.append("--fast_ft")
+            _reg = self.krea2_reg_dir_var.get().strip()
+            if _reg and os.path.isdir(_reg):
+                try:
+                    _rm = float(self.krea2_reg_mult_var.get())
+                except ValueError:
+                    _rm = 0.2
+                cmd += ["--reg_lr_multiplier", str(max(0.0, _rm))]
         if _watch_ok and self.krea2_auto_recaption_var.get():
             cmd.append("--auto_recaption")
             # Trigger word from the Captions tab — appended (', <trigger>') to AI captions if

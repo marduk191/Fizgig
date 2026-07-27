@@ -79,6 +79,11 @@ def setup_parser() -> argparse.ArgumentParser:
     p.add_argument("--finetune_rotation_mode", default="block", choices=["block", "component"],
                    help="block = contiguous depth slices; component = attention across ALL "
                         "blocks then MLP (same VRAM, each window spans full depth)")
+    p.add_argument("--reg_lr_multiplier", type=float, default=0.2,
+                   help="LR multiplier for images in a dataset block marked `is_reg = true`. "
+                        "They anchor the model's prior rather than teaching a subject, so they "
+                        "train as a nudge (0.1-0.3) and are exempt from the per-image loss "
+                        "watch. Ignored when no reg block is present.")
     p.add_argument("--fast_ft", action="store_true",
                    help="Fast FT: quantise the frozen fp8 base with per-tensor scales and run "
                         "it through torch._scaled_mm instead of dequantising every forward. "
@@ -162,6 +167,7 @@ def main():
         adaptive_lr=args.adaptive_lr,
         adaptive_lr_min=args.adaptive_lr_min, adaptive_lr_max=args.adaptive_lr_max,
         fast_ft=args.fast_ft,
+        reg_lr_multiplier=args.reg_lr_multiplier,
         finetune_rotation=args.finetune_rotation,
         finetune_rotate_every=args.finetune_rotate_every,
         finetune_rotation_mode=args.finetune_rotation_mode,

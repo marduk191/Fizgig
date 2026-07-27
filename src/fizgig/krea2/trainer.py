@@ -58,6 +58,19 @@ def _apply_context_lora(target, path, strength, *, device, dtype):
     return net
 
 
+def _batch_is_reg(item_keys, reg_keys) -> bool:
+    """True when EVERY item in the batch is a regularisation image.
+
+    Batches are drawn from a single dataset's BucketBatchManager, so in practice a batch is
+    wholly reg or wholly not (and FT runs at batch size 1 regardless). `all` rather than `any`
+    is the safe reading of a mixed batch: throttling a subject image by mistake costs training
+    signal, while missing a throttle on a reg image costs only a slightly firmer anchor.
+    """
+    if not item_keys or not reg_keys:
+        return False
+    return all(str(k) in reg_keys for k in item_keys)
+
+
 def load_dit_for_training(
     raw_path: str,
     *,
@@ -1082,6 +1095,7 @@ def train_krea2(
     save_every_n_epochs: int = 0,
     fp8_scaled: bool = True,
     fast_ft: bool = False,
+    reg_lr_multiplier: float = 0.2,
     quant_4bit: bool = False,
     quant_int8: str = "",
     blocks_to_swap: int = 0,
@@ -1165,6 +1179,37 @@ def train_krea2(
     if group.num_train_items == 0:
         raise RuntimeError("No training items — run the krea2 cache scripts first.")
     logger.info(f"Krea 2 training: {group.num_train_items} items, {max_train_epochs} epochs")
+
+    # --- Regularisation set -------------------------------------------------------------
+    # Images from a dataset block marked `is_reg = true`. They are a PRIOR ANCHOR, not a
+    # subject: trained at a fixed reduced LR so they tether the model's general distribution
+    # instead of teaching it a new one. Full fine-tuning moves every weight, so 40 epochs on a
+    # handful of subjects drifts the model's whole notion of people — reg data is what pulls
+    # back, and it only works if it stays a nudge.
+    reg_keys = set()
+    for _ds in group.datasets:
+        if not getattr(_ds, "is_reg", False):
+            continue
+        _bm = getattr(_ds, "batch_manager", None)
+        if _bm is None:
+            continue
+        for _bucket in _bm.buckets.values():
+            for _it in _bucket:
+                reg_keys.add(str(_it.item_key))
+    reg_mult = float(reg_lr_multiplier)
+    if reg_keys:
+        logger.info(f"[reg] {len(reg_keys)} regularisation image(s) at x{reg_mult:g} LR "
+                    f"({group.num_train_items - len(reg_keys)} subject items). They anchor the "
+                    "prior and are exempt from the per-image loss watch.")
+        if reg_mult > 1.0:
+            logger.warning(f"[reg] multiplier is {reg_mult:g} (>1) — regularisation images will "
+                           "train HARDER than your subjects. That is almost certainly not what "
+                           "you want; 0.1-0.3 is the intended range.")
+        if len(reg_keys) >= group.num_train_items - len(reg_keys):
+            logger.warning("[reg] regularisation images are at least half the training set. "
+                           "The LR multiplier only reads as a reduction while they are the "
+                           "minority — Adafactor normalises by a running second moment that the "
+                           "majority class dominates.")
 
     ft_rotation = max(0, int(finetune_rotation or 0))
     ft_stream_frozen = False
@@ -1630,6 +1675,9 @@ def train_krea2(
                          if getattr(ds, "batch_manager", None) is not None
                          for bucket in ds.batch_manager.buckets.values()
                          for it in bucket}
+        # Reg images are flat-and-unimproving BY DESIGN — exactly the stuck signature. Keep them
+        # out of the watch entirely rather than relying on it to acquit them each epoch.
+        _dataset_keys -= reg_keys
         loss_watch.preflight(_dataset_keys)
         logger.info(f"[loss-watch] per-image loss watch ON (per_image_lr={per_image_lr})")
         if warmup_look_outliers:
@@ -1782,7 +1830,8 @@ def train_krea2(
             # Excluded images (two failed AI recaptions, still stuck) are skipped ENTIRELY: no
             # forward, no gradient, and no loss recorded — avr_loss stops carrying their permanent
             # error term. Step accounting (bar + global_step) stays consistent for resume math.
-            if loss_watch is not None and loss_watch.is_excluded(batch.get("item_keys")):
+            _is_reg_step = bool(reg_keys) and _batch_is_reg(batch.get("item_keys"), reg_keys)
+            if loss_watch is not None and not _is_reg_step and loss_watch.is_excluded(batch.get("item_keys")):
                 loss_recorder.drop(step=i)  # the slot leaves avr_loss — no stale/zero padding
                 global_step += 1
                 progress_bar.update(1)
@@ -1792,7 +1841,12 @@ def train_krea2(
             # Per-image LR: scale THIS step's gradient by the image's multiplier (throttle stuck
             # images, boost healthy learned ones). Raw loss is still what gets recorded/averaged below,
             # so avr_loss and the global adaptive-LR watcher see unscaled numbers.
-            step_mult = loss_watch.multiplier(batch.get("item_keys")) if loss_watch is not None else 1.0
+            # Reg images take the fixed multiplier and never the watch's — a verdict-driven
+            # multiplier on an anchor would be the watch curating the thing it must not touch.
+            if reg_keys and _batch_is_reg(batch.get("item_keys"), reg_keys):
+                step_mult = reg_mult
+            else:
+                step_mult = loss_watch.multiplier(batch.get("item_keys")) if loss_watch is not None else 1.0
             # Divide by the accumulation count so N micro-batches AVERAGE into one update rather
             # than summing (which would scale the effective LR by N).
             _scaled = loss * step_mult if step_mult != 1.0 else loss
@@ -1812,7 +1866,7 @@ def train_krea2(
                 pending_accum = 0
             global_step += 1
             loss_recorder.add(epoch=epoch, step=i, loss=loss.item())
-            if loss_watch is not None:
+            if loss_watch is not None and not _is_reg_step:
                 loss_watch.observe(epoch=epoch + 1, step=global_step,
                                    item_keys=batch.get("item_keys"), timestep=t_used, loss=loss.item())
             # refresh=False so only update(1) draws the bar — otherwise set_postfix AND update each
