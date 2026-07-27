@@ -20,6 +20,8 @@
 
 > **🎉 New — Krea 2.** Fizgig now supports a **second, fully native model family**: **Krea 2 (12.9B)**. The whole workbench works with it — Repair Studio, Explorer, Royale, Profiler, Extract — plus Context LoRA, Adaptive LR, Pause/Resume, 4-bit (NF4) low-VRAM training, and the live sample override. [Details below ↓](#krea-2--second-model-family)
 
+> **🧪 On this branch — full fine-tuning, not just LoRAs.** Fizgig can now train the **Krea 2 base model itself** on a single 32 GB card, by keeping most of the model fp8-frozen and rotating which slice is trainable. Then a small **Checkpoint to LoRA** utility turns the result back into an ordinary, shareable LoRA. Experimental, and living on this branch only. [Details ↓](#full-fine-tuning-krea-2--experimental)
+
 > **🆕 Newest — the run that looks after itself.** The Krea 2 trainer now **curates your dataset live**: it detects problem images from their loss alone, throttles them, has the text encoder *look at* the stuck ones and rewrite their captions, warms in unusual angles gently, and **tells you the best epoch** when the run plateaus. [Details ↓](#the-trainer-curates-your-dataset-while-it-trains-krea-2-experimental) Around it, two new instruments for **both families**: the Image Prep tab's **Look Consistency Filter** pre-filters off-look images by face-embedding score, and the **sample gallery** now scores every sample's likeness against your own photos live during training — with a Royale-style **Training Run Visualiser** to scrub and export the run. [Details ↓](#the-sample-gallery-is-an-instrument-both-families)
 
 ---
@@ -102,6 +104,78 @@ You can also edit any caption yourself mid-run from the Problem Images window �
 
 ---
 
+## Full fine-tuning (Krea 2) — experimental
+
+Everything above trains a **LoRA**. This trains the **base model itself** — no adapter, no rank
+bottleneck — on a single consumer GPU. Tick **⚗ Fine-tune the BASE MODEL instead of training a
+LoRA** on the Training tab.
+
+**Why bother.** A LoRA constrains every update to a low-rank subspace, so concepts compete for the
+same handful of directions. That's why LoRAs tend to drag pose, framing and lighting toward the
+training set along with the likeness — they behave a bit like a filter over the model's output. A
+full-rank update can change how the model *represents* a concept, so it composes with what the
+model already knows.
+
+**How it fits.** A naive full fine-tune of Krea 2 (12.9B) needs roughly **78 GB** — bf16 weights,
+gradients and optimizer state at once. Rotating windows make only part of the model trainable at a
+time, advancing each epoch, so gradients and optimizer state only ever exist for the active slice.
+Over a full cycle every weight trains. Around that sit three decisions that do the heavy lifting: a
+**CPU-resident bf16 master copy** is the source of truth, so training never round-trips through fp8
+and quantisation can't erase the small updates being learned; **optimizer-in-backward** consumes
+and frees each gradient the moment it lands (worth 5.2 GB); and **Adafactor**'s factored state is
+~10× smaller than AdamW's.
+
+Measured on an RTX 5090 (32 GB), 36 images at 0.25 MP:
+
+| Window mode | Peak VRAM | s/it | Windows per cycle |
+|---|---|---|---|
+| **component** (default) | 30.1 GB | 1.03 | 4 |
+| block, 14 resident | 27.5 GB | 1.16 | 2 |
+| block, 8 resident | 24.2 GB | 1.01 | 4 |
+| block, 4 resident | 24.8 GB | 0.93 | 7 |
+
+**Component mode is the default** because every window spans the model's full depth — attention
+across all 28 blocks, then each MLP matrix in turn — so a concept is learned by every layer at
+once rather than one depth slice at a time. The text-fusion stack stays trainable throughout:
+rotation would never reach it, and it's where prompt-to-concept binding happens.
+
+### Then turn it back into a LoRA
+
+A fine-tune produces a **~26 GB checkpoint**, which is not what anyone wants to share. The
+**Checkpoint to LoRA** utility (`run_diff_to_lora.bat`, its own small window) takes the base model
+you started from and the checkpoint you produced, and extracts the difference as an ordinary
+kohya `.safetensors` — at several ranks at once, since one SVD per layer serves them all.
+
+This turned out to work far better than expected. On a three-subject fine-tune, **rank 64 was
+perceptually indistinguishable from the full 26 GB checkpoint** at ~0.5 GB, and even rank 8 kept
+the three identities cleanly separate — what degrades at low rank is likeness *precision*, not
+separation, and it degrades smoothly rather than falling off a cliff.
+
+The result worth knowing: a **rank-128 LoRA trained directly** on the same three subjects was a
+mushy failure, while a **rank-64 LoRA extracted** from the fine-tune is perfect. Sixty-four
+directions are enough to *hold* a solution that 128 trainable directions could not *find*. So
+fine-tune-then-extract isn't a workaround — the full-rank phase is the mechanism, and the
+extraction is nearly free. (Details and the experiments behind it: **[docs/FINETUNE_ROTATION.md](docs/FINETUNE_ROTATION.md)**.)
+
+### What it costs you
+
+Being straight about the trade-offs, because they're real:
+
+- **A 32 GB card** for component mode. Block mode with 4–8 blocks resident fits ~24 GB, and
+  `--blocks_to_swap` streams for smaller cards at a real speed cost.
+- **~24 GB of system RAM** for the bf16 master copy, on top of VRAM.
+- **Disk.** Every save is a full ~26 GB checkpoint. Saving once per 4-epoch cycle is ~260 GB over a
+  40-epoch run. Point the Output Directory somewhere with room.
+- **A low learning rate — 1e-5 or below.** LoRA learning rates will wreck a base model.
+- **Run at least one full cycle** (4 epochs in component mode) or some weights never train at all.
+  The console warns you.
+- **No in-training previews, and Adaptive LR off** — both are disabled automatically. Judge the
+  saved checkpoints in ComfyUI, or extract a LoRA and scrub the epochs in LoRA Royale.
+
+Experimental, and on this branch only — master is untouched.
+
+---
+
 ## Training
 
 The foundation: fast, light, and tuned for one model.
@@ -151,6 +225,9 @@ Loads kohya, PEFT, OneTrainer (OMI + legacy), AI-Toolkit, and LyCORIS (LoKR / Lo
 - **OS** — Windows 10 / 11 or Linux. macOS handles captioning and image prep, but training needs CUDA.
 - **Python** — 3.10, 3.11, 3.12, or 3.13.
 - **Disk** — ~10 GB for the venv, plus ~40 GB for model files.
+- **Full fine-tuning** (experimental, Krea 2 only) asks for more than the above: a **32 GB card**
+  for the default component mode (~24 GB with block mode), **~24 GB of free system RAM** for the
+  bf16 master copy, and disk room for **~26 GB per saved checkpoint**.
 - **Visual Studio Build Tools** (Windows only) — needed to compile InsightFace, and for the **torch.compile training speedup**. Direct installer (no hunting on the MS site): **[aka.ms/vs/17/release/vs_BuildTools.exe](https://aka.ms/vs/17/release/vs_BuildTools.exe)** — tick the **"Desktop development with C++"** workload. The installer and `update_fizgig.bat` detect it and print this link if it's missing; without it everything still works, you just skip the compile speedup. (triton, compile's other dependency, installs automatically with the requirements.)
 
 ---
@@ -265,6 +342,11 @@ Launch Fizgig and work left-to-right through the numbered tabs:
 5. **Training** — pick a preset, tune, click **Start Training**.
 
 The unnumbered tabs are the post-training workbench — and work on any Klein LoRA you've downloaded: **Profiler**, **Repair Studio**, **LoRA the Explorer**, **LoRA Royale**, **Extract**, and **Preferences** (model paths, output directories, inference block-swap preset, default Browse folders).
+
+One tool lives outside the main window: **Checkpoint to LoRA** (`run_diff_to_lora.bat`, or
+`python diff_to_lora_gui.py`) — point it at a base model and a fine-tuned checkpoint and it writes
+an ordinary LoRA at whichever ranks you tick. Only needed if you use the experimental full
+fine-tune above.
 
 ---
 
