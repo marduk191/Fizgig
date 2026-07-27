@@ -2764,7 +2764,7 @@ class LoRATrainerGUI:
         ttk.Label(self._krea2_reg_frame, text="LR ×").pack(side=tk.LEFT, padx=(14, 2))
         self.krea2_reg_mult_var = tk.StringVar(value=str(self.settings.get("KREA2_REG_MULT", "0.2")))
         ttk.Combobox(self._krea2_reg_frame, textvariable=self.krea2_reg_mult_var,
-                     values=["0.05", "0.1", "0.2", "0.3", "0.5"],
+                     values=["0.05", "0.1", "0.2", "0.3", "0.5", "0.75", "1.0"],
                      state="normal", width=5).pack(side=tk.LEFT)
         ToolTip(_regent,
                 "A folder of ordinary photos of the broader class — men, women, people — with "
@@ -2772,9 +2772,10 @@ class LoRATrainerGUI:
                 "Why real photos and not model output: generated regularisation images anchor "
                 "the model to its own artifacts, and a full fine-tune moves every weight, so "
                 "there is nothing bounding that drift. Real photos are an external reference.\n\n"
-                "They train at the LR multiplier beside this box — a nudge, not a lesson, so "
-                "they tether the model's prior instead of replacing it. 0.1-0.3 is the intended "
-                "range.\n\n"
+                "They train at the LR multiplier beside this box. 0.1-0.3 keeps them a nudge — "
+                "tethering the model's prior rather than replacing it. Higher values train them "
+                "more like real data: at 1.0 they are simply a second subject set, which is a "
+                "different (valid) thing — class-balanced training rather than a light anchor.\n\n"
                 "Captions matter: anything you leave unsaid gets attributed to the class word "
                 "itself. Caption them as you would any training image.")
 
