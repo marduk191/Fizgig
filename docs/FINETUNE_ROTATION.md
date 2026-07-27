@@ -274,6 +274,44 @@ confirming the rig. Their direction sets differed slightly -- 1.8 vs 2.7 hits --
 at identical LR disagree about which directions form early. Early structure is not a stable
 target.)
 
+**5. Per-layer rank allocation is not worth doing.** A standing suggestion was to truncate by
+*energy fraction* rather than fixed rank -- give layers carrying facial detail more directions and
+coarse-placement layers fewer, at the same file size. Measured on the epoch-60 delta (145 matrices,
+every allocation held to the exact parameter budget of flat rank 64), residual energy
+`sum||d - d_hat||^2 / sum||d||^2`:
+
+| allocation | residual | vs flat |
+|---|---|---|
+| flat r64 | 73.37% | -- |
+| energy fraction (tau = 24.6%) | 75.24% | **-1.86** |
+| relative movement (||d||/||W||) | 74.34% | -0.96 |
+| water-filling | 72.22% | **+1.15** |
+
+Both heuristics are *worse* than flat. Water-filling -- greedily taking the best marginal
+energy-per-parameter, which is provably optimal here because cumulative energy is concave in rank
+-- gains only **1.15 points**. That is the ceiling, not a result: no allocation rule can beat it.
+
+Flat rank is near-optimal because there is nothing to exploit. Energy captured at rank 64 per layer
+runs min 16.2% / median 26.4% / max 70.0%, **sd 9.0pp** -- every layer has the same heavy-tailed
+shape. The diffuse drift from finding 2 is not concentrated in particular layers; it is uniform
+across all of them.
+
+Two smaller notes. The two heuristics **anti-correlate (-0.52)** -- they disagree about which layers
+deserve rank and both lose to flat, so neither tracks anything real. And the energy rule **starves
+block 0** (r3-r7 against flat 64, its spectrum decaying fast enough to hit the threshold at once)
+while spending r142 on mid-block `mlp.down`; as the composition anchor, block 0 is likely the worst
+place to take rank from, which the energy metric cannot see.
+
+Finally, the 1.15-point ceiling is measured on an axis already known not to predict quality: the
+perceptually perfect extraction sits at 28% energy, and the span between perfect and nothing is ~73
+points. Flat rank stays.
+
+(Per-layer rank is still *supported* -- `modules_dim`/`modules_alpha` are read per module, and
+Repair Studio's donor blending emits such files. This finding is about allocating a fixed budget,
+not about the format.)
+
+---
+
 ### What this means
 
 Three independent attempts to shortcut the full-rank trajectory failed: training directly at rank
