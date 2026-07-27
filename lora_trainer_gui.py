@@ -3428,6 +3428,52 @@ class LoRATrainerGUI:
             self.adaptive_lr_var.set(bool(preset["ADAPTIVE_LR"]))
             if hasattr(self, '_on_adaptive_lr_toggle'):
                 self._on_adaptive_lr_toggle()
+            # Re-apply the Learning Rate AFTER the toggle has settled. The entries loop above
+            # runs while the LR box still reflects the PREVIOUS adaptive state — and a write to
+            # a disabled ttk.Entry is silently dropped. Restoring a non-adaptive run while
+            # adaptive happened to be on therefore kept the old rate, which on a fine-tune is
+            # the difference between 1e-5 and a LoRA-grade 1e-4.
+            _lr_entry = self.entries.get("LEARNING_RATE")
+            if "LEARNING_RATE" in preset and _lr_entry is not None:
+                try:
+                    _was = _lr_entry.cget("state")
+                    _lr_entry.config(state="normal")
+                    _lr_entry.delete(0, tk.END)
+                    _lr_entry.insert(0, str(preset["LEARNING_RATE"]))
+                    _lr_entry.config(state=_was)
+                except (AttributeError, tk.TclError):
+                    pass
+
+        # Krea 2 base-model fine-tune. Captured by _collect_preset_values but never applied
+        # back, so "Load Settings From Last Train" silently dropped the entire fine-tune
+        # config — mode, window size, fused backward, Fast FT and the regularisation set.
+        # Order matters: the fine-tune flag goes first, because the regularisation block is
+        # only written to the dataset TOML while fine-tune is on.
+        _ft_map = [
+            ("KREA2_FINETUNE", "krea2_finetune_var", bool),
+            ("KREA2_FT_MODE", "krea2_ft_mode_var", str),
+            ("KREA2_FT_BLOCKS", "krea2_ft_blocks_var", str),
+            ("KREA2_FT_EVERY", "krea2_ft_every_var", str),
+            ("KREA2_FT_FUSED", "krea2_ft_fused_var", bool),
+            ("KREA2_FAST_FT", "krea2_fast_ft_var", bool),
+            ("KREA2_REG_DIR", "krea2_reg_dir_var", str),
+            ("KREA2_REG_MULT", "krea2_reg_mult_var", str),
+        ]
+        _ft_touched = False
+        for _key, _attr, _cast in _ft_map:
+            if _key in preset and hasattr(self, _attr):
+                try:
+                    getattr(self, _attr).set(_cast(preset[_key]))
+                    _ft_touched = True
+                except Exception:
+                    pass
+        if _ft_touched:
+            # Show/hide the fine-tune panel to match, and rewrite the dataset TOML so the
+            # regularisation block tracks the restored state rather than the previous run's.
+            if hasattr(self, "_apply_krea2_ft_visibility"):
+                self._apply_krea2_ft_visibility()
+            if hasattr(self, "auto_save_dataset_config_silent"):
+                self.auto_save_dataset_config_silent()
 
         # Model Area to Train (training preset dropdown)
         if "TARGET_LAYERS" in preset and hasattr(self, 'training_preset_var'):
