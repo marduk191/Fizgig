@@ -210,17 +210,104 @@ Different from LoRA practice, and it matters more:
 
 ---
 
+## What SVD extraction and the shortcut experiments showed (27 Jul)
+
+The delta from a 60-epoch component-rotation run on three subjects (two of them women, i.e. one
+within-class pair) was extracted to LoRA at several ranks with the `comfyui-model-diff-to-lora`
+node, and the resulting subspaces measured against each other. Four results, all reproducible
+from checkpoints on disk with no training.
+
+**1. SVD extraction works, and works at low rank.** Ranks 8 / 16 / 32 / 64 / 128 all preserve
+*separation* -- the three identities never blend. What degrades below 64 is *likeness* precision,
+smoothly. Rank 64 is perceptually perfect and about half a gigabyte; rank 32 is very close.
+
+Identity **placement** is a coarse, high-energy move that lands in the top few singular directions
+and survives brutal truncation. Likeness **precision** is fine detail spread through the tail.
+That asymmetry is why separation is the robust part.
+
+**2. The delta is not low-rank, and energy is a poor proxy for quality.** The perceptually perfect
+rank-64 extraction captures only **~28%** of the delta's Frobenius energy (confirmed two ways:
+from the shipped LoRA's own up-matrices, and from a fresh decomposition -- 27.94% vs 27.78%).
+Nearly three-quarters of the update's magnitude is discardable without visible loss. The update is
+a small amount of highly structured learning inside a large amount of diffuse drift. Do not use
+energy capture to judge an extraction.
+
+**3. The good subspace is built late, and cannot be bought early.** Measuring each epoch's top-64
+basis against the known-good rank-64 basis (mean squared cosine of principal angles, plus a count
+of good directions individually captured at cos^2 > 0.5):
+
+| basis from | overlap | good directions captured |
+|---|---|---|
+| random | 1.8% | -- |
+| epoch 4 | 20.9% | 2.7 of 64 |
+| epoch 12 | 31.7% | 6.6 |
+| epoch 20 | 41.9% | 15.3 |
+| epoch 32 | 57.6% | 47.2 |
+| epoch 40 | 67.2% | 55.2 |
+
+Still climbing at epoch 40, with a sharp consolidation between 20 and 32 -- consistent with
+three-character separation only appearing around epoch 60. All three component groups (attn / mlp
+/ txtfusion) track within a point of each other, so no per-component strategy is needed.
+
+**Width does not substitute for time.** Widening the early basis saturates: excess coverage over a
+same-width random subspace goes 19.1 -> 24.6 -> 27.9 -> 28.0 points at ranks 64 -> 128 -> 256 ->
+512. Everything past rank 256 is luck. A rank-512 basis at epoch 4 captures 24.8 of the good 64; a
+rank-**64** basis at epoch 40 captures 55.2. Eight times the width, taken early, gets less than
+half as much as simply waiting.
+
+**4. A high-LR "fast-forward" probe makes it worse, not better.** Three 4-epoch probes from the
+same base on the same dataset, identical but for LR:
+
+| probe | delta norm | good directions captured |
+|---|---|---|
+| 1x (5e-5) | 2.38 | 1.8 |
+| 5x (2.5e-4) | 13.50 | 1.5 |
+| 20x (1e-3) | 37.19 | 0.3 |
+| *epoch 40 of the real run* | *7.27* | *58.1* |
+
+The 5x probe travelled nearly **twice as far** as epoch 40 and the 20x probe **five times** as far,
+yet captured essentially none of the right directions. Distance travelled is not what produces
+them. High LR does not advance along the trajectory -- it goes somewhere else.
+
+(Control: a 1x reproduction of the original epoch 4 travelled 2.38 against the original's 2.41,
+confirming the rig. Their direction sets differed slightly -- 1.8 vs 2.7 hits -- so even two runs
+at identical LR disagree about which directions form early. Early structure is not a stable
+target.)
+
+### What this means
+
+Three independent attempts to shortcut the full-rank trajectory failed: training directly at rank
+128 (mush), freezing a wide early basis (saturates far short), and a high-LR probe (actively
+worse). Taken together with a rank-128 *trained* LoRA failing where a rank-64 *extracted* one is
+perfect, the claim sharpens considerably:
+
+> The limitation of low-rank adaptation here is **optimisation, not expressivity** -- 64 directions
+> suffice to *hold* a solution that 128 trainable directions cannot *find*. And the full-rank
+> trajectory that produces those directions appears **irreducible**: they are constructed by slow
+> cumulative optimisation, not discovered by capacity, width, or step size.
+
+So fine-tune-then-extract is the correct architecture, not a stepping stone -- the "wasteful"
+full-rank phase is the mechanism, and the extraction is lossless enough at rank 64 to be free.
+
+**Direct-to-LoRA (DTL) is closed.** The idea was to keep the update in factored form as it is
+produced (a frozen basis with linearly-trained coefficients, GaLore-style, emitting an adapter
+natively) to reach 16 GB cards. Every variant needs a usable basis before the run, and results 3
+and 4 show no way to obtain one: any basis good enough only exists after ~40 epochs of the very
+fine-tune it was meant to replace. Recorded here so it is not re-derived.
+
+---
+
 ## Next
 
-1. **SVD the delta into a LoRA.** Now the interesting question rather than a convenience: if the
-   fine-tune generalises better *because* it's full-rank, does a rank-16 projection keep that or
-   throw away the thing that made it good? Either answer is worth knowing — and if it survives,
-   it's fine-tune quality in a shareable 100 MB file.
+1. ~~**SVD the delta into a LoRA.**~~ **Answered** -- see above. It survives, and at rank 64 it is
+   perceptually perfect. Extraction should become a first-class step: a GUI button that takes the
+   run's final checkpoint and emits the LoRA directly, rather than sending users to a ComfyUI node.
 2. **Regularisation-images support** in the GUI (second dataset block + ratio).
-3. **ReLoRA** — train a rank-16 LoRA, merge it into the bf16 master, reset, repeat. Accumulates a
-   high effective rank at LoRA memory cost (~16-18 GB, so 24 GB cards and maybe 16 GB). Merging
-   into the bf16 master rather than the fp8 base is what makes it viable. The most promising route
-   to giving smaller cards most of what this branch achieves.
+3. **ReLoRA** -- train a rank-16 LoRA, merge it into the bf16 master, reset, repeat, accumulating
+   effective rank at LoRA memory cost. Still the only untested route to smaller cards, but the
+   evidence above lowers its odds: each cycle's *search* stays rank-constrained, and the good
+   directions took ~40 epochs of unconstrained trajectory to form. If tried, expect it to need a
+   long full-rank warmup -- which is the memory cost it was meant to avoid.
 4. **Make the loss watch rotation-aware** — compare residuals against the same window position
    rather than the previous epoch. Only if the cyclic noise proves to matter.
 5. **Guard `--resume`** in fine-tune mode.
