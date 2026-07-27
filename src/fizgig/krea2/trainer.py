@@ -1180,31 +1180,41 @@ def train_krea2(
         raise RuntimeError("No training items — run the krea2 cache scripts first.")
     logger.info(f"Krea 2 training: {group.num_train_items} items, {max_train_epochs} epochs")
 
-    # --- Regularisation set -------------------------------------------------------------
+    ft_rotation = max(0, int(finetune_rotation or 0))
+
+    # --- Regularisation set (fine-tune only) ---------------------------------------------
     # Images from a dataset block marked `is_reg = true` — a PRIOR ANCHOR, not a subject.
     # Full fine-tuning moves every weight, so 40 epochs on a handful of subjects drifts the
     # model's whole notion of people, with no low-rank bound to limit it. Reg data pulls back,
-    # and it only works if it stays a nudge: fixed reduced LR, never a verdict-driven one.
+    # and it only works if it stays a nudge: a fixed reduced LR.
+    #
+    # LoRA training doesn't have that problem — the update is rank-bounded — so reg images are
+    # ignored outright rather than quietly trained as subjects at full LR.
     reg_keys = set()
-    for _ds in group.datasets:
-        if not getattr(_ds, "is_reg", False):
-            continue
-        _bm = getattr(_ds, "batch_manager", None)
-        if _bm is None:
-            continue
-        for _bucket in _bm.buckets.values():
-            for _it in _bucket:
-                reg_keys.add(str(_it.item_key))
     reg_mult = float(reg_lr_multiplier)
-    if reg_keys:
-        logger.info(f"[reg] {len(reg_keys)} regularisation image(s) at x{reg_mult:g} LR "
-                    f"({group.num_train_items - len(reg_keys)} subject items).")
-        if len(reg_keys) >= group.num_train_items - len(reg_keys):
-            logger.warning("[reg] regularisation images are at least half the training set — the "
-                           "multiplier only reads as an LR cut while they are the minority, since "
-                           "Adafactor normalises by a second moment the majority dominates.")
-
-    ft_rotation = max(0, int(finetune_rotation or 0))
+    if ft_rotation:
+        for _ds in group.datasets:
+            if not getattr(_ds, "is_reg", False):
+                continue
+            _bm = getattr(_ds, "batch_manager", None)
+            if _bm is None:
+                continue
+            for _bucket in _bm.buckets.values():
+                for _it in _bucket:
+                    reg_keys.add(str(_it.item_key))
+        if reg_keys:
+            logger.info(f"[reg] {len(reg_keys)} regularisation image(s) at x{reg_mult:g} LR "
+                        f"({group.num_train_items - len(reg_keys)} subject items).")
+            if len(reg_keys) >= group.num_train_items - len(reg_keys):
+                logger.warning("[reg] regularisation images are at least half the training set — "
+                               "the multiplier only reads as an LR cut while they are the "
+                               "minority, since Adafactor normalises by a second moment the "
+                               "majority dominates.")
+    elif any(getattr(_ds, "is_reg", False) for _ds in group.datasets):
+        logger.warning("[reg] the dataset config has a regularisation block, but this is a LoRA "
+                       "run — regularisation images are a fine-tune feature and are IGNORED "
+                       "here. They will train as ordinary images at full LR; remove the "
+                       "`is_reg` block from the TOML if that is not what you want.")
     ft_stream_frozen = False
 
     if ft_rotation:

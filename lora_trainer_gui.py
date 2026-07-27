@@ -2758,6 +2758,9 @@ class LoRATrainerGUI:
         _regent.pack(side=tk.LEFT, padx=(6, 4))
         ttk.Button(self._krea2_reg_frame, text="Browse", width=8,
                    command=self._browse_krea2_reg_dir).pack(side=tk.LEFT)
+        # Typed paths need the same TOML rewrite the Browse button triggers.
+        self.krea2_reg_dir_var.trace_add(
+            "write", lambda *_a: self.auto_save_dataset_config_silent())
         ttk.Label(self._krea2_reg_frame, text="LR ×").pack(side=tk.LEFT, padx=(14, 2))
         self.krea2_reg_mult_var = tk.StringVar(value=str(self.settings.get("KREA2_REG_MULT", "0.2")))
         ttk.Combobox(self._krea2_reg_frame, textvariable=self.krea2_reg_mult_var,
@@ -3915,6 +3918,8 @@ class LoRATrainerGUI:
         """User ticked/unticked base-model fine-tuning. Only push the recipe on the way ON,
         so re-showing the tab never stomps values the user has since tuned."""
         self._apply_krea2_ft_visibility()
+        # The regularisation block is fine-tune-only, so the TOML changes with this toggle.
+        self.auto_save_dataset_config_silent()
         if bool(self.krea2_finetune_var.get()):
             self._apply_krea2_ft_defaults()
 
@@ -16825,9 +16830,13 @@ class LoRATrainerGUI:
             # Optional regularisation set (Krea 2 fine-tune): a second dataset block marked
             # is_reg, so the cache scripts pick it up for free and the trainer can find its
             # items. Only written when a folder is set — no folder, no block, nothing changes.
+            # Fine-tune only: with FT off the block must not be written at all, or the reg
+            # images would be cached and trained as ordinary subjects at full LR.
             reg_dir = (self.krea2_reg_dir_var.get().strip().replace("\\", "/")
                        if hasattr(self, "krea2_reg_dir_var") else "")
-            if reg_dir and os.path.isdir(reg_dir) and not is_jsonl and not is_video:
+            reg_on = bool(getattr(self, "krea2_finetune_var", None)
+                          and self.krea2_finetune_var.get())
+            if reg_on and reg_dir and os.path.isdir(reg_dir) and not is_jsonl and not is_video:
                 toml_lines.append("")
                 toml_lines.append("[[datasets]]")
                 toml_lines.append(f'image_directory = "{reg_dir}"')
