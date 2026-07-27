@@ -1181,11 +1181,10 @@ def train_krea2(
     logger.info(f"Krea 2 training: {group.num_train_items} items, {max_train_epochs} epochs")
 
     # --- Regularisation set -------------------------------------------------------------
-    # Images from a dataset block marked `is_reg = true`. They are a PRIOR ANCHOR, not a
-    # subject: trained at a fixed reduced LR so they tether the model's general distribution
-    # instead of teaching it a new one. Full fine-tuning moves every weight, so 40 epochs on a
-    # handful of subjects drifts the model's whole notion of people — reg data is what pulls
-    # back, and it only works if it stays a nudge.
+    # Images from a dataset block marked `is_reg = true` — a PRIOR ANCHOR, not a subject.
+    # Full fine-tuning moves every weight, so 40 epochs on a handful of subjects drifts the
+    # model's whole notion of people, with no low-rank bound to limit it. Reg data pulls back,
+    # and it only works if it stays a nudge: fixed reduced LR, never a verdict-driven one.
     reg_keys = set()
     for _ds in group.datasets:
         if not getattr(_ds, "is_reg", False):
@@ -1199,17 +1198,11 @@ def train_krea2(
     reg_mult = float(reg_lr_multiplier)
     if reg_keys:
         logger.info(f"[reg] {len(reg_keys)} regularisation image(s) at x{reg_mult:g} LR "
-                    f"({group.num_train_items - len(reg_keys)} subject items). They anchor the "
-                    "prior and are exempt from the per-image loss watch.")
-        if reg_mult > 1.0:
-            logger.warning(f"[reg] multiplier is {reg_mult:g} (>1) — regularisation images will "
-                           "train HARDER than your subjects. That is almost certainly not what "
-                           "you want; 0.1-0.3 is the intended range.")
+                    f"({group.num_train_items - len(reg_keys)} subject items).")
         if len(reg_keys) >= group.num_train_items - len(reg_keys):
-            logger.warning("[reg] regularisation images are at least half the training set. "
-                           "The LR multiplier only reads as a reduction while they are the "
-                           "minority — Adafactor normalises by a running second moment that the "
-                           "majority class dominates.")
+            logger.warning("[reg] regularisation images are at least half the training set — the "
+                           "multiplier only reads as an LR cut while they are the minority, since "
+                           "Adafactor normalises by a second moment the majority dominates.")
 
     ft_rotation = max(0, int(finetune_rotation or 0))
     ft_stream_frozen = False
@@ -1675,9 +1668,6 @@ def train_krea2(
                          if getattr(ds, "batch_manager", None) is not None
                          for bucket in ds.batch_manager.buckets.values()
                          for it in bucket}
-        # Reg images are flat-and-unimproving BY DESIGN — exactly the stuck signature. Keep them
-        # out of the watch entirely rather than relying on it to acquit them each epoch.
-        _dataset_keys -= reg_keys
         loss_watch.preflight(_dataset_keys)
         logger.info(f"[loss-watch] per-image loss watch ON (per_image_lr={per_image_lr})")
         if warmup_look_outliers:
@@ -1830,8 +1820,7 @@ def train_krea2(
             # Excluded images (two failed AI recaptions, still stuck) are skipped ENTIRELY: no
             # forward, no gradient, and no loss recorded — avr_loss stops carrying their permanent
             # error term. Step accounting (bar + global_step) stays consistent for resume math.
-            _is_reg_step = bool(reg_keys) and _batch_is_reg(batch.get("item_keys"), reg_keys)
-            if loss_watch is not None and not _is_reg_step and loss_watch.is_excluded(batch.get("item_keys")):
+            if loss_watch is not None and loss_watch.is_excluded(batch.get("item_keys")):
                 loss_recorder.drop(step=i)  # the slot leaves avr_loss — no stale/zero padding
                 global_step += 1
                 progress_bar.update(1)
@@ -1841,10 +1830,8 @@ def train_krea2(
             # Per-image LR: scale THIS step's gradient by the image's multiplier (throttle stuck
             # images, boost healthy learned ones). Raw loss is still what gets recorded/averaged below,
             # so avr_loss and the global adaptive-LR watcher see unscaled numbers.
-            # Reg images take the fixed multiplier and never the watch's — a verdict-driven
-            # multiplier on an anchor would be the watch curating the thing it must not touch.
             if reg_keys and _batch_is_reg(batch.get("item_keys"), reg_keys):
-                step_mult = reg_mult
+                step_mult = reg_mult   # regularisation images: fixed nudge, never the watch's
             else:
                 step_mult = loss_watch.multiplier(batch.get("item_keys")) if loss_watch is not None else 1.0
             # Divide by the accumulation count so N micro-batches AVERAGE into one update rather
@@ -1866,7 +1853,7 @@ def train_krea2(
                 pending_accum = 0
             global_step += 1
             loss_recorder.add(epoch=epoch, step=i, loss=loss.item())
-            if loss_watch is not None and not _is_reg_step:
+            if loss_watch is not None:
                 loss_watch.observe(epoch=epoch + 1, step=global_step,
                                    item_keys=batch.get("item_keys"), timestep=t_used, loss=loss.item())
             # refresh=False so only update(1) draws the bar — otherwise set_postfix AND update each

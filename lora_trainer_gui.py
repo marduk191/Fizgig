@@ -2771,8 +2771,7 @@ class LoRATrainerGUI:
                 "there is nothing bounding that drift. Real photos are an external reference.\n\n"
                 "They train at the LR multiplier beside this box — a nudge, not a lesson, so "
                 "they tether the model's prior instead of replacing it. 0.1-0.3 is the intended "
-                "range. They are also exempt from the per-image loss watch, which would "
-                "otherwise flag them as stuck for sitting flat, which is exactly their job.\n\n"
+                "range.\n\n"
                 "Captions matter: anything you leave unsaid gets attributed to the class word "
                 "itself. Caption them as you would any training image.")
 
