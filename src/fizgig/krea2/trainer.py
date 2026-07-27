@@ -702,7 +702,25 @@ def _save_full_checkpoint(rotator, raw_path: str, path: str, extra_metadata=None
     if extra_metadata:
         meta.update({str(k): str(v) for k, v in extra_metadata.items()})
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    save_file(sd, path, metadata=meta)
+    # Write to a temp name and rename on completion. This file is ~24.5 GB and takes minutes;
+    # Stop (a hard kill) or a power cut partway through used to leave a TRUNCATED checkpoint
+    # sitting at the real filename — correct header, most of the tensors, and unloadable
+    # ("MetadataIncompleteBuffer"). It looked like a valid save until ComfyUI refused it, which
+    # could be days later. os.replace is atomic within a volume, so an interrupted write now
+    # leaves only a .tmp you can delete, and the previous checkpoint stays intact.
+    tmp = path + ".tmp"
+    try:
+        save_file(sd, tmp, metadata=meta)
+        os.replace(tmp, path)
+    except BaseException:
+        # BaseException, not Exception: KeyboardInterrupt/SystemExit are exactly the cases
+        # that produce a half-written file, and they must not leave the .tmp behind either.
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
     size_gb = os.path.getsize(path) / 1e9
     logger.info("[ft-rotation] saved full checkpoint (%d/%d tensors trained, %.1f GB) -> %s",
                 replaced, len(sd), size_gb, path)
