@@ -79,6 +79,12 @@ def setup_parser() -> argparse.ArgumentParser:
     p.add_argument("--finetune_rotation_mode", default="block", choices=["block", "component"],
                    help="block = contiguous depth slices; component = attention across ALL "
                         "blocks then MLP (same VRAM, each window spans full depth)")
+    p.add_argument("--fast_ft", action="store_true",
+                   help="Fast FT: quantise the frozen fp8 base with per-tensor scales and run "
+                        "it through torch._scaled_mm instead of dequantising every forward. "
+                        "Needs SM 8.9+ and an fp8 base; ignored otherwise. Costs ~1.5x the "
+                        "per-Linear forward error of the default path (3.7e-02 vs 2.5e-02), "
+                        "mostly from the fp8 activations the GEMM requires.")
     p.add_argument("--finetune_fused_backward", action="store_true",
                    help="Step each parameter inside backward and free its grad immediately "
                         "(rotation FT only) — cuts the gradient footprint, disables clipping")
@@ -155,6 +161,7 @@ def main():
         context_lora_path=args.context_lora_path, context_lora_strength=args.context_lora_strength,
         adaptive_lr=args.adaptive_lr,
         adaptive_lr_min=args.adaptive_lr_min, adaptive_lr_max=args.adaptive_lr_max,
+        fast_ft=args.fast_ft,
         finetune_rotation=args.finetune_rotation,
         finetune_rotate_every=args.finetune_rotate_every,
         finetune_rotation_mode=args.finetune_rotation_mode,

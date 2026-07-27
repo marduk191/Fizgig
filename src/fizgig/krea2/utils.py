@@ -93,6 +93,7 @@ def load_krea2_dit(
     split_attn: bool = False,
     lora_weights: Optional[list] = None,
     lora_multipliers: Optional[list] = None,
+    fp8_fast: bool = False,
 ) -> SingleStreamDiT:
     """Build the K2 single-stream MMDiT on meta and load weights (assign=True).
 
@@ -171,9 +172,12 @@ def load_krea2_dit(
             dit_weight_dtype=None if fp8_scaled else dtype,
             target_keys=KREA2_FP8_OPTIMIZATION_TARGET_KEYS if fp8_scaled else None,
             exclude_keys=KREA2_FP8_OPTIMIZATION_EXCLUDE_KEYS if fp8_scaled else None,
+            # Fast FT needs a per-tensor scale: _scaled_mm takes one scalar per operand,
+            # so the shipped block-64 layout cannot feed it.
+            quantization_mode="tensor" if (fp8_scaled and fp8_fast) else "block",
         )
         if fp8_scaled:
-            apply_fp8_monkey_patch(dit, sd, use_scaled_mm=False)
+            apply_fp8_monkey_patch(dit, sd, use_scaled_mm=False, fast=fp8_fast)
         if loading_device.type != "cpu":
             for key in sd.keys():
                 sd[key] = sd[key].to(loading_device)
@@ -194,6 +198,7 @@ def load_krea2_dit_state_dict(
     calc_device: Union[str, torch.device] = "cpu",
     result_device: Union[str, torch.device] = "cpu",
     config: SingleMMDiTConfig = single_mmdit_large_wide,
+    fp8_fast: bool = False,
 ) -> dict:
     """Produce a Krea 2 DiT state dict matching a model loaded via ``load_krea2_dit``.
 
@@ -229,6 +234,7 @@ def load_krea2_dit_state_dict(
             dit_weight_dtype=None,
             target_keys=KREA2_FP8_OPTIMIZATION_TARGET_KEYS,
             exclude_keys=KREA2_FP8_OPTIMIZATION_EXCLUDE_KEYS,
+            quantization_mode="tensor" if fp8_fast else "block",
         )
     else:
         # Load without mmap (disable_mmap=True) to avoid the official load_file's transient ~2x

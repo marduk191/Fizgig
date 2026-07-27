@@ -12,6 +12,8 @@ from tqdm import tqdm
 
 from fizgig.krea2.safetensors_utils import MemoryEfficientSafeOpen, TensorWeightAdapter, WeightTransformHooks
 
+from fizgig.modules.fp8 import _try_fp8_scaled_mm_train
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -377,6 +379,17 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
     Returns:
         torch.Tensor: Result of linear transformation
     """
+    # Fast FT: try the _scaled_mm path Klein already trains on. Opt-in per module via
+    # _fp8_fast (set by apply_fp8_monkey_patch), and only ever a fast path — it returns
+    # None whenever it can't run (unsupported card, non-per-tensor scale, ragged K/N,
+    # or a _scaled_mm RuntimeError) and we fall through to the dequant below, which is
+    # the shipped behaviour. Reused rather than reimplemented: that helper carries the
+    # block-swap scale-device fixup and the checkpoint-safe ctx stashing.
+    if getattr(self, "_fp8_fast", False):
+        out = _try_fp8_scaled_mm_train(self, x)
+        if out is not None:
+            return out
+
     if use_scaled_mm:
         # **not tested**
         # _scaled_mm only works for per-tensor scale for now (per-channel scale does not work in certain cases)
@@ -437,7 +450,7 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
         return output
 
 
-def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False):
+def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False, fast=False):
     """
     Apply monkey patching to a model using FP8 optimized state dict.
 
@@ -494,6 +507,10 @@ def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False):
                 "scale_weight",
                 torch.ones(scale_shape, dtype=scale_dtype, device=module.weight.device),
             )
+
+            # Fast FT opt-in. Per-module rather than global so a rotation window that
+            # re-freezes a Linear keeps the same behaviour without re-plumbing.
+            module._fp8_fast = bool(fast)
 
             # Create a new forward method with the patched version.
             def new_forward(self, x):

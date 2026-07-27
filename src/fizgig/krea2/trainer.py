@@ -73,6 +73,7 @@ def load_dit_for_training(
     context_lora_strength: float = 1.0,
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
+    fp8_fast: bool = False,
 ):
     """Load the RAW DiT (frozen base, optionally fp8) and apply a trainable full-model LoRA.
     An optional frozen Context LoRA is applied to the base first, so the new LoRA learns to
@@ -97,7 +98,7 @@ def load_dit_for_training(
     else:
         loading_device = "cpu" if blocks_to_swap > 0 else device
     dit = load_krea2_dit(raw_path, device=device, dtype=dtype, fp8_scaled=fp8_scaled,
-                         loading_device=loading_device)
+                         loading_device=loading_device, fp8_fast=fp8_fast)
     dit.requires_grad_(False)  # frozen base (QLoRA-style)
     if quant_int8:
         from fizgig.krea2.utils import KREA2_FP8_OPTIMIZATION_TARGET_KEYS, KREA2_FP8_OPTIMIZATION_EXCLUDE_KEYS
@@ -1080,6 +1081,7 @@ def train_krea2(
     max_train_epochs: int = 10,
     save_every_n_epochs: int = 0,
     fp8_scaled: bool = True,
+    fast_ft: bool = False,
     quant_4bit: bool = False,
     quant_int8: str = "",
     blocks_to_swap: int = 0,
@@ -1255,10 +1257,30 @@ def train_krea2(
         sample_ae = load_vae(vae_path, input_channels=3, device="cpu", disable_mmap=True)
         sample_dir = os.path.join(output_dir, "sample")
 
+    if fast_ft:
+        # Fast FT only has meaning on the fp8 path (it swaps the block-64 scale layout for a
+        # per-tensor one so _scaled_mm can take it). Say so plainly rather than no-op quietly.
+        from fizgig.modules.fp8 import _train_scaled_mm_supported
+        if not fp8_scaled:
+            logger.warning("[fast-ft] requested, but the base is not fp8 "
+                           f"({'INT8' if quant_int8 else '4-bit' if quant_4bit else 'bf16'}) "
+                           "— Fast FT does nothing here and is ignored.")
+            fast_ft = False
+        elif not _train_scaled_mm_supported():
+            logger.warning("[fast-ft] requested, but this GPU has no fp8 _scaled_mm support "
+                           "(needs SM 8.9+) — falling back to the standard dequant path.")
+            fast_ft = False
+        else:
+            logger.info("[fast-ft] ON — per-tensor fp8 scales + _scaled_mm on the frozen base. "
+                        "Costs ~1.5x the per-Linear forward error of the default path "
+                        "(3.7e-02 vs 2.5e-02) — mostly from quantising activations to fp8, which "
+                        "the fp8 GEMM requires; the scale change alone is 1.10x. "
+                        "Set FIZGIG_FP8_DIAG=1 to see per-Linear SCALED/DEQUANT decisions.")
+
     dit, network = load_dit_for_training(
         raw_path, network_dim=network_dim, network_alpha=network_alpha,
         fp8_scaled=fp8_scaled, quant_4bit=quant_4bit, quant_int8=quant_int8,
-        blocks_to_swap=blocks_to_swap, compile_blocks=_do_compile,
+        blocks_to_swap=blocks_to_swap, compile_blocks=_do_compile, fp8_fast=fast_ft,
         context_lora_path=context_lora_path, context_lora_strength=context_lora_strength,
         device=device, dtype=dtype)
     if blocks_to_swap > 0 and not quant_4bit and not quant_int8:
@@ -1276,7 +1298,8 @@ def train_krea2(
         # to the forward. We're training the base weights themselves.
         network.requires_grad_(False)
         master = _build_bf16_master(raw_path, dit)
-        rotator = BlockRotator(dit.blocks, master, key_prefix="blocks", device=device)
+        rotator = BlockRotator(dit.blocks, master, key_prefix="blocks", device=device,
+                               quantization_mode="tensor" if fast_ft else "block")
         if getattr(dit, "txtfusion", None) is not None:
             rotator.activate_always("txtfusion", dit.txtfusion)
         rot_schedule = RotationSchedule(len(dit.blocks), active=ft_rotation,

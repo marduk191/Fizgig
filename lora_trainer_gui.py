@@ -2722,6 +2722,27 @@ class LoRATrainerGUI:
         )
         self._krea2_ft_fused_cb.grid(row=27, column=0, columnspan=2, sticky=tk.W, padx=(21, 5), pady=(2, 0))
 
+        self.krea2_fast_ft_var = tk.BooleanVar(value=bool(self.settings.get("KREA2_FAST_FT", False)))
+        self._krea2_fast_ft_cb = ttk.Checkbutton(
+            training_content,
+            text="⚡ Fast FT — per-tensor fp8 + _scaled_mm on the frozen base (experimental)",
+            variable=self.krea2_fast_ft_var,
+        )
+        self._krea2_fast_ft_cb.grid(row=28, column=0, columnspan=2, sticky=tk.W, padx=(21, 5), pady=(2, 0))
+        ToolTip(self._krea2_fast_ft_cb,
+                "Runs the frozen base through torch._scaled_mm instead of dequantising every "
+                "weight on every forward. Needs an RTX 40-series or newer (SM 8.9+); silently "
+                "falls back to the normal path per-Linear if anything doesn't fit, and the "
+                "console says so.\n\n"
+                "Costs accuracy: ~1.5x the per-Linear forward error of the default path "
+                "(3.7e-02 vs 2.5e-02, measured on real Krea 2 weights). Most of that is NOT the "
+                "scale change (only 1.10x) — _scaled_mm needs the activations in fp8 too, and the "
+                "default path keeps them in bf16. That is the price of the fp8 GEMM.\n\n"
+                "Off by default so the default path stays exactly as it was. The saved checkpoint "
+                "comes from the bf16 master either way, so this never changes what lands on disk — "
+                "only the frozen forward the trainable window sees.\n\n"
+                "Speed is NOT yet measured. Time a few epochs against it off before trusting it.")
+
         self._krea2_ft_hint = ttk.Label(training_content,
                   text="Trains the base model's own weights, not an adapter — no rank bottleneck, so concepts "
                        "don't compete for the same directions. Only part of the model is trainable at a time and "
@@ -2736,7 +2757,7 @@ class LoRATrainerGUI:
                        "(the usual LoRA folder) — point it somewhere with room, e.g. your ComfyUI models/unet. "
                        "Test the result in ComfyUI as a normal Krea 2 model.",
                   foreground="#E67E22", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
-        self._krea2_ft_hint.grid(row=28, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 6))
+        self._krea2_ft_hint.grid(row=29, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 6))
 
         # === Optimizer Section (Collapsed by default) ===
         optimizer_section = CollapsibleFrame(outer,"Optimizer", default_expanded=False)
@@ -3507,6 +3528,7 @@ class LoRATrainerGUI:
         _grab("krea2_auto_recaption_var", "KREA2_AUTO_RECAPTION")
         _grab("krea2_warmup_look_var", "KREA2_WARMUP_LOOK")
         _grab("krea2_finetune_var", "KREA2_FINETUNE")
+        _grab("krea2_fast_ft_var", "KREA2_FAST_FT")
         _grab("krea2_ft_mode_var", "KREA2_FT_MODE")
         _grab("krea2_ft_blocks_var", "KREA2_FT_BLOCKS")
         _grab("krea2_ft_every_var", "KREA2_FT_EVERY")
@@ -3910,7 +3932,8 @@ class LoRATrainerGUI:
         if not hasattr(self, "_krea2_ft_frame"):
             return
         on = bool(self.krea2_finetune_var.get())
-        for w in (self._krea2_ft_frame, self._krea2_ft_fused_cb, self._krea2_ft_hint):
+        for w in (self._krea2_ft_frame, self._krea2_ft_fused_cb,
+                  self._krea2_fast_ft_cb, self._krea2_ft_hint):
             self._set_widget_visible(w, on)
         block_mode = str(self.krea2_ft_mode_var.get()) == "block"
         if on and block_mode:
@@ -17923,6 +17946,8 @@ class LoRATrainerGUI:
                     "--finetune_rotate_every", str(max(1, every))]
             if bool(self.krea2_ft_fused_var.get()):
                 cmd.append("--finetune_fused_backward")
+            if bool(self.krea2_fast_ft_var.get()):
+                cmd.append("--fast_ft")
         if _watch_ok and self.krea2_auto_recaption_var.get():
             cmd.append("--auto_recaption")
             # Trigger word from the Captions tab — appended (', <trigger>') to AI captions if
