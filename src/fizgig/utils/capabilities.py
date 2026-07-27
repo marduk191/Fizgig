@@ -181,6 +181,69 @@ class MemoryStrategy:
     quant_int8: str = ""     # "" | "bf16" — W8A8 base with exact bf16 gradients
 
 
+# --- Rotating fine-tune window sizing ------------------------------------------------
+# Measured peak reserved VRAM on a 5090, 130 steps (past a rotation boundary — component's
+# peak IS the window switch, ~7 GB above steady state, so a shorter probe understates it
+# badly). Requirements add ~2 GB on top for the CUDA context, which torch's `reserved`
+# figure excludes, plus a little headroom.
+#
+#   component            27.67 GB   every window spans all 28 blocks (quality-preferred)
+#   block 8 + streaming  20.71 GB
+#   block 4 + streaming  18.70 GB
+#   block 2 + streaming  17.62 GB   the floor of this architecture
+#
+# Streaming is deliberately absent from the component row: it cannot help there, because
+# every block holds a trainable slice so there is nothing to stream out.
+FT_ROTATION_TIERS = [
+    # (min_free_gb, mode,        blocks, stream, measured_peak_gb)
+    (29.5, "component", 14, False, 27.67),
+    (22.5, "block",      8, True,  20.71),
+    (20.5, "block",      4, True,  18.70),
+    (19.5, "block",      2, True,  17.62),
+]
+
+
+def recommend_ft_rotation(free_gb: Optional[float] = None):
+    """Pick a rotating fine-tune window config that fits the free VRAM.
+
+    Returns (mode, blocks_per_window, stream, reasons) where `reasons` is a list of lines
+    for the console. Budgets from FREE VRAM rather than card capacity, so another app
+    holding the GPU is accounted for.
+    """
+    if free_gb is None:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                free_b, _ = torch.cuda.mem_get_info(0)
+                free_gb = free_b / (1024 ** 3)
+        except Exception:
+            free_gb = None
+    if free_gb is None:
+        return ("component", 14, False,
+                ["could not read free VRAM — falling back to component mode"])
+
+    for min_free, mode, blocks, stream, peak in FT_ROTATION_TIERS:
+        if free_gb >= min_free:
+            why = [f"{free_gb:.1f} GB free -> "
+                   + (f"component mode" if mode == "component"
+                      else f"block mode, {blocks} blocks per window"
+                           + (" + frozen-block streaming" if stream else ""))
+                   + f"  (measured peak {peak:.1f} GB)"]
+            if mode != "component":
+                why.append("component mode needs ~29.5 GB free and does not fit here. Component "
+                           "trains a slice of EVERY block each window; block mode trains "
+                           "contiguous depth slices, so each window sees only part of the model.")
+                why.append("Block mode is not yet quality-tested — the good results so far are "
+                           "from component runs. Judge your checkpoints.")
+            return (mode, blocks, stream, why)
+
+    lo = FT_ROTATION_TIERS[-1]
+    return (lo[1], lo[2], lo[3],
+            [f"{free_gb:.1f} GB free is below the ~{lo[0]:.1f} GB this needs even at its "
+             f"smallest window — trying {lo[1]} mode with {lo[2]} blocks anyway "
+             f"(measured peak {lo[4]:.1f} GB). Expect an out-of-memory error.",
+             "Rotating fine-tune cannot reach 16 GB cards in any configuration."])
+
 def recommend_krea2_strategy(vram_gb: Optional[float] = None,
                              caps: Optional[Capabilities] = None,
                              mp: float = 0.25, batch: int = 1,

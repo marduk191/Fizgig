@@ -92,9 +92,12 @@ def setup_parser() -> argparse.ArgumentParser:
                         "Output is a full model checkpoint, not a LoRA.")
     p.add_argument("--finetune_rotate_every", type=int, default=1,
                    help="Epochs per rotation window (a full cycle = ceil(28/N) x this)")
-    p.add_argument("--finetune_rotation_mode", default="block", choices=["block", "component"],
-                   help="block = contiguous depth slices; component = attention across ALL "
-                        "blocks then MLP (same VRAM, each window spans full depth)")
+    p.add_argument("--finetune_rotation_mode", default="auto",
+                   choices=["auto", "block", "component"],
+                   help="auto (default) sizes the window to your free VRAM and says what it "
+                        "chose; block = contiguous depth slices; component = attention across "
+                        "ALL blocks then MLP (each window spans the full depth, best quality, "
+                        "needs ~29.5 GB free)")
     p.add_argument("--reg_lr_multiplier", type=float, default=0.2,
                    help="LR multiplier for images in a dataset block marked `is_reg = true`. "
                         "They anchor the model's prior rather than teaching a subject, so they "

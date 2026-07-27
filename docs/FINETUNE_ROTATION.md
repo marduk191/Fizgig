@@ -344,7 +344,11 @@ fine-tune it was meant to replace. Recorded here so it is not re-derived.
    multiplier beside the fine-tune toggles, written as a second `is_reg` dataset block so the
    cache scripts pick it up unchanged. Fine-tune only; a LoRA update is rank-bounded and cannot
    drift the general representation the way this can.
-3. **VRAM sweep — what actually fits a 4090 and a 16 GB card.** *(next up)* Nothing measured fits
+3. ~~**VRAM sweep — what actually fits a 4090 and a 16 GB card.**~~ **Answered — see below.**
+
+<details><summary>original plan</summary>
+
+**VRAM sweep — what actually fits a 4090 and a 16 GB card.** Nothing measured fits
    either: the lowest config on record is 24.2 GB (8 blocks resident) against ~22.4 GB usable on a
    4090 and ~14.5 GB on a 16 GB card. Run each candidate ~30 steps and read
    `torch.cuda.max_memory_allocated()` — no full run, no checkpoints. Candidates: block mode at 4
@@ -361,6 +365,41 @@ fine-tune it was meant to replace. Recorded here so it is not re-derived.
    Structural note that does hold: **16 GB is unreachable without streaming.** The frozen base
    alone is ~11.3 GB of fp8 blocks plus ~0.6 GB of bf16 norms/embeddings/IO before any trainable
    weight or activation exists.
+
+</details>
+
+   **Measured (5090, 130 steps — past a rotation boundary, which matters enormously: component's
+   peak IS the window switch and a 30-step probe reads 20.44 GB instead of 27.67).** Peak reserved,
+   excluding the ~0.5-1 GB CUDA context:
+
+   | config | peak | load | training | 4090 (~22.4) | 16 GB (~14.5) |
+   |---|---|---|---|---|---|
+   | component | **27.67 GB** | 19.54 | 27.67 | no | no |
+   | block 8 + streaming | 20.71 GB | 18.33 | 20.71 | **yes** | no |
+   | block 4 + streaming | 18.70 GB | -- | -- | **yes** | no |
+   | block 2 + streaming | **17.62 GB** | -- | -- | **yes** | no |
+
+   - **24 GB cards: yes, comfortably.** Block mode with streaming has room to spare.
+   - **16 GB: no, in any configuration.** The floor is 17.62 GB with the most aggressive window
+     and streaming already on. That leaves the txtfusion-only mode below as the only route.
+   - **The peak is TRAINING, not load**, in both modes (load is 18-19.5 GB either way). So
+     changing how the model is brought in -- e.g. sourcing frozen blocks from a pre-quantised
+     fp8 file rather than quantising RAW -- cannot help. The lever is the trainable window and
+     activations.
+   - **Streaming cannot help component mode at all.** Every block holds a trainable slice, so
+     there is nothing to stream out; the trainer disables it and says so. Component's floor is
+     fixed at its no-stream figure.
+   - Peaks are monotonic in resident blocks here (17.62 -> 18.70 -> 20.71), unlike the older
+     table. The earlier non-monotonic reading was probably fragmentation noise, since these were
+     taken with `expandable_segments` on.
+
+   **Shipped as an Auto window mode** (`--finetune_rotation_mode auto`, now the default; "Auto (by
+   VRAM)" in the GUI). Resolved in the trainer at launch from FREE VRAM, so headless runs get it
+   and another app holding the card is accounted for. Tiers add ~2 GB over the measured peak for
+   the CUDA context and headroom: >=29.5 component, >=22.5 block-8, >=20.5 block-4, >=19.5
+   block-2, below that a plain warning that it will not fit. The console states the pick, the
+   measured peak, and -- when it drops to block mode -- that block mode is **not yet
+   quality-tested**, since every good result so far came from component runs.
 
 4. **txtfusion-only window mode** (`--finetune_rotation_mode txtfusion`) — freeze all 28 blocks,
    train only the text-fusion stack, to bind a *name* to a concept the model can already render

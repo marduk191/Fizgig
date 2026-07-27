@@ -1209,6 +1209,19 @@ def train_krea2(
 
     ft_rotation = max(0, int(finetune_rotation or 0))
 
+    # Auto window mode: size the rotation window to the free VRAM. Resolved here rather than
+    # in the GUI so headless runs get it too, and so it reads the VRAM actually available at
+    # the moment training starts rather than whenever a dialog was last opened.
+    if ft_rotation and str(finetune_rotation_mode).lower().startswith("auto"):
+        from fizgig.utils.capabilities import recommend_ft_rotation
+        _mode, _blocks, _stream, _why = recommend_ft_rotation()
+        finetune_rotation_mode = _mode
+        ft_rotation = _blocks
+        if _stream and blocks_to_swap <= 0:
+            blocks_to_swap = 12      # any positive value switches on rotation-aware streaming
+        for _line in _why:
+            logger.info("[ft-auto] %s", _line)
+
     # --- Regularisation set (fine-tune only) ---------------------------------------------
     # Images from a dataset block marked `is_reg = true` — a PRIOR ANCHOR, not a subject.
     # Full fine-tuning moves every weight, so 40 epochs on a handful of subjects drifts the
@@ -1814,6 +1827,14 @@ def train_krea2(
                 move_nf4_to_device(dit, device)
             dit.train()
 
+    # VRAM probe: capture what the load phase alone cost, then zero the high-water mark so the
+    # training figure is training's own. Answers "is the peak the model coming in, or the steps?"
+    _probe_load_gb = 0.0
+    if int(os.environ.get("FIZGIG_VRAM_PROBE", "0") or 0) and torch.cuda.is_available():
+        torch.cuda.synchronize()
+        _probe_load_gb = torch.cuda.max_memory_reserved() / 1024**3
+        torch.cuda.reset_peak_memory_stats()
+
     progress_bar = tqdm(total=steps_per_epoch * max_train_epochs, initial=global_step,
                         desc="steps", smoothing=0)
     pending_accum = 0  # micro-batches backward'd since the last optimizer step
@@ -1910,6 +1931,27 @@ def train_krea2(
             # "187, 187, 188, 188" doubling). Training itself is one step per iteration.
             progress_bar.set_postfix(avr_loss=f"{loss_recorder.moving_average:.4f}", refresh=False)
             progress_bar.update(1)
+
+            # VRAM probe (FIZGIG_VRAM_PROBE=N): run N steps, report peak memory, exit. For
+            # answering "does this config fit card X" without a full run or a checkpoint write.
+            # `reserved` is the number to compare against a card's capacity — it is what torch
+            # holds from the driver; `allocated` is only what is live inside that. Neither
+            # includes the ~0.5-1 GB CUDA context, so nvidia-smi always reads a little higher.
+            _probe_n = int(os.environ.get("FIZGIG_VRAM_PROBE", "0") or 0)
+            if _probe_n and global_step >= _probe_n:
+                torch.cuda.synchronize()
+                _alloc = torch.cuda.max_memory_allocated() / 1024**3
+                _resv = torch.cuda.max_memory_reserved() / 1024**3
+                _tot = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                _overall = max(_resv, _probe_load_gb)
+                logger.info("[vram-probe] steps=%d  load=%.2f GB  training=%.2f GB  overall=%.2f GB  "
+                            "(peak is %s)  allocated=%.2f GB  card=%.1f GB  alloc_conf=%s",
+                            global_step, _probe_load_gb, _resv, _overall,
+                            "LOAD" if _probe_load_gb >= _resv else "TRAINING",
+                            _alloc, _tot, os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "(default)"))
+                print(f"VRAM_PROBE_RESULT reserved={_overall:.3f} allocated={_alloc:.3f} "
+                      f"load={_probe_load_gb:.3f} train={_resv:.3f}", flush=True)
+                sys.exit(0)
         # Flush a partial accumulation group at the epoch boundary: the epoch-end work (adaptive
         # LR decisions, rollback snapshot, state save) must see a settled optimizer, and leftover
         # grads must not leak into the next epoch.

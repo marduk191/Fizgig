@@ -2702,12 +2702,16 @@ class LoRATrainerGUI:
         self._krea2_ft_frame.grid(row=26, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(2, 0))
         ttk.Label(self._krea2_ft_frame, text="Window:").pack(side=tk.LEFT, padx=(16, 4))
         self.krea2_ft_mode_var = tk.StringVar(
-            value=str(self.settings.get("KREA2_FT_MODE", "component")))
+            value=str(self.settings.get("KREA2_FT_MODE", "Auto (by VRAM)")))
         _ftm = ttk.Combobox(self._krea2_ft_frame, textvariable=self.krea2_ft_mode_var,
-                            values=["component", "block"], state="readonly", width=11)
+                            values=["Auto (by VRAM)", "component", "block"],
+                            state="readonly", width=15)
         _ftm.pack(side=tk.LEFT)
         _ftm.bind("<<ComboboxSelected>>", lambda e: self._apply_krea2_ft_visibility())
-        ToolTip(_ftm, "component (recommended): attention, then each MLP matrix, across ALL 28 blocks — "
+        ToolTip(_ftm, "Auto (recommended): sizes the window to the VRAM free at launch and prints "
+                      "what it picked and why. Component needs ~29.5 GB free; below that it drops to "
+                      "block mode with frozen-block streaming, which fits a 24 GB card.  |  "
+                      "component: attention, then each MLP matrix, across ALL 28 blocks — "
                       "every window trains the model's full depth, so a concept is learned by every "
                       "layer at once. 4 windows per cycle.  |  "
                       "block: contiguous slices of blocks. Fewer windows, but each trains only part "
@@ -4044,7 +4048,7 @@ class LoRATrainerGUI:
         for w in (self._krea2_ft_frame, self._krea2_ft_fused_cb, self._krea2_fast_ft_cb,
                   self._krea2_reg_frame, self._krea2_ft_hint):
             self._set_widget_visible(w, on)
-        block_mode = str(self.krea2_ft_mode_var.get()) == "block"
+        block_mode = str(self.krea2_ft_mode_var.get()) == "block"   # Auto picks its own
         if on and block_mode:
             self._krea2_ft_blocks_lbl.pack(side=tk.LEFT, padx=(14, 4))
             self._krea2_ft_blocks_cb.pack(side=tk.LEFT)
@@ -18066,7 +18070,9 @@ class LoRATrainerGUI:
         # refreshed when a preset is collected, so reading it made this silently never fire and
         # the run trained a LoRA instead.
         if bool(self.krea2_finetune_var.get()):
-            mode = str(self.krea2_ft_mode_var.get() or "component")
+            mode = str(self.krea2_ft_mode_var.get() or "auto")
+            if mode.lower().startswith("auto"):
+                mode = "auto"   # the trainer resolves it from free VRAM at launch
             try:
                 nblocks = int(str(self.krea2_ft_blocks_var.get()))
             except ValueError:
