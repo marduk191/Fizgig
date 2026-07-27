@@ -11,6 +11,20 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
+# Must be set BEFORE torch initialises its CUDA allocator, so it lives above the trainer import.
+#
+# Rotating fine-tune churns the allocator hard: every window switch frees the outgoing window's
+# bf16 weights (~7 GB) and allocates the incoming fp8 ones (~3.5 GB), rebuilds a per-parameter
+# optimizer over ~65 large tensors, and does it again next epoch. Different sizes, repeatedly,
+# while sitting at ~96% VRAM. The default allocator carves blocks from fixed-size segments, so
+# that pattern fragments the pool and it degrades as the run goes on — empty_cache() hands
+# blocks back but cannot re-lay them out. expandable_segments lets a segment grow and shrink
+# instead, which is the case this option exists for.
+#
+# Respects an existing value, and FIZGIG_NO_EXPANDABLE=1 opts out for A/B testing.
+if not os.environ.get("PYTORCH_CUDA_ALLOC_CONF") and os.environ.get("FIZGIG_NO_EXPANDABLE") != "1":
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 from fizgig.krea2.trainer import train_krea2
 from fizgig.training.optimizers import available_optimizers
 
