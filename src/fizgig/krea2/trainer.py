@@ -321,7 +321,8 @@ def sample_krea2_timesteps(bsize: int, num_img_tokens: int, device, sigmoid_scal
     return (t * shift) / (1.0 + (shift - 1.0) * t)
 
 
-def compute_loss(dit, latent, hidden_states, attention_mask, *, shift=2.5, dtype=torch.bfloat16):
+def compute_loss(dit, latent, hidden_states, attention_mask, *, shift=2.5, dtype=torch.bfloat16,
+                 device=None):
     """Flow-matching training loss for Krea 2.
 
     latent:        (B, 16, h, w)         — cached Qwen-Image VAE latent
@@ -331,7 +332,11 @@ def compute_loss(dit, latent, hidden_states, attention_mask, *, shift=2.5, dtype
     `shift` is kept for signature compatibility but no longer used: krea2_shift derives the flow
     shift from the image resolution (see sample_krea2_timesteps), matching the musubi reference.
     """
-    device = next(p for p in dit.parameters()).device
+    # The caller knows the compute device; only fall back to sniffing a parameter when it
+    # doesn't say. Sniffing is fragile — under block swap some parameters are SUPPOSED to be on
+    # CPU, so a stray placement silently drags the whole batch onto the wrong device instead of
+    # failing loudly (which is exactly how the NF4 recaption bug presented).
+    device = device if device is not None else next(p for p in dit.parameters()).device
     B = latent.shape[0]
     latent = latent.to(device=device, dtype=dtype)
     patch = dit.config.patch
@@ -996,14 +1001,18 @@ def _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_sw
         # placement two lines above it — OOM on small cards at the next step.)
         gc.collect()
         torch.cuda.empty_cache()
-        if getattr(dit, "_nf4_quantized", False):
-            from fizgig.modules.nf4 import move_nf4_to_device
-            move_nf4_to_device(dit, device)
-        elif blocks_to_swap > 0:
+        # Placement first, THEN the NF4 packed weights — the two are complementary, not
+        # alternatives: nn.Module.to() moves the ordinary params/buffers, move_nf4_to_device
+        # moves `_nf4_packed`/`_nf4_state`, which are plain attributes .to() cannot see.
+        # Making the NF4 case an `elif` stranded every ordinary parameter on CPU.
+        if blocks_to_swap > 0:
             dit.move_to_device_except_swap_blocks(torch.device(device))
             dit.switch_block_swap_for_training()
         else:
             dit.to(device)
+        if getattr(dit, "_nf4_quantized", False):
+            from fizgig.modules.nf4 import move_nf4_to_device
+            move_nf4_to_device(dit, device)
         dit.train()
     return ok
 
@@ -1773,14 +1782,18 @@ def train_krea2(
         finally:
             gc.collect()
             torch.cuda.empty_cache()
-            if getattr(dit, "_nf4_quantized", False):
-                from fizgig.modules.nf4 import move_nf4_to_device
-                move_nf4_to_device(dit, device)
-            elif blocks_to_swap > 0:
+            # Placement first, THEN the NF4 packed weights — the two are complementary, not
+            # alternatives: nn.Module.to() moves the ordinary params/buffers, move_nf4_to_device
+            # moves `_nf4_packed`/`_nf4_state`, which are plain attributes .to() cannot see.
+            # Making the NF4 case an `elif` stranded every ordinary parameter on CPU.
+            if blocks_to_swap > 0:
                 dit.move_to_device_except_swap_blocks(torch.device(device))
                 dit.switch_block_swap_for_training()
             else:
                 dit.to(device)
+            if getattr(dit, "_nf4_quantized", False):
+                from fizgig.modules.nf4 import move_nf4_to_device
+                move_nf4_to_device(dit, device)
             dit.train()
 
     progress_bar = tqdm(total=steps_per_epoch * max_train_epochs, initial=global_step,
@@ -1836,6 +1849,7 @@ def train_krea2(
                 progress_bar.update(1)
                 continue
             loss, t_used = compute_loss(dit, batch["latents"], batch["hidden_states"], batch["attention_mask"],
+                                        device=device,
                                         shift=shift, dtype=dtype)
             # Per-image LR: scale THIS step's gradient by the image's multiplier (throttle stuck
             # images, boost healthy learned ones). Raw loss is still what gets recorded/averaged below,
