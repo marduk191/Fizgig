@@ -1822,8 +1822,15 @@ def train_krea2(
     # boundary re-plans every shape in epoch 2). Users watching a crawling bar assume a
     # hang, so repeat a gentle note every ~30 s while it lasts.
     _warmup_note_last = 0.0
+    # Per-epoch step rate. The progress bar runs with smoothing=0, so its it/s (and the ETA
+    # derived from it) are a CUMULATIVE average over the whole run — every second not spent
+    # iterating (checkpoint saves, the Qwen3-VL load at a recaption boundary, rotation window
+    # switches) is amortised in permanently and can only push it up. That makes "is it actually
+    # slowing down?" unanswerable from the bar. This measures each epoch on its own clock.
+    _epoch_rate_prev = None
     for epoch in range(start_epoch, max_train_epochs):
         shared_epoch.value = epoch + 1
+        _epoch_t0, _epoch_step0 = time.time(), global_step
         if _sampler is not None:
             _sampler.set_epoch(epoch)      # reshuffle within/across buckets each epoch
         if rotator is not None:
@@ -1914,7 +1921,19 @@ def train_krea2(
                 scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             pending_accum = 0
+        _ep_steps = global_step - _epoch_step0
+        _ep_secs = time.time() - _epoch_t0
+        _rate = f"  {_ep_secs / _ep_steps:.2f}s/it" if _ep_steps > 0 else ""
+        if _ep_steps > 0 and _epoch_rate_prev:
+            # Only flag a real change; epoch-to-epoch jitter of a few percent is normal, and in
+            # component rotation each window trains a different share of the model.
+            _drift = (_ep_secs / _ep_steps) / _epoch_rate_prev
+            if _drift >= 1.15 or _drift <= 0.87:
+                _rate += f" ({_drift:.2f}x vs last epoch)"
+        if _ep_steps > 0:
+            _epoch_rate_prev = _ep_secs / _ep_steps
         logger.info(f"epoch {epoch + 1}/{max_train_epochs}  avr_loss={loss_recorder.moving_average:.4f}  step={global_step}"
+                    + _rate
                     + (f"  lr={optimizer.param_groups[0]['lr']:.3e}" if (scheduler is not None and optimizer is not None) else ""))
 
         # Attention backend: cuDNN's kernel is ~6% faster per step but costs ~1.3 s per distinct
