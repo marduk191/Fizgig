@@ -2741,7 +2741,10 @@ class LoRATrainerGUI:
                 "Off by default so the default path stays exactly as it was. The saved checkpoint "
                 "comes from the bf16 master either way, so this never changes what lands on disk — "
                 "only the frozen forward the trainable window sees.\n\n"
-                "Speed is NOT yet measured. Time a few epochs against it off before trusting it.")
+                "Measured 1.14x on a 5090 (0.849 -> 0.742 s/it, component mode, epoch 4) — about "
+                "12% off the wall clock. Loss runs ~1.4% higher at the same step, as a lossier "
+                "frozen base predicts. Whether that costs output quality is NOT established — "
+                "compare checkpoints before trusting it on a real run.")
 
         self._krea2_ft_hint = ttk.Label(training_content,
                   text="Trains the base model's own weights, not an adapter — no rank bottleneck, so concepts "
