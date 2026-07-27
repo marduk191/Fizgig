@@ -12,6 +12,15 @@ import os
 # Ensure fizgig package is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
+# CUDA allocator policy, set before torch is imported below — the backend is fixed at CUDA init.
+# Training churns the allocator: large tensors allocated and freed every step, and on a rotating
+# fine-tune whole windows swap between bf16 and fp8 each epoch. The default allocator carves from
+# fixed-size segments, which fragments under that pattern and worsens as a run goes on.
+# The GUI already sets this and the training subprocess inherits it; this covers headless runs.
+# Respects an existing value, and FIZGIG_NO_EXPANDABLE=1 opts out for A/B testing.
+if not os.environ.get("PYTORCH_CUDA_ALLOC_CONF") and os.environ.get("FIZGIG_NO_EXPANDABLE") != "1":
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 from fizgig.training.trainer import KleinTrainer, setup_parser
 
 

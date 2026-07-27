@@ -15,6 +15,20 @@ import socket
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from PIL import Image, ImageTk
 
+# CUDA allocator policy, set before ANYTHING imports torch — the backend is fixed at CUDA init,
+# so this has to happen at startup rather than when a tool loads its model.
+#
+# The workbench tools (Repair Studio, LoRA the Explorer, LoRA Royale) run IN this process and
+# repeatedly allocate and free large, differently-sized blocks: a model load, then a preview per
+# slider change or per variant, then a swap to another LoRA. The default allocator carves those
+# from fixed-size segments, which fragments under exactly that pattern and bites hardest on cards
+# with little headroom. expandable_segments lets a segment grow and shrink instead.
+#
+# Note this is inherited by the training subprocess too, which is intended — the same churn
+# happens there. Respects an existing value, and FIZGIG_NO_EXPANDABLE=1 opts out for A/B testing.
+if not os.environ.get("PYTORCH_CUDA_ALLOC_CONF") and os.environ.get("FIZGIG_NO_EXPANDABLE") != "1":
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 # Face detection imports (optional - graceful fallback if not installed)
 try:
     from face_utils import (FaceDetector, FaceEmbedder, crop_to_face, draw_face_boxes,

@@ -64,3 +64,8 @@ repair_studio_last_preview.log
 
 # Checkpoint-to-LoRA utility state (per-machine)
 .diff_to_lora.json
+
+# Internal performance notes (not for publication)
+docs/PERF_ROADMAP.md
+docs/PERF_CHANGES.md
+docs/bench_krea2_baseline.json
