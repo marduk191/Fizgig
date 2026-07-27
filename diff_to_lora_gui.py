@@ -52,11 +52,13 @@ class DiffToLoRAApp:
         self._load_config()
         self._build_styles()
         self._build_ui()
+        self._watch_fields()
         self.master.after(100, self._drain)
 
     # ---------- persistence ----------
     def _load_config(self):
-        self.cfg = {"base": "", "tuned": "", "out": "", "name": "extracted"}
+        self.cfg = {"base": "", "tuned": "", "out": "", "name": "extracted",
+                    "ranks": sorted(DEFAULT_ON)}
         try:
             import json
             with open(CONFIG, encoding="utf-8") as f:
@@ -64,14 +66,31 @@ class DiffToLoRAApp:
         except Exception:
             pass
 
-    def _save_config(self):
+    def _save_config(self, *_args):
+        """Persist the four paths. Wired to a trace on every field, so a value survives
+        even if you set it and close the window without running anything."""
         try:
             import json
-            with open(CONFIG, "w", encoding="utf-8") as f:
+            tmp = CONFIG + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({"base": self.base_var.get(), "tuned": self.tuned_var.get(),
-                           "out": self.out_var.get(), "name": self.name_var.get()}, f, indent=2)
+                           "out": self.out_var.get(), "name": self.name_var.get(),
+                           "ranks": [r for r, v in self.rank_vars.items() if v.get()]},
+                          f, indent=2)
+            os.replace(tmp, CONFIG)
         except Exception:
             pass
+
+    def _watch_fields(self):
+        for var in (self.base_var, self.tuned_var, self.out_var, self.name_var,
+                    *self.rank_vars.values()):
+            var.trace_add("write", self._save_config)
+        self.master.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self):
+        self._save_config()
+        self._stop = True
+        self.master.destroy()
 
     # ---------- chrome ----------
     def _build_styles(self):
@@ -155,8 +174,9 @@ class DiffToLoRAApp:
         rr = tk.Frame(c, bg=COLORS["bg_surface"])
         rr.pack(anchor="w")
         self.rank_vars = {}
+        remembered = set(self.cfg.get("ranks") or DEFAULT_ON)
         for r in RANKS:
-            v = tk.BooleanVar(value=(r in DEFAULT_ON))
+            v = tk.BooleanVar(value=(r in remembered))
             self.rank_vars[r] = v
             ttk.Checkbutton(rr, text=str(r), variable=v).pack(side=tk.LEFT, padx=(0, 18))
 
