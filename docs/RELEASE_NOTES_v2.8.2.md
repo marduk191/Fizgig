@@ -1,6 +1,7 @@
 # Fizgig v2.8.2 — Long runs stay fast
 
-One fix, and it's a good one: **training no longer slows down as a run goes on**.
+One fix, and it's a good one: **training no longer slows down as a run goes on** — on Linux.
+See the platform note below: the fix is a no-op on Windows.
 
 ## 🐌 → 🚀 The slowdown that had no obvious cause
 
@@ -19,7 +20,15 @@ Fizgig now enables PyTorch's **expandable memory segments**, which let a memory 
 shrink instead of being carved into fixed blocks. **Confirmed on a real run to remove the
 slowdown entirely.**
 
-Applied everywhere it matters, so it doesn't depend on how you launch:
+> ⚠️ **Linux only — this does not apply on Windows.** PyTorch's CUDA allocator rejects
+> expandable segments on Windows outright and silently falls back to the default allocator,
+> logging `expandable_segments not supported on this platform`. Verified against torch
+> 2.10.0+cu128. Fizgig no longer sets the option there, so the warning is gone from the logs —
+> but so is the fix. **If you are on Windows and seeing this slowdown, it is still present and
+> still unsolved.** The original "confirmed on a real run" measurement was made on a platform
+> where the option takes effect; it was never true of Windows.
+
+Applied everywhere it matters on supported platforms, so it doesn't depend on how you launch:
 
 - **Training from the GUI** — Klein and Krea 2 alike.
 - **Headless / CLI training** — previously missed out; now covered.
