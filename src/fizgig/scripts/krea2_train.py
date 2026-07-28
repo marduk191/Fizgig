@@ -18,15 +18,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 # The GUI already sets this and the training subprocess inherits it; this covers headless runs.
 # Respects an existing value, and FIZGIG_NO_EXPANDABLE=1 opts out for A/B testing.
 #
-# Not on Windows: the CUDA allocator there rejects the option outright ("expandable_segments not
-# supported on this platform") and falls back to the default allocator, so setting it bought
-# nothing and printed a warning on every process launch.
-if (
-    sys.platform != "win32"
-    and not os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
-    and os.environ.get("FIZGIG_NO_EXPANDABLE") != "1"
-):
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# Windows can't use expandable_segments — the allocator rejects it outright and silently falls
+# back to the default allocator, so the fix never applied there. It gets CUDA's stream-ordered
+# allocator (cudaMallocAsync) instead, which solves the same problem a different way: the driver
+# manages one growable pool rather than PyTorch carving fixed segments, so a freed block of the
+# wrong shape doesn't strand memory. Measured on a fragmentation repro at ~5% headroom:
+# num_alloc_retries 9 -> 0, worst-case step 84ms -> 3.8ms. See lora_trainer_gui.py for the full
+# note and the rejected alternatives.
+if not os.environ.get("PYTORCH_CUDA_ALLOC_CONF") and os.environ.get("FIZGIG_NO_EXPANDABLE") != "1":
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+        "backend:cudaMallocAsync" if sys.platform == "win32" else "expandable_segments:True"
+    )
 
 from fizgig.krea2.trainer import train_krea2
 from fizgig.training.optimizers import available_optimizers

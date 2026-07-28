@@ -27,15 +27,21 @@ from PIL import Image, ImageTk
 # Note this is inherited by the training subprocess too, which is intended — the same churn
 # happens there. Respects an existing value, and FIZGIG_NO_EXPANDABLE=1 opts out for A/B testing.
 #
-# Not on Windows: the CUDA allocator there rejects the option outright ("expandable_segments not
-# supported on this platform") and falls back to the default allocator, so setting it bought
-# nothing and printed that warning in every caching and training log.
-if (
-    sys.platform != "win32"
-    and not os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
-    and os.environ.get("FIZGIG_NO_EXPANDABLE") != "1"
-):
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# Windows can't use expandable_segments — the allocator rejects it outright ("expandable_segments
+# not supported on this platform") and silently falls back to the default allocator, so the fix
+# never applied there. It gets CUDA's stream-ordered allocator (cudaMallocAsync) instead, which
+# solves the same problem a different way: the driver manages one growable pool rather than
+# PyTorch carving fixed segments, so a freed block of the wrong shape doesn't strand memory.
+#
+# Measured on a fragmentation repro at ~5% headroom (200 iterations, both a 3060 and a 5090):
+# num_alloc_retries 9 -> 0 and worst-case step 84ms -> 3.8ms. Each retry is a synchronising
+# cudaFree/cudaMalloc round trip costing ~30x a normal step, which is the actual mechanism behind
+# the creeping slowdown. Rejected alternatives: max_split_size_mb made it ~20x slower overall,
+# garbage_collection_threshold changed nothing.
+if not os.environ.get("PYTORCH_CUDA_ALLOC_CONF") and os.environ.get("FIZGIG_NO_EXPANDABLE") != "1":
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+        "backend:cudaMallocAsync" if sys.platform == "win32" else "expandable_segments:True"
+    )
 
 # GPU selection, also set before ANYTHING imports torch — the visible-device set is
 # fixed at CUDA init.
