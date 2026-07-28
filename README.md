@@ -125,19 +125,42 @@ and quantisation can't erase the small updates being learned; **optimizer-in-bac
 and frees each gradient the moment it lands (worth 5.2 GB); and **Adafactor**'s factored state is
 ~10× smaller than AdamW's.
 
-Measured on an RTX 5090 (32 GB), 36 images at 0.25 MP:
+**It sizes itself to your card.** Leave **Window** on **Auto (by VRAM)** and Fizgig measures the
+memory actually free at launch, picks the largest window that fits, and prints what it chose and
+why. Measured peaks (RTX 5090, past a rotation boundary — which is where the peak actually is):
 
-| Window mode | Peak VRAM | s/it | Windows per cycle |
+| Window mode | Peak VRAM | Speed | Fits |
 |---|---|---|---|
-| **component** (default) | 30.1 GB | 1.03 | 4 |
-| block, 14 resident | 27.5 GB | 1.16 | 2 |
-| block, 8 resident | 24.2 GB | 1.01 | 4 |
-| block, 4 resident | 24.8 GB | 0.93 | 7 |
+| **component** — every window spans all 28 blocks | 27.7 GB | ~1.0 s/it | 32 GB |
+| block, 8 per window + streaming | 20.7 GB | ~2–3× slower | **24 GB** |
+| block, 4 per window + streaming | 18.7 GB | ~2–3× slower | **24 GB** |
+| block, 2 per window + streaming | 17.6 GB | ~2–3× slower | **24 GB** |
 
-**Component mode is the default** because every window spans the model's full depth — attention
-across all 28 blocks, then each MLP matrix in turn — so a concept is learned by every layer at
-once rather than one depth slice at a time. The text-fusion stack stays trainable throughout:
-rotation would never reach it, and it's where prompt-to-concept binding happens.
+**Component is the best mode, and it needs a 32 GB card.** Every window spans the model's full
+depth — attention across all 28 blocks, then each MLP matrix in turn — so a concept is learned by
+every layer at once rather than one depth slice at a time. The text-fusion stack stays trainable
+throughout: rotation would never reach it, and it's where prompt-to-concept binding happens.
+
+**On a 24 GB card it drops to block mode**, which trains contiguous depth slices instead and
+streams the frozen blocks from system RAM. That fits comfortably, but be clear about the two
+costs: steps run roughly **2–3× slower** because of the PCIe transfers, and block mode is **not
+yet quality-tested** — every good result so far came from component runs. The console says so when
+it picks it.
+
+**16 GB cards can't run it** in any configuration. The floor is 17.6 GB with the smallest window
+and streaming already on, and the model alone occupies ~18 GB before training starts.
+
+### Optional: regularisation images
+
+Full fine-tuning moves every weight, so a long run on a handful of subjects drifts the model's
+whole notion of people — there's no low-rank bound to limit it the way there is with a LoRA. Point
+**Regularisation images** at a folder of ordinary photos of the broader class and they train at a
+reduced learning rate (**LR ×**, default 0.2) as an anchor rather than a lesson.
+
+Use **real photos, not model output** — anchoring a fine-tune to its own samples distils its
+artifacts back in, and there's nothing bounding that drift. Caption them normally: anything you
+leave unsaid gets attributed to the class word itself. Leave the folder empty to train without
+one.
 
 ### Then turn it back into a LoRA
 
@@ -161,8 +184,8 @@ extraction is nearly free. (Details and the experiments behind it: **[docs/FINET
 
 Being straight about the trade-offs, because they're real:
 
-- **A 32 GB card** for component mode. Block mode with 4–8 blocks resident fits ~24 GB, and
-  `--blocks_to_swap` streams for smaller cards at a real speed cost.
+- **A 32 GB card** for the good mode. 24 GB works but drops to block mode with streaming — ~2–3×
+  slower per step, and a learning shape that hasn't been quality-tested yet. 16 GB can't run it.
 - **~24 GB of system RAM** for the bf16 master copy, on top of VRAM.
 - **Disk.** Every save is a full ~26 GB checkpoint. Saving once per 4-epoch cycle is ~260 GB over a
   40-epoch run. Point the Output Directory somewhere with room.
@@ -226,8 +249,8 @@ Loads kohya, PEFT, OneTrainer (OMI + legacy), AI-Toolkit, and LyCORIS (LoKR / Lo
 - **Python** — 3.10, 3.11, 3.12, or 3.13.
 - **Disk** — ~10 GB for the venv, plus ~40 GB for model files.
 - **Full fine-tuning** (experimental, Krea 2 only) asks for more than the above: a **32 GB card**
-  for the default component mode (~24 GB with block mode), **~24 GB of free system RAM** for the
-  bf16 master copy, and disk room for **~26 GB per saved checkpoint**.
+  for the best mode — 24 GB works at ~2–3× slower steps, 16 GB not at all — plus **~24 GB of free
+  system RAM** for the bf16 master copy, and disk room for **~26 GB per saved checkpoint**.
 - **Visual Studio Build Tools** (Windows only) — needed to compile InsightFace, and for the **torch.compile training speedup**. Direct installer (no hunting on the MS site): **[aka.ms/vs/17/release/vs_BuildTools.exe](https://aka.ms/vs/17/release/vs_BuildTools.exe)** — tick the **"Desktop development with C++"** workload. The installer and `update_fizgig.bat` detect it and print this link if it's missing; without it everything still works, you just skip the compile speedup. (triton, compile's other dependency, installs automatically with the requirements.)
 
 ---
