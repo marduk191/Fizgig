@@ -37,6 +37,199 @@ if (
 ):
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+# GPU selection, also set before ANYTHING imports torch — the visible-device set is
+# fixed at CUDA init.
+#
+# On a multi-GPU box the user picks a card on the Preferences tab. Rather than thread a
+# device index through every model load, offload hook and helper script, we mask the
+# process down to that one card: with CUDA_VISIBLE_DEVICES set, the hardcoded "cuda" /
+# index-0 lookups all over src/fizgig resolve to the chosen GPU, and the training
+# subprocess inherits it (run_subprocess copies os.environ). torch is only ever imported
+# lazily inside functions in this file, so doing it here is early enough.
+#
+# Side effect, and a wanted one: masking to a single visible card keeps trainer.py's
+# `torch.cuda.device_count() > 1` DDP branch from firing on a multi-GPU host.
+#
+# "Auto" leaves the environment untouched, so single-GPU users and anyone who never
+# opens this setting get byte-identical behaviour to before it existed.
+SELECTED_GPU_INDEX = 0
+
+
+def _parse_gpu_index(value):
+    """Leading integer of a gpu_index pref value ("1", "1: RTX 4090 (24.0 GB)", "2,3").
+
+    Returns None for blank values and for the "Auto ..." label — i.e. "don't pin".
+    Anything else is scanned for its first integer, so a hand-edited prefs.json (there's
+    an "Open prefs.json" button) saying "cuda:1" or "GPU 1" still pins correctly.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower().startswith("auto"):
+        return None
+    match = re.search(r'\d+', text)
+    return int(match.group()) if match else None
+
+
+def _pin_device_order():
+    """Make CUDA number devices the way NVML and nvidia-smi do (PCI bus order).
+
+    CUDA's default is "fastest first", so on a box with mixed cards CUDA index 0 and
+    nvidia-smi index 0 can be different GPUs. Every index in play here — the picker's
+    labels, SELECTED_GPU_INDEX, the status bar's NVML reads, CUDA_VISIBLE_DEVICES — then
+    means one thing: the number nvidia-smi prints.
+
+    Only called when a device is actually being pinned, so the Auto path keeps whatever
+    ordering torch would have picked on its own. setdefault, so a user who set
+    CUDA_DEVICE_ORDER themselves keeps it.
+    """
+    os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+
+
+def _nvml_gpu_count():
+    """Physical GPU count via NVML, or None if NVML can't answer.
+
+    NVML only — no nvidia-smi fallback — because this runs on the import path and
+    shelling out would add up to seconds to every launch. None means "can't tell", which
+    callers treat as "don't second-guess the user".
+    """
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        return int(pynvml.nvmlDeviceGetCount())
+    except Exception:
+        return None
+
+
+def _boot_pin_cuda_device():
+    """Mask the process to the GPU saved in prefs.json.
+
+    Reads prefs.json directly rather than via load_prefs() because that lives far below
+    this point in the file and this has to run at import time. An explicit
+    CUDA_VISIBLE_DEVICES already in the environment wins — launching with a mask is a
+    deliberate override of the pref.
+    """
+    global SELECTED_GPU_INDEX
+    existing = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if existing and existing.strip():
+        first = _parse_gpu_index(existing.split(",")[0])
+        if first is not None:
+            _pin_device_order()
+            SELECTED_GPU_INDEX = first
+        return
+    try:
+        prefs_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prefs.json")
+        with open(prefs_path, 'r', encoding='utf-8') as f:
+            index = _parse_gpu_index(json.load(f).get("gpu_index"))
+    except Exception:
+        return
+    if index is None:
+        return  # Auto — every card stays visible and torch uses its own index 0.
+    count = _nvml_gpu_count()
+    if count is not None and index >= count:
+        # Saved index no longer exists (card pulled, slots reordered). Pinning it anyway
+        # would mask the process down to nothing and every tool would die on "No CUDA GPUs
+        # are available" for the whole session. Fall through to Auto instead; the
+        # Preferences picker snaps the stale value back to Auto when the tab is built.
+        return
+    _pin_device_order()
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(index)
+    SELECTED_GPU_INDEX = index
+
+
+_boot_pin_cuda_device()
+
+
+def _enumerate_gpus():
+    """Physical NVIDIA GPUs as a list of (index, name, total_gb).
+
+    NVML first, nvidia-smi as fallback. Deliberately not torch: by the time this runs
+    CUDA_VISIBLE_DEVICES may already hide the other cards from torch, and the picker has
+    to offer all of them. Indices are NVML/PCI-bus indices, which is what
+    _boot_pin_cuda_device pins against. Returns [] when there's no NVIDIA GPU.
+    """
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        gpus = []
+        for i in range(pynvml.nvmlDeviceGetCount()):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            name = pynvml.nvmlDeviceGetName(handle)
+            if isinstance(name, bytes):
+                name = name.decode("utf-8", "replace")
+            total_gb = pynvml.nvmlDeviceGetMemoryInfo(handle).total / (1024 ** 3)
+            gpus.append((i, name, total_gb))
+        if gpus:
+            return gpus
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,name,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=6,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        gpus = []
+        for line in out.stdout.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 3:
+                gpus.append((int(parts[0]), parts[1], int(parts[2]) / 1024))
+        return gpus
+    except Exception:
+        return []
+
+
+_ACTIVE_GPU_RESOLVED = False
+
+
+def _active_gpu_index():
+    """Physical (NVML / nvidia-smi) index of the GPU torch is actually running on.
+
+    With a card pinned this is just SELECTED_GPU_INDEX. On the Auto path it isn't knowable
+    up front: CUDA's default "fastest first" ordering means torch's cuda:0 can be a
+    different card than NVML's index 0 — on a 3060 + 5090 box torch takes the 5090 while
+    NVML index 0 is the 3060, so the status bar was reporting the idle card's VRAM.
+
+    Resolved by matching torch's device UUID against NVML's, but only once torch has
+    initialised CUDA of its own accord — this runs on the status bar's 1 Hz poll, so it
+    must never import torch or force a CUDA init itself. Returns 0 until then, and caches
+    the answer once found (the visible device set can't change mid-process).
+    """
+    global SELECTED_GPU_INDEX, _ACTIVE_GPU_RESOLVED
+    if _ACTIVE_GPU_RESOLVED or os.environ.get("CUDA_VISIBLE_DEVICES"):
+        return SELECTED_GPU_INDEX
+    try:
+        torch = sys.modules.get("torch")
+        if torch is None or not torch.cuda.is_initialized():
+            return SELECTED_GPU_INDEX
+        target = str(torch.cuda.get_device_properties(0).uuid).strip().lower()
+        if not target:
+            return SELECTED_GPU_INDEX
+        import pynvml
+        pynvml.nvmlInit()
+        for i in range(pynvml.nvmlDeviceGetCount()):
+            uuid = pynvml.nvmlDeviceGetUUID(pynvml.nvmlDeviceGetHandleByIndex(i))
+            if isinstance(uuid, bytes):
+                uuid = uuid.decode("utf-8", "replace")
+            # NVML reports "GPU-<uuid>"; torch's CUuuid stringifies to the bare uuid.
+            if target in uuid.lower():
+                SELECTED_GPU_INDEX = i
+                _ACTIVE_GPU_RESOLVED = True
+                break
+    except Exception:
+        pass
+    return SELECTED_GPU_INDEX
+
+
+def _gpu_option_label(index, name, total_gb):
+    """Combobox label for one GPU. The leading integer is what _parse_gpu_index reads
+    back out, so it must stay first."""
+    return f"{index}: {name} ({total_gb:.1f} GB)"
+
+
+GPU_AUTO_LABEL = "Auto (first GPU)"
+
 # Face detection imports (optional - graceful fallback if not installed)
 try:
     from face_utils import (FaceDetector, FaceEmbedder, crop_to_face, draw_face_boxes,
@@ -573,6 +766,13 @@ DEFAULT_PREFS = {
     # Absolute paths (may live anywhere); empty = no default (last folder).
     "input_lora_dir": "",
     "input_ref_dir": "",
+    # GPU selection for multi-GPU hosts. Stored as the picker's whole label; only the
+    # leading integer is meaningful (see _parse_gpu_index) so the label can be re-derived
+    # from whatever hardware is present at the next launch. "Auto (first GPU)" means
+    # "don't pin" — the process sees every card and torch uses its own index 0.
+    # Applied at import time by _boot_pin_cuda_device(); changing it needs a relaunch
+    # because the visible-device set is fixed once torch initialises CUDA.
+    "gpu_index": GPU_AUTO_LABEL,
     # Inference DiT block swap — int 0-16 for Klein 9B. With the Distilled fp8
     # model (workbench default) 0 = no swap fits ~16GB; loading Base is heavier
     # (0 ≈ 24GB). 16 = max swap for the smallest cards. Applies to Repair Studio,
@@ -1505,13 +1705,21 @@ class LoRATrainerGUI:
             pass
 
     def _read_vram(self):
-        """Return (used_bytes, total_bytes) for GPU 0, or None. Prefers pynvml
-        (fast); falls back to a one-shot nvidia-smi query."""
+        """Return (used_bytes, total_bytes) for the selected GPU, or None. Prefers pynvml
+        (fast); falls back to a one-shot nvidia-smi query.
+
+        Both APIs enumerate physical cards and ignore CUDA_VISIBLE_DEVICES, so they're
+        queried by the active GPU's physical index rather than a hardcoded 0 — otherwise
+        the bar reports whichever card happens to sit in the first PCI slot instead of the
+        one Fizgig is using. The index can firm up mid-session on the Auto path (see
+        _active_gpu_index), so the cached NVML handle is rebuilt when it changes."""
+        physical = _active_gpu_index()
         try:
             import pynvml
-            if not getattr(self, "_nvml_init", False):
+            if not getattr(self, "_nvml_init", False) or getattr(self, "_nvml_index", None) != physical:
                 pynvml.nvmlInit()
-                self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(physical)
+                self._nvml_index = physical
                 self._nvml_init = True
             m = pynvml.nvmlDeviceGetMemoryInfo(self._nvml_handle)
             return int(m.used), int(m.total)
@@ -1520,7 +1728,8 @@ class LoRATrainerGUI:
         try:
             import subprocess
             out = subprocess.run(
-                ["nvidia-smi", "--query-gpu=memory.used,memory.total",
+                ["nvidia-smi", "-i", str(physical),
+                 "--query-gpu=memory.used,memory.total",
                  "--format=csv,noheader,nounits"],
                 capture_output=True, text=True, timeout=4,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -11244,6 +11453,63 @@ class LoRATrainerGUI:
             download_url="https://huggingface.co/Comfy-Org/Krea-2/blob/main/text_encoders/qwen3vl_4b_bf16.safetensors",
             download_note="~8GB bf16 — Comfy-Org/Krea-2 → text_encoders/qwen3vl_4b_bf16.safetensors",
         )
+
+        # Card 1c: GPU selection — only interesting on multi-GPU hosts, but harmless
+        # (and informative) on single-GPU ones.
+        gpu_card = self._start_section_card(
+            outer, "GPU",
+            "Which card Fizgig trains, caches and renders previews on. Fizgig masks itself to the one GPU you "
+            "pick (CUDA_VISIBLE_DEVICES), so every tab and the training subprocess follow it. Takes effect on "
+            "the next launch — the visible-device set is fixed once CUDA initialises.",
+        )
+        gpu_card.columnconfigure(1, weight=1)
+
+        ttk.Label(gpu_card, text="GPU:").grid(row=0, column=0, sticky=tk.W, padx=(0, 10), pady=4)
+        gpus = _enumerate_gpus()
+        gpu_options = [GPU_AUTO_LABEL] + [_gpu_option_label(*g) for g in gpus]
+        _gpu_combo = ttk.Combobox(
+            gpu_card, textvariable=self.prefs_vars["gpu_index"],
+            values=gpu_options, width=46, state="readonly",
+        )
+        _gpu_combo.grid(row=0, column=1, sticky=tk.W, pady=4)
+
+        def _on_gpu_selected(_event=None):
+            """Say out loud that the change is deferred. Without this, picking another card
+            looks like it did nothing until the next launch."""
+            picked = _parse_gpu_index(self.prefs_vars["gpu_index"].get())
+            if picked is None or picked != SELECTED_GPU_INDEX:
+                target = "the default GPU" if picked is None else f"GPU {picked}"
+                messagebox.showinfo(
+                    "Restart Required",
+                    f"Saved. Fizgig will use {target} the next time it starts.\n\n"
+                    "This session stays on the card it launched with — CUDA fixes the visible "
+                    "device set when the first model loads.",
+                )
+
+        _gpu_combo.bind("<<ComboboxSelected>>", _on_gpu_selected)
+        # Snap the saved value onto this launch's label: the pref stores the whole label,
+        # but names/VRAM/driver order can differ between launches, so the index is the only
+        # part we trust. A saved index with no matching card (GPU pulled, slots reordered)
+        # falls back to Auto rather than pinning a device torch will refuse to open.
+        _saved_gpu_idx = _parse_gpu_index(self.prefs_vars["gpu_index"].get())
+        if _saved_gpu_idx is not None:
+            _gpu_match = next((o for o in gpu_options if _parse_gpu_index(o) == _saved_gpu_idx), None)
+            self.prefs_vars["gpu_index"].set(_gpu_match if _gpu_match else GPU_AUTO_LABEL)
+
+        if len(gpus) > 1 and os.environ.get("CUDA_VISIBLE_DEVICES"):
+            _gpu_hint = (f"{len(gpus)} GPUs detected — this session is pinned to index {SELECTED_GPU_INDEX}. "
+                         "Pick another card and relaunch Fizgig to move onto it.")
+        elif len(gpus) > 1:
+            _gpu_hint = (f"{len(gpus)} GPUs detected, none pinned — CUDA is picking for you (its own "
+                         "\"fastest first\" order, which need not be the order listed here). Pick a card "
+                         "and relaunch to make it explicit.")
+        elif len(gpus) == 1:
+            _gpu_hint = "One GPU detected, so there's nothing to choose here. This setting is for multi-GPU machines."
+        else:
+            _gpu_hint = "No NVIDIA GPU detected (NVML and nvidia-smi both unavailable). Leave this on Auto."
+        tk.Label(gpu_card, text=_gpu_hint, font=(FONT_FAMILY, 9),
+                 fg=COLORS["text_muted"], bg=COLORS["bg_surface"], justify=tk.LEFT).grid(
+            row=1, column=1, sticky=tk.W, padx=5, pady=(0, 4))
 
         # Card 2: Inference Performance
         inf_card = self._start_section_card(
