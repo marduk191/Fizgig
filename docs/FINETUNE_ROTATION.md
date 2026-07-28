@@ -441,6 +441,12 @@ fine-tune it was meant to replace. Recorded here so it is not re-derived.
 6. **Make the loss watch rotation-aware** — compare residuals against the same window position
    rather than the previous epoch. Only if the cyclic noise proves to matter.
 7. **Guard `--resume`** in fine-tune mode.
+8. **Two-machine pipeline split** — see [`DISTRIBUTED_FINETUNE.md`](DISTRIBUTED_FINETUNE.md).
+   Costed, nothing built. Splitting the block list across two machines is the only remaining
+   attack on **component** mode, which streaming provably cannot help. A 12/16 split models at
+   12.68 GB / ~18 GB, i.e. component mode on a **24 GB + 16 GB pair** — the mode every good
+   result came from, on hardware that today gets block mode at best. The wire is not the
+   obstacle: one split ships 38 MB/step at 512 px, which plain gigabit already carries.
 
 ---
 
