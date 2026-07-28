@@ -1,6 +1,20 @@
 @echo off
-cd /d "%~dp0"
+REM Self-update guard: cmd reads a running .bat by BYTE OFFSET, so when git pull rewrites
+REM this file mid-run, execution resumes at a garbage position in the new content (seen in
+REM the wild as: 'installers' is not recognized as an internal or external command). Stage 1
+REM copies this script to TEMP and re-launches the copy with the repo dir as an argument;
+REM the copy is never rewritten by the pull, so it runs to completion untouched.
+if "%~1"=="" (
+    copy /y "%~f0" "%TEMP%\fizgig_update_stage2.bat" >nul
+    call "%TEMP%\fizgig_update_stage2.bat" "%~dp0"
+    exit /b %errorlevel%
+)
+cd /d "%~1"
 echo Updating Fizgig...
+REM Older installers overwrote the tracked run_fizgig.bat with a console-attached version.
+REM Restore the repo's launcher so it never blocks a pull that touches the file — harmless
+REM when the file is already clean.
+git checkout -- run_fizgig.bat 2>nul
 git pull
 echo.
 echo Installing/updating dependencies...
@@ -36,6 +50,15 @@ if errorlevel 1 (
 )
 
 :skip_deps
+
+REM ---- Krea 2 Turbo LoRA (~470 MB, Krea 2 users only) ----
+REM Idempotent: exits instantly when the file is already present + linked in
+REM Preferences, so this step is safe to keep across releases. Downloads only
+REM for installs with a Krea 2 RAW DiT configured; failure never aborts the
+REM update (the GUI fetches it at training start as a fallback).
+if exist "venv\Scripts\python.exe" (
+    "venv\Scripts\python.exe" "src\fizgig\scripts\fetch_turbo_lora.py"
+)
 
 REM ---- MSVC C++ Build Tools check (needed by torch.compile's inductor backend) ----
 REM triton installs via requirements.txt, but inductor also needs a C++ compiler on

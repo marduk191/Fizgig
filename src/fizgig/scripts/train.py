@@ -31,6 +31,15 @@ if not os.environ.get("PYTORCH_CUDA_ALLOC_CONF") and os.environ.get("FIZGIG_NO_E
         "backend:cudaMallocAsync" if sys.platform == "win32" else "expandable_segments:True"
     )
 
+# OpenMP wait policy, before torch loads libiomp: Intel OpenMP keeps every pool thread
+# actively spinning for 200 ms after each parallel region, so the small per-step CPU ops
+# re-arm an all-core busy-spin for the whole run (issue #18 — 100% CPU on every core while
+# the actual training is on the GPU). BLOCKTIME=0 measured: 14.8 spinning cores -> 0, no
+# step-time cost. The GUI sets this too; this covers headless runs. setdefault, so an
+# explicit user value wins.
+os.environ.setdefault("KMP_BLOCKTIME", "0")
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+
 from fizgig.training.trainer import KleinTrainer, setup_parser
 
 

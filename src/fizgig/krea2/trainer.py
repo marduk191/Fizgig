@@ -58,6 +58,58 @@ def _apply_context_lora(target, path, strength, *, device, dtype):
     return net
 
 
+def _apply_turbo_lora(dit, path, *, device, dtype):
+    """Stage the Turbo distillation LoRA (rank 64) on the TRAINING DiT, disabled.
+
+    RAW + this LoRA at strength 1.0 behaves as the Turbo model, so previews can render on the
+    resident training DiT with the exact settings the Turbo path uses (8-step, CFG-free,
+    mu=1.15). Between previews the net is disabled (a disabled module's forward is one flag
+    check) and its params live on CPU, so training pays nothing for it.
+
+    The file also carries `diff_b` BIAS deltas the kohya conversion cannot represent — on the
+    I/O layers (first, last.linear, tmlp, tproj, txtmlp), the timestep embedding among them,
+    where much of the 8-step distillation plausibly lives. They are resolved to the actual
+    bias Parameters here, at setup, so a bad key fails loudly now rather than mid-run; the
+    preview path applies them by exact snapshot/restore (bf16 `+=` then `-=` is not
+    bit-clean; `copy_` of a clone is), so training weights are never altered.
+
+    Returns (net, diffb) where diffb is a list of (bias_param, delta_cpu) pairs.
+    """
+    from safetensors.torch import load_file
+    from fizgig.networks.lora import create_network_from_weights, ensure_kohya_lora_state_dict
+
+    raw_sd = load_file(path)
+    diffb = []
+    for key in sorted(raw_sd):
+        if not key.endswith(".diff_b"):
+            continue
+        mod_path = key[:-len(".diff_b")]
+        if mod_path.startswith("diffusion_model."):
+            mod_path = mod_path[len("diffusion_model."):]
+        delta = raw_sd[key]
+        try:
+            bias = dit.get_submodule(mod_path).bias
+            if bias is None or tuple(bias.shape) != tuple(delta.shape):
+                raise AttributeError("no bias / shape mismatch")
+        except AttributeError as e:
+            logger.warning("[turbo-lora] diff_b %s has no matching model bias (%s) — skipped", key, e)
+            continue
+        diffb.append((bias, delta.detach().to("cpu").clone()))
+
+    sd = ensure_kohya_lora_state_dict(raw_sd)
+    net = create_network_from_weights(None, 1.0, sd, None, dit, for_inference=True)
+    net.apply_to(text_encoders=None, unet=dit, apply_text_encoder=False, apply_unet=True)
+    # Structure only until this lands — without it the LoRA sits at zero init and the
+    # "turbo" previews would silently render the undistilled RAW at 8 steps (mush).
+    net.load_state_dict(sd, strict=False)
+    net.to(device="cpu", dtype=dtype).eval()
+    net.requires_grad_(False)
+    net.set_enabled(False)
+    logger.info("[turbo-lora] %s staged on the training DiT: %d LoRA modules + %d bias deltas "
+                "(disabled outside previews)", os.path.basename(path), len(net.unet_loras), len(diffb))
+    return net, diffb
+
+
 def load_dit_for_training(
     raw_path: str,
     *,
@@ -71,6 +123,7 @@ def load_dit_for_training(
     compile_blocks: bool = False,   # resolved by the caller; load_dit_ takes a plain bool
     context_lora_path: str = None,
     context_lora_strength: float = 1.0,
+    turbo_lora_path: str = None,    # Turbo distillation LoRA — staged disabled, for on-DiT previews
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
 ):
@@ -125,6 +178,18 @@ def load_dit_for_training(
     if gradient_checkpointing:
         dit.enable_gradient_checkpointing()
 
+    # Stacking order (deliberate): Turbo LoRA innermost, then Context, then the trainable LoRA
+    # outermost. The deltas are additive so the sum is order-independent, but this order tells
+    # the deployment story: base+turbo ≈ the Turbo model, context rides on that, and the LoRA
+    # being trained samples on top of the whole stack — exactly how it will be used.
+
+    # Turbo distillation LoRA (rank 64): staged DISABLED on the training DiT so previews can
+    # render on the resident model (RAW + turbo@1.0 ≈ Turbo, same 8-step CFG-free settings)
+    # instead of loading the ~13 GB Turbo checkpoint and parking the trainer to CPU.
+    turbo_net = turbo_diffb = None
+    if turbo_lora_path:
+        turbo_net, turbo_diffb = _apply_turbo_lora(dit, turbo_lora_path, device=device, dtype=dtype)
+
     # Context LoRA: frozen + active on the base BEFORE the trainable LoRA, so the trainable
     # one wraps the context-included forward (both additive; grads only flow to the trainable).
     if context_lora_path:
@@ -136,12 +201,14 @@ def load_dit_for_training(
     network.requires_grad_(True)
     network.to(device=device, dtype=dtype)
 
-    # torch.compile LAST — after the LoRA has patched the forwards, so the compiled graph is the
-    # one that actually runs. Per block, not whole-model: the 28 blocks share a graph signature so
-    # inductor compiles once and reuses, and a failure is contained to one block.
+    # torch.compile LAST — after the LoRAs have patched the forwards, so the compiled graph is
+    # the one that actually runs. Per block, not whole-model: the 28 blocks share a graph
+    # signature so inductor compiles once and reuses, and a failure is contained to one block.
+    # With a turbo net staged, its enabled flag becomes a dynamo guard: the first preview
+    # compiles a second graph variant (enabled=True), after which both states are cached.
     if compile_blocks:
         _compile_blocks(dit, blocks_to_swap)
-    return dit, network
+    return dit, network, turbo_net, turbo_diffb
 
 
 class _CheckpointedBlock(torch.nn.Module):
@@ -943,10 +1010,8 @@ def sample_previews(turbo_path, ae, encoded_prompts, lora_sd, out_dir, epoch, *,
     Filenames follow the Fizgig samples-gallery pattern
     `{name}_e{epoch:06d}_{idx:02d}_{timestamp:14d}_{seed}.png` so the live preview gallery
     (which parses that exact format) picks them up — same as the Klein training path."""
-    import datetime
     from fizgig.krea2.utils import load_krea2_dit
     from fizgig.networks.lora import create_network_from_weights
-    from fizgig.krea2 import sampling
 
     _ld = "cpu" if blocks_to_swap > 0 else device
     turbo = load_krea2_dit(turbo_path, device=device, dtype=torch.bfloat16,
@@ -982,6 +1047,20 @@ def sample_previews(turbo_path, ae, encoded_prompts, lora_sd, out_dir, epoch, *,
         turbo.move_to_device_except_swap_blocks(torch.device(device))
         turbo.switch_block_swap_for_inference()
     turbo.eval()
+    paths = _render_prompt_set(turbo, ae, encoded_prompts, out_dir, epoch,
+                               output_name=output_name, steps=steps, cfg_scale=cfg_scale,
+                               neg=neg, width=width, height=height, seed=seed, device=device)
+    del turbo, net, ctx_net
+    torch.cuda.empty_cache()
+    return paths
+
+
+def _render_prompt_set(model, ae, encoded_prompts, out_dir, epoch, *, output_name, steps,
+                       cfg_scale, neg, width, height, seed, device):
+    """Shared preview render loop — identical settings (mu=1.15 pinned) and the exact gallery
+    filename pattern for both the Turbo-model path and the turbo-LoRA-on-training-DiT path."""
+    import datetime
+    from fizgig.krea2 import sampling
     os.makedirs(out_dir, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")  # 14-digit timestamp
     paths = []
@@ -991,15 +1070,57 @@ def sample_previews(turbo_path, ae, encoded_prompts, lora_sd, out_dir, epoch, *,
         _untxt, _untxtmask = neg
     for i, (txt, txtmask) in enumerate(encoded_prompts):
         with torch.no_grad():
-            imgs = sampling.sample(turbo, ae, txt, txtmask, untxt=_untxt, untxtmask=_untxtmask,
+            imgs = sampling.sample(model, ae, txt, txtmask, untxt=_untxt, untxtmask=_untxtmask,
                                    device=device, dtype=torch.bfloat16, width=width, height=height,
                                    steps=steps, cfg_scale=cfg_scale, mu=1.15, seed=seed + i)
         p = os.path.join(out_dir, f"{output_name}_e{epoch:06d}_{i:02d}_{ts}_{seed + i}.png")
         imgs[0].save(p)
         paths.append(p)
-    del turbo, net, ctx_net
-    torch.cuda.empty_cache()
     return paths
+
+
+def sample_previews_on_dit(dit, turbo_net, turbo_diffb, ae, encoded_prompts, out_dir, epoch, *,
+                           output_name="krea2", steps=8, cfg_scale=1.0, neg=None,
+                           width=512, height=512, seed=42, blocks_to_swap=0, device="cuda"):
+    """Render previews on the RESIDENT training DiT with the Turbo LoRA enabled at 1.0 —
+    no Turbo checkpoint load, no parking the trainer to CPU.
+
+    Stack order at render time is turbo (innermost) -> context -> trainable, i.e. the model
+    behaves as Turbo, the context rides on it, and the LoRA being trained samples on top —
+    matching deployment. The trainable network is live, so previews reflect current weights
+    with no save/reload round-trip.
+
+    Everything is reverted in the finally: turbo net disabled + back to CPU, bias deltas
+    undone by exact snapshot restore, block swap returned to training mode, train() mode
+    re-entered. Training state is untouched whether the render succeeds or raises.
+
+    `blocks_to_swap` here is the TRAINING swap setting (this is the training model), not the
+    preview-model swap the Turbo-checkpoint path uses.
+    """
+    saved_biases = []
+    was_training = dit.training
+    try:
+        dit.eval()
+        if blocks_to_swap > 0:
+            dit.switch_block_swap_for_inference()
+        turbo_net.to(device=device)
+        turbo_net.set_enabled(True)
+        for bias, delta in turbo_diffb:
+            saved_biases.append((bias, bias.detach().clone()))
+            bias.data.add_(delta.to(device=bias.device, dtype=bias.dtype))
+        return _render_prompt_set(dit, ae, encoded_prompts, out_dir, epoch,
+                                  output_name=output_name, steps=steps, cfg_scale=cfg_scale,
+                                  neg=neg, width=width, height=height, seed=seed, device=device)
+    finally:
+        for bias, snap in saved_biases:
+            bias.data.copy_(snap)
+        turbo_net.set_enabled(False)
+        turbo_net.to(device="cpu")
+        if blocks_to_swap > 0:
+            dit.switch_block_swap_for_training()
+        if was_training:
+            dit.train()
+        torch.cuda.empty_cache()
 
 
 def train_krea2(
@@ -1033,9 +1154,11 @@ def train_krea2(
     lr_decay_steps: int = 0,
     lr_scheduler_num_cycles: int = 1,
     lr_scheduler_power: float = 1.0,
-    # in-training previews (sample the fp8 Turbo with the live LoRA)
+    # in-training previews (sample the fp8 Turbo with the live LoRA — or, when
+    # turbo_lora_path is set, the resident training DiT with the Turbo LoRA @1.0)
     sample_prompts: list = None,
     turbo_path: str = None,
+    turbo_lora_path: str = None,
     vae_path: str = None,
     te_path: str = None,
     sample_every_n_epochs: int = 0,
@@ -1114,8 +1237,16 @@ def train_krea2(
     # Preview setup: pre-encode prompts (frees the 8GB encoder) + load the VAE BEFORE the RAW DiT,
     # so the encoder never coexists with the resident base.
     # sample_at_first counts as wanting previews even without a per-epoch cadence.
+    # A missing turbo-LoRA file must be caught BEFORE prompts are encoded, so the fallback
+    # decision (Turbo checkpoint, or no previews at all) is made once, up front.
+    if turbo_lora_path and not os.path.isfile(turbo_lora_path):
+        logger.warning("[preview] turbo LoRA not found at %s — %s", turbo_lora_path,
+                       "falling back to the Turbo checkpoint" if turbo_path
+                       else "previews need it or a Turbo checkpoint; disabling previews")
+        turbo_lora_path = None
     do_previews = bool((sample_every_n_epochs or sample_at_first)
-                       and sample_prompts and turbo_path and vae_path and te_path)
+                       and sample_prompts and (turbo_path or turbo_lora_path)
+                       and vae_path and te_path)
     encoded_prompts = sample_ae = sample_dir = None
     encoded_negative = None
     if do_previews:
@@ -1132,12 +1263,17 @@ def train_krea2(
         sample_ae = load_vae(vae_path, input_channels=3, device="cpu", disable_mmap=True)
         sample_dir = os.path.join(output_dir, "sample")
 
-    dit, network = load_dit_for_training(
+    dit, network, turbo_net, turbo_diffb = load_dit_for_training(
         raw_path, network_dim=network_dim, network_alpha=network_alpha,
         fp8_scaled=fp8_scaled, quant_4bit=quant_4bit, quant_int8=quant_int8,
         blocks_to_swap=blocks_to_swap, compile_blocks=_do_compile,
         context_lora_path=context_lora_path, context_lora_strength=context_lora_strength,
+        turbo_lora_path=(turbo_lora_path if do_previews else None),
         device=device, dtype=dtype)
+    if turbo_net is not None:
+        logger.info("[preview] turbo-LoRA mode: previews render on the resident training DiT "
+                    "(RAW + Turbo LoRA @1.0, same 8-step CFG-free settings) — the Turbo "
+                    "checkpoint is not loaded and the trainer is never parked to CPU")
     if blocks_to_swap > 0 and not quant_4bit and not quant_int8:
         from fizgig.krea2.offloading import BlockSwapConfig
         dit.enable_block_swap(blocks_to_swap, BlockSwapConfig(torch.device(device), supports_backward=True))
@@ -1417,7 +1553,21 @@ def train_krea2(
             loss_watch.resume_from_jsonl(up_to_epoch=start_epoch, resets=_resets)
     # Sample at Start: an epoch-0 preview (base model + zero-init LoRA) so the run's
     # starting point is on record. Fresh runs only — a resume already has samples.
-    if sample_at_first and do_previews and start_epoch == 0:
+    if sample_at_first and do_previews and start_epoch == 0 and turbo_net is not None:
+        # Turbo-LoRA mode: render on the resident training DiT (live network — no save/reload,
+        # no parking). sample_previews_on_dit reverts everything in its finally.
+        logger.info("rendering epoch-0 preview (Sample at Start, on training DiT)...")
+        try:
+            _seed0 = sample_seed if sample_seed != 0 else random.randint(1, 2**31 - 1)
+            sample_previews_on_dit(dit, turbo_net, turbo_diffb, sample_ae, encoded_prompts,
+                                   sample_dir, 0, output_name=output_name, steps=sample_steps,
+                                   cfg_scale=sample_cfg_scale, neg=encoded_negative,
+                                   width=sample_width, height=sample_height, seed=_seed0,
+                                   blocks_to_swap=blocks_to_swap, device=device)
+        except Exception as _e0:
+            logger.warning(f"[preview] Sample at Start failed ({type(_e0).__name__}) — training "
+                           f"continues; per-epoch previews will still be attempted.")
+    elif sample_at_first and do_previews and start_epoch == 0:
         from safetensors.torch import load_file as _lf0
         _tmp0 = os.path.join(output_dir, "_sample_lora.safetensors")
         _save_lora(network, _tmp0, network_dim, network_alpha, dtype)
@@ -1570,7 +1720,42 @@ def train_krea2(
             _save_lora(network, os.path.join(output_dir, f"{output_name}-{epoch + 1:06d}.safetensors"),
                        network_dim, network_alpha, dtype)
 
-        if do_previews and sample_every_n_epochs and (epoch + 1) % sample_every_n_epochs == 0:
+        if (do_previews and sample_every_n_epochs and (epoch + 1) % sample_every_n_epochs == 0
+                and turbo_net is not None):
+            # Turbo-LoRA mode: live network, resident DiT, no parking. The override TE encode
+            # is the one VRAM risk (the ~8 GB Qwen3-VL loads alongside the resident trainer,
+            # where the parked path had the DiT out of the way) — the except keeps an OOM from
+            # killing the run, same as the Turbo-checkpoint path.
+            logger.info(f"rendering previews (epoch {epoch + 1}) on the training DiT + Turbo LoRA...")
+            try:
+                ov = _read_sample_override(output_dir)
+                if ov:
+                    logger.info(f"[sample override] active — '{ov['prompt'][:60]}' "
+                                f"seed={ov['seed']} {ov['width']}x{ov['height']}"
+                                f"{' +ref' if ov.get('ref_image') else ''}")
+                    prev_enc = encode_sample_prompts(te_path, [ov["prompt"]],
+                                                     ref_image=ov.get("ref_image") or None, device=device)
+                    prev_w, prev_h, prev_seed = ov["width"], ov["height"], ov["seed"]
+                else:
+                    prev_enc, prev_w, prev_h, prev_seed = encoded_prompts, sample_width, sample_height, sample_seed
+                if prev_seed == 0:
+                    prev_seed = random.randint(1, 2**31 - 1)
+                    logger.info(f"[sample] seed 0 -> random {prev_seed}")
+                sample_previews_on_dit(dit, turbo_net, turbo_diffb, sample_ae, prev_enc,
+                                       sample_dir, epoch + 1, output_name=output_name,
+                                       steps=sample_steps, cfg_scale=sample_cfg_scale,
+                                       neg=encoded_negative, width=prev_w, height=prev_h,
+                                       seed=prev_seed, blocks_to_swap=blocks_to_swap, device=device)
+            except Exception as _prev_err:
+                _oom = "out of memory" in str(_prev_err).lower()
+                logger.warning(
+                    f"[preview] epoch {epoch + 1} preview failed "
+                    f"({'CUDA OOM' if _oom else type(_prev_err).__name__}); "
+                    f"disabling previews for the rest of the run. Training continues and LoRAs still save normally."
+                )
+                do_previews = False
+            network.train()
+        elif do_previews and sample_every_n_epochs and (epoch + 1) % sample_every_n_epochs == 0:
             from safetensors.torch import load_file
             tmp = os.path.join(output_dir, "_sample_lora.safetensors")
             _save_lora(network, tmp, network_dim, network_alpha, dtype)

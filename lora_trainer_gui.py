@@ -236,6 +236,18 @@ def _gpu_option_label(index, name, total_gb):
 
 GPU_AUTO_LABEL = "Auto (first GPU)"
 
+# OpenMP wait policy, also before anything loads torch (which loads libiomp on Windows).
+# Intel OpenMP's default is to keep its whole thread pool ACTIVELY SPINNING for 200 ms
+# (KMP_BLOCKTIME) after every parallel region, "in case more work arrives". Training work is
+# on the GPU, but each step touches small CPU tensors (collate, noise, timestep bookkeeping),
+# so the pool — sized to every core — re-arms its spin constantly and burns 100% of every
+# core doing nothing (issue #18: 4080 Super pegged on all cores at CUDA 85%). Measured here:
+# simulated per-step CPU ops with GPU-sized gaps burn 14.8 cores spinning by default, 0.0
+# with BLOCKTIME=0, no step-time cost. Inherited by the training subprocess, which is the
+# point. Both vars set: KMP_* is Intel-runtime-specific, OMP_WAIT_POLICY is the portable one.
+os.environ.setdefault("KMP_BLOCKTIME", "0")
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+
 # Face detection imports (optional - graceful fallback if not installed)
 try:
     from face_utils import (FaceDetector, FaceEmbedder, crop_to_face, draw_face_boxes,
@@ -501,7 +513,7 @@ ARCHITECTURES = {
         "sample_width_default": 768,
         "sample_height_default": 768,
     },
-    "Krea 2 (experimental)": {
+    "Krea 2": {
         # Krea 2 trains natively via fizgig.scripts.krea2_* (no accelerate launch — a
         # single-process script). The command builders branch on "is_krea2" and ignore
         # the Klein-shaped keys below; they're kept so start_training / the Samples tab /
@@ -612,10 +624,37 @@ BUILT_IN_PRESETS = {
 KREA2_BUILT_IN_PRESETS = {
     "✨ Krea 2 Defaults (rank 32, full model)": {
         "NETWORK_DIM": 32, "NETWORK_ALPHA": 32, "LEARNING_RATE": 1e-4,
-        "MAX_TRAIN_EPOCHS": 10, "SAVE_EVERY_N_EPOCHS": 1, "SEED": 42,
+        "MAX_TRAIN_EPOCHS": 30, "SAVE_EVERY_N_EPOCHS": 1, "SEED": 42,
         "ADAPTIVE_LR": False, "ADAPTIVE_LR_MIN": "1e-4", "ADAPTIVE_LR_MAX": "4e-4",
         "TARGET_LAYERS": "Full Model", "MIN_TIMESTEP": "", "MAX_TIMESTEP": "",
         "OPTIMIZER_TYPE": "adamw8bit",
+        "GRADIENT_ACCUMULATION": 1, "MAX_GRAD_NORM": 1.0,
+        "DATASET_MEGAPIXELS": "0.25",
+        # Memory settings all auto — each resolves from the actual GPU at launch.
+        # BLOCKS_SWAP must be the combobox's exact label: _apply_preset_values matches a
+        # preset value against the offered options on its first token, case-sensitively,
+        # so a bare "auto" would not select "Auto (detect from GPU)".
+        "BLOCKS_SWAP": "Auto (detect from GPU)",
+        "QUANT_4BIT_MODE": "Auto", "COMPILE_BLOCKS": "Auto",
+        # Per-image loss watch: detection + the LR throttle on, the two interventions that
+        # rewrite captions or pre-judge images left off — those want a deliberate choice.
+        "KREA2_LOSS_WATCH": True, "KREA2_PER_IMAGE_LR": True,
+        "KREA2_AUTO_RECAPTION": False, "KREA2_WARMUP_LOOK": False,
+    },
+    # Rank 8 + Adaptive LR at an aggressive floor: fewer epochs to a usable LoRA. Everything
+    # else identical to Krea 2 Defaults (which stays the preset applied on family switch).
+    "✨ Krea 2 Ultra Fast (rank 8, adaptive LR)": {
+        "NETWORK_DIM": 8, "NETWORK_ALPHA": 8, "LEARNING_RATE": 1e-4,
+        "MAX_TRAIN_EPOCHS": 20, "SAVE_EVERY_N_EPOCHS": 1, "SEED": 42,
+        "ADAPTIVE_LR": True, "ADAPTIVE_LR_MIN": "2e-4", "ADAPTIVE_LR_MAX": "4e-4",
+        "TARGET_LAYERS": "Full Model", "MIN_TIMESTEP": "", "MAX_TIMESTEP": "",
+        "OPTIMIZER_TYPE": "adamw8bit",
+        "GRADIENT_ACCUMULATION": 1, "MAX_GRAD_NORM": 1.0,
+        "DATASET_MEGAPIXELS": "0.25",
+        "BLOCKS_SWAP": "Auto (detect from GPU)",
+        "QUANT_4BIT_MODE": "Auto", "COMPILE_BLOCKS": "Auto",
+        "KREA2_LOSS_WATCH": True, "KREA2_PER_IMAGE_LR": True,
+        "KREA2_AUTO_RECAPTION": False, "KREA2_WARMUP_LOOK": False,
     },
 }
 
@@ -748,12 +787,16 @@ DEFAULT_PREFS = {
     "distilled_dit": "",
     "vae": "",
     "text_encoder": "",
-    # Krea 2 model paths (experimental). RAW = training base; Turbo (pre-quant fp8) = previews/
+    # Krea 2 model paths. RAW = training base; Turbo (pre-quant fp8) = previews/
     # inference; Qwen-Image VAE; Qwen3-VL-4B text encoder (bf16 for training).
     "krea2_raw_dit": "",
     "krea2_turbo_dit": "",
     "krea2_vae": "",
     "krea2_text_encoder": "",
+    # Turbo distillation LoRA (rank 64) — RAW + this at strength 1.0 behaves as the Turbo
+    # model, so samples can render on the resident training DiT instead of loading the
+    # separate Turbo checkpoint (saves the park-to-CPU shuffle during previews).
+    "krea2_turbo_lora": "",
     # Output directories — relative to repo root, portable across clones/moves.
     # Resolved to absolute in load_prefs(); in-memory pref values are absolute.
     # All three live as top-level folders inside the repo:
@@ -983,9 +1026,14 @@ class LoRATrainerGUI:
 
         # Image Converter variables — source is unified with self.image_folder_var
         # (the Start-tab picker); only the output folder is Image-Prep-specific.
+        # Always empty since the Output Folder UI was removed — prep always writes into the
+        # training folder. Kept because the convert pipeline reads it ("or source_folder").
         self.convert_output_var = tk.StringVar()
         self.max_size_var = tk.StringVar(value="1024")
-        self.delete_originals_var = tk.BooleanVar(value=True)
+        # Default flipped to KEEP (False) 2026-07-28 — safe-by-default like the Look Filter and
+        # the Captions Remove button; remembered across restarts now that it's a real choice.
+        self.delete_originals_var = tk.BooleanVar(
+            value=bool(self.last_used.get("prep_replace_originals", False)))
 
         # Prep Mode and Face Cropping variables
         self.prep_mode_var = tk.StringVar(value=self.last_used.get("prep_mode", "Auto Prep (Face Crops)"))
@@ -1033,6 +1081,11 @@ class LoRATrainerGUI:
         self.image_folder_var.trace_add("write", self._save_last_used_paths)
         self.caption_text_var.trace_add("write", self._save_last_used_paths)
         self.prep_mode_var.trace_add("write", self._save_last_used_paths)
+        self.delete_originals_var.trace_add("write", self._save_last_used_paths)
+        # The Image Prep summary shows a live image count + resolution check for the folder,
+        # so a folder change on the Start tab must refresh it. Guarded: fires before the
+        # Image Prep tab exists during startup, and _update_prep_note no-ops then.
+        self.image_folder_var.trace_add("write", self._update_prep_note)
         # Auto-save the dataset TOML on every relevant change (no Save button needed)
         def _auto_save_ds(*_a):
             if hasattr(self, "auto_save_dataset_config_silent"):
@@ -1230,6 +1283,9 @@ class LoRATrainerGUI:
         self.create_lora_royale_tab()
         self.create_extract_tab()
         self.create_prefs_tab()
+        # Restore remembered Repair Studio / Explorer Setup fields + attach save traces.
+        # After ALL tabs exist: restoring fires their traces, which touch other tabs' widgets.
+        self._restore_workbench_setup_fields()
 
         # Florence model state (lazy loaded)
         self.florence_model = None
@@ -1239,7 +1295,6 @@ class LoRATrainerGUI:
         self.caption_thumbnails = {}
         self.current_caption_page = 0
         self.images_per_page = 12
-        self.selected_images = set()
 
         # Load architecture defaults first (populates optimizer / fp8 / timestep
         # fields that the built-in presets don't explicitly set), then overlay
@@ -1485,6 +1540,61 @@ class LoRATrainerGUI:
         except Exception as e:
             messagebox.showerror("Open Failed", f"Could not open:\n{path}\n\n{e}")
 
+    # Setup-area fields remembered across restarts for the two hands-on workbench tabs.
+    # (attr, last_used key) — one table drives restore, the save stanza, and the traces.
+    _WORKBENCH_REMEMBER = [
+        ("repair_primary_var", "repair_primary"),
+        ("repair_donor_var", "repair_donor"),
+        ("repair_prompt_var", "repair_prompt"),
+        ("repair_seed_var", "repair_seed"),
+        ("repair_res_var", "repair_res"),
+        ("repair_turbo_var", "repair_turbo"),
+        ("repair_ref_path_var", "repair_ref_path"),
+        ("repair_ref_mp_var", "repair_ref_mp"),
+        ("repair_ref_strength_var", "repair_ref_strength"),
+        ("explorer_lora_var", "explorer_lora"),
+        ("explorer_prompt_var", "explorer_prompt"),
+        ("explorer_ref_path_var", "explorer_ref_path"),
+        ("explorer_ref_mp_var", "explorer_ref_mp"),
+        ("explorer_ref_strength_var", "explorer_ref_strength"),
+        ("explorer_seed_var", "explorer_seed"),
+        ("explorer_res_var", "explorer_res"),
+        ("explorer_intensity_var", "explorer_intensity"),
+        ("explorer_mutations_var", "explorer_mutations"),
+        ("explorer_structure_var", "explorer_structure"),
+    ]
+
+    def _restore_workbench_setup_fields(self):
+        """Restore remembered Repair Studio / Explorer Setup values, then attach debounced
+        save traces so edits persist without needing a clean app close. Restore is safe at
+        startup: every var trace on these fields no-ops while its engine is unloaded."""
+        for attr, key in self._WORKBENCH_REMEMBER:
+            var = getattr(self, attr, None)
+            if var is None or key not in self.last_used:
+                continue
+            try:
+                var.set(self.last_used[key])
+            except Exception:
+                pass
+        # Traces AFTER restore, so restoring doesn't immediately rewrite the file N times.
+        self._workbench_save_after = None
+
+        def _debounced_save(*_):
+            if self._workbench_save_after is not None:
+                try:
+                    self.master.after_cancel(self._workbench_save_after)
+                except Exception:
+                    pass
+            self._workbench_save_after = self.master.after(600, self._save_last_used_paths)
+
+        for attr, _key in self._WORKBENCH_REMEMBER:
+            var = getattr(self, attr, None)
+            if var is not None:
+                try:
+                    var.trace_add("write", _debounced_save)
+                except Exception:
+                    pass
+
     def _save_last_used_paths(self, *args):
         """Save last-used folder paths and settings to config file"""
         if _persist_disabled():
@@ -1496,6 +1606,7 @@ class LoRATrainerGUI:
         data = dict(self.last_used) if isinstance(getattr(self, "last_used", None), dict) else {}
         data.update({
             "prep_mode": self.prep_mode_var.get(),
+            "prep_replace_originals": bool(self.delete_originals_var.get()),
             "image_folder": self.image_folder_var.get(),
             "caption_trigger": self.caption_text_var.get(),
             "dataset_cache_dir": self.dataset_cache_dir_var.get(),
@@ -1509,6 +1620,17 @@ class LoRATrainerGUI:
         # Save the sample reference image path
         if hasattr(self, 'sample_ref_image_var'):
             data["sample_ref_image"] = self.sample_ref_image_var.get()
+        # Krea 2 preview engine (Samples tab) — stored canonical, not the display label
+        if hasattr(self, 'krea2_preview_engine_var'):
+            data["krea2_preview_engine"] = self._krea2_preview_engine()
+        # Repair Studio / Explorer Setup fields (one shared table drives restore + save)
+        for _attr, _key in self._WORKBENCH_REMEMBER:
+            _var = getattr(self, _attr, None)
+            if _var is not None:
+                try:
+                    data[_key] = _var.get()
+                except Exception:
+                    pass
         # Save LoRA output directory if entry exists
         if "LORA_OUTPUT_DIR" in self.entries:
             data["lora_output_dir"] = self.entries["LORA_OUTPUT_DIR"].get()
@@ -2501,21 +2623,44 @@ class LoRATrainerGUI:
                  font=(FONT_FAMILY, 10),
                  fg=COLORS["text_primary"], bg="#2A2200",
                  wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, padx=20, pady=(0, 4))
-        ttk.Button(setup_inner, text="Open Preferences",
-                   command=lambda: self.notebook.select(self.prefs_tab)).pack(
-            anchor=tk.W, padx=20, pady=(4, 12))
+        _setup_btn_row = tk.Frame(setup_inner, bg="#2A2200")
+        _setup_btn_row.pack(anchor=tk.W, padx=20, pady=(4, 12))
+        ttk.Button(_setup_btn_row, text="Open Preferences",
+                   command=lambda: self.notebook.select(self.prefs_tab)).pack(side=tk.LEFT)
+
+        def _dismiss_setup_prompt():
+            # Permanent, by request: a Krea-only user never fills the Klein paths (or vice
+            # versa, or skips the Turbo checkpoint entirely) and shouldn't be nagged forever.
+            self.prefs["setup_prompt_dismissed"] = True
+            save_prefs(self.prefs)
+            self._setup_prompt_frame.pack_forget()
+
+        _dismiss_lbl = tk.Label(_setup_btn_row, text="Don't show this again",
+                                font=(FONT_FAMILY, 9, "underline"),
+                                fg=COLORS["text_secondary"], bg="#2A2200", cursor="hand2")
+        _dismiss_lbl.pack(side=tk.LEFT, padx=(16, 0))
+        _dismiss_lbl.bind("<Button-1>", lambda e: _dismiss_setup_prompt())
 
         def _check_model_paths(*_args):
-            model_keys = ["base_dit", "distilled_dit", "vae", "text_encoder"]
-            any_empty = any(not self.prefs_vars[k].get().strip() for k in model_keys)
-            if any_empty:
+            # Hidden forever once dismissed; otherwise satisfied by EITHER family being
+            # usable — Klein's four paths, or Krea 2's training trio (the Turbo checkpoint
+            # is optional now that previews default to the Turbo LoRA).
+            if self.prefs.get("setup_prompt_dismissed"):
+                self._setup_prompt_frame.pack_forget()
+                return
+            klein_ok = all(self.prefs_vars[k].get().strip()
+                           for k in ("base_dit", "distilled_dit", "vae", "text_encoder"))
+            krea_ok = all(self.prefs_vars[k].get().strip()
+                          for k in ("krea2_raw_dit", "krea2_vae", "krea2_text_encoder"))
+            if klein_ok or krea_ok:
+                self._setup_prompt_frame.pack_forget()
+            else:
                 self._setup_prompt_frame.pack(fill=tk.X, pady=(20, 0),
                                                before=tools_card)
-            else:
-                self._setup_prompt_frame.pack_forget()
 
-        # Re-check whenever a model path changes
-        for _mk in ("base_dit", "distilled_dit", "vae", "text_encoder"):
+        # Re-check whenever a model path (either family) changes
+        for _mk in ("base_dit", "distilled_dit", "vae", "text_encoder",
+                    "krea2_raw_dit", "krea2_vae", "krea2_text_encoder"):
             self.prefs_vars[_mk].trace_add("write", _check_model_paths)
 
         # Initial check (deferred so tools_card exists)
@@ -2601,18 +2746,28 @@ class LoRATrainerGUI:
         _saved_arch = "Flux 2 Klein Base 9B"
         try:
             _candidate = self.last_used.get("architecture", _saved_arch)
+            if _candidate == "Krea 2 (experimental)":   # pre-rename saves (2026-07-28)
+                _candidate = "Krea 2"
             if _candidate in ARCHITECTURE_LIST:
                 _saved_arch = _candidate
         except Exception:
             pass
         self.architecture_var = tk.StringVar(value=_saved_arch)
+        # Seeded so _on_architecture_selected can tell a real family change from the user
+        # re-picking the entry that's already selected (both fire <<ComboboxSelected>>).
+        self._arch_last_selected = _saved_arch
+        # Per-family settings memory, session-scoped: architecture -> the Training-tab
+        # snapshot it had when you last switched away from it, and the preset label it was
+        # showing. First visit to a family falls back to that family's default preset.
+        self._arch_settings_memory = {}
+        self._arch_preset_name_memory = {}
 
         # === Base Model card (only shown when more than one architecture is available) ===
         if len(ARCHITECTURE_LIST) > 1:
             model_card = self._start_section_card(
                 outer, "Base Model",
-                "Pick the model family to train. Krea 2 is experimental — set its four "
-                "model paths on the Preferences tab before training.",
+                "Pick the model family to train. Krea 2 needs its model paths set on the "
+                "Preferences tab before training.",
             )
             model_row = tk.Frame(model_card, bg=COLORS["bg_surface"])
             model_row.pack(anchor=tk.W)
@@ -3398,6 +3553,15 @@ class LoRATrainerGUI:
     def get_preset_dir_for_architecture(self, arch):
         """Get the preset directory for an architecture, creating if needed"""
         preset_dir = os.path.join(PRESETS_DIR, arch)
+        # One-shot folder rename from the pre-2026-07-28 arch name, or user-saved Krea 2
+        # presets would silently vanish from the dropdown.
+        if arch == "Krea 2" and not os.path.isdir(preset_dir):
+            _legacy = os.path.join(PRESETS_DIR, "Krea 2 (experimental)")
+            if os.path.isdir(_legacy):
+                try:
+                    os.rename(_legacy, preset_dir)
+                except OSError:
+                    pass
         os.makedirs(preset_dir, exist_ok=True)
         return preset_dir
 
@@ -3527,6 +3691,13 @@ class LoRATrainerGUI:
                 self.quant_4bit_mode_var.set("On" if bool(preset["QUANT_4BIT"]) else "Off")
                 self._on_quant_4bit_mode_changed()
 
+        # torch.compile mode — collected by _collect_preset_values but, until now, never
+        # restored, so a preset's COMPILE_BLOCKS was silently dropped on load.
+        if "COMPILE_BLOCKS" in preset and hasattr(self, 'compile_blocks_var'):
+            _cb = str(preset["COMPILE_BLOCKS"]).capitalize()
+            if _cb in ("Auto", "On", "Off"):
+                self.compile_blocks_var.set(_cb)
+
         # Per-image loss watch toggles (krea2) — dedicated vars, same not-in-self.entries situation.
         if "KREA2_LOSS_WATCH" in preset and hasattr(self, 'krea2_loss_watch_var'):
             self.krea2_loss_watch_var.set(bool(preset["KREA2_LOSS_WATCH"]))
@@ -3542,6 +3713,22 @@ class LoRATrainerGUI:
             self.adaptive_lr_var.set(bool(preset["ADAPTIVE_LR"]))
             if hasattr(self, '_on_adaptive_lr_toggle'):
                 self._on_adaptive_lr_toggle()
+
+        # LEARNING_RATE is state-gated: the adaptive checkbox greys the LR box, and a tk
+        # Entry silently DROPS delete/insert while disabled — so the generic loop above
+        # lost the preset's LR whenever adaptive was on at that moment (e.g. Old Reliable
+        # active, then loading Identity kept 1e-4 instead of 4e-4). Re-apply after the
+        # adaptive toggle has settled, forcing the widget writable for the write.
+        if "LEARNING_RATE" in preset and "LEARNING_RATE" in self.entries:
+            _lr_ent = self.entries["LEARNING_RATE"]
+            try:
+                _prev_state = str(_lr_ent.cget("state"))
+                _lr_ent.config(state="normal")
+                _lr_ent.delete(0, tk.END)
+                _lr_ent.insert(0, str(preset["LEARNING_RATE"]))
+                _lr_ent.config(state=_prev_state)
+            except (AttributeError, tk.TclError):
+                pass
 
         # Model Area to Train (training preset dropdown)
         if "TARGET_LAYERS" in preset and hasattr(self, 'training_preset_var'):
@@ -5263,7 +5450,6 @@ class LoRATrainerGUI:
         action_row = tk.Frame(actions_card, bg=COLORS["bg_surface"])
         action_row.pack(anchor=tk.W)
         ttk.Button(action_row, text="Caption All Images (AI)", command=self.caption_all_florence).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(action_row, text="Caption Selected", command=self.caption_selected_florence).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(action_row, text="Static Caption All", command=self.generate_captions).pack(side=tk.LEFT, padx=(0, 8))
         self.caption_stop_btn = ttk.Button(action_row, text="Stop", command=self.stop_captioning, state=tk.DISABLED)
         self.caption_stop_btn.pack(side=tk.LEFT, padx=(0, 8))
@@ -5388,7 +5574,6 @@ class LoRATrainerGUI:
         for widget in self.caption_grid_frame.winfo_children():
             widget.destroy()
         self.caption_thumbnails.clear()
-        self.selected_images.clear()
 
         images = self.get_caption_image_files()
         total_images = len(images)
@@ -5417,9 +5602,25 @@ class LoRATrainerGUI:
         card_frame = ttk.Frame(self.caption_grid_frame, relief="solid", borderwidth=1)
         card_frame.grid(row=row, column=col, padx=5, pady=5, sticky=tk.NSEW)
 
-        # Create thumbnail
+        # Edit + Remove pinned to the card's BOTTOM edge, packed first for priority. Cards in
+        # a grid row share the tallest card's height (sticky=NSEW), so pinning puts every
+        # row's buttons on the same level regardless of thumbnail shape.
+        btn_row = tk.Frame(card_frame)
+        btn_row.pack(side=tk.BOTTOM, pady=(2, 6))
+        ttk.Button(btn_row, text="Edit",
+                   command=lambda p=img_path: self.show_edit_caption_dialog(p)).pack(side=tk.LEFT, padx=(0, 4))
+        rm_btn = ttk.Button(btn_row, text="Remove",
+                            command=lambda p=img_path: self.remove_caption_image(p))
+        rm_btn.pack(side=tk.LEFT)
+        ToolTip(rm_btn, "Move this image + its caption to a 'removed' subfolder — nothing is\n"
+                        "deleted, so it's easy to undo. Use after Image Prep to cull face\n"
+                        "close-ups that came out soft or blurry.")
+
+        # Create thumbnail (original resolution captured before thumbnail() shrinks it)
+        img_res = None
         try:
             with Image.open(img_path) as img:
+                img_res = img.size
                 img.thumbnail((150, 150), Image.LANCZOS)
                 photo = ImageTk.PhotoImage(img)
                 self.caption_thumbnails[img_path] = photo  # Keep reference
@@ -5429,37 +5630,52 @@ class LoRATrainerGUI:
         except Exception as e:
             ttk.Label(card_frame, text="Error loading image").pack(padx=5, pady=5)
 
-        # Filename
+        # Filename + original resolution — the res is what you're eyeballing for (tiny face
+        # crops read as "(180×240)" here long before the blur is obvious in a 150px thumb).
         filename = os.path.basename(img_path)
-        name_label = ttk.Label(card_frame, text=filename[:20] + "..." if len(filename) > 20 else filename)
+        name_label = ttk.Label(card_frame, text=filename[:30] + "..." if len(filename) > 30 else filename)
         name_label.pack()
+        if img_res:
+            ttk.Label(card_frame, text=f"({img_res[0]}×{img_res[1]})",
+                      foreground=COLORS["text_muted"]).pack()
 
-        # Load and display caption if exists
+        # Load and display caption if exists — wrapped to the cell's usable width
         caption_path = os.path.splitext(img_path)[0] + ".txt"
         if os.path.exists(caption_path):
             try:
                 with open(caption_path, 'r', encoding='utf-8') as f:
                     caption = f.read().strip()
-                caption_preview = caption[:50] + "..." if len(caption) > 50 else caption
-                caption_label = ttk.Label(card_frame, text=caption_preview, wraplength=140, foreground=COLORS["text_secondary"])
-                caption_label.pack(pady=2)
+                caption_preview = caption[:110] + "..." if len(caption) > 110 else caption
+                caption_label = ttk.Label(card_frame, text=caption_preview, wraplength=270,
+                                          justify=tk.LEFT, foreground=COLORS["text_secondary"])
+                caption_label.pack(fill=tk.X, padx=8, pady=2)
             except Exception:
                 pass
         else:
             ttk.Label(card_frame, text="[No caption]", foreground=COLORS["warning"]).pack(pady=2)
 
-        # Selection checkbox
-        var = tk.BooleanVar(value=img_path in self.selected_images)
-        def on_select(path=img_path, v=var):
-            if v.get():
-                self.selected_images.add(path)
-            else:
-                self.selected_images.discard(path)
-        check = ttk.Checkbutton(card_frame, text="Select", variable=var, command=on_select)
-        check.pack()
-
-        # Edit button
-        ttk.Button(card_frame, text="Edit", command=lambda p=img_path: self.show_edit_caption_dialog(p)).pack(pady=2)
+    def remove_caption_image(self, img_path):
+        """Move an image + its caption .txt to <folder>/removed/ — the never-delete pattern
+        ('originals', 'excluded_by_look') applied to manual culling. Subfolders aren't globbed
+        by the dataset builder, so removed files simply stop being training data."""
+        folder = os.path.dirname(img_path)
+        dest_dir = os.path.join(folder, "removed")
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+            for p in (img_path, os.path.splitext(img_path)[0] + ".txt"):
+                if not os.path.exists(p):
+                    continue
+                dest = os.path.join(dest_dir, os.path.basename(p))
+                stem, ext = os.path.splitext(dest)
+                n = 1
+                while os.path.exists(dest):
+                    dest = f"{stem}_{n}{ext}"
+                    n += 1
+                os.rename(p, dest)
+        except OSError as e:
+            messagebox.showerror("Remove failed", f"Could not move the file:\n{e}")
+            return
+        self.refresh_caption_images()
 
     def caption_prev_page(self):
         """Go to previous page of images"""
@@ -5479,17 +5695,27 @@ class LoRATrainerGUI:
         """Show dialog to edit caption for an image"""
         dialog = tk.Toplevel(self.master)
         dialog.title(f"Edit Caption - {os.path.basename(img_path)}")
-        dialog.geometry("600x500")
         dialog.configure(bg=BG_COLOR)
+        # No fixed geometry: content height varies (a portrait thumbnail is up to 300 px tall),
+        # and the old 600x500 clipped the buttons under exactly that case. The dialog sizes to
+        # its content; the button row is packed side=BOTTOM *first*, so pack gives it its space
+        # before anything else and it can never be pushed off the edge.
+        dialog.minsize(600, 360)
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(side=tk.BOTTOM, pady=10)
 
         # Image preview
         try:
             with Image.open(img_path) as img:
+                _w, _h = img.size
                 img.thumbnail((300, 300), Image.LANCZOS)
                 photo = ImageTk.PhotoImage(img)
                 img_label = ttk.Label(dialog, image=photo)
                 img_label.image = photo
-                img_label.pack(pady=10)
+                img_label.pack(pady=(10, 2))
+                ttk.Label(dialog, text=f"{_w}×{_h} px",
+                          foreground=COLORS["text_muted"]).pack()
         except Exception:
             ttk.Label(dialog, text="Could not load image preview").pack(pady=10)
 
@@ -5506,10 +5732,6 @@ class LoRATrainerGUI:
                     caption_text.insert("1.0", f.read())
             except Exception:
                 pass
-
-        # Buttons
-        btn_frame = ttk.Frame(dialog)
-        btn_frame.pack(pady=10)
 
         def save_caption():
             text = caption_text.get("1.0", tk.END).strip()
@@ -5869,40 +6091,6 @@ class LoRATrainerGUI:
 
         threading.Thread(target=caption_thread, daemon=True).start()
 
-    def caption_selected_florence(self):
-        """Caption only selected images"""
-        if not self.selected_images:
-            messagebox.showinfo("Info", "No images selected. Use checkboxes to select images.")
-            return
-
-        images = list(self.selected_images)
-        self.captioning_stop_flag = False
-        self._captioning_running = True
-        self.caption_stop_btn.configure(state=tk.NORMAL)
-
-        def caption_thread():
-            total = len(images)
-            self.update_caption_log(f"Captioning {total} selected images...\n")
-
-            for i, img_path in enumerate(images):
-                if self.captioning_stop_flag:
-                    self.master.after(0, lambda: self.update_caption_log("Captioning stopped by user\n"))
-                    break
-
-                progress = ((i + 1) / total) * 100
-                self.master.after(0, lambda p=progress, c=i+1, t=total: self.update_caption_progress(p, c, t))
-
-                caption = self.generate_florence_caption(img_path)
-                if caption:
-                    self.save_caption_with_trigger(img_path, caption)
-                    self.master.after(0, lambda f=os.path.basename(img_path): self.update_caption_log(f"✓ {f}\n"))
-
-            self._captioning_running = False
-            self.master.after(0, lambda: self.update_caption_log(f"\nCaptioning complete!\n"))
-            self.master.after(0, lambda: self.caption_stop_btn.configure(state=tk.DISABLED))
-            self.master.after(0, self.refresh_caption_images)
-
-        threading.Thread(target=caption_thread, daemon=True).start()
 
     def caption_single_image(self, img_path):
         """Caption a single image (for regenerate button)"""
@@ -6176,6 +6364,7 @@ class LoRATrainerGUI:
         )
         self.sample_enabled_check.pack(anchor=tk.W, padx=20, pady=14)
 
+
         # --- Sample settings container (the 4 cards live inside this) ---
         self.sample_settings_frame = tk.Frame(grid_holder, bg=COLORS["bg_deep"])
         self.sample_settings_frame.grid(row=2, column=0, sticky=tk.EW)
@@ -6309,6 +6498,41 @@ class LoRATrainerGUI:
                  font=(FONT_FAMILY, 8, "italic"), fg=COLORS["text_muted"], bg=COLORS["bg_surface"],
                  wraplength=600, justify=tk.LEFT)
         self.cache_sample_model_note.grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
+
+        # Krea 2 preview engine — lives HERE with the other sample-model choices (the Distilled
+        # toggle above is Klein's equivalent choice). Shown only in Krea 2 mode, via
+        # _apply_samples_klein_only. raw_lora: previews render on the resident training DiT
+        # with the Turbo LoRA @1.0 — identical 8-step CFG-free settings, no ~13 GB Turbo load,
+        # no parking the trainer to CPU per preview. turbo_model: classic checkpoint path.
+        self._KREA2_ENGINE_LABELS = {
+            "raw_lora": "RAW + Turbo LoRA (no model swapping — recommended)",
+            "turbo_model": "Turbo model (classic — loads the fp8 Turbo each preview)",
+        }
+        _eng_saved = str(self.last_used.get("krea2_preview_engine", "raw_lora"))
+        if _eng_saved not in self._KREA2_ENGINE_LABELS:
+            _eng_saved = "raw_lora"
+        self.krea2_preview_engine_var = tk.StringVar(value=self._KREA2_ENGINE_LABELS[_eng_saved])
+        self.krea2_engine_frame = tk.Frame(freq_card, bg=COLORS["bg_surface"])
+        tk.Label(self.krea2_engine_frame, text="Krea 2 preview engine:", font=(FONT_FAMILY, 10),
+                 fg=COLORS["text_secondary"], bg=COLORS["bg_surface"]).pack(side=tk.LEFT, padx=(0, 8))
+        _eng_combo = ttk.Combobox(self.krea2_engine_frame, textvariable=self.krea2_preview_engine_var,
+                                  state="readonly", width=52,
+                                  values=list(self._KREA2_ENGINE_LABELS.values()))
+        _eng_combo.pack(side=tk.LEFT)
+        _eng_combo.bind("<<ComboboxSelected>>", lambda e: self._save_last_used_paths())
+        ToolTip(_eng_combo,
+                "RAW + Turbo LoRA renders previews on the training model itself with the Turbo\n"
+                "distillation LoRA applied at 1.0 — same 8-step CFG-free settings as the Turbo\n"
+                "model, but nothing is loaded or moved between epochs. The LoRA auto-downloads\n"
+                "(~470 MB) if missing. The classic mode loads the fp8 Turbo checkpoint per preview.")
+        self.krea2_engine_note = tk.Label(
+            freq_card,
+            text="Renders previews on the model already training, with the official Turbo LoRA "
+                 "switched on just for the render — nothing loaded or moved between epochs. The "
+                 "classic mode loads the ~13 GB Turbo checkpoint per preview instead.",
+            font=(FONT_FAMILY, 8, "italic"), fg=COLORS["text_muted"], bg=COLORS["bg_surface"],
+            wraplength=600, justify=tk.LEFT)
+        # Gridded (rows 6-7) / removed by _apply_samples_klein_only; hidden by default (Klein).
 
         # Card 3: Architecture-Specific (Flow Shift / Guidance / Negative / CFG)
         arch_card = self._start_section_card(
@@ -6444,6 +6668,22 @@ class LoRATrainerGUI:
 
     def _on_architecture_selected(self, event=None):
         """Model-family selector changed — refresh sample defaults + presets + persist."""
+        # Snapshot the family we're LEAVING before anything reshapes the tab. The combobox
+        # has already moved to the new value by the time this fires, so the outgoing family
+        # is _arch_last_selected and the widgets still hold its values — but only until
+        # update_ui_for_architecture() runs below. Hence: first thing, before any UI work.
+        _arch_new = self.architecture_var.get()
+        _arch_old = getattr(self, "_arch_last_selected", None)
+        _arch_changed = _arch_new != _arch_old
+        if _arch_changed and _arch_old:
+            try:
+                self._arch_settings_memory[_arch_old] = self._collect_preset_values()
+                # Capture the preset LABEL here too — refresh_preset_combobox() below
+                # rewrites it, so this is the last moment it still names the old family's.
+                self._arch_preset_name_memory[_arch_old] = self.custom_preset_var.get()
+            except Exception:
+                pass
+
         try:
             self.update_samples_ui_for_architecture()
         except Exception:
@@ -6459,12 +6699,38 @@ class LoRATrainerGUI:
             self._refresh_training_buttons()
         except Exception:
             pass
-        # Swap the preset dropdown to this architecture's built-ins + user presets.
+        # Swap the preset dropdown to this family's presets, and actually load values into
+        # the fields — either what this family last had, or its default preset.
+        #
+        # Naming a preset without applying it is a lie the user acts on: switching to Krea 2
+        # left Klein's 55 epochs / rank 16 sitting in the fields while the dropdown read
+        # "Krea 2 Defaults (rank 32, full model)". Those values don't transfer — Klein's
+        # rank/epoch/block-targeting recipe is meaningless for Krea 2.
+        #
+        # Per-family memory: first visit to a family gets its default preset, every later
+        # visit gets that family's own settings back, so flipping over to check something
+        # doesn't cost you your tuning. Session-scoped — a restart starts fresh.
+        #
+        # Only on a REAL family change: re-selecting the entry that's already active fires
+        # <<ComboboxSelected>> too, and that must not touch the fields at all.
         try:
+            self._arch_last_selected = _arch_new
             self.refresh_preset_combobox()
-            builtins = self._builtins_for_arch(self.architecture_var.get())
-            if builtins:
-                self.custom_preset_var.set(next(iter(builtins)))
+            builtins = self._builtins_for_arch(_arch_new)
+            _default_name = next(iter(builtins)) if builtins else None
+            if _arch_changed:
+                _remembered = self._arch_settings_memory.get(_arch_new)
+                if _remembered:
+                    self._apply_preset_values(_remembered)
+                    self.custom_preset_var.set(self._arch_preset_name_memory.get(_arch_new, ""))
+                    self.update_console(f"[preset] {_arch_new} selected — restored your settings "
+                                        f"from earlier this session\n")
+                elif _default_name:
+                    self._apply_preset_values(builtins[_default_name])
+                    self.custom_preset_var.set(_default_name)
+                    self.update_console(f"[preset] {_arch_new} selected — applied {_default_name}\n")
+            elif _default_name and not self.custom_preset_var.get():
+                self.custom_preset_var.set(_default_name)
         except Exception:
             pass
         try:
@@ -6573,20 +6839,30 @@ class LoRATrainerGUI:
         secondary = COLORS["text_secondary"]
         label_fg = muted if is_krea2 else secondary
 
-        # "Use Distilled model for samples" checkbox
+        # "Use Distilled model for samples" checkbox — Klein's sample-model choice. Krea 2's
+        # equivalent choice is the Preview engine dropdown, shown right below in Krea 2 mode.
         if hasattr(self, "use_distilled_check"):
             self.use_distilled_check.configure(
                 state=(tk.DISABLED if is_krea2 else tk.NORMAL),
-                text=("Use Distilled model for samples — Klein only (Krea 2 always uses the fp8 Turbo)"
+                text=("Use Distilled model for samples — Klein only (Krea 2: pick a preview engine below)"
                       if is_krea2 else
                       "Use Distilled model for samples (4-step, matches ComfyUI)"))
 
         # Steps note
         if hasattr(self, "sample_steps_note"):
             self.sample_steps_note.configure(
-                text=("Klein only — Krea 2 previews always use the 8-step fp8 Turbo"
+                text=("Klein only — Krea 2 previews are 8-step either way (engine choice below)"
                       if is_krea2 else
                       "Base samples only — Distilled is locked at 4 steps"))
+
+        # Krea 2 preview engine dropdown + note (rows 6-7 of the cadence card) — Krea 2 only.
+        if hasattr(self, "krea2_engine_frame"):
+            if is_krea2:
+                self.krea2_engine_frame.grid(row=6, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
+                self.krea2_engine_note.grid(row=7, column=0, columnspan=3, sticky=tk.W, pady=(0, 4))
+            else:
+                self.krea2_engine_frame.grid_remove()
+                self.krea2_engine_note.grid_remove()
 
         # Reference image — supported by BOTH families now (Klein: edit conditioning; Krea 2:
         # Qwen3-VL vision path). Always enabled; only the note differs. No strength dial on this
@@ -8111,130 +8387,150 @@ class LoRATrainerGUI:
             "Optional — skip straight to Captions if your images are already prepared.",
         )
 
-        # Card 1: Folders
+        # Card 1: Training folder — display only. Everything happens IN this folder; the old
+        # optional Output Folder is gone (it silently diverged from the training source set on
+        # the Start tab, which is never what a training workflow wants).
         folders_card = self._start_section_card(
-            outer, "Folders",
-            "Source is the Training image folder from the Start tab. Output is where "
-            "prepared images land — leave blank to write next to the originals.",
+            outer, "Training Folder",
+            "Everything below happens inside the training folder from the Start tab — "
+            "prepared images land there, ready for the Captions tab and training.",
         )
         folders_card.grid_columnconfigure(1, weight=1)
-
-        ttk.Label(folders_card, text="Source Folder:").grid(row=0, column=0, sticky=tk.W, padx=(0, 10), pady=4)
+        ttk.Label(folders_card, text="Folder:").grid(row=0, column=0, sticky=tk.W, padx=(0, 10), pady=4)
         tk.Label(folders_card, textvariable=self.image_folder_var,
                  font=(FONT_FAMILY, 10),
                  fg=COLORS["text_secondary"], bg=COLORS["bg_surface"],
-                 anchor="w").grid(row=0, column=1, columnspan=2, sticky=tk.W, pady=4)
+                 anchor="w").grid(row=0, column=1, sticky=tk.W, pady=4)
         tk.Label(folders_card, text="(set on the Start tab)",
                  font=(FONT_FAMILY, 9, "italic"),
                  fg=COLORS["text_muted"], bg=COLORS["bg_surface"]).grid(
-            row=1, column=1, columnspan=2, sticky=tk.W, pady=(0, 8)
+            row=1, column=1, sticky=tk.W, pady=(0, 4)
         )
 
-        ttk.Label(folders_card, text="Output Folder:").grid(row=2, column=0, sticky=tk.W, padx=(0, 10), pady=4)
-        ttk.Entry(folders_card, textvariable=self.convert_output_var, width=40).grid(
-            row=2, column=1, sticky=tk.EW, pady=4
-        )
-        ttk.Button(folders_card, text="Browse", command=self.browse_convert_output).grid(
-            row=2, column=2, sticky=tk.W, padx=(8, 0), pady=4
-        )
-        tk.Label(folders_card, text="(leave empty to save in source folder)",
-                 font=(FONT_FAMILY, 9, "italic"),
-                 fg=COLORS["text_muted"], bg=COLORS["bg_surface"]).grid(
-            row=3, column=1, columnspan=2, sticky=tk.W
-        )
+        # Card 2: What to do — one radio per outcome, plain-language hint under each. The radio
+        # VALUES stay the historical mode strings so persistence and the convert pipeline are
+        # untouched; only the visible labels changed.
+        mode_card = self._start_section_card(outer, "1 · What to do", None)
 
-        # Card 2: Resize
-        resize_card = self._start_section_card(
-            outer, "Resize",
-            "Images larger than Max Size are downscaled on the longer edge; smaller images are left untouched.",
-        )
-        resize_card.grid_columnconfigure(1, weight=1)
+        def _mode_radio(text, value, hint, hint_fg=None):
+            rb = ttk.Radiobutton(mode_card, text=text, variable=self.prep_mode_var,
+                                 value=value, command=self._on_prep_mode_changed)
+            rb.pack(anchor=tk.W, pady=(6, 0))
+            lbl = tk.Label(mode_card, text=hint, font=(FONT_FAMILY, 9),
+                           fg=hint_fg or COLORS["text_muted"], bg=COLORS["bg_surface"],
+                           wraplength=680, justify=tk.LEFT)
+            lbl.pack(anchor=tk.W, padx=(24, 0))
+            return rb
 
-        ttk.Label(resize_card, text="Max Size (px):").grid(row=0, column=0, sticky=tk.W, padx=(0, 10), pady=4)
-        ttk.Combobox(resize_card, textvariable=self.max_size_var,
-                     values=["256", "512", "640", "768", "1024", "1280", "1536", "2048"],
-                     state="readonly", width=10).grid(row=0, column=1, sticky=tk.W, pady=4)
+        _mode_radio(
+            "Resize + face close-ups — recommended for people",
+            "Auto Prep (Face Crops)",
+            "Every photo is resized and saved as PNG, PLUS a zoomed-in copy of the face saved "
+            "beside it — more detail shots for better likeness.\n"
+            "\U0001F4A1 Works best on high-res originals: if your photos are already shrunk to "
+            "training size, the face close-ups come out soft. Start from the biggest versions "
+            "you have.")
+        _mode_radio(
+            "Resize only",
+            "Resize Only",
+            "Just resize + convert to PNG. Use for styles, objects, or already-cropped sets.")
+        _mode_radio(
+            "Face close-ups only",
+            "Face Crop Only",
+            "Keep only the cropped face from each photo — the full shot is not kept.")
 
-        # Card 3: Prep Mode (face-related controls live here; _on_prep_mode_changed grid_removes them)
-        prep_card = self._start_section_card(
-            outer, "Prep Mode",
-            "Auto Prep generates face-cropped derivatives alongside resized originals. "
-            "Resize Only skips face detection; Face Crop Only replaces the original with the detected crop.",
-        )
-        prep_card.grid_columnconfigure(1, weight=1)
-
-        ttk.Label(prep_card, text="Mode:").grid(row=0, column=0, sticky=tk.W, padx=(0, 10), pady=4)
-        self.prep_mode_combo = ttk.Combobox(
-            prep_card, textvariable=self.prep_mode_var,
-            values=["Auto Prep (Face Crops)", "Resize Only", "Face Crop Only"],
-            state="readonly", width=24,
-        )
-        self.prep_mode_combo.grid(row=0, column=1, sticky=tk.W, pady=4)
-        self.prep_mode_combo.bind("<<ComboboxSelected>>", self._on_prep_mode_changed)
-
-        # Face Target (row 1 — hidden when Resize Only)
-        self._face_target_label = ttk.Label(prep_card, text="Face Target:")
-        self._face_target_label.grid(row=1, column=0, sticky=tk.W, padx=(0, 10), pady=4)
+        # Options row: max size always live; face options grey out in Resize Only (kept visible
+        # so the layout doesn't jump and users learn they exist).
+        opts_row = tk.Frame(mode_card, bg=COLORS["bg_surface"])
+        opts_row.pack(anchor=tk.W, pady=(12, 0))
+        ttk.Label(opts_row, text="Max size:").pack(side=tk.LEFT, padx=(0, 4))
+        _max_combo = ttk.Combobox(opts_row, textvariable=self.max_size_var,
+                                  values=["256", "512", "640", "768", "1024", "1280", "1536", "2048"],
+                                  state="readonly", width=6)
+        _max_combo.pack(side=tk.LEFT)
+        _max_combo.bind("<<ComboboxSelected>>", lambda e: self._update_prep_note())
+        tk.Label(opts_row, text="px  (larger images shrink to fit; smaller are left alone)",
+                 font=(FONT_FAMILY, 9), fg=COLORS["text_muted"], bg=COLORS["bg_surface"]).pack(
+            side=tk.LEFT, padx=(4, 16))
+        self._face_target_label = ttk.Label(opts_row, text="Face:")
+        self._face_target_label.pack(side=tk.LEFT, padx=(0, 4))
         self._face_target_combo = ttk.Combobox(
-            prep_card, textvariable=self.face_selection_var,
+            opts_row, textvariable=self.face_selection_var,
             values=["Largest Face", "Largest Male Face", "Largest Female Face"],
-            state="readonly" if FACE_DETECTION_AVAILABLE else "disabled", width=20,
+            state="readonly" if FACE_DETECTION_AVAILABLE else "disabled", width=18,
         )
-        self._face_target_combo.grid(row=1, column=1, sticky=tk.W, pady=4)
-        self._face_target_row = 1
-
+        self._face_target_combo.pack(side=tk.LEFT, padx=(0, 12))
+        self._face_padding_label = ttk.Label(opts_row, text="Padding:")
+        self._face_padding_label.pack(side=tk.LEFT, padx=(0, 4))
+        self._face_padding_entry = ttk.Entry(opts_row, textvariable=self.face_padding_var, width=5)
+        self._face_padding_entry.pack(side=tk.LEFT)
+        self._face_pct_label = tk.Label(opts_row, text="% around the face",
+                                        font=(FONT_FAMILY, 9), fg=COLORS["text_muted"],
+                                        bg=COLORS["bg_surface"])
+        self._face_pct_label.pack(side=tk.LEFT, padx=(4, 0))
         if not FACE_DETECTION_AVAILABLE:
             self._face_unavail_label = ttk.Label(
-                prep_card, text="(Run install_fizgig.py to enable)",
+                opts_row, text="(Run install_fizgig.py to enable)",
                 foreground=COLORS["warning"],
             )
-            self._face_unavail_label.grid(row=1, column=2, sticky=tk.W, padx=(8, 0))
+            self._face_unavail_label.pack(side=tk.LEFT, padx=(8, 0))
         else:
             self._face_unavail_label = None
 
-        # Face Padding (row 2 — hidden when Resize Only)
-        self._face_padding_label = ttk.Label(prep_card, text="Face Padding (%):")
-        self._face_padding_label.grid(row=2, column=0, sticky=tk.W, padx=(0, 10), pady=4)
-        self._face_padding_frame = tk.Frame(prep_card, bg=COLORS["bg_surface"])
-        self._face_padding_frame.grid(row=2, column=1, sticky=tk.W, pady=4)
-        ttk.Entry(self._face_padding_frame, textvariable=self.face_padding_var, width=8).pack(side=tk.LEFT)
-        tk.Label(self._face_padding_frame, text="(extra space around face)",
-                 font=(FONT_FAMILY, 9), fg=COLORS["text_muted"], bg=COLORS["bg_surface"]).pack(side=tk.LEFT, padx=(8, 0))
-        self._face_padding_row = 2
+        # Card 3: Your originals — the one real destination question, as an explicit choice
+        # (replaces the old inverted "Replace originals" checkbox). Keep-safe is the default.
+        orig_card = self._start_section_card(outer, "2 · Your originals", None)
+        ttk.Radiobutton(
+            orig_card, text="Keep them safe — moved to an 'originals' subfolder",
+            variable=self.delete_originals_var, value=False,
+            command=self._update_prep_note).pack(anchor=tk.W, pady=(4, 0))
+        ttk.Radiobutton(
+            orig_card, text="Replace them  ⚠ originals are gone after this",
+            variable=self.delete_originals_var, value=True,
+            command=self._update_prep_note).pack(anchor=tk.W, pady=(4, 2))
 
-        # Replace originals (row 3)
-        replace_frame = tk.Frame(prep_card, bg=COLORS["bg_surface"])
-        replace_frame.grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=(10, 0))
-        ttk.Checkbutton(
-            replace_frame, text="Replace originals", variable=self.delete_originals_var,
-            command=self._update_prep_note,
-        ).pack(side=tk.LEFT)
-        tk.Label(replace_frame, text="(untick to keep originals in a subfolder)",
-                 font=(FONT_FAMILY, 9), fg=COLORS["text_muted"], bg=COLORS["bg_surface"]).pack(side=tk.LEFT, padx=(8, 0))
-
-        # Dynamic note (row 4)
+        # Card 4: What will happen — the single honest summary, computed from ALL the settings
+        # (the old one-line note ignored half of them). Accent border so it reads as the answer.
+        summary_card = self._start_section_card(outer, "\U0001F4CB What will happen", None,
+                                                accent_border=True)
         self._prep_note_var = tk.StringVar()
         self._prep_note_label = tk.Label(
-            prep_card, textvariable=self._prep_note_var,
-            font=(FONT_FAMILY, 9, "italic"),
-            fg=COLORS["accent_hover"], bg=COLORS["bg_surface"],
+            summary_card, textvariable=self._prep_note_var,
+            font=(FONT_FAMILY, 10),
+            fg=COLORS["text_primary"], bg=COLORS["bg_surface"],
             wraplength=700, justify=tk.LEFT,
         )
-        self._prep_note_label.grid(row=4, column=0, columnspan=3, sticky=tk.W, pady=(8, 0))
+        self._prep_note_label.pack(anchor=tk.W)
 
-        # Card 4: Actions
-        action_card = self._start_section_card(outer, "Run", None)
+        # Card 5: Run it — one unmistakable primary action (label carries the live image count,
+        # set by _update_prep_note), with the face-detection test framed as the optional,
+        # nothing-is-written side step it actually is.
+        action_card = self._start_section_card(outer, "3 · Run it", None)
 
-        button_frame = tk.Frame(action_card, bg=COLORS["bg_surface"])
-        button_frame.pack(anchor=tk.W)
+        self.prepare_images_btn = tk.Button(
+            action_card, text="✨ Prepare Images Now", command=self.convert_images,
+            font=(FONT_FAMILY, 12, "bold"),
+            fg="#FFFFFF", bg=COLORS["accent"],
+            activeforeground="#FFFFFF", activebackground=COLORS["accent_hover"],
+            relief="flat", bd=0, padx=24, pady=8, cursor="hand2",
+        )
+        self.prepare_images_btn.pack(anchor=tk.W, pady=(4, 10))
+
+        test_row = tk.Frame(action_card, bg=COLORS["bg_surface"])
+        test_row.pack(anchor=tk.W)
+        tk.Label(test_row, text="Want to check first?",
+                 font=(FONT_FAMILY, 9), fg=COLORS["text_secondary"],
+                 bg=COLORS["bg_surface"]).pack(side=tk.LEFT, padx=(0, 8))
         self.preview_faces_btn = ttk.Button(
-            button_frame, text="Preview Faces", command=self.preview_faces,
+            test_row, text="Test face detection on one photo…", command=self.preview_faces,
             state="normal" if FACE_DETECTION_AVAILABLE else "disabled",
         )
-        self.preview_faces_btn.pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(button_frame, text="Prepare Images", command=self.convert_images).pack(side=tk.LEFT)
+        self.preview_faces_btn.pack(side=tk.LEFT)
+        tk.Label(test_row, text="optional and safe — shows the crop, writes nothing",
+                 font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_muted"],
+                 bg=COLORS["bg_surface"]).pack(side=tk.LEFT, padx=(8, 0))
 
-        # Apply initial visibility (may grid_remove face widgets in prep_card)
+        # Apply initial state (face-control greying + summary + button count)
         self._on_prep_mode_changed()
 
         # Card 5: Output Log
@@ -8277,12 +8573,6 @@ class LoRATrainerGUI:
 
         self._add_youtube_help_button(outer, "image_prep")
 
-    def browse_convert_output(self):
-        """Browse for output folder"""
-        folder = filedialog.askdirectory()
-        if folder:
-            self.convert_output_var.set(folder)
-
     @property
     def face_detector(self):
         """Lazy-loaded face detector instance"""
@@ -8291,55 +8581,97 @@ class LoRATrainerGUI:
         return self._face_detector
 
     def _on_prep_mode_changed(self, *args):
-        """Show/hide face-related controls based on prep mode."""
+        """Grey out face-related controls in Resize Only (kept visible — layout doesn't jump,
+        and users learn the options exist)."""
         mode = self.prep_mode_var.get()
-        show_face = mode != "Resize Only"
-
-        if show_face:
-            self._face_target_label.grid()
-            self._face_target_combo.grid()
-            self._face_padding_label.grid()
-            self._face_padding_frame.grid()
-            if self._face_unavail_label:
-                self._face_unavail_label.grid()
-            self.preview_faces_btn.configure(state="normal" if FACE_DETECTION_AVAILABLE else "disabled")
-        else:
-            self._face_target_label.grid_remove()
-            self._face_target_combo.grid_remove()
-            self._face_padding_label.grid_remove()
-            self._face_padding_frame.grid_remove()
-            if self._face_unavail_label:
-                self._face_unavail_label.grid_remove()
-            self.preview_faces_btn.configure(state="disabled")
+        face_on = mode != "Resize Only"
+        muted, secondary = COLORS["text_muted"], COLORS["text_secondary"]
+        self._face_target_combo.configure(
+            state=("readonly" if (face_on and FACE_DETECTION_AVAILABLE) else "disabled"))
+        self._face_padding_entry.configure(state=("normal" if face_on else "disabled"))
+        for lbl in (self._face_target_label, self._face_padding_label):
+            try:
+                lbl.configure(foreground=(secondary if face_on else muted))
+            except tk.TclError:
+                pass
+        self._face_pct_label.configure(fg=(secondary if face_on else muted))
+        self.preview_faces_btn.configure(
+            state=("normal" if (face_on and FACE_DETECTION_AVAILABLE) else "disabled"))
 
         self._update_prep_note()
 
-    def _update_prep_note(self):
-        """Update the contextual note based on prep mode and replace originals setting."""
+    def _prep_source_stats(self, max_sample=40):
+        """(image_count, median_longest_edge) for the training folder's top-level images.
+
+        Edge read from image HEADERS only (PIL .size — no pixel decode), sampled at most
+        `max_sample` files, so it's cheap enough to run on every settings change. Returns
+        (0, None) when the folder is unset/empty."""
+        folder = self.image_folder_var.get().strip()
+        exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+        try:
+            files = [os.path.join(folder, f) for f in os.listdir(folder)
+                     if os.path.splitext(f)[1].lower() in exts]
+        except OSError:
+            return 0, None
+        edges = []
+        for p in files[:max_sample]:
+            try:
+                with Image.open(p) as im:
+                    edges.append(max(im.size))
+            except Exception:
+                pass
+        median = sorted(edges)[len(edges) // 2] if edges else None
+        return len(files), median
+
+    def _update_prep_note(self, *args):
+        """The 'What will happen' summary — computed from ALL the settings (mode, originals
+        choice, max size, live folder contents). The one-line note this replaces ignored the
+        output folder entirely and taught users the wrong answer to 'does this touch my
+        folder?'."""
         if not hasattr(self, '_prep_note_var'):
             return
         mode = self.prep_mode_var.get()
         replace = self.delete_originals_var.get()
+        try:
+            max_px = int(self.max_size_var.get())
+        except (ValueError, tk.TclError):
+            max_px = 1024
+        n, median_edge = self._prep_source_stats()
 
+        count = f"your {n} images" if n else "your images"
         if mode == "Auto Prep (Face Crops)":
-            if replace:
-                note = "Result: Your folder will contain resized originals + face crop derivatives. Images larger than max size will be shrunk in place."
-            else:
-                note = "Result: Your folder will contain resized copies + face crop derivatives. Original files will be moved to an 'originals' subfolder."
-        elif mode == "Resize Only":
-            if replace:
-                note = "Result: Images larger than max size will be shrunk in place and converted to PNG. Smaller images converted to PNG only."
-            else:
-                note = "Result: Resized PNG copies in your folder. Original files will be moved to an 'originals' subfolder."
+            what = (f"{count} → resized to fit {max_px} px and saved as PNG, plus one face "
+                    f"close-up each{f' (≈{n * 2} files)' if n else ''}")
         elif mode == "Face Crop Only":
-            if replace:
-                note = "Result: Your folder will contain ONLY face crops. Original images will be replaced."
-            else:
-                note = "Result: Face crops in your folder. Original files will be moved to an 'originals' subfolder."
+            what = (f"{count} → replaced by just the cropped face from each photo, "
+                    f"saved as PNG")
         else:
-            note = ""
+            what = f"{count} → resized to fit {max_px} px and saved as PNG"
 
-        self._prep_note_var.set(note)
+        where = "Everything lands in your training folder."
+        if replace:
+            originals = "Your original files are replaced ⚠ there is no undo."
+        else:
+            originals = ("Your originals are moved to the 'originals' subfolder — "
+                         "nothing is deleted.")
+
+        lines = [f"{what}. {where} {originals}"]
+        # Soft-crop warning: face modes cropping from images that are already training-size
+        # produce small, blurry faces. Header-read median across a sample of the folder.
+        if mode != "Resize Only" and median_edge is not None and median_edge <= max_px:
+            lines.append(f"⚠ Your images are already ≤ {max_px} px — face "
+                         f"close-ups cut from them will be soft. If you have higher-res "
+                         f"versions, prep from those instead.")
+        if mode != "Resize Only":
+            lines.append("Next: eyeball the face close-ups on the Captions tab and Remove any "
+                         "blurry ones before captioning.")
+        self._prep_note_var.set("\n".join(lines))
+
+        # The Run button carries the live count — "Prepare 34 Images Now" answers "run on what?"
+        if hasattr(self, "prepare_images_btn"):
+            self.prepare_images_btn.configure(
+                text=(f"✨ Prepare {n} Image{'s' if n != 1 else ''} Now" if n
+                      else "✨ Prepare Images Now"))
 
     def _get_face_selection_mode(self):
         """Parse face selection mode from Face Target dropdown."""
@@ -9443,7 +9775,7 @@ class LoRATrainerGUI:
         _xf.pack(anchor=tk.W)
         ttk.Radiobutton(_xf, text="Klein 9B", variable=self.explorer_family_var, value="klein",
                         command=self._on_explorer_family_changed).pack(side=tk.LEFT, padx=(0, 20))
-        ttk.Radiobutton(_xf, text="Krea 2 (experimental)", variable=self.explorer_family_var, value="krea2",
+        ttk.Radiobutton(_xf, text="Krea 2", variable=self.explorer_family_var, value="krea2",
                         command=self._on_explorer_family_changed).pack(side=tk.LEFT)
 
         # Card 1: Setup
@@ -10452,6 +10784,14 @@ class LoRATrainerGUI:
         """Send the current Explorer baseline to the Repair Studio for manual editing."""
         if self._explorer_engine is None or self._explorer_baseline_state is None:
             return
+        # Mid-generation handoff hard-hangs: the unload below no-ops (its own worker guard),
+        # then Repair Studio loads a SECOND pipeline on the GUI thread while the Explorer
+        # worker is mid-CUDA on the first — two pipelines, two threads, one GPU, and the GUI
+        # thread blocks inside a CUDA call. Same guard every other Explorer action uses.
+        if getattr(self, "_explorer_generating", False):
+            self.explorer_status_var.set(
+                "Still generating variants — wait for them to finish, then Refine.")
+            return
         lora_path = self._explorer_engine.primary_path
         if not lora_path:
             return
@@ -10603,7 +10943,7 @@ class LoRATrainerGUI:
         _ef.pack(anchor=tk.W)
         ttk.Radiobutton(_ef, text="Klein 9B", variable=self.extract_family_var, value="klein",
                         command=self._on_extract_family_changed).pack(side=tk.LEFT, padx=(0, 20))
-        ttk.Radiobutton(_ef, text="Krea 2 (experimental)", variable=self.extract_family_var, value="krea2",
+        ttk.Radiobutton(_ef, text="Krea 2", variable=self.extract_family_var, value="krea2",
                         command=self._on_extract_family_changed).pack(side=tk.LEFT)
 
         # Card 1: Source & Output
@@ -11426,9 +11766,9 @@ class LoRATrainerGUI:
             download_note="~15GB single-file safetensors — Qwen3-8B packaged for Klein 9B (Comfy-Org)",
         )
 
-        # Card 1b: Krea 2 model paths (experimental)
+        # Card 1b: Krea 2 model paths
         krea_card = self._start_section_card(
-            outer, "Model Paths (Krea 2 — experimental)",
+            outer, "Model Paths (Krea 2)",
             "Krea 2 LoRA training + inference. Train on RAW; previews and inference use the pre-quant fp8 Turbo "
             "(8-step, CFG-free). The text encoder must be the bf16 Qwen3-VL-4B — the fp8 ComfyUI variant is not "
             "loadable for training.",
@@ -11458,6 +11798,14 @@ class LoRATrainerGUI:
             "Qwen3-VL-4B text encoder in bf16 — NOT the fp8 ComfyUI variant (not loadable for training)",
             download_url="https://huggingface.co/Comfy-Org/Krea-2/blob/main/text_encoders/qwen3vl_4b_bf16.safetensors",
             download_note="~8GB bf16 — Comfy-Org/Krea-2 → text_encoders/qwen3vl_4b_bf16.safetensors",
+        )
+        kr = self._add_pref_row(
+            krea_card, kr, "Turbo LoRA (rank 64):", "krea2_turbo_lora",
+            "Turbo distillation as a LoRA — RAW + this at strength 1.0 samples like the Turbo model "
+            "(same 8-step CFG-free settings), letting previews run on the training DiT without loading "
+            "the separate Turbo checkpoint",
+            download_url="https://huggingface.co/Comfy-Org/Krea-2/blob/main/loras/krea2_turbo_lora_rank_64_bf16.safetensors",
+            download_note="~470MB bf16 — Comfy-Org/Krea-2 → loras/krea2_turbo_lora_rank_64_bf16.safetensors",
         )
 
         # Card 1c: GPU selection — only interesting on multi-GPU hosts, but harmless
@@ -11697,7 +12045,7 @@ class LoRATrainerGUI:
         _pf.pack(anchor=tk.W)
         ttk.Radiobutton(_pf, text="Klein 9B", variable=self.profiler_family_var, value="klein",
                         command=self._on_profiler_family_changed).pack(side=tk.LEFT, padx=(0, 20))
-        ttk.Radiobutton(_pf, text="Krea 2 (experimental)", variable=self.profiler_family_var, value="krea2",
+        ttk.Radiobutton(_pf, text="Krea 2", variable=self.profiler_family_var, value="krea2",
                         command=self._on_profiler_family_changed).pack(side=tk.LEFT)
 
         # Card 1: Model selection
@@ -12360,7 +12708,7 @@ class LoRATrainerGUI:
         fam_frame.grid(row=r, column=1, columnspan=3, sticky=tk.W, padx=4, pady=2)
         ttk.Radiobutton(fam_frame, text="Klein 9B", variable=self.repair_family_var, value="klein",
                         style="Surface.TRadiobutton", command=self._on_repair_family_changed).pack(side=tk.LEFT, padx=(0, 12))
-        ttk.Radiobutton(fam_frame, text="Krea 2 (experimental)", variable=self.repair_family_var, value="krea2",
+        ttk.Radiobutton(fam_frame, text="Krea 2", variable=self.repair_family_var, value="krea2",
                         style="Surface.TRadiobutton", command=self._on_repair_family_changed).pack(side=tk.LEFT)
         r += 1
         # DiT toggle (relabelled per family — Distilled/Base for Klein, Turbo/RAW for Krea 2)
@@ -13139,7 +13487,7 @@ class LoRATrainerGUI:
         _rf.pack(anchor=tk.W)
         ttk.Radiobutton(_rf, text="Klein 9B", variable=self.royale_family_var, value="klein",
                         command=self._on_royale_family_changed).pack(side=tk.LEFT, padx=(0, 20))
-        ttk.Radiobutton(_rf, text="Krea 2 (experimental)", variable=self.royale_family_var, value="krea2",
+        ttk.Radiobutton(_rf, text="Krea 2", variable=self.royale_family_var, value="krea2",
                         command=self._on_royale_family_changed).pack(side=tk.LEFT)
 
         setup = self._start_section_card(outer, "Setup",
@@ -16326,6 +16674,14 @@ class LoRATrainerGUI:
         if self.repair_engine is None or self.repair_engine.primary_network is None:
             messagebox.showerror("Error", "Load a primary LoRA first.")
             return
+        # Mirror of the Explorer-side guard: _reset_repair_session below refuses to tear down
+        # mid-preview, but it returns into THIS method which would then build the Explorer
+        # pipeline alongside the still-rendering preview — two pipelines, two threads, one
+        # GPU, GUI thread stuck in a CUDA call. Stop the whole handoff instead.
+        if getattr(self, "_repair_preview_in_flight", False):
+            self.repair_status_var.set(
+                "A preview is still rendering — wait for it to finish, then Explore.")
+            return
 
         # Warn if LyCORIS — saving from Explorer will require SVD
         lora_path = self.repair_engine.primary_path
@@ -17064,7 +17420,12 @@ class LoRATrainerGUI:
                 ("krea2_text_encoder", "Qwen3-VL-4B text encoder"),
             ]
             if self.sample_enabled_var.get():
-                krea2_required.append(("krea2_turbo_dit", "Krea 2 Turbo DiT (fp8) — needed for previews"))
+                # raw_lora engine renders previews on the training DiT + Turbo LoRA — the LoRA
+                # is auto-downloaded at training start if missing, so nothing is hard-required
+                # here (a failed download degrades to no previews, with console messages, never
+                # a blocked run). The classic engine still needs the Turbo checkpoint.
+                if self._krea2_preview_engine() != "raw_lora":
+                    krea2_required.append(("krea2_turbo_dit", "Krea 2 Turbo DiT (fp8) — needed for previews"))
             for pref_key, label in krea2_required:
                 path = self._krea2_pref(pref_key)
                 if not path:
@@ -17881,6 +18242,20 @@ class LoRATrainerGUI:
         var = self.prefs_vars.get(key)
         return var.get().strip() if var is not None else ""
 
+    def _krea2_preview_engine(self) -> str:
+        """Canonical Samples-tab preview engine for Krea 2: 'raw_lora' or 'turbo_model'.
+
+        The combobox holds a display label; this maps it back. Unknown/missing -> 'raw_lora'
+        (the default): renders previews on the resident training DiT with the Turbo LoRA @1.0
+        instead of loading the Turbo checkpoint and parking the trainer to CPU."""
+        var = getattr(self, "krea2_preview_engine_var", None)
+        if var is not None:
+            label = var.get()
+            for key, text in self._KREA2_ENGINE_LABELS.items():
+                if label == text:
+                    return key
+        return "raw_lora"
+
     def _krea2_script(self, name: str) -> str:
         return os.path.join(FIZGIG_DIR, "src", "fizgig", "scripts", name)
 
@@ -18099,8 +18474,38 @@ class LoRATrainerGUI:
                     "--text_encoder", self._krea2_pref("krea2_text_encoder"),
                     # Forward-only block swap on the preview Turbo, auto-detected for the Turbo's
                     # VRAM profile so previews fit the card — mirrors Klein's Distilled sample swap.
+                    # (Ignored in raw_lora engine mode — that path uses the training placement.)
                     "--preview_blocks_to_swap", str(self._auto_krea2_inference_blocks_swap()),
                 ]
+                # Preview engine (Samples tab): raw_lora renders on the resident training DiT
+                # with the Turbo LoRA @1.0 — no Turbo checkpoint load, no CPU parking. The
+                # trainer prefers --turbo_lora over --turbo_dit when both are given, and falls
+                # back to the Turbo checkpoint by itself if the LoRA file has gone missing.
+                if self._krea2_preview_engine() == "raw_lora":
+                    _tlora = self._krea2_pref("krea2_turbo_lora")
+                    if not _tlora or not os.path.isfile(_tlora):
+                        # First use after an update: fetch it now (~470 MB, idempotent — the
+                        # update script usually gets there first) and populate the pref.
+                        try:
+                            import sys as _sys
+                            _sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+                            from fizgig.scripts.fetch_turbo_lora import ensure_turbo_lora
+                            self.update_console("[preview] Turbo LoRA not set — downloading it "
+                                                "now (one-time, ~470 MB)...\n")
+                            _tlora = ensure_turbo_lora(
+                                log=lambda m: self.update_console(f"[preview] {m}\n"),
+                                require=True)
+                            if _tlora and "krea2_turbo_lora" in self.prefs_vars:
+                                self.prefs_vars["krea2_turbo_lora"].set(_tlora)
+                        except Exception:
+                            _tlora = None
+                    if _tlora:
+                        cmd += ["--turbo_lora", _tlora]
+                    else:
+                        self.update_console(
+                            "[preview] Turbo LoRA unavailable (download failed?) — using the "
+                            "classic Turbo model for previews this run. Set the path in "
+                            "Preferences or re-run update_fizgig.bat.\n")
                 # Steps / CFG / Negative / Sample-at-Start — previously visible on the Samples
                 # tab but never wired into krea2_train.
                 _st = self.sample_steps_var.get().strip()
@@ -18329,6 +18734,12 @@ class LoRATrainerGUI:
                 self.stop_training()
             except Exception:
                 pass
+        # Final settings snapshot — some fields only persist via debounced traces or other
+        # tabs' events, so closing mid-edit would otherwise drop the last change.
+        try:
+            self._save_last_used_paths()
+        except Exception:
+            pass
         try:
             self.master.destroy()
         except Exception:

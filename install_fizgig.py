@@ -225,22 +225,21 @@ except Exception as e:
 
 
 def create_launcher_scripts():
-    """Create launcher scripts for different platforms"""
+    """Verify/create launcher scripts.
 
-    # Windows batch file
-    bat_content = '''@echo off
-cd /d "%~dp0"
-call venv\\Scripts\\activate
-python lora_trainer_gui.py
-pause
-'''
-
+    Windows: run_fizgig.bat ships WITH the repo (the consoleless chain: .bat -> run_silent.vbs
+    -> pythonw launch.pyw). This step used to overwrite it with an ancient console-attached
+    version (python + pause), which (a) gave every fresh install a lingering console window
+    that ended in 'Press any key to continue', and (b) dirtied a tracked file so the next
+    update_fizgig.bat's `git pull` refused to run. Never write it here.
+    """
     bat_path = SCRIPT_DIR / "run_fizgig.bat"
-    with open(bat_path, 'w', newline='\r\n') as f:
-        f.write(bat_content)
-    print(f"Created: {bat_path}")
+    if bat_path.exists():
+        print(f"Launcher present: {bat_path} (ships with the repo — not modified)")
+    else:
+        print(f"WARNING: {bat_path} is missing — restore it with `git checkout -- run_fizgig.bat`")
 
-    # Linux/Mac shell script
+    # Linux/Mac shell script (not shipped in the repo — generated here)
     sh_content = '''#!/bin/bash
 cd "$(dirname "$0")"
 source venv/bin/activate
@@ -248,14 +247,12 @@ python lora_trainer_gui.py
 '''
 
     sh_path = SCRIPT_DIR / "run_fizgig.sh"
-    with open(sh_path, 'w', newline='\n') as f:
-        f.write(sh_content)
-
-    # Make executable on Unix
-    if platform.system() != "Windows":
-        os.chmod(sh_path, 0o755)
-
-    print(f"Created: {sh_path}")
+    if not sh_path.exists():
+        with open(sh_path, 'w', newline='\n') as f:
+            f.write(sh_content)
+        if platform.system() != "Windows":
+            os.chmod(sh_path, 0o755)
+        print(f"Created: {sh_path}")
     return True
 
 

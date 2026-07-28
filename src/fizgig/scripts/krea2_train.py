@@ -30,6 +30,15 @@ if not os.environ.get("PYTORCH_CUDA_ALLOC_CONF") and os.environ.get("FIZGIG_NO_E
         "backend:cudaMallocAsync" if sys.platform == "win32" else "expandable_segments:True"
     )
 
+# OpenMP wait policy, before torch loads libiomp: Intel OpenMP keeps every pool thread
+# actively spinning for 200 ms after each parallel region, so the small per-step CPU ops
+# re-arm an all-core busy-spin for the whole run (issue #18 — 100% CPU on every core while
+# the actual training is on the GPU). BLOCKTIME=0 measured: 14.8 spinning cores -> 0, no
+# step-time cost. The GUI sets this too; this covers headless runs. setdefault, so an
+# explicit user value wins.
+os.environ.setdefault("KMP_BLOCKTIME", "0")
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+
 from fizgig.krea2.trainer import train_krea2
 from fizgig.training.optimizers import available_optimizers
 
@@ -58,6 +67,10 @@ def setup_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=42)
     # previews (sample the fp8 Turbo with the live LoRA)
     p.add_argument("--turbo_dit", default=None, help="Pre-quant fp8 Turbo for previews")
+    p.add_argument("--turbo_lora", default=None,
+                   help="Turbo distillation LoRA (rank 64) — previews render on the resident "
+                        "training DiT with this at strength 1.0 instead of loading the Turbo "
+                        "checkpoint (no CPU parking; same 8-step CFG-free settings)")
     p.add_argument("--vae", default=None, help="Qwen-Image VAE (for preview decode)")
     p.add_argument("--text_encoder", default=None, help="bf16 Qwen3-VL-4B (for preview prompt encode)")
     p.add_argument("--sample_prompts", default=None, help="Sample-prompts file (one prompt per line)")
@@ -143,7 +156,8 @@ def main():
         save_every_n_epochs=args.save_every_n_epochs, fp8_scaled=not args.no_fp8,
         quant_4bit=args.quantize_4bit, quant_int8=args.quant_int8,
         blocks_to_swap=args.blocks_to_swap, shift=args.discrete_flow_shift, seed=args.seed,
-        sample_prompts=prompts, turbo_path=args.turbo_dit, vae_path=args.vae, te_path=args.text_encoder,
+        sample_prompts=prompts, turbo_path=args.turbo_dit, turbo_lora_path=args.turbo_lora,
+        vae_path=args.vae, te_path=args.text_encoder,
         sample_every_n_epochs=args.sample_every_n_epochs,
         sample_width=args.sample_width, sample_height=args.sample_height,
         sample_steps=args.sample_steps, sample_cfg_scale=args.sample_cfg_scale,
