@@ -56,6 +56,14 @@ def setup_parser() -> argparse.ArgumentParser:
     p.add_argument("--learning_rate", type=float, default=1e-4)
     p.add_argument("--max_train_epochs", type=int, default=10)
     p.add_argument("--save_every_n_epochs", type=int, default=0)
+    p.add_argument("--save_state", action="store_true",
+                   help="Write a resumable <name>-NNNNNN-state/ dir at every checkpoint.")
+    p.add_argument("--save_state_on_train_end", action="store_true",
+                   help="Write a resumable state dir when the run finishes, so a completed LoRA "
+                        "can be trained further by raising --max_train_epochs.")
+    p.add_argument("--keep_last_n_states", type=int, default=2,
+                   help="Keep only the N newest state dirs (each is LoRA + optimizer, hundreds "
+                        "of MB). Clamped to >= 1.")
     p.add_argument("--no_fp8", action="store_true", help="Train the base in bf16 instead of dynamic fp8")
     p.add_argument("--quantize_4bit", action="store_true",
                    help="QLoRA-style 4-bit (NF4) frozen base — ~5.6 GB DiT, fits 10-12 GB cards (no block swap)")
@@ -135,6 +143,12 @@ def setup_parser() -> argparse.ArgumentParser:
                         "(reads <dataset>/fizgig_look_scores.json from the Image Prep Look Filter)")
     p.add_argument("--trigger_word", default=None,
                    help="Trigger word appended (', <trigger>') to auto-generated captions")
+    p.add_argument("--recaption_instruction", default=None,
+                   help="Instruction for auto-recaption attempt 1 (the Captions tab's edited "
+                        "Training-caption preset). Omit to use the built-in")
+    p.add_argument("--recaption_instruction_detailed", default=None,
+                   help="Instruction for auto-recaption attempt 2 (the Captions tab's edited "
+                        "Exhaustive-detail preset). Omit to use the built-in")
     return p
 
 
@@ -154,6 +168,8 @@ def main():
         network_dim=args.network_dim, network_alpha=args.network_alpha,
         learning_rate=args.learning_rate, max_train_epochs=args.max_train_epochs,
         save_every_n_epochs=args.save_every_n_epochs, fp8_scaled=not args.no_fp8,
+        save_state=args.save_state, save_state_on_train_end=args.save_state_on_train_end,
+        keep_last_n_states=args.keep_last_n_states,
         quant_4bit=args.quantize_4bit, quant_int8=args.quant_int8,
         blocks_to_swap=args.blocks_to_swap, shift=args.discrete_flow_shift, seed=args.seed,
         sample_prompts=prompts, turbo_path=args.turbo_dit, turbo_lora_path=args.turbo_lora,
@@ -186,6 +202,8 @@ def main():
         auto_recaption=args.auto_recaption,
         warmup_look_outliers=args.warmup_look_outliers,
         trigger_word=args.trigger_word,
+        recaption_instruction=args.recaption_instruction,
+        recaption_instruction_detailed=args.recaption_instruction_detailed,
     )
 
 

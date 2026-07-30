@@ -13,6 +13,7 @@ instead of requiring a separate transformers/Diffusers checkpoint.
 """
 
 import logging
+import re
 from dataclasses import dataclass
 
 import torch
@@ -129,8 +130,43 @@ def _load_qwen3_vl_model(
         model = Qwen3VLForConditionalGeneration._from_config(config)
 
     logger.info(f"Loading Krea 2 text encoder (Qwen3-VL) weights from {model_path}")
-    sd = load_split_weights(model_path, device=str(device), disable_mmap=disable_mmap, dtype=dtype)
+    # ComfyUI's fp8_scaled variant quantises ONLY the language Linears — its 315 vision-tower
+    # tensors are bf16, so reference images and captioning work exactly as on the bf16 file.
+    # (An earlier comment here claimed the vision tower "can't run in fp8"; that was wrong, and
+    # the real blocker was simply that this loader had no fp8 path.) Keeping the weights fp8 and
+    # dequantising per matmul is what actually saves the ~3.6 GB — converting to bf16 at load
+    # would load fine and save nothing.
+    from fizgig.krea2.utils import (is_prequantized_fp8, _FP8_SCALE_SUFFIX,
+                                    _COMFY_FP8_MARKER_SUFFIX, _reshape_prequant_fp8_scale)
+    prequant = is_prequantized_fp8(model_path)
+
+    # dtype=None on the fp8 path: passing a dtype converts the fp8 weights on load and there is
+    # nothing left to be resident about.
+    sd = load_split_weights(model_path, device=str(device), disable_mmap=disable_mmap,
+                            dtype=(None if prequant else dtype))
     sd = _convert_comfyui_qwen3vl_state_dict(sd)
+
+    if prequant:
+        # Comfy stores `.weight_scale`; the monkey patch looks for `.scale_weight` (and wants it
+        # broadcastable against [out, in]). Same normalisation the DiT does — reusing its helpers
+        # so the two can't drift. Dropping these keys WITHOUT applying them is the bug that once
+        # left the Klein DiT with weights ~1230x too large, so they are renamed, never discarded.
+        fixed = {}
+        for k, v in sd.items():
+            if k.endswith(_COMFY_FP8_MARKER_SUFFIX):
+                continue
+            if k.endswith(_FP8_SCALE_SUFFIX):
+                fixed[k[: -len(_FP8_SCALE_SUFFIX)] + ".scale_weight"] = \
+                    _reshape_prequant_fp8_scale(v).to(dtype)
+            else:
+                fixed[k] = v
+        sd = fixed
+        # Registers a scale_weight buffer on each quantised Linear and swaps in the dequantising
+        # forward. Must run BEFORE load_state_dict, or the scale keys have nowhere to land and
+        # come back as "unexpected". Only the language Linears carry scales, so the bf16 vision
+        # tower is untouched by design.
+        from fizgig.krea2.fp8_optimization_utils import apply_fp8_monkey_patch
+        apply_fp8_monkey_patch(model, sd, use_scaled_mm=False)
 
     info = model.load_state_dict(sd, strict=False, assign=True)
     # Qwen3-VL-4B ties the LM head to the input embeddings (tie_word_embeddings=true), so the
@@ -145,7 +181,10 @@ def _load_qwen3_vl_model(
         )
 
     model.to(device)
-    if dtype is not None:
+    # Never cast an fp8 model to dtype — that would convert the weights straight back to bf16 and
+    # throw away the whole point. The unquantised parts (vision tower, norms, embeddings) are
+    # already stored in the target dtype anyway.
+    if dtype is not None and not prequant:
         model.to(dtype)
     return model.eval().requires_grad_(False)
 
@@ -170,11 +209,44 @@ def load_qwen3_vl_conditioner(
     return conditioner.eval().requires_grad_(False)
 
 
+# Ordering comes from the community's structured-caption template (trigger, features, clothing,
+# pose, expression, setting, lighting, camera angle) — a fixed order is what makes a whole dataset's
+# captions structurally consistent, which is the part a per-image VLM otherwise gets wrong.
+#
+# What is deliberately NOT taken from that template: its advice to OMIT invariant features ("if your
+# character always has blue eyes, don't mention it"). That is SD1.5/SDXL-era guidance and it is
+# wrong here. On LLM-conditioned models the omit-to-bake-in trick is dead — unnamed features don't
+# bake in, unnamed CONTRADICTIONS fight, and the salient unnamed deviation is exactly the poison the
+# per-image loss watch keeps flagging. Naming a thing doesn't stop the model learning it; it binds
+# it to a token you can then steer. Hence "name anything prominent", not "omit what's constant".
+#
+# Two rules earned from real output (29 Jul):
+#   SUBJECT_RULE — the 4B model hedged to "a person" in roughly a third of captions. That is a
+#   worse token than "a woman": the dataset then teaches the trigger against an inconsistent
+#   subject noun, and the noun is the one word every caption shares.
+#   NO_PREAMBLE_RULE — it opened with "This image shows…" constantly on the longer tasks. The
+#   preamble is pure noise in a training caption and, prepended after the trigger, reads as
+#   "<trigger>, this image shows…". Belt and braces: the instruction asks, and
+#   _strip_caption_preamble removes it deterministically afterwards.
+SUBJECT_RULE = (
+    "Name the subject with the specific term that is visually apparent — 'a woman', 'a man', "
+    "'a girl', 'a boy' — and not the vague 'a person'. Use 'a person' only when the image "
+    "genuinely does not show enough to tell. "
+)
+NO_PREAMBLE_RULE = (
+    "Begin directly with the subject. Never open with 'This image shows', 'The image depicts', "
+    "'In this image', 'Here we see', 'The photo shows' or any similar preamble. "
+)
+
 CAPTION_INSTRUCTION = (
-    "Write one factual training caption for this image as a single sentence. Describe the subject, "
-    "their pose and clothing, the camera viewpoint (e.g. 'viewed from behind', 'side profile', "
-    "'close-up'), whether the face is visible, and the setting. State only what is visible — no "
-    "speculation, no names, no style commentary."
+    "Write one factual training caption for this image as a single sentence, covering these in "
+    "order: the subject and what they are doing; the camera viewpoint (e.g. 'viewed from behind', "
+    "'side profile', 'close-up') and whether the face is visible; their pose; their clothing; the "
+    "setting; the lighting. Use the same order and the same plain phrasing every time. "
+    + SUBJECT_RULE + NO_PREAMBLE_RULE +
+    "Name anything prominent a viewer would notice, especially anything unusual about the angle, "
+    "the framing, or what is hidden or cropped. State only what is visible — no speculation, no "
+    "proper names, no style or quality commentary."
 )
 
 # Second-attempt instruction: if the standard caption didn't unstick the image, the miss is
@@ -186,13 +258,84 @@ DETAILED_CAPTION_INSTRUCTION = (
     "the face is visible or hidden), their pose and body position, every visible clothing item "
     "with colors, hair style and color, any objects they hold or touch, anything partially "
     "blocking or cropping the subject, the lighting, and the background/setting with its main "
-    "objects. State only what is visible — no speculation, no names, no style commentary."
+    "objects. " + SUBJECT_RULE + NO_PREAMBLE_RULE +
+    "State only what is visible — no speculation, no names, no style commentary."
 )
+
+
+# The system prompt used when ENCODING text for training and inference — NOT a captioning
+# instruction. It must stay byte-identical to ComfyUI's Text-Encode-(Krea2) node: changing it
+# would silently alter every cached embedding and desync training from ComfyUI. Module-level so
+# the GUI can display it read-only without duplicating the string.
+ENCODE_SYSTEM_DESCRIPTOR = (
+    "Describe the image by detailing the color, shape, size, texture, "
+    "quantity, text, spatial relationships of the objects and background:"
+)
+
+SHORT_CAPTION_INSTRUCTION = (
+    "Write one short factual caption for this image — a single clause naming the subject, what "
+    "they are doing, and the setting. " + SUBJECT_RULE + NO_PREAMBLE_RULE +
+    "State only what is visible. No speculation, no names, no style commentary."
+)
+
+DETAILED_DESCRIPTION_INSTRUCTION = (
+    "Describe this image in 2-3 factual sentences, starting with the subject: their pose and "
+    "clothing, the camera viewpoint, the lighting, and the setting. "
+    + SUBJECT_RULE + NO_PREAMBLE_RULE +
+    "State only what is visible — no speculation, no names, no style commentary."
+)
+
+# The task menu the Captions tab offers for this model. Lives here rather than in the GUI so the
+# trainer's auto-recaption and the GUI read the same text — the instruction is part of the
+# captioning contract, not a piece of UI.
+#   key -> (menu label, instruction, suggested max_new_tokens)
+# "training" is the default: it is the doctrine-aligned instruction auto-recaption already uses
+# (name the viewpoint, say whether the face is visible), which is what makes a caption safe to
+# train on rather than merely accurate.
+CAPTION_TASKS = {
+    "training":   ("Training caption (viewpoint-aware)", CAPTION_INSTRUCTION, 120),
+    "short":      ("Short caption", SHORT_CAPTION_INSTRUCTION, 60),
+    "detailed":   ("Detailed description", DETAILED_DESCRIPTION_INSTRUCTION, 160),
+    "exhaustive": ("Exhaustive detail", DETAILED_CAPTION_INSTRUCTION, 240),
+}
+DEFAULT_CAPTION_TASK = "training"
+
+
+_PREAMBLE_RE = re.compile(
+    r"^\s*(?:"
+    r"(?:in|within)\s+th(?:is|e)\s+(?:image|photo|photograph|picture|shot)\s*,?\s*|"
+    r"th(?:is|e)\s+(?:image|photo|photograph|picture|shot)\s+"
+    r"(?:shows?|depicts?|features?|captures?|presents?|displays?|is\s+of)\s+|"
+    r"here\s+(?:is|we\s+see)\s+|"
+    r"we\s+see\s+|"
+    r"the\s+(?:image|photo)\s+is\s+a\s+"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _strip_caption_preamble(text: str) -> str:
+    """Remove a leading 'This image shows…' style preamble.
+
+    Instructing the model not to produce one is unreliable at 4B and temperature 0.5, and the
+    preamble is pure noise in a training caption — worse once the trigger word is prepended, where
+    it reads "<trigger>, this image shows a woman…". Applied repeatedly because the model
+    occasionally stacks them ("In this image, we see …"). Never returns empty: if stripping would
+    consume everything, the original is kept."""
+    out = text
+    for _ in range(3):
+        stripped = _PREAMBLE_RE.sub("", out, count=1)
+        if stripped == out:
+            break
+        out = stripped
+    out = out.strip()
+    return out if out else text.strip()
 
 
 def generate_caption(conditioner: "Qwen3VLConditioner", image_path: str, *,
                      max_new_tokens: int = 120, megapixels: float = 1.0,
-                     detailed: bool = False, seed: int = None) -> str:
+                     detailed: bool = False, seed: int = None,
+                     instruction: str = None) -> str:
     """Caption an image with the SAME Qwen3-VL the trainer conditions on (its LM head is
     legitimately tied to the embeddings — unlike Klein's stripped Qwen3-8B — so generation is
     real). Used by auto-recaption to rewrite a stuck image's caption from what's actually in it,
@@ -209,7 +352,10 @@ def generate_caption(conditioner: "Qwen3VLConditioner", image_path: str, *,
 
     proc = conditioner._get_image_processor()
     im = conditioner._cap_image(Image.open(image_path), megapixels)
-    instruction = DETAILED_CAPTION_INSTRUCTION if detailed else CAPTION_INSTRUCTION
+    # An explicit instruction wins (the Captions tab's task menu, or a user-edited one); otherwise
+    # the historical detailed/standard pair, so existing callers are unaffected.
+    if instruction is None:
+        instruction = DETAILED_CAPTION_INSTRUCTION if detailed else CAPTION_INSTRUCTION
     if detailed:
         max_new_tokens = max(max_new_tokens, 240)
     messages = [{"role": "user", "content": [{"type": "image"},
@@ -229,7 +375,7 @@ def generate_caption(conditioner: "Qwen3VLConditioner", image_path: str, *,
         if cuda_states is not None:
             torch.cuda.set_rng_state_all(cuda_states)
     text = proc.batch_decode(out[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0]
-    return " ".join(text.split()).strip()
+    return _strip_caption_preamble(" ".join(text.split()).strip())
 
 
 class Qwen3VLConditioner(torch.nn.Module):
@@ -250,8 +396,7 @@ class Qwen3VLConditioner(torch.nn.Module):
         self._image_processor = None  # lazily-loaded full Qwen3-VL processor (for image refs)
         self.max_length = max_length
         self.select_layers = select_layers
-        self.system_descriptor = ("Describe the image by detailing the color, shape, size, texture, "
-                                  "quantity, text, spatial relationships of the objects and background:")
+        self.system_descriptor = ENCODE_SYSTEM_DESCRIPTOR
         self.prompt_template_encode_prefix = "<|im_start|>system\n" + self.system_descriptor + "<|im_end|>\n<|im_start|>user\n"
         self.prompt_template_encode_suffix = "<|im_end|>\n<|im_start|>assistant\n"
         self.prompt_template_encode_start_idx = 34
@@ -265,8 +410,12 @@ class Qwen3VLConditioner(torch.nn.Module):
         list of PIL.Image references (or None). When any prompt has references they are fed
         through Qwen3-VL's *vision* path under the same descriptor template, so the conditioning
         becomes "visually aware" of the image (a prompt-from-a-picture effect — Krea 2's DiT has
-        no reference-latent slot, so this is the only reference mechanism). Requires the bf16 TE:
-        ComfyUI's Qwen3-VL vision tower can't run in fp8.
+        no reference-latent slot, so this is the only reference mechanism).
+
+        Works with either checkpoint. An earlier version of this docstring claimed the vision
+        tower "can't run in fp8" — that was wrong: ComfyUI's fp8_scaled file quantises only the
+        language Linears and ships all 315 vision-tower tensors in bf16. The real constraint was
+        that this loader had no fp8 dequantisation path; see _load_qwen3_vl_model.
         """
         has_imgs = bool(images) and any(images[i] for i in range(min(len(images), len(text))))
         if has_imgs:

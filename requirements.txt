@@ -43,6 +43,9 @@ tqdm==4.67.1
 
 # HuggingFace
 huggingface-hub==0.34.3
+hf_xet>=1.0  # Xet-backed repos (Comfy-Org/Krea-2 is one) transfer much faster with this than
+             # over plain HTTP — it matters on the 26 GB RAW DiT that fetch_models pulls. Purely
+             # an accelerator: without it huggingface-hub falls back to HTTP and still works.
 
 # Face detection (for data preparation)
 insightface>=0.7.0

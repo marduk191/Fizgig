@@ -64,7 +64,8 @@ from fizgig.training.train_utils import (
     get_remove_step_no,
     get_sanitized_config_or_none,
     get_lin_function,
-    save_and_remove_state_on_epoch_end,
+    prune_state_dirs,
+    save_state_on_epoch_end,
     save_and_remove_state_stepwise,
     save_state_on_train_end,
 )
@@ -2276,6 +2277,18 @@ class KleinTrainer:
                     f"[resume] WARN: could not parse epoch number from '{_resume_basename}'; starting from epoch 0"
                 )
 
+        # Resuming a state that's already at the final epoch trains nothing — the epoch loop is
+        # empty and we fall through to writing the final LoRA. That fall-through is deliberate and
+        # load-bearing (pausing ON the last epoch exits before the final LoRA is written, and
+        # Resume is what writes it), so this must stay a loud message and NOT an error.
+        if epoch_to_start >= num_train_epochs:
+            accelerator.print(
+                f"[resume] state is at epoch {epoch_to_start} of {num_train_epochs} — nothing left "
+                f"to train. Writing the final LoRA from the restored state. To train further, "
+                f"raise Max Train Epochs above {epoch_to_start} and resume again."
+            )
+            import sys as _sys; _sys.stdout.flush()
+
         # tqdm init AFTER resume parse so the progress bar shows the correct starting step count
         progress_bar = tqdm(
             range(args.max_train_steps), initial=global_step, smoothing=0,
@@ -2422,6 +2435,30 @@ class KleinTrainer:
         # NOT preserved across pause/resume — too large for per-epoch JSON. First post-resume
         # epoch can't blend on a stability event; recaptured next epoch.
         adaptive_snapshot = None
+
+        def _write_adaptive_sidecar(state_dir):
+            """Drop adaptive_lr_state.json into a just-written state dir.
+
+            Reads the watcher's scalars from the enclosing scope at call time, so it always
+            records the CURRENT values. Called from the epoch boundary AND from the end-of-run
+            save — miss the latter and a refinement pass resumed from a finished run restarts the
+            watcher cold (best_loss=None, streaks 0), which the restore path accepts silently."""
+            if not args.adaptive_lr:
+                return
+            try:
+                import json as _json
+                with open(os.path.join(state_dir, "adaptive_lr_state.json"), "w") as _f:
+                    _json.dump({
+                        "best_loss": adaptive_best_loss,
+                        "good_streak": adaptive_good_streak,
+                        "bad_streak": adaptive_bad_streak,
+                        "stability_streak": adaptive_stability_streak,
+                        "stability_triggered": adaptive_stability_triggered,
+                        "prev_weight_norm": adaptive_prev_weight_norm,
+                    }, _f, indent=2)
+            except Exception as _e:
+                accelerator.print(f"[adaptive_lr] sidecar save failed: {_e}")
+
         # Restore adaptive LR scalars from sidecar JSON on resume (small, ~6 scalars)
         if args.adaptive_lr and args.resume:
             import json as _json
@@ -2831,23 +2868,12 @@ class KleinTrainer:
                         remove_model(get_epoch_ckpt_name(args.output_name, remove_epoch_no))
 
                     if args.save_state or pause_requested:
-                        save_and_remove_state_on_epoch_end(args, accelerator, epoch + 1)
+                        _state_dir = save_state_on_epoch_end(args, accelerator, epoch + 1)
                         # Adaptive LR sidecar — restore-on-resume continuity for the watcher's scalars
-                        if args.adaptive_lr:
-                            _state_dir = os.path.join(args.output_dir, f"{args.output_name}-{epoch + 1:06d}-state")
-                            try:
-                                import json as _json
-                                with open(os.path.join(_state_dir, "adaptive_lr_state.json"), "w") as _f:
-                                    _json.dump({
-                                        "best_loss": adaptive_best_loss,
-                                        "good_streak": adaptive_good_streak,
-                                        "bad_streak": adaptive_bad_streak,
-                                        "stability_streak": adaptive_stability_streak,
-                                        "stability_triggered": adaptive_stability_triggered,
-                                        "prev_weight_norm": adaptive_prev_weight_norm,
-                                    }, _f, indent=2)
-                            except Exception as _e:
-                                accelerator.print(f"[adaptive_lr] sidecar save failed: {_e}")
+                        _write_adaptive_sidecar(_state_dir)
+                        # Prune LAST: the sidecar has to land in the dir we just wrote, and a
+                        # prune that ran first could delete it out from under that write.
+                        prune_state_dirs(args.output_dir, args.output_name, args.keep_last_n_states)
 
             # A preview failure must never end a run that might be hours in (Krea 2 already
             # degrades gracefully here) — the checkpoint for this epoch is already saved.
@@ -2885,8 +2911,13 @@ class KleinTrainer:
         accelerator.end_training()
         optimizer_eval_fn()
 
-        if is_main_process and (args.save_state or args.save_state_on_train_end):
-            save_state_on_train_end(args, accelerator)
+        # End-of-run state. Skipped when the run trained nothing (resumed from a state already at
+        # the final epoch): the only dir we'd write is the one we resumed FROM, and save_state
+        # overwrites in place — a crash mid-rewrite would destroy the state for no gain.
+        if is_main_process and args.save_state_on_train_end and num_train_epochs > epoch_to_start:
+            _final_state = save_state_on_train_end(args, accelerator, num_train_epochs)
+            _write_adaptive_sidecar(_final_state)
+            prune_state_dirs(args.output_dir, args.output_name, args.keep_last_n_states)
 
         if is_main_process:
             ckpt_name = get_last_ckpt_name(args.output_name)
@@ -3148,11 +3179,16 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--save_every_n_epochs", type=int, default=None)
     parser.add_argument("--save_every_n_steps", type=int, default=None)
     parser.add_argument("--save_last_n_epochs", type=int, default=None)
-    parser.add_argument("--save_last_n_epochs_state", type=int, default=None)
     parser.add_argument("--save_last_n_steps", type=int, default=None)
     parser.add_argument("--save_last_n_steps_state", type=int, default=None)
-    parser.add_argument("--save_state", action="store_true")
-    parser.add_argument("--save_state_on_train_end", action="store_true")
+    parser.add_argument("--save_state", action="store_true",
+                        help="Write a resumable <name>-NNNNNN-state/ dir at every checkpoint.")
+    parser.add_argument("--save_state_on_train_end", action="store_true",
+                        help="Write a resumable state dir when the run finishes, so a completed "
+                             "LoRA can be trained further by raising --max_train_epochs.")
+    parser.add_argument("--keep_last_n_states", type=int, default=2,
+                        help="Keep only the N newest state dirs (each is LoRA + optimizer, "
+                             "hundreds of MB). Clamped to >= 1.")
     parser.add_argument("--pause_flag_path", type=str, default=None,
                         help="Sentinel file path. If present at end of an epoch, trainer "
                              "saves state (forced) and exits cleanly to free GPU memory.")

@@ -1,0 +1,8 @@
+# core.autocrlf=true on Windows rewrites checked-out files to CRLF. That is fine for Python,
+# which does not care, and fatal for a shell script that runs inside a Linux container: the
+# kernel reads the shebang literally and fails with "bad interpreter: /usr/bin/env bash^M",
+# which looks nothing like a line-ending problem when you hit it.
+*.sh text eol=lf
+docker/entrypoint.sh text eol=lf
+Dockerfile text eol=lf
+docker/Dockerfile text eol=lf

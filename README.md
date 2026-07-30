@@ -10,8 +10,12 @@
 </p>
 
 <p align="center">
-  <a href="https://youtu.be/sH-kGR8yzBU"><img src="assets/hero.png" alt="Fizgig LoRA Studio — now with Krea 2 support" width="600"></a><br>
-  <em>Watch the full walkthrough on YouTube</em>
+  <a href="https://www.youtube.com/watch?v=yrz0l6URGGk"><img src="assets/hero.png" alt="Fizgig LoRA Studio — watch the full video tutorial" width="600"></a>
+</p>
+
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=yrz0l6URGGk"><img src="https://img.shields.io/badge/▶%20Watch%20the%20full%20video%20tutorial-FF0000?style=for-the-badge&logo=youtube&logoColor=white" alt="Watch the full video tutorial on YouTube"></a><br>
+  <sub>Start-to-finish walkthrough — install, prep, caption, train, and the workbench tools</sub>
 </p>
 
 <p align="center">
@@ -19,15 +23,15 @@
 </p>
 
 > ### 📰 Latest news
-> **Krea 2 training just got a lot faster and lighter** (v2.8.3 →):
-> - **Big step-rate boost.** A community bug report ([#18](https://github.com/shootthesound/Fizgig/issues/18) — thanks!) led to a fix that stops a hidden all-core CPU burn during training. It was meant to quiet the CPU; it turned out to **speed up training steps too** — up to **~1.6×** measured. Update and it's just on.
-> - **Long runs no longer slow down over time** — the gradual per-step slowdown on long runs is fixed (v2.8.2).
-> - **New Krea 2 preview engine.** In-training samples now render **on the training model itself** using the official **Turbo LoRA** — no more loading the 13 GB Turbo checkpoint and shuffling models between CPU and GPU every preview. Same look, same settings, far less memory traffic. The LoRA **auto-downloads** on update or first use; the classic Turbo-model mode is still there on the Samples tab.
-> - **New preset: ✨ Krea 2 Ultra Fast** — rank 8 with Adaptive LR at an aggressive floor, 20 epochs. Fewer epochs to a usable LoRA; the rank-32 **Krea 2 Defaults** preset remains the standard pick.
+> - **Never lose a run** (v2.11) — training state now saves at every checkpoint *and* at the end of a run, so a crash costs you nothing and a **finished LoRA can be trained further**: raise the epoch count, resume, and it carries on with the optimizer and learning-rate history intact. Old states are pruned automatically so they don't fill your disk.
+> - **Krea 2 trains on 8 GB** — confirmed by users running nothing but the stock preset defaults at batch size 1, with everything left on Auto. 10–12 GB cards do the same with headroom to spare. [VRAM guidance ↓](#vram-guidance)
+> - **Caption with the model that trains your LoRA** (v2.10) — the Captions tab can use **Qwen3-VL**, the same vision-language model that conditions Krea 2 training, and picks it by default when you have that text encoder. Four tasks, each an **editable preset**: rewrite the instruction the model is given, save it, reset to the built-in anytime. Works for Klein datasets too — captions are just `.txt`.
+> - **Bring your own text encoder** (v2.10) — the Qwen3-VL slot takes **fp8_scaled** (4.9 GB resident vs 8.3 GB, output we couldn't tell apart — now the recommended download) and **community fine-tunes or abliterated builds**. Since that model writes your captions, swapping it changes how your dataset gets described.
+> - **Faster Krea 2 training** (v2.8.3) — a community bug report ([#18](https://github.com/shootthesound/Fizgig/issues/18) — thanks!) led to a fix for a hidden all-core CPU burn. It was meant to quiet the CPU; it sped up training steps too, up to **~1.6×** measured. Previews also now render **on the training model itself** via the official Turbo LoRA, instead of loading a 13 GB checkpoint every time.
 
-> **🎉 New — Krea 2.** Fizgig now supports a **second, fully native model family**: **Krea 2 (12.9B)**. The whole workbench works with it — Repair Studio, Explorer, Royale, Profiler, Extract — plus Context LoRA, Adaptive LR, Pause/Resume, 4-bit (NF4) low-VRAM training, and the live sample override. [Details below ↓](#krea-2--second-model-family)
+> **Two model families, one workbench.** Everything here works with both **Flux 2 Klein 9B** and **Krea 2 (12.9B)** — Repair Studio, Explorer, Royale, Profiler, Extract, plus Context LoRA, Adaptive LR and Pause/Resume. [Krea 2 details ↓](#krea-2--second-model-family)
 
-> **🆕 Newest — the run that looks after itself.** The Krea 2 trainer now **curates your dataset live**: it detects problem images from their loss alone, throttles them, has the text encoder *look at* the stuck ones and rewrite their captions, warms in unusual angles gently, and **tells you the best epoch** when the run plateaus. [Details ↓](#the-trainer-curates-your-dataset-while-it-trains-krea-2-experimental) Around it, two new instruments for **both families**: the Image Prep tab's **Look Consistency Filter** pre-filters off-look images by face-embedding score, and the **sample gallery** now scores every sample's likeness against your own photos live during training — with a Royale-style **Training Run Visualiser** to scrub and export the run. [Details ↓](#the-sample-gallery-is-an-instrument-both-families)
+> **Two things worth reading about before you start.** The Krea 2 trainer **curates your dataset while it trains** — detecting problem images from their loss alone, throttling them, having the text encoder *look at* the stuck ones and rewrite their captions, and telling you the best epoch when the run plateaus. [Details ↓](#the-trainer-curates-your-dataset-while-it-trains-krea-2-experimental) And the **sample gallery is an instrument**, not a contact sheet: it scores every sample's likeness against your own photos live during training, with a Royale-style **Training Run Visualiser** to scrub and export the run. [Details ↓](#the-sample-gallery-is-an-instrument-both-families)
 
 ---
 
@@ -43,7 +47,7 @@ Every trainer makes LoRAs. Fizgig is built around what you do with them **afterw
 
 Under that workbench sits a fast, light trainer tuned for its models — and tuned to **fit your GPU**, not a datacenter's. Because everything is built natively for Klein 9B and Krea 2 instead of bolted onto a dozen models, Fizgig can do things the generalists can't:
 
-- **Big models on modest cards.** A full **Klein 9B** LoRA trains on a **16 GB card** — and the 12.9B **Krea 2** trains on a **10–12 GB card** thanks to the 4-bit (NF4) base (~8 GB resident, QLoRA-style: the base is 4-bit, your LoRA still trains in bf16 on top). Block swap and previews **size themselves to your VRAM automatically** — nothing to configure — and if a preview can't fit, it steps aside so **training keeps running and saving**. You don't need a 4090 to train on the newest 12.9B model.
+- **Big models on modest cards.** A full **Klein 9B** LoRA trains on a **16 GB card** — and the 12.9B **Krea 2** trains on **8 GB**, confirmed by users running nothing but the stock preset defaults at batch size 1 with everything on Auto. That's the 4-bit (NF4) base doing the work (~8 GB resident, QLoRA-style: the base is 4-bit, your LoRA still trains in bf16 on top). Block swap, quantisation and previews **size themselves to your VRAM automatically** — nothing to configure — and if a preview can't fit, it steps aside so **training keeps running and saving**. You don't need a 4090 to train on the newest 12.9B model.
 - **A workbench nobody else has.** Repair broken LoRAs block-by-block, evolve new ones like a game, and crossfade every epoch of a run to find the sweet spot — then the tools **read each other's output** (profile → repair → explore → compare, one closed loop).
 - **It just works on your files.** Loads kohya / PEFT / OneTrainer / AI-Toolkit / LyCORIS, auto-converted; saves kohya `.safetensors` that drop straight into ComfyUI.
 
@@ -86,11 +90,13 @@ Everything works on Krea 2: **all five workbench tools** (Profiler, Extract, Rep
 
 > **📣 Help map Krea 2's blocks — [open an issue](https://github.com/shootthesound/Fizgig/issues).** The colour-coded sliders, Model-Area targeting, and block-aware presets are Klein-only right now because Krea 2's per-block roles (which blocks carry **identity**, **style**, and **detail**) aren't mapped yet. The **Profiler**'s weight-only report is the instrument for discovering them. If you find patterns — a block that clearly drives identity, a range that governs style — please share your findings in the **[GitHub Issues](https://github.com/shootthesound/Fizgig/issues)**. Community block-discovery is what will drive the colour-coding and finer layer targeting coming to the Krea 2 presets and Repair Studio.
 
-**Runs on smaller cards, and adapts to yours.** Krea 2 is a bigger model than Klein, but the low-VRAM paths are wired — and with everything on **Auto**, Fizgig plans the whole run for you:
+**Runs on smaller cards, and adapts to yours.** Krea 2 is a bigger model than Klein, but the low-VRAM paths are wired — and with everything on **Auto**, Fizgig plans the whole run for you.
+
+> **8 GB is enough.** Users have trained full Krea 2 LoRAs on **8 GB** cards with everything left on **Auto**, batch size **1**, and the stock defaults of any of the Krea 2 presets — no hand-tuning. **10–12 GB** cards do the same with more headroom to spare, so there's room to raise batch size or resolution before anything gets tight. On 8 GB, leave batch size at 1 and let Auto do its thing.
 
 - **Auto memory strategy** — leave Blocks Swap and 4-bit Base on **Auto** and Fizgig picks the best of **INT8 W8A8** (fastest, near-exact — the default wherever it fits), **NF4 4-bit**, or fp8 from your *free* VRAM — budgeted for your actual run shape (batch size is the big cost: ~2.4 GB per extra image, measured). The console explains what it chose and why.
 - **torch.compile speedup** — on longer runs the transformer blocks compile automatically (needs the MSVC C++ Build Tools on Windows; triton installs with the requirements). Roughly 2× faster steady-state steps on the INT8 path after a one-off warm-up — putting per-step speed **approximately on a par with OneTrainer**. Combine that with the real-time dataset intelligence below (which showed faster likeness and a higher ceiling in matched-epoch A/Bs) and time-to-a-*good*-LoRA should now favour Fizgig: same step speed, smarter steps.
-- **4-bit (NF4) base** — the base trains frozen at ~5.6 GB (base + LoRA ~8.3 GB), so a full Krea 2 LoRA fits a **10–12 GB card with no block swap** — QLoRA-style, the LoRA still trains in bf16 on top. Auto picks it when it's the right call; the *4-bit Base* dropdown forces it On/Off.
+- **4-bit (NF4) base** — the base trains frozen at ~5.6 GB (base + LoRA ~8.3 GB), so a full Krea 2 LoRA fits a **10–12 GB card with no block swap at all**, and an **8 GB** card with the swap Auto sizes for it — QLoRA-style, the LoRA still trains in bf16 on top. Auto picks it when it's the right call; the *4-bit Base* dropdown forces it On/Off.
 - **Previews with no model swapping** — the default **RAW + Turbo LoRA** preview engine renders samples on the model that's already training, so nothing big is loaded or moved between epochs. The Samples tab keeps the classic mode (load the fp8 Turbo checkpoint per preview) if you prefer it; the workbench tools (Repair Studio / Explorer / Royale) still use the Turbo checkpoint, auto-sizing its block swap to your GPU.
 - **Previews never crash a run** — if a preview can't fit, previews auto-disable and **training keeps going and saving**; evaluate the LoRA in ComfyUI.
 
@@ -143,7 +149,9 @@ The browser gallery of training samples now *measures* the run instead of just s
 - **Training Run Visualiser** — scrub the current run epoch by epoch, Royale-style: a slider carousel per sample prompt, play/pause with ping-pong looping, likeness score inline, and share-ready export — a WebM clip with the epoch ticker and Fizgig tag burned in, or full-res PNG frames. It's a taste of the **LoRA Royale** tab, right in the browser.
 
 ### Dataset prep
-- **Florence-2 AI captioning** — bulk-generate detailed captions in one click.
+- **AI captioning, with the captioner that trains your model** — if you have Krea 2's Qwen3-VL text encoder, the Captions tab uses it by default. It's the same vision-language model that conditions training, so it captions to the doctrine that actually matters for LoRAs: name the camera viewpoint, say whether the face is visible, describe what's there instead of hedging. Four tasks (training caption / short / detailed / exhaustive) — and **every one of them is an editable preset, not a fixed mode**. Open the instruction the model is actually given, rewrite it in plain English, and save it; each preset keeps its own wording, your edits persist between sessions, and a Reset button restores the built-in whenever you want it back. Tune one preset for products and another for portraits and just switch between them. The trainer's mid-run auto-recaption picks up your edited wording too, so a caption style you settle on is the style the run keeps writing. **Florence-2** remains the zero-setup option, downloading itself on first use. Either way it's bulk-generate in one click, with your trigger word prepended.
+
+  The text encoder slot is **open**: bf16, the smaller **fp8_scaled** (recommended — 4.9 GB resident vs 8.3 GB, output we couldn't tell apart), or a **community fine-tune / abliterated build**. Because the same model writes your captions, swapping it changes how your dataset gets described — useful when a stock instruct model hedges on or refuses your subject matter.
 - **Bilingual captions** — optionally append Chinese via Helsinki-NLP. Klein's Qwen3 text encoder has deep Chinese training, so bilingual captions act as text-level data augmentation, improving visual quality without changing loss. In a controlled A/B (same data, seed, and hyperparameters — captions the only change) the loss curves stayed within ±0.001/epoch, yet the bilingual run produced visibly more skin detail and faster visual convergence.
 - **Image Prep** — batch resize, PNG conversion, and InsightFace face-crop derivatives, with optional **gender targeting** (largest male/female face) so it locks onto your subject in group shots. Pairing a tight crop with a full shot adds a lot to a character dataset. Training defaults to ~512² (0.25 MP) and resizes in-cache, so any resolution or aspect ratio just works — nothing has to be square or pre-sized.
 - **Look Consistency Filter** — the final prep stage, built for **synthetic-heavy datasets**: the subtly off-look near-misses that drag a likeness down are *easy* for the model to reconstruct, so a loss curve never sees them — but face-embedding distance does. Pick the **3 images that best nail the look** and every image is scored against all three, averaged (close-up faces included — detection pads-and-retries). Worst matches surface first with colour-coded verdicts; mark drifters by click or let **Auto-Suggest** flag the statistical outliers, then move them out of the dataset in one go (to a subfolder — nothing is deleted, and moving them back re-admits them). The scores save with your dataset and drive the trainer's **look-outlier warm-up**.
@@ -155,7 +163,7 @@ Loads kohya, PEFT, OneTrainer (OMI + legacy), AI-Toolkit, and LyCORIS (LoKR / Lo
 
 ## Requirements
 
-- **GPU** — NVIDIA RTX 30 / 40 / 50-series. **16 GB+ VRAM** recommended (24 GB+ comfortable). The fp8 Base's VRAM savings apply on every supported card.
+- **GPU** — NVIDIA RTX 30 / 40 / 50-series. **16 GB+ VRAM** recommended (24 GB+ comfortable), but the floor is lower than that suggests: **Klein 9B** needs 16 GB, while **Krea 2** trains on **8 GB** with everything on Auto and batch size 1 — see [VRAM guidance](#vram-guidance). The fp8 Base's VRAM savings apply on every supported card.
 - **NVIDIA driver** — 555+ on Windows, 550+ on Linux (for the CUDA 12.8 PyTorch wheels).
 - **OS** — Windows 10 / 11 or Linux. macOS handles captioning and image prep, but training needs CUDA.
 - **Python** — 3.10, 3.11, 3.12, or 3.13.
@@ -189,7 +197,17 @@ Three small models auto-download on first use: InsightFace `buffalo_l` (~300 MB,
 
 ## Model downloads (you provide)
 
-Fizgig doesn't bundle weights — they're large and licensing varies. Each row in the **Preferences** tab has a **Download** link to the right HuggingFace page. You only need the family you're using.
+Fizgig doesn't bundle weights — they're large and licensing varies. You only need the family you're using.
+
+> **Or let Fizgig fetch them.** Preferences has a **⬇ Download models for me** button under each model card: it downloads that family's files, verifies them, and fills in the paths for you. **Krea 2 needs no HuggingFace account** — those files aren't gated. Klein does (Black Forest Labs require you to accept their licence), so Fizgig asks for a free read token and tells you which pages to accept on. Interrupted downloads resume rather than restart. There's a CLI too:
+>
+> ```bash
+> python -m fizgig.scripts.fetch_models --family krea2   # ~32 GB, no account needed
+> python -m fizgig.scripts.fetch_models --family klein   # ~34 GB, needs a token
+> python -m fizgig.scripts.fetch_models --family tools   # Florence-2, face model, translator
+> ```
+
+Prefer to do it by hand? Each row in **Preferences** also has a **Download** link to the right HuggingFace page.
 
 ### Klein 9B
 
@@ -217,9 +235,18 @@ All four files live in the one [**Comfy-Org/Krea-2**](https://huggingface.co/Com
 | **Turbo DiT (fp8) — workbench / classic previews** | `krea2_turbo_fp8_scaled.safetensors` | ~13 GB fp8 | [Comfy-Org/Krea-2 → diffusion_models](https://huggingface.co/Comfy-Org/Krea-2/blob/main/diffusion_models/krea2_turbo_fp8_scaled.safetensors) |
 | **Turbo LoRA — in-training previews** (auto-downloads) | `krea2_turbo_lora_rank_64_bf16.safetensors` | ~470 MB bf16 | [Comfy-Org/Krea-2 → loras](https://huggingface.co/Comfy-Org/Krea-2/blob/main/loras/krea2_turbo_lora_rank_64_bf16.safetensors) |
 | Qwen-Image VAE | `qwen_image_vae.safetensors` | ~250 MB | [Comfy-Org/Krea-2 → vae](https://huggingface.co/Comfy-Org/Krea-2/blob/main/vae/qwen_image_vae.safetensors) |
-| Text Encoder (bf16) | `qwen3vl_4b_bf16.safetensors` | ~8 GB bf16 | [Comfy-Org/Krea-2 → text_encoders](https://huggingface.co/Comfy-Org/Krea-2/blob/main/text_encoders/qwen3vl_4b_bf16.safetensors) |
+| **Text Encoder — recommended** | `qwen3vl_4b_fp8_scaled.safetensors` | ~5.2 GB fp8 | [Comfy-Org/Krea-2 → text_encoders](https://huggingface.co/Comfy-Org/Krea-2/blob/main/text_encoders/qwen3vl_4b_fp8_scaled.safetensors) |
+| Text Encoder — full precision | `qwen3vl_4b_bf16.safetensors` | ~8.9 GB bf16 | [Comfy-Org/Krea-2 → text_encoders](https://huggingface.co/Comfy-Org/Krea-2/blob/main/text_encoders/qwen3vl_4b_bf16.safetensors) |
 
-Training and its previews run on the **RAW DiT** (the Turbo LoRA auto-downloads — no need to grab it by hand); the **fp8 Turbo checkpoint** powers the workbench tools (Repair Studio / Explorer / Royale) and the classic preview mode, so grab it if you'll use those. The text encoder must be the **bf16** Qwen3-VL-4B (the fp8 ComfyUI variant can't run the vision path used for reference images, or training). On smaller cards, the **4-bit (NF4)** toggle shrinks the RAW base to ~5.6 GB so it fits 10–12 GB GPUs.
+Training and its previews run on the **RAW DiT** (the Turbo LoRA auto-downloads — no need to grab it by hand); the **fp8 Turbo checkpoint** powers the workbench tools (Repair Studio / Explorer / Royale) and the classic preview mode, so grab it if you'll use those. On smaller cards, the **4-bit (NF4)** toggle shrinks the RAW base to ~5.6 GB — which is how Krea 2 fits 10–12 GB GPUs, and 8 GB ones at batch size 1. Leave it on Auto and Fizgig decides.
+
+**The text encoder slot is open.** Fizgig loads any Qwen3-VL-4B checkpoint you point it at, so you have real choice here:
+
+- **fp8_scaled — recommended.** Measured **4.9 GB resident vs 8.3 GB** for bf16, with captions we couldn't tell apart. ComfyUI's fp8 conversion quantises only the language layers and ships the **full bf16 vision tower**, so reference images and AI captioning are unaffected. Fizgig keeps the weights in fp8 and dequantises per matmul, so the saving is real memory, not just a smaller download.
+- **bf16** — the full-precision original, if you'd rather not quantise at all.
+- **Community fine-tunes and abliterated builds work too.** Any Qwen3-VL-4B variant in the ComfyUI layout loads, in bf16 or fp8_scaled. Since the same model writes your captions, swapping it changes *how your dataset gets described* — an uncensored or domain-tuned build will caption subjects a stock instruct model hedges on or refuses. Verified against a third-party abliterated fp8 build alongside the official files.
+
+Nothing else about Krea 2 is needed to use it as a captioner — Klein-only datasets benefit just as much, since captions are plain `.txt`.
 
 ---
 
@@ -245,9 +272,15 @@ Training and its previews run on the **RAW DiT** (the Turbo LoRA auto-downloads 
 
 ### Krea 2
 
-Krea 2 is a bigger model, so the numbers differ — but Fizgig **auto-sizes block swap to your card** for both training and the workbench, so there's nothing to tune:
+Krea 2 is a bigger model, so the numbers differ — but Fizgig **auto-sizes block swap and quantisation to your card** for both training and the workbench, so there's nothing to tune:
 
-- **Training** runs on the RAW fp8 base (~14 GB resident); block swap auto-detects from VRAM (32 GB → none, scaling up to maximum on sub-16 GB cards). The **4-bit (NF4)** toggle drops the base to ~5.6 GB (base + LoRA ~8.3 GB), fitting a **10–12 GB card with no swap**.
+| Your card | What to do | What to expect |
+|---|---|---|
+| **8 GB** | Everything on **Auto**, **batch size 1**, stock preset defaults | Trains full Krea 2 LoRAs — reported working by users on real runs. Keep batch size at 1; that's the one setting worth leaving alone |
+| **10–12 GB** | Same — everything on Auto | Same, with headroom to spare. Room to raise batch size or resolution before it gets tight |
+| **16 GB+** | Same | Comfortable; Auto will usually pick the faster INT8 path over 4-bit |
+
+- **Training** runs on the RAW fp8 base (~14 GB resident); block swap auto-detects from VRAM (32 GB → none, scaling up to maximum on sub-16 GB cards). The **4-bit (NF4)** toggle drops the base to ~5.6 GB (base + LoRA ~8.3 GB), fitting a **10–12 GB card with no swap** and an 8 GB card with the swap Auto sizes for it. You don't need to pick: Auto budgets from your *free* VRAM and the console explains its choice.
 - **In-training previews** default to the **RAW + Turbo LoRA** engine: they render on the model already training, so previews add almost nothing on top of the training footprint — no checkpoint load, no CPU↔GPU shuffling between epochs. The **workbench** (Repair Studio / Explorer / Royale) and the classic preview mode run on the fp8 Turbo checkpoint, which peaks ~22.6 GB unswapped — Fizgig auto-swaps it to fit your GPU (≈17 GB at swap 12; 16 GB cards swap enough to fit). If a preview still can't fit, it **auto-disables and training keeps running and saving** — evaluate the LoRA in ComfyUI.
 
 ---
@@ -270,7 +303,7 @@ Launch Fizgig and work left-to-right through the numbered tabs:
 
 1. **Start** — set your training image folder. If model paths aren't configured, a prompt points you to Preferences.
 2. **Image Prep** (optional) — resize, PNG-convert, or face-crop your images; finish with the **Look Consistency Filter** to weed out off-look images before they train.
-3. **Captions** — write trigger-word captions or generate with Florence-2; optionally translate to bilingual English + Chinese.
+3. **Captions** — write trigger-word captions or generate them with AI (Qwen3-VL or Florence-2); optionally translate to bilingual English + Chinese.
 4. **Samples** — configure the preview prompts that render during training (Distilled 4-step on by default).
 5. **Training** — pick a preset, tune, click **Start Training**.
 

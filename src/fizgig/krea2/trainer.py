@@ -34,7 +34,7 @@ from fizgig.krea2.sampling import gather_valid_text, prepare
 from fizgig.modules.sdpa import consider_training_backend as _consider_training_backend
 from fizgig.networks.lora import create_network
 from fizgig.training.metadata import ARCHITECTURE_KREA2
-from fizgig.training.train_utils import LossRecorder
+from fizgig.training.train_utils import LossRecorder, prune_state_dirs
 
 logger = logging.getLogger(__name__)
 
@@ -500,7 +500,16 @@ def _save_training_state(output_dir, output_name, network, optimizer, *, epoch, 
 def _load_training_state(state_dir, network, optimizer, *, device):
     """Restore network + optimizer + RNG from a state dir. Returns (start_epoch, global_step, meta)."""
     from safetensors.torch import load_file
-    network.load_state_dict(load_file(os.path.join(state_dir, "lora.safetensors")), strict=False)
+    # strict=False tolerates benign key drift, but if NOTHING matched the LoRA silently stays at
+    # its zero init and the run "succeeds" while training from scratch — then overwrites the
+    # finished LoRA with a no-op. That's most reachable via resume-a-finished-run, so refuse it.
+    _incompat = network.load_state_dict(load_file(os.path.join(state_dir, "lora.safetensors")), strict=False)
+    _missing = getattr(_incompat, "missing_keys", [])
+    if _missing and len(_missing) >= len(network.state_dict()):
+        raise RuntimeError(
+            f"[state] {state_dir} matched none of this network's {len(network.state_dict())} keys — "
+            f"refusing to resume into a zero-initialised LoRA. The state was almost certainly saved "
+            f"with a different network config (rank/alpha/target modules or a different Context LoRA).")
     opt_path = os.path.join(state_dir, "optimizer.pt")
     if os.path.exists(opt_path):
         optimizer.load_state_dict(torch.load(opt_path, map_location=device))
@@ -777,7 +786,8 @@ def _remove_claimed_queue(path: str) -> None:
 
 def _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_swap, loss_watch, epoch,
                            *, auto_recaption=False, trigger_word=None, recaptioned=None,
-                           image_dir=None, caption_ext=".txt"):
+                           image_dir=None, caption_ext=".txt", recaption_instruction=None,
+                           recaption_instruction_detailed=None):
     """Live caption repair (Problem Images window). Consume <output_dir>/loss_log/caption_updates.json
     ({item_key: new_caption}), re-encode each caption with Qwen3-VL, and OVERWRITE the item's
     text-embedding cache file — the collate re-reads that file from disk every step, so the very
@@ -792,6 +802,13 @@ def _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_sw
     exhaustive-detail caption; after that it's permanently human-review. A manual edit already
     queued for a key always wins over the auto path. Both jobs share one DiT park + one
     text-encoder load.
+
+    recaption_instruction / recaption_instruction_detailed: the Captions tab's Training-caption
+    and Exhaustive-detail instructions, sent only when the user has edited that preset. Attempt 1
+    uses the training one, attempt 2 the exhaustive one — so the escalation to exhaustive detail
+    (the point of a second attempt, and what makes the two-attempt protocol a causal test
+    separating caption-fixable images from entropy-limited ones) is preserved whether the user
+    edited those presets or not. Either being None just means "use the built-in".
 
     The GUI separately rewrites the .txt for manual edits; the auto path writes the .txt itself
     (image_dir + caption_ext from the dataset TOML) so fixes survive future re-caches. The 8 GB
@@ -884,9 +901,20 @@ def _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_sw
         # trigger word (if any) is appended at the END — per the conditional-trigger doctrine,
         # a trailing token is a far weaker identity claim than a leading one. Attempt 2 (the
         # first caption demonstrably failed) goes exhaustive-detail.
+        if recaption_instruction or recaption_instruction_detailed:
+            _which = " + ".join(
+                w for w, v in (("Training caption", recaption_instruction),
+                               ("Exhaustive detail", recaption_instruction_detailed)) if v)
+            logger.info("[auto-recaption] using your edited instruction for: %s", _which)
         for k, img_path, attempt in auto_todo:
             try:
-                cap = generate_caption(encoder, img_path, detailed=(attempt >= 2))
+                # Attempt 1 uses the Training-caption instruction, attempt 2 the Exhaustive one —
+                # the user's edited version of each where they have one, the built-in otherwise.
+                # The escalation to exhaustive detail is preserved either way.
+                _instr = (recaption_instruction_detailed if attempt >= 2
+                          else recaption_instruction) or None
+                cap = generate_caption(encoder, img_path, detailed=(attempt >= 2),
+                                       instruction=_instr)
                 if trigger_word:
                     cap = f"{cap}, {trigger_word}"
                 cap_path = os.path.join(image_dir, os.path.basename(k) + caption_ext)
@@ -1134,6 +1162,11 @@ def train_krea2(
     learning_rate: float = 1e-4,
     max_train_epochs: int = 10,
     save_every_n_epochs: int = 0,
+    # Resumable state dirs. Pause/Resume saves state regardless of these — they only govern the
+    # automatic saves. Each dir is LoRA + optimizer moments (~474 MB at rank 32), hence keep_n.
+    save_state: bool = False,
+    save_state_on_train_end: bool = False,
+    keep_last_n_states: int = 2,
     fp8_scaled: bool = True,
     quant_4bit: bool = False,
     quant_int8: str = "",
@@ -1177,6 +1210,10 @@ def train_krea2(
     auto_recaption: bool = False,
     warmup_look_outliers: bool = False,
     trigger_word: str = None,
+    # Captions-tab instructions for auto-recaption: the Training-caption preset for attempt 1,
+    # the Exhaustive-detail preset for attempt 2. Each sent only when the user edited that preset.
+    recaption_instruction: str = None,
+    recaption_instruction_detailed: str = None,
     resume_state_dir: str = None,
     context_lora_path: str = None,
     context_lora_strength: float = 1.0,
@@ -1345,6 +1382,14 @@ def train_krea2(
                         f"stability_triggered={adaptive.stability_triggered}")
         logger.info(f"[resume] from {resume_state_dir}: continuing at epoch {start_epoch + 1}/{max_train_epochs} "
                     f"(global_step {global_step})")
+        # Nothing left to train: the epoch loop below is empty and we fall through to writing the
+        # final LoRA. That fall-through is deliberate — pausing ON the last epoch exits before the
+        # final LoRA is written, so Resume is what completes it — hence a loud log, not an error.
+        if start_epoch >= max_train_epochs:
+            logger.warning(
+                f"[resume] state is at epoch {start_epoch} of {max_train_epochs} — nothing left to "
+                f"train. Writing the final LoRA from the restored state. To train further, raise "
+                f"Max Train Epochs above {start_epoch} and resume again.")
     try:
         steps_per_epoch = len(loader)
     except TypeError:
@@ -1714,11 +1759,24 @@ def train_krea2(
                                loss_watch, epoch + 1,
                                auto_recaption=auto_recaption, trigger_word=trigger_word,
                                recaptioned=recaptioned, image_dir=ar_image_dir,
-                               caption_ext=ar_caption_ext)
+                               caption_ext=ar_caption_ext,
+                               recaption_instruction=recaption_instruction,
+                               recaption_instruction_detailed=recaption_instruction_detailed)
 
+        state_saved_this_epoch = False
         if save_every_n_epochs and (epoch + 1) % save_every_n_epochs == 0 and (epoch + 1) < max_train_epochs:
             _save_lora(network, os.path.join(output_dir, f"{output_name}-{epoch + 1:06d}.safetensors"),
                        network_dim, network_alpha, dtype)
+            # Resumable state rides the checkpoint cadence. Safe to snapshot here: pending_accum
+            # was flushed above, the adaptive-LR watcher has already made its call for this epoch,
+            # and any queued caption updates are applied — so the optimizer is settled.
+            if save_state:
+                _save_training_state(output_dir, output_name, network, optimizer,
+                                     epoch=epoch + 1, global_step=global_step,
+                                     network_dim=network_dim, network_alpha=network_alpha, dtype=dtype,
+                                     extra={"adaptive_lr_state": adaptive.state_dict()} if adaptive else None)
+                state_saved_this_epoch = True
+                prune_state_dirs(output_dir, output_name, keep_last_n_states)
 
         if (do_previews and sample_every_n_epochs and (epoch + 1) % sample_every_n_epochs == 0
                 and turbo_net is not None):
@@ -1832,11 +1890,20 @@ def train_krea2(
         # state at this epoch boundary and exit cleanly so the GPU frees. The GUI detects the
         # clean exit, records the paused state, and offers Resume. Same contract as Klein.
         if os.path.exists(pause_flag):
-            logger.info(f"[pause] requested — saving state at epoch {epoch + 1} and exiting cleanly")
-            _save_training_state(output_dir, output_name, network, optimizer,
-                                 epoch=epoch + 1, global_step=global_step,
-                                 network_dim=network_dim, network_alpha=network_alpha, dtype=dtype,
-                                 extra={"adaptive_lr_state": adaptive.state_dict()} if adaptive else None)
+            # Pause ALWAYS saves state, regardless of the save-state settings — that's the whole
+            # contract of the button. But if the cadence already wrote this epoch's state above,
+            # don't re-dump ~0.5 GB into the same dir: _save_training_state overwrites in place,
+            # so a crash during the rewrite would destroy the very state we're pausing to keep.
+            # The flag (not os.path.isdir) is the right check — a stale dir left by an earlier
+            # run with the same name would wrongly suppress a real pause save.
+            if state_saved_this_epoch:
+                logger.info(f"[pause] requested — state for epoch {epoch + 1} already saved; exiting cleanly")
+            else:
+                logger.info(f"[pause] requested — saving state at epoch {epoch + 1} and exiting cleanly")
+                _save_training_state(output_dir, output_name, network, optimizer,
+                                     epoch=epoch + 1, global_step=global_step,
+                                     network_dim=network_dim, network_alpha=network_alpha, dtype=dtype,
+                                     extra={"adaptive_lr_state": adaptive.state_dict()} if adaptive else None)
             try:
                 os.remove(pause_flag)
             except Exception:
@@ -1848,6 +1915,17 @@ def train_krea2(
     progress_bar.close()
     if loss_watch is not None:
         loss_watch.close()
+
+    # End-of-run state, so a finished LoRA can be trained further by raising max_train_epochs.
+    # Skipped when the run trained nothing (resumed from a state already at the final epoch) —
+    # the only dir we'd write is the one we resumed FROM, and the save overwrites in place.
+    if save_state_on_train_end and max_train_epochs > start_epoch:
+        _save_training_state(output_dir, output_name, network, optimizer,
+                             epoch=max_train_epochs, global_step=global_step,
+                             network_dim=network_dim, network_alpha=network_alpha, dtype=dtype,
+                             extra={"adaptive_lr_state": adaptive.state_dict()} if adaptive else None)
+        prune_state_dirs(output_dir, output_name, keep_last_n_states)
+
     out = os.path.join(output_dir, f"{output_name}.safetensors")
     # Record the context LoRA in metadata so users know to pair it at the same strength at
     # inference (the trained LoRA is context-dependent — same contract as Klein).

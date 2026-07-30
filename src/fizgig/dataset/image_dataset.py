@@ -30,6 +30,7 @@ from fizgig.training.metadata import ARCHITECTURE_KLEIN_9B, ARCHITECTURE_KLEIN_9
 import logging
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 
 def decode_caption(raw: bytes, caption_path: str) -> str:
@@ -67,7 +68,6 @@ def decode_caption(raw: bytes, caption_path: str) -> str:
     logger.warning("Caption %s could not be decoded in any known encoding — undecodable bytes "
                    "replaced.", caption_path)
     return raw.decode("utf-8", errors="replace")
-logging.basicConfig(level=logging.INFO)
 
 
 # ---------------------------------------------------------------------------
@@ -667,10 +667,10 @@ class ImageDataset(torch.utils.data.Dataset):
     # -- cache paths -------------------------------------------------------
 
     def get_all_latent_cache_files(self) -> list[str]:
-        return glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
+        return glob.glob(os.path.join(glob.escape(self.cache_directory), f"*_{self.architecture}.safetensors"))
 
     def get_all_text_encoder_output_cache_files(self) -> list[str]:
-        return glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}_te.safetensors"))
+        return glob.glob(os.path.join(glob.escape(self.cache_directory), f"*_{self.architecture}_te.safetensors"))
 
     def get_latent_cache_path(self, item_info: ItemInfo) -> str:
         w, h = item_info.original_size
@@ -827,7 +827,7 @@ class ImageDataset(torch.utils.data.Dataset):
         """Build the BucketBatchManager from cached latent files on disk."""
         bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale)
 
-        latent_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
+        latent_cache_files = glob.glob(os.path.join(glob.escape(self.cache_directory), f"*_{self.architecture}.safetensors"))
 
         # The training set is built from CACHE files, not from the image folder — so stale cache
         # entries get silently TRAINED ON: an image deleted from the dataset lingers as its cache,

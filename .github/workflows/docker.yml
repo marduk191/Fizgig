@@ -1,0 +1,71 @@
+# Builds the Fizgig pod image and pushes it to GHCR.
+#
+# GHCR rather than Docker Hub: it's free and unlimited for public images, needs no extra account
+# or secret (GITHUB_TOKEN is enough), and has no anonymous pull rate limit — which matters,
+# because a cold-starting pod is an anonymous pull.
+#
+# Runs on release tags and on demand. Deliberately NOT on every push to master: the image holds
+# only system packages and pip dependencies, and Fizgig's source is pulled at boot — so a code
+# change needs no rebuild. Only requirements.txt changes do.
+name: Build pod image
+
+on:
+  push:
+    tags: ["v*"]
+    paths-ignore: ["**.md"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Extra tag to publish (e.g. test)"
+        required: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The torch cu128 wheel alone is several GB and the runner ships with ~14 GB free.
+      # Clearing the preinstalled toolchains buys back ~20 GB and is the difference between
+      # this building and dying on "no space left on device" halfway through pip.
+      - name: Free up runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

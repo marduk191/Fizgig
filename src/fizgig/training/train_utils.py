@@ -3,6 +3,7 @@
 import argparse
 import logging
 import os
+import re
 import shutil
 from typing import Callable
 
@@ -14,7 +15,6 @@ logger = logging.getLogger(__name__)
 # Checkpoint file naming patterns
 EPOCH_STATE_NAME = "{}-{:06d}-state"
 EPOCH_FILE_NAME = "{}-{:06d}"
-LAST_STATE_NAME = "{}-state"
 STEP_STATE_NAME = "{}-step{:08d}-state"
 STEP_FILE_NAME = "{}-step{:08d}"
 
@@ -61,6 +61,55 @@ class LossRecorder:
         return self.loss_total / n
 
 
+def list_state_dirs(output_dir: str, output_name: str) -> list[tuple[int, str]]:
+    """Every `<output_name>-NNNNNN-state/` in output_dir as (epoch_no, full_path), newest first.
+
+    The regex is ANCHORED and scoped to output_name on purpose: several LoRAs commonly share one
+    output directory, and a loose `*-state` glob would let one run's pruning delete another's
+    states. Shared by both trainers (Klein and Krea 2 agree on this naming) so the pattern lives
+    in exactly one place — the GUI's _detect_latest_state_dir mirrors it."""
+    pattern = re.compile(rf"^{re.escape(output_name)}-(\d{{6}})-state$")
+    found: list[tuple[int, str]] = []
+    try:
+        entries = os.listdir(output_dir)
+    except OSError:
+        return found
+    for entry in entries:
+        m = pattern.match(entry)
+        if not m:
+            continue
+        full = os.path.join(output_dir, entry)
+        if os.path.isdir(full):
+            found.append((int(m.group(1)), full))
+    found.sort(reverse=True)
+    return found
+
+
+def prune_state_dirs(output_dir: str, output_name: str, keep_n) -> None:
+    """Keep the keep_n highest-numbered state dirs, delete the rest.
+
+    Two deliberate safety choices:
+      * keep_n is clamped to >= 1. A blank/0/negative box must never mean "delete everything" —
+        that would take the state just written with it, and the caller then recreates the dir as
+        an adaptive-LR sidecar with no weights in it, which resume would happily pick up and choke
+        on. Clamping here as well as in the GUI keeps the invariant with the code that relies on it.
+      * every rmtree is caught individually. This runs at an epoch boundary of a multi-hour run;
+        a Windows AV scanner holding a just-written .safetensors raises PermissionError, and the
+        old unguarded call would have taken the whole run down over a housekeeping failure.
+
+    Always call AFTER the state (and any sidecar) is written, never before."""
+    try:
+        keep_n = max(1, int(keep_n))
+    except (TypeError, ValueError):
+        keep_n = 1
+    for _epoch_no, path in list_state_dirs(output_dir, output_name)[keep_n:]:
+        try:
+            shutil.rmtree(path)
+            logger.info(f"[state] pruned old state: {os.path.basename(path)}")
+        except Exception as e:
+            logger.warning(f"[state] could not remove {path}: {e}")
+
+
 def get_epoch_ckpt_name(model_name: str, epoch_no: int) -> str:
     return EPOCH_FILE_NAME.format(model_name, epoch_no) + ".safetensors"
 
@@ -92,21 +141,18 @@ def get_remove_step_no(args: argparse.Namespace, step_no: int):
     return remove_step_no
 
 
-def save_and_remove_state_on_epoch_end(args: argparse.Namespace, accelerator: accelerate.Accelerator, epoch_no: int):
+def save_state_on_epoch_end(args: argparse.Namespace, accelerator: accelerate.Accelerator, epoch_no: int):
+    """Write `<name>-NNNNNN-state/` for this epoch and return its path.
+
+    Pruning is deliberately NOT done here — the caller writes the adaptive-LR sidecar into this
+    dir first, so pruning has to happen after that, not inside the save."""
     model_name = args.output_name
     logger.info(f"Saving state at epoch {epoch_no}")
     os.makedirs(args.output_dir, exist_ok=True)
 
     state_dir = os.path.join(args.output_dir, EPOCH_STATE_NAME.format(model_name, epoch_no))
     accelerator.save_state(state_dir)
-
-    last_n_epochs = args.save_last_n_epochs_state if args.save_last_n_epochs_state else args.save_last_n_epochs
-    if last_n_epochs is not None:
-        remove_epoch_no = epoch_no - args.save_every_n_epochs * last_n_epochs
-        state_dir_old = os.path.join(args.output_dir, EPOCH_STATE_NAME.format(model_name, remove_epoch_no))
-        if os.path.exists(state_dir_old):
-            logger.info(f"Removing old state: {state_dir_old}")
-            shutil.rmtree(state_dir_old)
+    return state_dir
 
 
 def save_and_remove_state_stepwise(args: argparse.Namespace, accelerator: accelerate.Accelerator, step_no: int):
@@ -128,13 +174,20 @@ def save_and_remove_state_stepwise(args: argparse.Namespace, accelerator: accele
                 shutil.rmtree(state_dir_old)
 
 
-def save_state_on_train_end(args: argparse.Namespace, accelerator: accelerate.Accelerator):
+def save_state_on_train_end(args: argparse.Namespace, accelerator: accelerate.Accelerator, epoch_no: int):
+    """Write the end-of-run state as `<name>-NNNNNN-state/` and return its path.
+
+    Numbered like every other state dir on purpose. This used to be written as a bare
+    `<name>-state`, which neither the GUI's state-dir scan nor this trainer's own --resume epoch
+    parser could match — so the one state a finished run left behind was the one state nobody
+    could resume from. Numbering it is what makes "train 20 more epochs on a finished LoRA" work."""
     model_name = args.output_name
     logger.info("Saving final state.")
     os.makedirs(args.output_dir, exist_ok=True)
 
-    state_dir = os.path.join(args.output_dir, LAST_STATE_NAME.format(model_name))
+    state_dir = os.path.join(args.output_dir, EPOCH_STATE_NAME.format(model_name, epoch_no))
     accelerator.save_state(state_dir)
+    return state_dir
 
 
 def get_sanitized_config_or_none(args: argparse.Namespace):

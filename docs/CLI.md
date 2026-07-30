@@ -283,7 +283,11 @@ Loads the existing LoRA frozen-but-active on the base, so your new LoRA learns t
 **Checkpoints / state**
 
 - `--save_every_n_epochs 1` + `--save_state` — per-epoch LoRA checkpoints plus resumable state dirs (`<name>-NNNNNN-state/`). State is what makes pause/resume and epoch-scrubbing possible; keep it on.
+- `--save_state_on_train_end` — write a state dir when the run finishes, so a completed LoRA can be trained further later by raising `--max_train_epochs` and resuming. Without it, a finished run leaves only the LoRA and can't be continued.
+- `--keep_last_n_states 2` — keep only the N newest state dirs. Each is the LoRA plus optimizer moments (~470 MB at rank 32), so an unpruned 55-epoch run leaves tens of GB behind. Only dirs matching the current `--output_name` are touched, and the newest is always kept (values below 1 are clamped).
 - `--resume <path-to-state-dir>` — continue a run (see [Pause and resume](#pause-and-resume)).
+
+Both trainers write the same `<name>-NNNNNN-state/` layout, where `NNNNNN` is the number of completed epochs. Pause always writes state regardless of the flags above.
 
 ---
 
@@ -415,6 +419,14 @@ python src/fizgig/scripts/krea2_train.py ... --resume ./output_loras/my_subject/
 ```
 
 The epoch number is parsed from the dir name; optimizer, scheduler, RNG, dataloader state, adaptive-LR scalars, and (Krea 2) the full per-image watch history are all restored. Pass the same flags as the original run plus `--resume`.
+
+**Training a finished LoRA further.** Resume its end-of-run state and raise `--max_train_epochs` in the same command — the state records how many epochs are already done, so a run resumed at its final epoch has nothing left to do and simply rewrites the final LoRA (the trainer says so plainly in the log rather than pretending it trained). Raising the ceiling is what gives it epochs to run:
+
+```bash
+# LoRA finished at 30 epochs; take it to 45
+python src/fizgig/scripts/krea2_train.py ... --max_train_epochs 45 \
+    --resume ./output_loras/my_subject/my_subject-000030-state
+```
 
 ---
 

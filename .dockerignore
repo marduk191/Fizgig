@@ -1,0 +1,33 @@
+# The build context is sent to the Docker daemon before anything runs, so anything large left
+# in here is copied on every build. A dev checkout holds a multi-GB venv, downloaded models and
+# a latent cache — none of which belong in an image that clones the repo at boot anyway.
+
+venv/
+models/
+cache/
+output_loras/
+profiles/
+dataset/
+presets/
+loss_log/
+*.safetensors
+*.ckpt
+*.pt
+*.onnx
+
+# Local state — machine-specific, and prefs.json holds absolute paths to this machine's models
+prefs.json
+last_used.json
+.fizgig_paused.json
+.pause_requested
+
+# Scratch
+__pycache__/
+*.pyc
+.pytest_cache/
+*.log
+_statetest*/
+.git/
+.github/
+assets/
+docs/

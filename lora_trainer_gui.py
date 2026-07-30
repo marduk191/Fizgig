@@ -266,8 +266,15 @@ COLORS = {
     "bg_header": "#1A2028",      # Collapsible section headers
 
     "text_primary": "#F0F4F8",   # Main text
-    "text_secondary": "#8A9BAE", # Labels, hints
-    "text_muted": "#5A6B7E",     # Disabled, placeholders
+    "text_secondary": "#8A9BAE", # Labels
+    # Explanatory prose — card descriptions, row hints, fine print. Its own tier because the
+    # muted grey below reads at 2.54:1 on a card, which fails WCAG even for large text, and this
+    # is the copy that actually explains the app. 8.64:1, still a step down from text_primary so
+    # a card title stays visibly louder than its explanation.
+    "text_explain": "#C3CDD9",
+    # Genuinely de-emphasised UI only: disabled controls, placeholders, and the one-word captions
+    # beside widgets ("seed", "W", "H"). NOT for prose — that is text_explain above.
+    "text_muted": "#5A6B7E",
 
     "accent": "#3B82F6",         # Primary actions, links
     "accent_hover": "#60A5FA",   # Accent hover
@@ -275,6 +282,12 @@ COLORS = {
 
     "border": "#3A4555",         # Borders, dividers
     "border_focus": "#3B82F6",   # Focus rings
+
+    # Scrollbar thumb — the accent blue, matching the selected tab. Named entries rather than
+    # pointing straight at "accent" so this stays tunable without dragging tabs and links along
+    # with it. 4.19:1 against the trough, up from the 1.06:1 it used to be.
+    "scrollbar_thumb": "#3B82F6",
+    "scrollbar_thumb_hover": "#60A5FA",
 
     "success": "#10B981",        # Success states
     "warning": "#F59E0B",        # Warnings
@@ -512,6 +525,9 @@ ARCHITECTURES = {
         "sample_steps_default": 40,  # Base is not step-distilled — BFL spec is ~50 steps; 40 balances quality vs sample time. Distilled path overrides to 4.
         "sample_width_default": 768,
         "sample_height_default": 768,
+        # Trailing tag on the default LoRA name, so a file says which family made it. Swapped
+        # when the family changes — see _apply_lora_name_suffix.
+        "lora_name_suffix": "k9b",
     },
     "Krea 2": {
         # Krea 2 trains natively via fizgig.scripts.krea2_* (no accelerate launch — a
@@ -548,10 +564,24 @@ ARCHITECTURES = {
         "sample_steps_default": 8,
         "sample_width_default": 1024,
         "sample_height_default": 1024,
+        "lora_name_suffix": "krea2",
     },
 }
 
 ARCHITECTURE_LIST = list(ARCHITECTURES.keys())
+
+# Every family suffix we recognise on a LoRA name. Used to swap ONE tag for another when the
+# model family changes — matching this set (never "the last underscore segment") is what stops
+# a name like portrait_v2 being mangled into portrait_krea2.
+LORA_NAME_SUFFIXES = {c["lora_name_suffix"] for c in ARCHITECTURES.values()
+                      if c.get("lora_name_suffix")}
+
+# Preview resolutions offered by BOTH the Samples tab and the live "Override next sample" panel.
+# They used to be two hardcoded lists that had drifted — the Samples tab reached 1536 while the
+# override stopped at 1024, so a run previewing at 1280+ could not be reproduced by the override,
+# which silently downgraded it. Nothing downstream caps the value (Krea 2 rounds up to alignment,
+# Klein floors to a multiple of 16), so the ceiling was purely this list.
+SAMPLE_RESOLUTIONS = ["512", "768", "1024", "1280", "1536"]
 
 # Fizgig installation directory (where this GUI lives)
 FIZGIG_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -635,7 +665,7 @@ KREA2_BUILT_IN_PRESETS = {
         # preset value against the offered options on its first token, case-sensitively,
         # so a bare "auto" would not select "Auto (detect from GPU)".
         "BLOCKS_SWAP": "Auto (detect from GPU)",
-        "QUANT_4BIT_MODE": "Auto", "COMPILE_BLOCKS": "Auto",
+        "QUANT_4BIT_MODE": "auto", "COMPILE_BLOCKS": "Auto",
         # Per-image loss watch: detection + the LR throttle on, the two interventions that
         # rewrite captions or pre-judge images left off — those want a deliberate choice.
         "KREA2_LOSS_WATCH": True, "KREA2_PER_IMAGE_LR": True,
@@ -652,7 +682,40 @@ KREA2_BUILT_IN_PRESETS = {
         "GRADIENT_ACCUMULATION": 1, "MAX_GRAD_NORM": 1.0,
         "DATASET_MEGAPIXELS": "0.25",
         "BLOCKS_SWAP": "Auto (detect from GPU)",
-        "QUANT_4BIT_MODE": "Auto", "COMPILE_BLOCKS": "Auto",
+        "QUANT_4BIT_MODE": "auto", "COMPILE_BLOCKS": "Auto",
+        "KREA2_LOSS_WATCH": True, "KREA2_PER_IMAGE_LR": True,
+        "KREA2_AUTO_RECAPTION": False, "KREA2_WARMUP_LOOK": False,
+    },
+    # Style. Two deliberate departures from the identity-shaped presets above:
+    #
+    #   Rank 16 — style is a broad global direction (palette, texture, rendering), not the
+    #   fine detail identity memorises. The only style-specific parameter advice published
+    #   for Krea 2 is about rank, not LR ("rank 16 for simple styles, 64 for complex
+    #   subjects" — Krea2Trainer), so 16 follows the one datapoint that exists.
+    #
+    #   LR ceiling 2e-4, not 4e-4 — this matters MORE than the floor. The adaptive watcher
+    #   probes UP x1.25 on steady descent, and style loss descends steadily early, so it
+    #   climbs toward whatever ceiling it's given; 4e-4 is where style overbake lives. The
+    #   geometric-midpoint start rule puts min 5e-5 / max 2e-4 at exactly 1e-4 — the LR the
+    #   whole Krea 2 ecosystem defaults to (Krea's own docs, Krea2Trainer, RunComfy) — while
+    #   the watcher keeps its protection in both directions.
+    #
+    # Fewer epochs (15) because style overbakes fast, and on Krea 2 that shows up as
+    # generations dragging toward the training set's COMPOSITIONS, not just its look —
+    # so save every epoch and scrub for the sweet spot in LoRA Royale.
+    "✨ Krea 2 Style (rank 16, gentle LR)": {
+        "NETWORK_DIM": 16, "NETWORK_ALPHA": 16, "LEARNING_RATE": 1e-4,
+        "MAX_TRAIN_EPOCHS": 15, "SAVE_EVERY_N_EPOCHS": 1, "SEED": 42,
+        "ADAPTIVE_LR": True, "ADAPTIVE_LR_MIN": "5e-5", "ADAPTIVE_LR_MAX": "2e-4",
+        "TARGET_LAYERS": "Full Model", "MIN_TIMESTEP": "", "MAX_TIMESTEP": "",
+        "OPTIMIZER_TYPE": "adamw8bit",
+        "GRADIENT_ACCUMULATION": 1, "MAX_GRAD_NORM": 1.0,
+        "DATASET_MEGAPIXELS": "0.25",
+        "BLOCKS_SWAP": "Auto (detect from GPU)",
+        "QUANT_4BIT_MODE": "auto", "COMPILE_BLOCKS": "Auto",
+        # Detection + throttle on as usual. Look-outlier warm-up stays off for an extra
+        # reason here: it scores images by FACE embedding, which is meaningless on a style
+        # set that may have no faces at all.
         "KREA2_LOSS_WATCH": True, "KREA2_PER_IMAGE_LR": True,
         "KREA2_AUTO_RECAPTION": False, "KREA2_WARMUP_LOOK": False,
     },
@@ -733,6 +796,18 @@ def save_last_used(data):
 PREFS_FILE = os.path.join(os.path.dirname(__file__), "prefs.json")
 HELP_FILE = os.path.join(os.path.dirname(__file__), "help.json")
 _FIZGIG_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# --- Captioning models -----------------------------------------------------
+# Florence-2 downloads itself from HuggingFace on first use; the Qwen3-VL entry appears only when
+# the Krea 2 text-encoder file is present in Preferences. That file is a full vision-language
+# model with a real LM head, so it can genuinely describe an image — and the captions it writes
+# are plain .txt, so it is useful for ANY dataset, Klein runs included. The label names where the
+# file comes from, not who it is for.
+FLORENCE_DEFAULT_MODEL = "MiaoshouAI/Florence-2-base-PromptGen"
+FLORENCE_MODELS = [FLORENCE_DEFAULT_MODEL, "microsoft/Florence-2-base", "microsoft/Florence-2-large"]
+FLORENCE_TASKS = ["<CAPTION>", "<DETAILED_CAPTION>", "<MORE_DETAILED_CAPTION>"]
+QWEN_CAPTION_MODEL = "Qwen3-VL 4B (Krea 2 text encoder)"
+QWEN_CUSTOM_TASK = "Custom…"
 
 # Prefs whose VALUE is a directory we want to keep portable across repo
 # clones/moves. When saved to disk, paths inside _FIZGIG_DIR are stored as
@@ -1160,6 +1235,11 @@ class LoRATrainerGUI:
             "COMPILE_BLOCKS": "auto",  # torch.compile the DiT blocks (krea2): auto | on | off
                 "GRADIENT_CHECKPOINTING": True,  # ON by default — recompute activations to fit 9B on most cards
             "FP8_TEXT_ENCODER": True,  # FP8 for text encoder (T5/LLM)
+            # Resumable state dirs. Pause/Resume writes state regardless — these only govern the
+            # automatic saves. Keep-N matters: a state is LoRA + optimizer (~470 MB at rank 32).
+            "SAVE_STATE": True,
+            "SAVE_STATE_ON_TRAIN_END": True,
+            "KEEP_LAST_N_STATES": 2,
             "KREA2_LOSS_WATCH": False,   # per-image loss tracking + stuck-image detection (krea2)
             "KREA2_PER_IMAGE_LR": False,  # per-image adaptive LR (throttle stuck images) — experimental
             "KREA2_AUTO_RECAPTION": False,  # Qwen3-VL rewrites stuck images' captions mid-run — experimental
@@ -1286,11 +1366,19 @@ class LoRATrainerGUI:
         # Restore remembered Repair Studio / Explorer Setup fields + attach save traces.
         # After ALL tabs exist: restoring fires their traces, which touch other tabs' widgets.
         self._restore_workbench_setup_fields()
+        # Retag the LoRA name for the restored family. The settings dict is built long before
+        # architecture_var exists, so its default is hardcoded Klein-shaped — without this, a
+        # user whose last session was Krea 2 reopens to a name ending _k9b.
+        try:
+            self._apply_lora_name_suffix(self.architecture_var.get())
+        except Exception:
+            pass
 
-        # Florence model state (lazy loaded)
+        # Caption model state (lazy loaded, one at a time — see unload_florence_model)
         self.florence_model = None
         self.florence_processor = None
         self.florence_device = None
+        self.qwen_captioner = None      # Krea 2 Qwen3-VL, ~8 GB when resident
         self.captioning_stop_flag = False
         self.caption_thumbnails = {}
         self.current_caption_page = 0
@@ -1518,6 +1606,11 @@ class LoRATrainerGUI:
             self._unload_explorer_models()
         if tab_text != "LoRA Royale" and not self._royale_is_busy():
             self._royale_unload()
+        # Same rule for the ~8 GB Qwen3-VL captioner: leaving the Captions tab means you're done
+        # with it. Guarded on the in-flight flag like the others — a batch running in the
+        # background must not have its model pulled out from under it.
+        if tab_text != "3. Captions" and not getattr(self, '_captioning_running', False):
+            self._release_qwen_captioner_if_idle()
 
     def remove_focus(self, event):
         """Remove focus from active widget when clicking background"""
@@ -1604,6 +1697,22 @@ class LoRATrainerGUI:
         # instance) have no widget stanza below, so building `data` from scratch silently dropped
         # them on the very next save — the setting looked persisted until you restarted.
         data = dict(self.last_used) if isinstance(getattr(self, "last_used", None), dict) else {}
+        # Caption model / task / token budget — these were read at widget-creation time and never
+        # written back, so every restart reset them. Now that the model choice matters (Florence
+        # vs Qwen3-VL), losing it silently would be a real annoyance.
+        for _attr, _key in (("caption_model_var", "caption_model"),
+                            ("caption_task_var", "caption_task"),
+                            ("caption_max_tokens_var", "caption_max_tokens")):
+            _v = getattr(self, _attr, None)
+            if _v is not None:
+                try:
+                    data[_key] = _v.get()
+                except Exception:
+                    pass
+        # Per-model task memory. The flat "caption_task" above is still written so an older
+        # build (or a downgrade) finds something sensible rather than nothing.
+        if getattr(self, "_caption_task_memory", None):
+            data["caption_tasks"] = dict(self._caption_task_memory)
         data.update({
             "prep_mode": self.prep_mode_var.get(),
             "prep_replace_originals": bool(self.delete_originals_var.get()),
@@ -1761,7 +1870,9 @@ class LoRATrainerGUI:
                  font=(FONT_FAMILY, 8)).pack(side=tk.LEFT, padx=(16, 3))
         self.sample_override_seed_var = tk.StringVar(value="1234")
         ttk.Entry(r1, textvariable=self.sample_override_seed_var, width=8).pack(side=tk.LEFT)
-        _res_vals = ["512", "640", "768", "896", "1024"]
+        # Same list as the Samples tab (SAMPLE_RESOLUTIONS) — these two had drifted, and
+        # the override's lower ceiling silently downgraded a 1280/1536 preview.
+        _res_vals = SAMPLE_RESOLUTIONS
         tk.Label(r1, text="W", bg=_sbg, fg=COLORS["text_muted"],
                  font=(FONT_FAMILY, 8)).pack(side=tk.LEFT, padx=(14, 3))
         self.sample_override_w_var = tk.StringVar(value="768")
@@ -1772,9 +1883,10 @@ class LoRATrainerGUI:
         self.sample_override_h_var = tk.StringVar(value="768")
         ttk.Combobox(r1, textvariable=self.sample_override_h_var, values=_res_vals,
                      state="readonly", width=6).pack(side=tk.LEFT)
-        # Reference image (Klein edit conditioning) — auto-capped to ~0.20 MP by
-        # the trainer so a big image can't OOM the sample. Hidden in Krea 2 mode (Krea 2
-        # isn't an edit model, so samples generate from scratch — no reference image).
+        # Reference image — auto-capped to ~0.20 MP by the trainer so a big image can't OOM the
+        # sample. Shown for BOTH families: Klein uses it as edit conditioning, Krea 2 routes it
+        # through the Qwen3-VL vision path. (This comment used to claim it was hidden under
+        # Krea 2 — it never was; there is no hide call for these widgets anywhere.)
         self._override_ref_caption = tk.Label(r1, text="Ref", bg=_sbg, fg=COLORS["text_muted"],
                  font=(FONT_FAMILY, 8))
         self._override_ref_caption.pack(side=tk.LEFT, padx=(14, 3))
@@ -2196,21 +2308,28 @@ class LoRATrainerGUI:
             bordercolor=[("focus", COLORS["border_focus"])]
         )
 
-        # Scrollbar
-        style.configure(
-            "Vertical.TScrollbar",
-            background=COLORS["bg_header"],
-            troughcolor=COLORS["bg_deep"],
-            bordercolor=COLORS["border"],
-            arrowcolor=COLORS["text_secondary"],
-            darkcolor=COLORS["bg_deep"],
-            lightcolor=COLORS["bg_deep"],
-            width=12
-        )
-        style.map(
-            "Vertical.TScrollbar",
-            background=[("active", COLORS["border"]), ("pressed", COLORS["border"])]
-        )
+        # Scrollbar. `background` is the thumb — the part you drag — and it used to be bg_header
+        # on a bg_deep trough, which is 1.06:1. Not "subtle": indistinguishable from the track,
+        # so on a tall tab there was no visible clue that the panel scrolled at all.
+        #
+        # The accent blue, same as the selected tab. Colour lives in COLORS as its own entry so
+        # the scrollbar can be retuned without touching what "accent" means everywhere else.
+        for _orient in ("Vertical", "Horizontal"):
+            style.configure(
+                f"{_orient}.TScrollbar",
+                background=COLORS["scrollbar_thumb"],
+                troughcolor=COLORS["bg_deep"],
+                bordercolor=COLORS["border"],
+                arrowcolor=COLORS["text_primary"],
+                darkcolor=COLORS["bg_deep"],
+                lightcolor=COLORS["bg_deep"],
+                width=12
+            )
+            style.map(
+                f"{_orient}.TScrollbar",
+                background=[("active", COLORS["scrollbar_thumb_hover"]),
+                            ("pressed", COLORS["scrollbar_thumb_hover"])]
+            )
 
         # LabelFrame
         style.configure("TLabelframe",
@@ -2274,9 +2393,12 @@ class LoRATrainerGUI:
                  font=(FONT_FAMILY, 22, "bold"),
                  fg=COLORS["text_primary"], bg=COLORS["bg_deep"]).pack(anchor=tk.W)
         if subtitle:
+            # Colour only — 11pt is already comfortable, and this passed contrast before. Moved
+            # onto text_explain so every piece of explanatory copy is one colour, rather than the
+            # subtitle being a shade apart from the card descriptions directly beneath it.
             tk.Label(banner, text=subtitle,
                      font=(FONT_FAMILY, 11),
-                     fg=COLORS["text_secondary"], bg=COLORS["bg_deep"],
+                     fg=COLORS["text_explain"], bg=COLORS["bg_deep"],
                      wraplength=1050, justify=tk.LEFT).pack(anchor=tk.W, pady=(4, 0))
         return banner
 
@@ -2286,7 +2408,9 @@ class LoRATrainerGUI:
         `tab_key` selects the URL from help.json's `youtube_urls` dict.
         `prominent=True` uses a larger button with a hint about per-tab help (for the Start tab).
         """
-        fallback = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        # Used only when help.json is missing or unreadable — point it at the real guide
+        # rather than the old joke URL, since that path fires on a genuine error.
+        fallback = "https://www.youtube.com/watch?v=yrz0l6URGGk"
         try:
             with open(HELP_FILE, "r", encoding="utf-8") as f:
                 urls = json.load(f).get("youtube_urls", {})
@@ -2361,7 +2485,7 @@ class LoRATrainerGUI:
 
         heading("Fizgig", 22)
         tk.Label(pad, text="Klein 9B & Krea 2 LoRA Studio — by Peter Neill",
-                 font=(FONT_FAMILY, 11), fg=COLORS["text_secondary"],
+                 font=(FONT_FAMILY, 11), fg=COLORS["text_explain"],
                  bg=COLORS["bg_deep"]).pack(anchor=tk.W, pady=(0, 14))
 
         para("By trade I'm a photographer and videographer — mostly live music, portraits, and a "
@@ -2423,8 +2547,8 @@ class LoRATrainerGUI:
             )
         if description:
             tk.Label(card, text=description,
-                     font=(FONT_FAMILY, 9),
-                     fg=COLORS["text_muted"], bg=COLORS["bg_surface"],
+                     font=(FONT_FAMILY, 10),
+                     fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
                      wraplength=760, justify=tk.LEFT).pack(
                 anchor=tk.W, padx=20, pady=(0, 10)
             )
@@ -2552,7 +2676,7 @@ class LoRATrainerGUI:
         steps = [
             ("1", "Start",      "Choose your training image folder below.",                     False),
             ("2", "Image Prep", "Resize, convert to PNG, or face-crop.",                        True),   # optional
-            ("3", "Captions",   "Write trigger-word captions or generate with Florence AI.",    False),
+            ("3", "Captions",   "Write trigger-word captions or generate them with AI.",        False),
             ("4", "Samples",    "Configure in-training preview prompts.",                       False),
             ("5", "Training",   "Pick a preset, tune settings, click Start Training.",          False),
         ]
@@ -2597,8 +2721,8 @@ class LoRATrainerGUI:
         tk.Label(picker_card,
                  text="This is the single place you set your dataset folder. Image Prep, Captions, "
                       "and Training all read from it automatically.",
-                 font=(FONT_FAMILY, 9),
-                 fg=COLORS["text_muted"], bg=COLORS["bg_surface"],
+                 font=(FONT_FAMILY, 10),
+                 fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
                  wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, padx=20, pady=(0, 12))
 
         row = tk.Frame(picker_card, bg=COLORS["bg_surface"])
@@ -2678,8 +2802,8 @@ class LoRATrainerGUI:
         tk.Label(tools_card,
                  text="Fizgig is more than a trainer — these tabs let you understand and tune any Klein LoRA "
                       "you've made (or downloaded).",
-                 font=(FONT_FAMILY, 9),
-                 fg=COLORS["text_muted"], bg=COLORS["bg_surface"],
+                 font=(FONT_FAMILY, 10),
+                 fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
                  wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, padx=20, pady=(0, 12))
 
         tools = [
@@ -3035,7 +3159,7 @@ class LoRATrainerGUI:
             training_content,
             text="Per-image features need Batch Size 1 (Dataset section) — a batch-mean loss "
                  "isn't a per-image signal, so these are disabled at the current batch size.",
-            font=(FONT_FAMILY, 8, "italic"), fg=COLORS["text_muted"], bg=COLORS["bg_surface"],
+            font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
             wraplength=680, justify=tk.LEFT)
         self._krea2_perimage_batch_note.grid(row=24, column=0, columnspan=2, sticky=tk.W,
                                              padx=5, pady=(2, 0))
@@ -3159,8 +3283,11 @@ class LoRATrainerGUI:
         # Inline Attention / Logging / Memory / Metadata fields (formerly the Advanced tab)
         self._populate_other_options(scheduler_content, start_row=11)
 
-        # === Memory & FP8 / FP4 Section (Collapsed by default) ===
-        memory_section = CollapsibleFrame(outer,"Memory & FP8 / FP4", default_expanded=True)
+        # === Memory & precision section ===
+        # Header names every path the section now offers, INT8 included — it is the default on
+        # 20 GB+ cards and had no presence anywhere in the UI.
+        memory_section = CollapsibleFrame(outer, "Memory & Precision (INT8 / FP8 / NF4)",
+                                          default_expanded=True)
         memory_section.pack(fill=tk.X, padx=36, pady=(0, 16))
         self.collapsible_sections["memory"] = memory_section
 
@@ -3197,19 +3324,34 @@ class LoRATrainerGUI:
             self.entries["BLOCKS_SWAP"].set(blocks_swap_options[0])
 
         self._add_field_to_section(memory_content, "RESUME_TRAINING", "Resume Training", "directory", 1)
+        # The field had no explanation at all, which made the whole resume feature invisible
+        # unless you already knew a state dir was a folder (not a .safetensors) and where it lived.
+        tk.Label(memory_content,
+                 text="Leave empty for a normal run. To carry on from a saved state, Browse to a folder named "
+                      "like myLora-000012-state in your LoRA output folder — the number is the epoch it "
+                      "finished. Training continues at the next epoch with the optimizer, learning rate and "
+                      "seed exactly as they were, so it picks up mid-run rather than starting over. To train a "
+                      "FINISHED LoRA further, pick its highest-numbered state and raise Max Train Epochs first "
+                      "— otherwise there are no epochs left to run. Pausing writes one of these for you, and "
+                      "the Resume button fills this in automatically; you only need Browse for an older "
+                      "checkpoint or a run from a previous session.",
+                 font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
+                 wraplength=600, justify=tk.LEFT).grid(row=2, column=1, sticky=tk.W, padx=5, pady=(0, 4))
 
-        # FP8 Checkboxes
-        fp8_label = tk.Label(
+        # FP8 Checkboxes. Row label + hint are captured on self (not locals) so
+        # _apply_training_arch_visibility can hide them alongside the checkboxes for Krea 2 —
+        # otherwise hiding the controls leaves their label and explanation floating.
+        self._fp8_row_label = tk.Label(
             memory_content,
             text="Weight Optimization:",
             font=(FONT_FAMILY, 10),
             fg=COLORS["text_secondary"],
             bg=COLORS["bg_surface"]
         )
-        fp8_label.grid(row=2, column=0, sticky=tk.W, padx=(12, 8), pady=4)
+        self._fp8_row_label.grid(row=3, column=0, sticky=tk.W, padx=(12, 8), pady=4)
 
         fp8_frame = tk.Frame(memory_content, bg=COLORS["bg_surface"])
-        fp8_frame.grid(row=2, column=1, sticky=tk.W, padx=5, pady=4)
+        fp8_frame.grid(row=3, column=1, sticky=tk.W, padx=5, pady=4)
 
         self.fp8_var = tk.BooleanVar(value=self.settings["FP8"])
         self.scaled_var = tk.BooleanVar(value=self.settings["SCALED"])
@@ -3219,14 +3361,15 @@ class LoRATrainerGUI:
 
         self.scaled_check = ttk.Checkbutton(fp8_frame, text="FP8 Scaled", variable=self.scaled_var, state=tk.DISABLED if not self.fp8_var.get() else tk.NORMAL, style="Surface.TCheckbutton")
         self.scaled_check.pack(side=tk.LEFT)
-        tk.Label(memory_content,
-                 text="Converts a bf16 model to fp8 at load time. If your Base DiT is already fp8 "
-                      "(e.g. flux-2-klein-base-9b-fp8), leave this unchecked — Fizgig detects "
-                      "pre-quantised fp8 files automatically.",
-                 font=(FONT_FAMILY, 8, "italic"),
-                 fg=COLORS["text_muted"], bg=COLORS["bg_surface"],
-                 wraplength=600, justify=tk.LEFT).grid(
-            row=3, column=1, sticky=tk.W, padx=5, pady=(0, 4))
+        self._fp8_hint = tk.Label(
+            memory_content,
+            text="Converts a bf16 model to fp8 at load time. If your Base DiT is already fp8 "
+                 "(e.g. flux-2-klein-base-9b-fp8), leave this unchecked — Fizgig detects "
+                 "pre-quantised fp8 files automatically.",
+            font=(FONT_FAMILY, 9, "italic"),
+            fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
+            wraplength=600, justify=tk.LEFT)
+        self._fp8_hint.grid(row=4, column=1, sticky=tk.W, padx=5, pady=(0, 4))
 
         # FP8 Text Encoder
         self.fp8_text_encoder_label = tk.Label(
@@ -3236,69 +3379,72 @@ class LoRATrainerGUI:
             fg=COLORS["text_secondary"],
             bg=COLORS["bg_surface"]
         )
-        self.fp8_text_encoder_label.grid(row=4, column=0, sticky=tk.W, padx=(12, 8), pady=4)
+        self.fp8_text_encoder_label.grid(row=5, column=0, sticky=tk.W, padx=(12, 8), pady=4)
 
         self.fp8_text_encoder_var = tk.BooleanVar(value=self.settings["FP8_TEXT_ENCODER"])
         self.fp8_text_encoder_check = ttk.Checkbutton(memory_content, text="Enable FP8 T5/LLM", variable=self.fp8_text_encoder_var, style="Surface.TCheckbutton")
-        self.fp8_text_encoder_check.grid(row=4, column=1, sticky=tk.W, padx=5, pady=4)
+        self.fp8_text_encoder_check.grid(row=5, column=1, sticky=tk.W, padx=5, pady=4)
 
-        # 4-bit (NF4) base — Auto / On / Off. quant_4bit_var stays the BooleanVar every
-        # downstream consumer reads; the mode combobox derives it. "Auto" hands the choice
-        # to the launch-time memory strategy (Krea 2 + Blocks Swap on Auto picks
-        # INT8/NF4/fp8 from free VRAM; Klein has no NF4 auto, so Auto = off there).
-        self._quant_4bit_label = tk.Label(memory_content, text="4-bit Base:", font=(FONT_FAMILY, 10),
+        # Base precision (Krea 2 only — hidden for Klein by _apply_training_arch_visibility).
+        #
+        # Was "4-bit Base: Auto / On / Off", which was actively misleading: "Off" meant "not
+        # NF4", and on a capable card you would then silently get INT8 — a quantisation the UI
+        # never named anywhere. Reading Off as "no quantisation" is what produced the v2.8.6
+        # regression; the UI invited that misreading. Every path is now named and selectable,
+        # INT8 included, and each one is planned for properly by the memory strategy.
+        #
+        # quant_4bit_var stays the BooleanVar every downstream consumer reads (True only for
+        # NF4); quant_4bit_mode_var holds the canonical key and the combobox shows its label.
+        self._quant_4bit_label = tk.Label(memory_content, text="Base precision:", font=(FONT_FAMILY, 10),
                  fg=COLORS["text_secondary"], bg=COLORS["bg_surface"])
-        self._quant_4bit_label.grid(row=5, column=0, sticky=tk.W, padx=(12, 8), pady=4)
+        self._quant_4bit_label.grid(row=6, column=0, sticky=tk.W, padx=(12, 8), pady=4)
         self.quant_4bit_var = tk.BooleanVar(value=False)
-        _q4_mode = str(self.settings.get("QUANT_4BIT_MODE", "") or
-                       ("On" if self.settings.get("QUANT_4BIT", False) else "Auto"))
-        if _q4_mode not in ("Auto", "On", "Off"):
-            _q4_mode = "Auto"
-        self.quant_4bit_mode_var = tk.StringVar(value=_q4_mode)
+        self.quant_4bit_mode_var = tk.StringVar(value=self._BASE_PRECISION_LABELS[
+            self._normalize_base_precision(
+                self.settings.get("QUANT_4BIT_MODE", "")
+                or ("On" if self.settings.get("QUANT_4BIT", False) else "auto"))])
         _q4_row = ttk.Frame(memory_content)
-        _q4_row.grid(row=5, column=1, sticky=tk.W, padx=5, pady=4)
+        _q4_row.grid(row=6, column=1, sticky=tk.W, padx=5, pady=4)
         self.quant_4bit_check = ttk.Combobox(
             _q4_row, textvariable=self.quant_4bit_mode_var,
-            values=["Auto", "On", "Off"], state="readonly", width=6)
+            values=list(self._BASE_PRECISION_LABELS.values()), state="readonly", width=34)
         self.quant_4bit_check.pack(side=tk.LEFT)
         self.quant_4bit_check.bind("<<ComboboxSelected>>",
                                    lambda e: self._on_quant_4bit_mode_changed())
-        tk.Label(_q4_row, text="NF4 quantized base (low VRAM)",
-                 font=(FONT_FAMILY, 10), fg=COLORS["text_secondary"],
-                 bg=COLORS["bg_surface"]).pack(side=tk.LEFT, padx=(8, 0))
         self._quant_4bit_hint = tk.Label(memory_content,
-                 text="Auto (recommended): with Blocks Swap on Auto, the launch-time strategy picks the best "
-                      "of INT8 / NF4 4-bit / fp8 from your FREE VRAM (Krea 2; Klein has no NF4 auto). "
-                      "On forces the NF4 base — halves DiT VRAM (~9.6 → ~5.6 GB) for 10–12 GB cards, forces "
-                      "block swap off, supersedes FP8 Base; slight quality trade — check the LoRA in ComfyUI. "
-                      "Off never uses NF4 even if the strategy would pick it.",
-                 font=(FONT_FAMILY, 8, "italic"), fg=COLORS["text_muted"], bg=COLORS["bg_surface"],
+                 text="Auto (recommended) picks the fastest option that fits your FREE VRAM, and sizes block "
+                      "swap to match. INT8 is 8-bit — fastest, and ~7x more accurate than 4-bit, but needs "
+                      "~18 GB free. 4-bit NF4 is the smallest (~5.6 GB base) so it fits 10–12 GB cards with "
+                      "no swap, at a slight quality cost. fp8 is the least compressed of the three and needs "
+                      "the most VRAM, so it swaps blocks to fit. Anything you pick explicitly is planned "
+                      "for — swap is sized for the option that will actually run.",
+                 font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
                  wraplength=600, justify=tk.LEFT)
-        self._quant_4bit_hint.grid(row=6, column=1, sticky=tk.W, padx=5, pady=(0, 4))
+        self._quant_4bit_hint.grid(row=7, column=1, sticky=tk.W, padx=5, pady=(0, 4))
         self._on_quant_4bit_mode_changed()  # derive the boolean + sync dependent locks
 
         # Gradient checkpointing — trades compute for VRAM.
         self._grad_checkpoint_label = tk.Label(memory_content, text="Grad Checkpoint:", font=(FONT_FAMILY, 10),
                  fg=COLORS["text_secondary"], bg=COLORS["bg_surface"])
-        self._grad_checkpoint_label.grid(row=7, column=0, sticky=tk.W, padx=(12, 8), pady=4)
+        self._grad_checkpoint_label.grid(row=8, column=0, sticky=tk.W, padx=(12, 8), pady=4)
         self.grad_checkpoint_var = tk.BooleanVar(value=self.settings.get("GRADIENT_CHECKPOINTING", True))
         self.grad_checkpoint_check = ttk.Checkbutton(
             memory_content, text="Gradient checkpointing (recommended — lower VRAM)",
             variable=self.grad_checkpoint_var, command=self._on_grad_checkpoint_toggle,
             style="Surface.TCheckbutton")
-        self.grad_checkpoint_check.grid(row=7, column=1, sticky=tk.W, padx=5, pady=4)
+        self.grad_checkpoint_check.grid(row=8, column=1, sticky=tk.W, padx=5, pady=4)
         self._grad_checkpoint_hint = tk.Label(memory_content,
                  text="On (default) recomputes activations during the backward pass to save VRAM — it's what lets "
                       "a 9B LoRA fit on a 16 GB card. Turning it OFF makes training ~20–30% faster but uses far more "
                       "VRAM, so it's only for big cards (24 GB+, ideally 32 GB) with Blocks Swap at 0. On 16 GB, or "
                       "with block swap on, leave it ON.",
-                 font=(FONT_FAMILY, 8, "italic"), fg=COLORS["text_muted"], bg=COLORS["bg_surface"],
+                 font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
                  wraplength=600, justify=tk.LEFT)
-        self._grad_checkpoint_hint.grid(row=8, column=1, sticky=tk.W, padx=5, pady=(0, 4))
+        self._grad_checkpoint_hint.grid(row=9, column=1, sticky=tk.W, padx=5, pady=(0, 4))
         # torch.compile (Krea 2 only — hidden under Klein by _apply_training_arch_visibility).
         self._compile_blocks_label = tk.Label(memory_content, text="Compile Blocks:", font=(FONT_FAMILY, 10),
                  fg=COLORS["text_secondary"], bg=COLORS["bg_surface"])
-        self._compile_blocks_label.grid(row=9, column=0, sticky=tk.W, padx=(12, 8), pady=4)
+        self._compile_blocks_label.grid(row=10, column=0, sticky=tk.W, padx=(12, 8), pady=4)
         # Auto / On / Off rather than a checkbox: compile is a long-run win and a short-run loss,
         # so the right default is a judgement the trainer makes from the actual run length, the
         # same way Blocks Swap defaults to "Auto (detect from GPU)".
@@ -3306,7 +3452,7 @@ class LoRATrainerGUI:
         self.compile_blocks_check = ttk.Combobox(
             memory_content, textvariable=self.compile_blocks_var, state="readonly", width=36,
             values=["Auto", "On", "Off"])
-        self.compile_blocks_check.grid(row=9, column=1, sticky=tk.W, padx=5, pady=4)
+        self.compile_blocks_check.grid(row=10, column=1, sticky=tk.W, padx=5, pady=4)
         self._compile_blocks_hint = tk.Label(memory_content,
                  text="Auto (recommended) turns torch.compile on only when this run is long enough to repay it. "
                       "It fuses the per-matmul quantise/dequantise work that bounds the INT8 and NF4 paths — "
@@ -3316,9 +3462,47 @@ class LoRATrainerGUI:
                       "card (verified under a 13.5 GB cap); INT8 + compile needs ~24 GB. Requires Triton and, on "
                       "Windows, a C++ compiler (VS Build Tools) — both located automatically. Never used with "
                       "Blocks Swap, since swapping moves weights and compiled graphs assume they stay put.",
-                 font=(FONT_FAMILY, 8, "italic"), fg=COLORS["text_muted"], bg=COLORS["bg_surface"],
+                 font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
                  wraplength=600, justify=tk.LEFT)
-        self._compile_blocks_hint.grid(row=10, column=1, sticky=tk.W, padx=5, pady=(0, 4))
+        self._compile_blocks_hint.grid(row=11, column=1, sticky=tk.W, padx=5, pady=(0, 4))
+
+        # --- Save State ------------------------------------------------------------------
+        # Deliberately next to Resume Training (row 1): what writes state and what reads it back
+        # belong together. Both families, so NOT added to either list in
+        # _apply_training_arch_visibility.
+        tk.Label(memory_content, text="Save State:", font=(FONT_FAMILY, 10),
+                 fg=COLORS["text_secondary"], bg=COLORS["bg_surface"]
+                 ).grid(row=12, column=0, sticky=tk.NW, padx=(12, 8), pady=(10, 4))
+        _state_frame = tk.Frame(memory_content, bg=COLORS["bg_surface"])
+        _state_frame.grid(row=12, column=1, sticky=tk.W, padx=5, pady=(10, 4))
+        self.save_state_var = tk.BooleanVar(value=self.settings.get("SAVE_STATE", True))
+        ttk.Checkbutton(_state_frame, text="At each checkpoint", variable=self.save_state_var,
+                        style="Surface.TCheckbutton").pack(anchor=tk.W)
+        self.save_state_on_train_end_var = tk.BooleanVar(
+            value=self.settings.get("SAVE_STATE_ON_TRAIN_END", True))
+        ttk.Checkbutton(_state_frame, text="At end of training",
+                        variable=self.save_state_on_train_end_var,
+                        style="Surface.TCheckbutton").pack(anchor=tk.W)
+        tk.Label(memory_content,
+                 text="A state dir holds the LoRA plus the optimizer, so a run can pick up exactly where it "
+                      "left off — after a crash, or to train a finished LoRA further by raising Max Train "
+                      "Epochs and resuming. \"At each checkpoint\" follows Save Every N Epochs. Pause always "
+                      "saves state whether these are ticked or not.",
+                 font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
+                 wraplength=600, justify=tk.LEFT).grid(row=13, column=1, sticky=tk.W, padx=5, pady=(0, 4))
+
+        tk.Label(memory_content, text="Keep Last:", font=(FONT_FAMILY, 10),
+                 fg=COLORS["text_secondary"], bg=COLORS["bg_surface"]
+                 ).grid(row=14, column=0, sticky=tk.W, padx=(12, 8), pady=4)
+        self.entries["KEEP_LAST_N_STATES"] = ttk.Entry(memory_content, width=40)
+        self.entries["KEEP_LAST_N_STATES"].insert(0, str(self.settings.get("KEEP_LAST_N_STATES", 2)))
+        self.entries["KEEP_LAST_N_STATES"].grid(row=14, column=1, sticky=tk.W, padx=5, pady=4)
+        tk.Label(memory_content,
+                 text="States are big — roughly 470 MB at rank 32, 240 MB at rank 16 — so older ones are "
+                      "deleted as new ones are written. Only state dirs for THIS LoRA name are touched, and "
+                      "the newest is always kept.",
+                 font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
+                 wraplength=600, justify=tk.LEFT).grid(row=15, column=1, sticky=tk.W, padx=5, pady=(0, 4))
 
         # Re-sync now that the GC checkbox exists: the earlier _on_quant_4bit_toggle
         # call ran before it was created, so this applies the NF4→force-GC-on lock
@@ -3678,17 +3862,20 @@ class LoRATrainerGUI:
         if "SCALED" in preset:
             self.scaled_var.set(preset["SCALED"])
 
-        # 4-bit (NF4) base — dedicated mode var (not in self.entries), so the generic loop
-        # never restores it. New presets carry QUANT_4BIT_MODE (Auto/On/Off); legacy ones
-        # carry the old boolean, which maps to an explicit On/Off.
+        # Base precision — a dedicated var (not in self.entries), so the generic loop never
+        # restores it. _normalize_base_precision takes the canonical key, the display label,
+        # or a legacy Auto/On/Off alike, so old presets keep working.
         if hasattr(self, 'quant_4bit_mode_var'):
+            _key = None
             if "QUANT_4BIT_MODE" in preset:
-                _m = str(preset["QUANT_4BIT_MODE"])
-                if _m in ("Auto", "On", "Off"):
-                    self.quant_4bit_mode_var.set(_m)
-                    self._on_quant_4bit_mode_changed()
+                _key = self._normalize_base_precision(preset["QUANT_4BIT_MODE"])
             elif "QUANT_4BIT" in preset:
-                self.quant_4bit_mode_var.set("On" if bool(preset["QUANT_4BIT"]) else "Off")
+                # Legacy boolean. False means "4-bit not requested", i.e. no opinion — NOT an
+                # explicit demand for fp8, which would pin every old preset (including Klein's
+                # defaults, which carry QUANT_4BIT: False) away from Auto.
+                _key = "nf4" if bool(preset["QUANT_4BIT"]) else "auto"
+            if _key:
+                self.quant_4bit_mode_var.set(self._BASE_PRECISION_LABELS[_key])
                 self._on_quant_4bit_mode_changed()
 
         # torch.compile mode — collected by _collect_preset_values but, until now, never
@@ -3697,6 +3884,13 @@ class LoRATrainerGUI:
             _cb = str(preset["COMPILE_BLOCKS"]).capitalize()
             if _cb in ("Auto", "On", "Off"):
                 self.compile_blocks_var.set(_cb)
+
+        # Save-state toggles — dedicated vars, same not-in-self.entries situation. Presets saved
+        # before these existed simply don't carry the keys, so they keep the current setting.
+        if "SAVE_STATE" in preset and hasattr(self, 'save_state_var'):
+            self.save_state_var.set(bool(preset["SAVE_STATE"]))
+        if "SAVE_STATE_ON_TRAIN_END" in preset and hasattr(self, 'save_state_on_train_end_var'):
+            self.save_state_on_train_end_var.set(bool(preset["SAVE_STATE_ON_TRAIN_END"]))
 
         # Per-image loss watch toggles (krea2) — dedicated vars, same not-in-self.entries situation.
         if "KREA2_LOSS_WATCH" in preset and hasattr(self, 'krea2_loss_watch_var'):
@@ -3858,8 +4052,15 @@ class LoRATrainerGUI:
         _grab("fp8_var", "FP8")
         _grab("scaled_var", "SCALED")
         _grab("quant_4bit_var", "QUANT_4BIT")
-        _grab("quant_4bit_mode_var", "QUANT_4BIT_MODE")
+        # Store the canonical key, never the display label — the wording can change without
+        # invalidating everyone's saved presets.
+        if hasattr(self, "quant_4bit_mode_var"):
+            preset["QUANT_4BIT_MODE"] = self._base_precision()
         _grab("compile_blocks_var", "COMPILE_BLOCKS")
+        # BooleanVars aren't in self.entries, so they need grabbing explicitly — unlike
+        # KEEP_LAST_N_STATES, which is an Entry and is captured by the generic sweep above.
+        _grab("save_state_var", "SAVE_STATE")
+        _grab("save_state_on_train_end_var", "SAVE_STATE_ON_TRAIN_END")
         _grab("krea2_loss_watch_var", "KREA2_LOSS_WATCH")
         _grab("krea2_per_image_lr_var", "KREA2_PER_IMAGE_LR")
         _grab("krea2_auto_recaption_var", "KREA2_AUTO_RECAPTION")
@@ -4215,21 +4416,30 @@ class LoRATrainerGUI:
           • FP8 Scaled (in Memory & FP8)                        — krea2's fp8 path is always scaled
           • FP8 Text Encoder (in Memory & FP8)                  — krea2 caches the TE in bf16
           • Gradient Checkpointing (in Memory & FP8)            — krea2_train hardcodes it ON
-        Kept (model-agnostic / wired): FP8 Base (-> --no_fp8), and the full live "Override next
-        sample" status-bar panel including its Reference image — krea2 reads the override sentinel
-        for previews (prompt/seed/resolution) and routes the reference through the Qwen3-VL vision
-        path.
+          • FP8 Base (in Memory & FP8)                          — see below; an OOM trap on krea2
+        Kept (model-agnostic / wired): the full live "Override next sample" status-bar panel
+        including its Reference image — krea2 reads the override sentinel for previews
+        (prompt/seed/resolution) and routes the reference through the Qwen3-VL vision path.
+
+        FP8 Base is hidden for Krea 2 (29 Jul) because unticking it was a guaranteed OOM, not a
+        useful option. It sends --no_fp8, i.e. a bf16 base: 25.8 GB of weights alone, ~28 GB in
+        total, which no consumer card can hold. The auto swap planner never saw it — the plan is
+        identical ticked or unticked — so the run got a swap count sized for fp8/INT8/NF4 and
+        then loaded something twice that size. The command builder's elif chain also meant
+        unticking it silently dropped the INT8 flag the planner had just chosen. Krea 2's real
+        base-precision choices all live on the 4-bit control (Auto / On / Off -> NF4 / INT8 /
+        fp8), which the planner does see.
         """
         # Guard: this may run via update_ui_for_architecture before the Training tab is built.
         if not hasattr(self, "_adaptive_cb"):
             return
-        # Per-widget groups across the Training Parameters + Memory & FP8 sections. FP8 Base
-        # stays visible (wired -> --no_fp8); only the unwired Memory controls are hidden.
-        # NOTE: the 4-bit NF4 base toggle (_quant_4bit_*) is NOT hidden — it's wired into krea2_train
-        # (--quantize_4bit) as the low-VRAM path for 10-12 GB cards.
+        # Per-widget groups across the Training Parameters + Memory & FP8 sections.
         widgets = [
             self._modelarea_label, self._modelarea_combo, self._modelarea_desc_label,
-            self.scaled_check,                                   # FP8 Scaled
+            # The whole Weight Optimization row: label, both checkboxes, and the hint under
+            # them. Hiding only the controls left an orphaned label and a paragraph of text
+            # explaining something no longer on screen.
+            self._fp8_row_label, self.fp8_check, self.scaled_check, self._fp8_hint,
             self.fp8_text_encoder_label, self.fp8_text_encoder_check,
             self._grad_checkpoint_label, self.grad_checkpoint_check, self._grad_checkpoint_hint,
             # LR Decay steps: Klein-only (warmup_stable_decay). LR Scheduler + Warmup ARE wired
@@ -4241,6 +4451,13 @@ class LoRATrainerGUI:
         ]
         for w in widgets:
             self._set_widget_visible(w, not is_krea2)
+
+        # Base precision is the inverse: Krea 2 ONLY. Its options (Auto / INT8 / NF4 / fp8) and
+        # the memory strategy behind them are entirely krea2_train's; Klein's trainer has no
+        # INT8 path and no auto strategy, so offering the dropdown there would list options
+        # Klein cannot run. (Klein's --quant_4bit still exists on its CLI.)
+        for w in (self._quant_4bit_label, self.quant_4bit_check, self._quant_4bit_hint):
+            self._set_widget_visible(w, is_krea2)
 
         # The two families resolve optimizer names differently, so the dropdown's contents follow
         # the selector. A name valid for one may not exist in the other (Klein takes module paths;
@@ -4738,7 +4955,7 @@ class LoRATrainerGUI:
         btns.pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=(6, 12))
         status = tk.Label(win, text="Tip: caption what the image actually shows — viewpoint "
                                     "(“from behind”, “side profile”), pose, occlusions.",
-                          font=(FONT_FAMILY, 9), fg=COLORS["text_muted"], bg=COLORS["bg_deep"],
+                          font=(FONT_FAMILY, 10), fg=COLORS["text_explain"], bg=COLORS["bg_deep"],
                           wraplength=520, justify=tk.LEFT)
         status.pack(side=tk.BOTTOM, fill=tk.X, padx=14)
 
@@ -4886,7 +5103,18 @@ class LoRATrainerGUI:
                 _rk = int(self.entries["NETWORK_DIM"].get().strip() or 32)
             except (ValueError, KeyError, AttributeError):
                 _rk = 32
-            plan = recommend_krea2_strategy(caps=caps, mp=_mp, batch=_bs, rank=_rk)
+            # If the user pinned the 4-bit control, the plan must be built AROUND that choice —
+            # otherwise the swap count is sized for a quantisation that will not run. That
+            # exact mismatch (fp8 given NF4's swap-0 plan) OOM'd 16 GB cards; reproduced and
+            # fixed 28 Jul.
+            #
+            # "Off" maps to no_4bit, not fp8: the control is labelled *4-bit Base*, so turning
+            # it off is a vote against NF4, not against every quantisation. INT8 is 8-bit,
+            # faster than NF4 and far more accurate, so it still applies where it fits —
+            # briefly making Off mean plain fp8 cost 20 GB+ cards the fastest path for nothing.
+            _force = self._krea2_force_quant() if hasattr(self, "quant_4bit_mode_var") else None
+            plan = recommend_krea2_strategy(caps=caps, mp=_mp, batch=_bs, rank=_rk,
+                                            force_quant=_force)
         except Exception:
             self._auto_quant_int8 = ""   # no strategy ran — a stale INT8 pick must not leak
             return self._auto_krea2_blocks_swap()
@@ -4898,10 +5126,11 @@ class LoRATrainerGUI:
         # INT8 has no GUI toggle (it is newer than the 4-bit control) — carry it on the
         # instance so the krea2 command builder can pass --quant_int8.
         self._auto_quant_int8 = getattr(plan, "quant_int8", "") or ""
-        # The plan only drives the NF4 flag when the user left the 4-bit control on Auto —
-        # an explicit On/Off is their call and the strategy must not override it.
+        # The plan only drives the NF4 flag when Base precision is on Auto — an explicit
+        # choice is the user's call and the strategy must not override it. (Compared via the
+        # canonical key, not the display label, which is why the label can change freely.)
         _q4_auto = (not hasattr(self, "quant_4bit_mode_var")
-                    or self.quant_4bit_mode_var.get() == "Auto")
+                    or self._base_precision() == "auto")
         if (_q4_auto and hasattr(self, "quant_4bit_var")
                 and bool(self.quant_4bit_var.get()) != plan.quant_4bit):
             self.quant_4bit_var.set(plan.quant_4bit)
@@ -5209,11 +5438,46 @@ class LoRATrainerGUI:
             except Exception:
                 pass
 
+    # Base precision (Krea 2). Canonical key -> the label shown in the combobox. Stored as the
+    # KEY so the saved value stays stable if the wording changes.
+    _BASE_PRECISION_LABELS = {
+        "auto": "Auto (recommended)",
+        "int8": "INT8 — 8-bit, fastest",
+        "nf4":  "4-bit NF4 — smallest",
+        "fp8":  "fp8 — least compressed",
+    }
+
+    @classmethod
+    def _normalize_base_precision(cls, value) -> str:
+        """Canonical key from a stored value, a display label, or a legacy Auto/On/Off.
+
+        Legacy migration preserves BEHAVIOUR, not the old label's wording. "Off" meant "not
+        4-bit", which the strategy resolved to INT8 wherever it fits — so Off maps to int8,
+        and int8 degrades to fp8 by itself on a card that cannot run it or has too little
+        VRAM. Mapping Off to fp8 instead would silently drop 20 GB+ cards off the INT8 path,
+        which is precisely the regression v2.8.7 had to hotfix.
+        """
+        v = str(value or "").strip()
+        if v in cls._BASE_PRECISION_LABELS:
+            return v
+        for key, label in cls._BASE_PRECISION_LABELS.items():
+            if v == label:
+                return key
+        return {"Auto": "auto", "On": "nf4", "Off": "int8", "no_4bit": "int8"}.get(v, "auto")
+
+    def _base_precision(self) -> str:
+        """Canonical base-precision key currently selected."""
+        return self._normalize_base_precision(self.quant_4bit_mode_var.get())
+
+    def _krea2_force_quant(self):
+        """force_quant for recommend_krea2_strategy — None when Auto (let the ladder choose)."""
+        key = self._base_precision()
+        return None if key == "auto" else key
+
     def _on_quant_4bit_mode_changed(self):
-        """Derive quant_4bit_var from the Auto/On/Off mode. Auto rests at False — the
-        launch-time strategy sets it (Krea 2 + Blocks Swap on Auto) and only in Auto mode."""
-        mode = self.quant_4bit_mode_var.get()
-        self.quant_4bit_var.set(mode == "On")
+        """Derive quant_4bit_var from the selected base precision. Only NF4 sets it True; Auto
+        rests at False and the launch-time strategy sets it (Krea 2 + Blocks Swap on Auto)."""
+        self.quant_4bit_var.set(self._base_precision() == "nf4")
         self._on_quant_4bit_toggle()
 
     def _on_quant_4bit_toggle(self):
@@ -5385,15 +5649,18 @@ class LoRATrainerGUI:
         self._add_tab_banner(
             outer,
             "Captions",
-            "Write trigger-word captions or generate them with Florence-2 AI. "
-            "Skip this tab if your images already have .txt caption files.",
+            "Write trigger-word captions or generate them with AI. "
+            "You can optionally skip this tab if your images already have .txt caption files.",
         )
 
         # Card 1: Captioning Settings
         settings_card = self._start_section_card(
             outer, "Captioning Settings",
-            "Trigger word is prepended to every caption. Florence produces detailed image descriptions; "
-            "Static Caption writes the trigger word only.",
+            "Trigger word is prepended to every caption. Qwen3-VL follows a captioning instruction "
+            "you can read and edit, and is the better fit for training data — it needs the Krea 2 "
+            "text encoder set in Preferences, and captions any dataset, Klein included. Florence-2 "
+            "is smaller and downloads itself on first use. Static Caption writes the trigger word "
+            "only.",
         )
         settings_card.grid_columnconfigure(1, weight=1)
 
@@ -5418,28 +5685,55 @@ class LoRATrainerGUI:
         )
 
         ttk.Label(settings_card, text="Model:").grid(row=3, column=0, sticky=tk.W, padx=(0, 10), pady=4)
-        self.caption_model_var = tk.StringVar(value=self.settings.get("CAPTION_MODEL", "MiaoshouAI/Florence-2-base-PromptGen"))
+        # Populated properly by _restore_caption_selection() once both vars exist.
+        self.caption_model_var = tk.StringVar(value=self._initial_caption_model())
+        self._caption_task_memory = {}
+        self._caption_model_last = None
         self.caption_model_combo = ttk.Combobox(
             settings_card, textvariable=self.caption_model_var,
-            values=["MiaoshouAI/Florence-2-base-PromptGen",
-                    "microsoft/Florence-2-base",
-                    "microsoft/Florence-2-large"],
-            state="readonly", width=37,
+            values=self._caption_model_values(), state="readonly", width=37,
         )
         self.caption_model_combo.grid(row=3, column=1, sticky=tk.W, pady=4)
+        self.caption_model_combo.bind("<<ComboboxSelected>>",
+                                      lambda e: self._on_caption_model_changed())
+        # The Qwen3-VL entry appears as soon as the Krea 2 text encoder path is filled in on
+        # Preferences — no restart. It's a captioner for ANY dataset, Klein included; the file
+        # just happens to ship with the Krea 2 models.
+        try:
+            self.prefs_vars["krea2_text_encoder"].trace_add(
+                "write", lambda *_: self._refresh_caption_model_values())
+        except Exception:
+            pass
 
         ttk.Label(settings_card, text="Task:").grid(row=4, column=0, sticky=tk.W, padx=(0, 10), pady=4)
-        self.caption_task_var = tk.StringVar(value=self.settings.get("CAPTION_TASK", "<DETAILED_CAPTION>"))
+        self.caption_task_var = tk.StringVar(value="<DETAILED_CAPTION>")
+        _task_row = tk.Frame(settings_card, bg=COLORS["bg_surface"])
+        _task_row.grid(row=4, column=1, columnspan=2, sticky=tk.W, pady=4)
         self.caption_task_combo = ttk.Combobox(
-            settings_card, textvariable=self.caption_task_var,
-            values=["<CAPTION>", "<DETAILED_CAPTION>", "<MORE_DETAILED_CAPTION>"],
-            state="readonly", width=37,
+            _task_row, textvariable=self.caption_task_var,
+            values=FLORENCE_TASKS, state="readonly", width=37,
         )
-        self.caption_task_combo.grid(row=4, column=1, sticky=tk.W, pady=4)
+        self.caption_task_combo.pack(side=tk.LEFT)
+        self.caption_task_combo.bind("<<ComboboxSelected>>",
+                                     lambda e: self._on_caption_task_changed())
+        self.caption_edit_instr_btn = ttk.Button(
+            _task_row, text="Edit instructions…",
+            command=self._open_caption_instruction_editor)
+        self.caption_edit_instr_btn.pack(side=tk.LEFT, padx=(8, 0))
+        ToolTip(self.caption_edit_instr_btn,
+                "See and edit the exact instruction sent to the vision model for this task.\n"
+                "Saving edits THIS preset — each of the four keeps its own wording, and your\n"
+                "edit persists between sessions, including for the trainer's auto-recaption.\n"
+                "'Restore default' puts the shipped text back.")
 
         ttk.Label(settings_card, text="Max Tokens:").grid(row=5, column=0, sticky=tk.W, padx=(0, 10), pady=4)
-        self.caption_max_tokens_var = tk.StringVar(value=str(self.settings.get("CAPTION_MAX_TOKENS", 256)))
+        self.caption_max_tokens_var = tk.StringVar(
+            value=str(self.last_used.get("caption_max_tokens",
+                                         self.settings.get("CAPTION_MAX_TOKENS", 256))))
         ttk.Entry(settings_card, textvariable=self.caption_max_tokens_var, width=10).grid(row=5, column=1, sticky=tk.W, pady=4)
+        # Without this the value only reached disk when some OTHER control happened to trigger a
+        # save, so a hand-typed budget was usually lost on restart.
+        self.caption_max_tokens_var.trace_add("write", lambda *_: self._save_last_used_paths())
 
         ttk.Checkbutton(
             settings_card, text="Overwrite existing caption files", variable=self.overwrite_captions_var,
@@ -5449,8 +5743,14 @@ class LoRATrainerGUI:
         actions_card = self._start_section_card(outer, "Generate Captions", None)
         action_row = tk.Frame(actions_card, bg=COLORS["bg_surface"])
         action_row.pack(anchor=tk.W)
-        ttk.Button(action_row, text="Caption All Images (AI)", command=self.caption_all_florence).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(action_row, text="Static Caption All", command=self.generate_captions).pack(side=tk.LEFT, padx=(0, 8))
+        # Kept on self so a running job can grey them out — clicking Caption All twice used to
+        # start a SECOND worker over the same files, which reads as the job having been queued.
+        self.caption_all_btn = ttk.Button(action_row, text="Caption All Images (AI)",
+                                          command=self.caption_all_florence)
+        self.caption_all_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self.caption_static_btn = ttk.Button(action_row, text="Static Caption All",
+                                             command=self.generate_captions)
+        self.caption_static_btn.pack(side=tk.LEFT, padx=(0, 8))
         self.caption_stop_btn = ttk.Button(action_row, text="Stop", command=self.stop_captioning, state=tk.DISABLED)
         self.caption_stop_btn.pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(action_row, text="Unload Model", command=self.unload_florence_model).pack(side=tk.LEFT)
@@ -5539,6 +5839,9 @@ class LoRATrainerGUI:
             highlightbackground=COLORS["border"], highlightcolor=COLORS["border_focus"],
         )
         self.caption_log.pack(fill=tk.BOTH, expand=True)
+
+        # Apply the saved model + per-model task, then sync the task list / editor button.
+        self._restore_caption_selection()
 
         self._add_youtube_help_button(outer, "captions")
 
@@ -5751,6 +6054,271 @@ class LoRATrainerGUI:
         ttk.Button(btn_frame, text="Regenerate (AI)", command=regenerate).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
 
+    # region Caption model selection (Florence-2 / Qwen3-VL)
+
+    def _qwen_captioner_path(self) -> str:
+        """The Krea 2 text-encoder file, if it's set AND actually on disk — else ""."""
+        p = self._krea2_pref("krea2_text_encoder") if hasattr(self, "prefs_vars") else ""
+        return p if (p and os.path.isfile(p)) else ""
+
+    def _caption_model_values(self):
+        """Model dropdown contents. Qwen3-VL is offered whenever its file exists — it captions to
+        .txt like Florence does, so it serves Klein datasets just as well as Krea 2 ones."""
+        return FLORENCE_MODELS + ([QWEN_CAPTION_MODEL] if self._qwen_captioner_path() else [])
+
+    def _default_caption_model(self) -> str:
+        """What to select when there is no usable saved choice.
+
+        Qwen3-VL wherever its file exists: it follows an editable instruction written to the
+        captioning doctrine, so it produces better training data than Florence out of the box.
+        Florence is the fallback for anyone without that file."""
+        return QWEN_CAPTION_MODEL if self._qwen_captioner_path() else FLORENCE_DEFAULT_MODEL
+
+    def _initial_caption_model(self) -> str:
+        """Startup selection: the saved choice if it is still offered, else the default.
+
+        Validating against the live values list is what stops a saved 'Qwen3-VL …' from being
+        displayed after its file has been deleted — the combobox would otherwise show a value
+        absent from its own options, since _refresh_caption_model_values only runs from the
+        Preferences write-trace and never at startup."""
+        saved = str(self.last_used.get("caption_model", "") or "").strip()
+        return saved if saved in self._caption_model_values() else self._default_caption_model()
+
+    def _refresh_caption_model_values(self):
+        """Re-read the Preferences path and rebuild the dropdown (bound to that pref's trace)."""
+        if not hasattr(self, "caption_model_combo"):
+            return
+        try:
+            vals = self._caption_model_values()
+            self.caption_model_combo.configure(values=vals)
+            if self.caption_model_var.get() not in vals:
+                # The path was cleared while Qwen3-VL was selected — fall back rather than leave a
+                # selection that no longer resolves to anything loadable.
+                self.caption_model_var.set(FLORENCE_DEFAULT_MODEL)
+                self._on_caption_model_changed()
+        except tk.TclError:
+            pass
+
+    def _restore_caption_selection(self):
+        """Apply the saved caption model and its remembered task to the live vars.
+
+        Each captioner remembers its OWN task: their task lists have nothing in common (Florence
+        takes task tokens, Qwen an instruction preset), so a single shared value meant flipping
+        models threw away whichever task you had picked. Same snapshot-on-leave /
+        restore-on-return shape as the Training tab's per-family memory.
+
+        Called at startup and by the tests, so both exercise the identical path."""
+        self._caption_task_memory = dict(self.last_used.get("caption_tasks", {}) or {})
+        model = self._initial_caption_model()
+        # Upgrade path: the old flat caption_task belongs to whichever model is selected now.
+        legacy = str(self.last_used.get("caption_task", "") or "").strip()
+        if legacy and model not in self._caption_task_memory:
+            self._caption_task_memory[model] = legacy
+        self._caption_model_last = model
+        self.caption_model_var.set(model)
+        remembered = self._caption_task_memory.get(model)
+        if remembered:
+            self.caption_task_var.set(remembered)
+        self._on_caption_model_changed()
+
+    def _is_qwen_captioner(self) -> bool:
+        return self.caption_model_var.get() == QWEN_CAPTION_MODEL
+
+    def _qwen_task_labels(self):
+        from fizgig.krea2.embedder import CAPTION_TASKS
+        return [label for (label, _instr, _tok) in CAPTION_TASKS.values()] + [QWEN_CUSTOM_TASK]
+
+    def _on_caption_model_changed(self):
+        """Swap the Task dropdown between Florence's task tokens and Qwen3-VL's instruction menu,
+        restore that model's remembered task, and show the instruction editor only for the model
+        that has one."""
+        try:
+            new_model = self.caption_model_var.get()
+            prev_model = getattr(self, "_caption_model_last", None)
+            model_changed = bool(prev_model) and prev_model != new_model
+            if model_changed:
+                # Snapshot the model we're leaving before its task list is replaced.
+                self._caption_task_memory[prev_model] = self.caption_task_var.get()
+            self._caption_model_last = new_model
+
+            if self._is_qwen_captioner():
+                from fizgig.krea2.embedder import CAPTION_TASKS, DEFAULT_CAPTION_TASK
+                labels = self._qwen_task_labels()
+                default_task = CAPTION_TASKS[DEFAULT_CAPTION_TASK][0]
+            else:
+                labels = list(FLORENCE_TASKS)
+                default_task = "<DETAILED_CAPTION>"
+            self.caption_task_combo.configure(values=labels)
+            remembered = self._caption_task_memory.get(new_model)
+            # On a real model change ALWAYS prefer this model's remembered task. Only correcting
+            # an out-of-range value would restore it merely by luck — it works today because the
+            # two task lists share nothing, and would quietly stop working the moment they did.
+            if model_changed or self.caption_task_var.get() not in labels:
+                self.caption_task_var.set(remembered if remembered in labels else default_task)
+            if self._is_qwen_captioner():
+                self.caption_edit_instr_btn.pack(side=tk.LEFT, padx=(8, 0))
+            else:
+                self.caption_edit_instr_btn.pack_forget()
+            self._on_caption_task_changed()
+        except (tk.TclError, AttributeError):
+            pass
+        self._save_last_used_paths()
+
+    def _on_caption_task_changed(self):
+        """Seed Max Tokens from the task's suggested length, so each Qwen task gets a sensible
+        budget without a second control. Florence keeps whatever is in the box."""
+        # Record against the current model whether or not it's Qwen, so the memory is right even
+        # when the task changes without a model switch.
+        try:
+            self._caption_task_memory[self.caption_model_var.get()] = self.caption_task_var.get()
+        except (tk.TclError, AttributeError):
+            pass
+        if not self._is_qwen_captioner():
+            self._save_last_used_paths()
+            return
+        try:
+            from fizgig.krea2.embedder import CAPTION_TASKS
+            label = self.caption_task_var.get()
+            for _key, (lbl, _instr, tok) in CAPTION_TASKS.items():
+                if lbl == label:
+                    self.caption_max_tokens_var.set(str(tok))
+                    break
+        except Exception:
+            pass
+        self._save_last_used_paths()
+
+    def _caption_task_key(self, label: str) -> str:
+        """Canonical key for a task label — 'custom' for the free-slot entry."""
+        from fizgig.krea2.embedder import CAPTION_TASKS
+        for key, (lbl, _instr, _tok) in CAPTION_TASKS.items():
+            if lbl == label:
+                return key
+        return "custom"
+
+    def _caption_overrides(self) -> dict:
+        """{task_key: instruction} — every preset the user has edited.
+
+        Each preset is independently editable and keeps its own default, so a tuned Training
+        caption and a tuned Exhaustive one can coexist. Migrates the older single-slot pref
+        (one shared instruction) into the 'custom' entry."""
+        raw = self.prefs.get("caption_qwen_instructions")
+        out = dict(raw) if isinstance(raw, dict) else {}
+        legacy = str(self.prefs.get("caption_qwen_instruction", "") or "").strip()
+        if legacy and "custom" not in out:
+            out["custom"] = legacy
+        return out
+
+    def _caption_builtin_for_key(self, key: str) -> str:
+        """The shipped text for a task key. 'custom' has none, so it borrows the default task's."""
+        from fizgig.krea2.embedder import CAPTION_TASKS, DEFAULT_CAPTION_TASK
+        if key in CAPTION_TASKS:
+            return CAPTION_TASKS[key][1]
+        return CAPTION_TASKS[DEFAULT_CAPTION_TASK][1]
+
+    def _caption_instruction_for_task(self, label: str, *, builtin_only: bool = False) -> str:
+        """The instruction for a task label — the user's edited version if there is one."""
+        key = self._caption_task_key(label)
+        if not builtin_only:
+            saved = str(self._caption_overrides().get(key, "") or "").strip()
+            if saved:
+                return saved
+        return self._caption_builtin_for_key(key)
+
+    def _caption_task_is_edited(self, label: str) -> bool:
+        key = self._caption_task_key(label)
+        return bool(str(self._caption_overrides().get(key, "") or "").strip())
+
+    def _resolve_caption_instruction(self) -> str:
+        """The instruction that will actually be sent for the current selection."""
+        return self._caption_instruction_for_task(self.caption_task_var.get())
+
+    def _open_caption_instruction_editor(self):
+        """Show (and allow editing of) the instruction sent to Qwen3-VL for the current task.
+
+        Saving stores it in prefs against THIS preset's key (each of the four keeps its own
+        wording), so what you edited is what runs — here AND in the trainer's auto-recaption.
+        Saving the shipped text back drops the override rather than storing a redundant copy."""
+        opened_from = self.caption_task_var.get()
+        edited = self._caption_task_is_edited(opened_from)
+        dialog = tk.Toplevel(self.master)
+        dialog.title(f"Captioning instruction — {opened_from}")
+        dialog.configure(bg=BG_COLOR)
+        dialog.minsize(660, 420)
+
+        # Buttons packed BOTTOM first so a long instruction can never push them off the edge
+        # (the v2.8.5 caption-dialog fix).
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(side=tk.BOTTOM, pady=10)
+
+        tk.Label(dialog,
+                 text=f"{opened_from}{'  (edited)' if edited else ''}",
+                 font=(FONT_FAMILY, 11, "bold"), fg=COLORS["text_primary"],
+                 bg=BG_COLOR).pack(anchor=tk.W, padx=14, pady=(14, 2))
+        tk.Label(dialog,
+                 text="This is the whole prompt the model is given, alongside the image. Saving "
+                      "edits THIS preset — each one keeps its own wording, and Restore default "
+                      "puts the shipped text back.",
+                 font=(FONT_FAMILY, 10), fg=COLORS["text_explain"], bg=BG_COLOR,
+                 wraplength=620, justify=tk.LEFT).pack(anchor=tk.W, padx=14, pady=(0, 8))
+
+        instr_text = tk.Text(dialog, height=9, wrap="word", bg=COLORS["bg_surface"],
+                             fg=COLORS["text_primary"], insertbackground=COLORS["text_primary"],
+                             font=(FONT_FAMILY, 10), relief="flat", highlightthickness=1,
+                             highlightbackground=COLORS["border"])
+        instr_text.pack(fill=tk.BOTH, expand=True, padx=14)
+        instr_text.insert("1.0", self._caption_instruction_for_task(opened_from))
+
+        # The encoder's own system prompt, shown for context and deliberately NOT editable: it is
+        # what conditions training and inference, and must stay byte-identical to ComfyUI's
+        # Text-Encode-(Krea2) node. Editing it would silently change every cached embedding.
+        # Read from the module constant so this can never drift from what actually runs.
+        from fizgig.krea2.embedder import ENCODE_SYSTEM_DESCRIPTOR as sys_prompt
+        tk.Label(dialog, text="For reference — the encoder's own system prompt (not editable):",
+                 font=(FONT_FAMILY, 9, "bold"), fg=COLORS["text_secondary"],
+                 bg=BG_COLOR).pack(anchor=tk.W, padx=14, pady=(10, 2))
+        tk.Label(dialog, text=sys_prompt, font=(FONT_FAMILY, 9, "italic"),
+                 fg=COLORS["text_explain"], bg=BG_COLOR, wraplength=620,
+                 justify=tk.LEFT).pack(anchor=tk.W, padx=14)
+        tk.Label(dialog,
+                 text="That one conditions training and inference and must match ComfyUI exactly, "
+                      "so Fizgig keeps it fixed. It is not the captioning instruction above.",
+                 font=(FONT_FAMILY, 9), fg=COLORS["text_explain"], bg=BG_COLOR,
+                 wraplength=620, justify=tk.LEFT).pack(anchor=tk.W, padx=14, pady=(2, 10))
+
+        def restore_default():
+            instr_text.delete("1.0", tk.END)
+            instr_text.insert("1.0", self._caption_instruction_for_task(opened_from,
+                                                                       builtin_only=True))
+
+        def save_instruction():
+            text = instr_text.get("1.0", tk.END).strip()
+            if not text:
+                messagebox.showerror("Empty instruction",
+                                     "The instruction can't be empty — use Restore default.")
+                return
+            key = self._caption_task_key(opened_from)
+            overrides = self._caption_overrides()
+            if text == self._caption_builtin_for_key(key):
+                # Saving the shipped text back = "no override" rather than a redundant copy, so
+                # Restore default + Save genuinely returns the preset to stock.
+                overrides.pop(key, None)
+                msg = f"'{opened_from}' restored to its default instruction.\n"
+            else:
+                overrides[key] = text
+                msg = f"'{opened_from}' saved — this preset now uses your instruction.\n"
+            self.prefs["caption_qwen_instructions"] = overrides
+            self.prefs.pop("caption_qwen_instruction", None)   # retire the old single slot
+            save_prefs(self.prefs)
+            self._save_last_used_paths()
+            self.update_caption_log(msg)
+            dialog.destroy()
+
+        ttk.Button(btn_frame, text="Restore default", command=restore_default).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Save", command=save_instruction).pack(side=tk.LEFT, padx=5)
+
+    # endregion
+
     def load_florence_model(self):
         """Load Florence model (lazy loading)"""
         if self.florence_model is not None:
@@ -5809,18 +6377,45 @@ class LoRATrainerGUI:
             return False
 
     def unload_florence_model(self, silent=False):
-        """Unload Florence model to free memory"""
-        if self.florence_model is not None:
-            import torch
+        """Unload whichever caption model is resident (Florence-2 or Qwen3-VL) to free VRAM.
+
+        Name kept for the existing button and the pre-training hook. The Qwen3-VL captioner is
+        ~8 GB, so leaving it resident would OOM the training run this is called before."""
+        # Refuse while a captioning job is running. Without this, unloading mid-job freed the
+        # model and the worker's very next image called _generate_ai_caption, found no model,
+        # and quietly RELOADED it — which looks exactly like the job resuming after you pressed
+        # Unload. _release_qwen_captioner_if_idle already had this guard; the button did not.
+        if getattr(self, "_captioning_running", False):
+            self.update_caption_log(
+                "Captioning is still running — press Stop first, then Unload.\n")
+            if not silent:
+                messagebox.showinfo(
+                    "Captioning in progress",
+                    "A captioning job is still running.\n\nPress Stop and wait for it to finish, "
+                    "then unload. (Unloading now would just make the job reload the model and "
+                    "carry on.)")
+            return
+        import gc
+        import torch
+        freed = []
+        if getattr(self, "florence_model", None) is not None:
             del self.florence_model
             del self.florence_processor
             self.florence_model = None
             self.florence_processor = None
             self.florence_device = None
+            freed.append("Florence-2")
+        if getattr(self, "qwen_captioner", None) is not None:
+            del self.qwen_captioner
+            self.qwen_captioner = None
+            freed.append("Qwen3-VL")
+        if freed:
+            gc.collect()
             torch.cuda.empty_cache()
-            self.update_caption_log("Model unloaded\n")
+            self.update_caption_log(f"{' + '.join(freed)} unloaded\n")
             if not silent:
-                messagebox.showinfo("Model Unloaded", "Florence model unloaded. VRAM freed.")
+                messagebox.showinfo("Model Unloaded",
+                                    f"{' + '.join(freed)} unloaded. VRAM freed.")
         elif not silent:
             messagebox.showinfo("Info", "No model loaded")
 
@@ -5913,7 +6508,9 @@ class LoRATrainerGUI:
         """Background worker: load Qwen3, walk folder, translate each .txt, write back."""
         self._translating = True
         import glob
-        files = sorted(glob.glob(os.path.join(folder, "*.txt")))
+        # glob.escape: a dataset folder containing [brackets] is a glob character class,
+        # so an unescaped pattern silently matches nothing.
+        files = sorted(glob.glob(os.path.join(glob.escape(folder), "*.txt")))
         if not files:
             self.master.after(0, lambda: self.update_caption_log(f"No .txt files in {folder}\n"))
             return
@@ -6025,6 +6622,100 @@ class LoRATrainerGUI:
             self.update_caption_log(f"Error captioning {os.path.basename(img_path)}: {e}\n")
             return None
 
+    def load_qwen_captioner(self):
+        """Load the Krea 2 Qwen3-VL text encoder for captioning (lazy, ~8 GB bf16)."""
+        if getattr(self, "qwen_captioner", None) is not None:
+            return True
+        path = self._qwen_captioner_path()
+        if not path:
+            self.update_caption_log("Qwen3-VL captioner: the Krea 2 text encoder path isn't set "
+                                    "(Preferences tab), or the file is missing.\n")
+            return False
+        try:
+            self.update_caption_log(f"Loading Qwen3-VL captioner (~8 GB) from "
+                                    f"{os.path.basename(path)}...\n")
+            self.master.update_idletasks()
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+            import torch
+            from fizgig.krea2.utils import load_krea2_text_encoder
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.qwen_captioner = load_krea2_text_encoder(path, dtype=torch.bfloat16, device=device)
+            self.update_caption_log(f"Qwen3-VL captioner ready on {device}.\n")
+            return True
+        except Exception as e:
+            self.update_caption_log(
+                f"Could not load the Qwen3-VL captioner: {type(e).__name__}: {e}\n"
+                "Check the Krea 2 text-encoder path in Preferences — Fizgig reads the bf16 and "
+                "fp8_scaled Qwen3-VL-4B files from Comfy-Org/Krea-2.\n")
+            self.qwen_captioner = None
+            return False
+
+    def generate_qwen_caption(self, img_path):
+        """Caption one image with Qwen3-VL, using the currently-selected task's instruction."""
+        if getattr(self, "qwen_captioner", None) is None:
+            if not self.load_qwen_captioner():
+                return None
+        try:
+            from fizgig.krea2.embedder import generate_caption
+            try:
+                max_tokens = int(self.caption_max_tokens_var.get())
+            except (ValueError, tk.TclError):
+                max_tokens = 120
+            return generate_caption(self.qwen_captioner, img_path,
+                                    max_new_tokens=max_tokens,
+                                    instruction=self._resolve_caption_instruction())
+        except Exception as e:
+            self.update_caption_log(f"Error captioning {os.path.basename(img_path)}: {e}\n")
+            return None
+
+    def _generate_ai_caption(self, img_path):
+        """Route to whichever caption model is selected. Both bulk captioning and the Edit
+        dialog's Regenerate (AI) go through here, which is what keeps them in step — and why
+        trigger-word handling (save_caption_with_trigger) stays identical for both models."""
+        if self._is_qwen_captioner():
+            return self.generate_qwen_caption(img_path)
+        return self.generate_florence_caption(img_path)
+
+    def _release_qwen_captioner_if_idle(self):
+        """Free the Qwen3-VL captioner (~8 GB) when a captioning job is finished with it.
+
+        Called after a bulk batch, on leaving the Captions tab, and from the Unload button — but
+        NOT after a single regenerate, which is an iterative loop where a ~30 s reload per click
+        would hurt and nothing is at risk: training lives on another tab, so leaving this one
+        (which releases) is unavoidable before a run starts. Guarded on _captioning_running so a
+        job still in flight never has the model pulled out from under it."""
+        if getattr(self, "_captioning_running", False):
+            return
+        if getattr(self, "qwen_captioner", None) is None:
+            return
+        import gc
+        import torch
+        del self.qwen_captioner
+        self.qwen_captioner = None
+        gc.collect()
+        torch.cuda.empty_cache()
+        self.update_caption_log("Qwen3-VL unloaded — ~8 GB of VRAM released.\n")
+
+    def _caption_model_blocked_by_training(self) -> bool:
+        """True (with a message) if a training run is live and the chosen captioner won't co-fit.
+
+        Qwen3-VL is ~8 GB — loading it alongside a resident training DiT is an OOM either for the
+        captioner or, worse, for the run. Florence-2 is small enough to leave alone."""
+        if not self._is_qwen_captioner():
+            return False
+        proc = getattr(self, "current_process", None)
+        try:
+            running = proc is not None and proc.poll() is None
+        except Exception:
+            running = False
+        if running:
+            messagebox.showwarning(
+                "Training is running",
+                "The Qwen3-VL captioner needs about 8 GB of VRAM, which won't fit alongside a "
+                "training run — and trying would risk the run itself.\n\n"
+                "Wait for training to finish, or switch the Model dropdown to Florence-2.")
+        return running
+
     def save_caption_with_trigger(self, img_path, caption):
         """Save caption with trigger word prepended"""
         trigger = self.caption_trigger_var.get().strip()
@@ -6049,6 +6740,8 @@ class LoRATrainerGUI:
         if not images:
             messagebox.showinfo("Info", "No images found in folder")
             return
+        if self._caption_model_blocked_by_training():
+            return
 
         overwrite = self.overwrite_captions_var.get()
 
@@ -6059,10 +6752,18 @@ class LoRATrainerGUI:
                 messagebox.showinfo("Info", "All images already have captions. Enable 'Overwrite' to regenerate.")
                 return
 
+        # Guard against a second job over the same files — the previous behaviour was two worker
+        # threads writing the same .txt files, which looks like the job restarting itself.
+        if getattr(self, "_captioning_running", False):
+            messagebox.showinfo("Already running",
+                                "A captioning job is already running. Press Stop to end it first.")
+            return
+
         # Run in thread
         self.captioning_stop_flag = False
         self._captioning_running = True
         self.caption_stop_btn.configure(state=tk.NORMAL)
+        self._set_caption_buttons_running(True)
 
         def caption_thread():
             total = len(images)
@@ -6077,7 +6778,7 @@ class LoRATrainerGUI:
                 progress = ((i + 1) / total) * 100
                 self.master.after(0, lambda p=progress, c=i+1, t=total: self.update_caption_progress(p, c, t))
 
-                caption = self.generate_florence_caption(img_path)
+                caption = self._generate_ai_caption(img_path)
                 if caption:
                     self.save_caption_with_trigger(img_path, caption)
                     self.master.after(0, lambda f=os.path.basename(img_path): self.update_caption_log(f"✓ {f}\n"))
@@ -6087,30 +6788,64 @@ class LoRATrainerGUI:
             self._captioning_running = False
             self.master.after(0, lambda: self.update_caption_log(f"\nCaptioning complete!\n"))
             self.master.after(0, lambda: self.caption_stop_btn.configure(state=tk.DISABLED))
+            self.master.after(0, lambda: self._set_caption_buttons_running(False))
             self.master.after(0, self.refresh_caption_images)
+            # A finished batch is a finished job — give the ~8 GB back rather than holding it
+            # until the user thinks to press Unload. Florence (~1 GB) keeps its old behaviour:
+            # it's small, and reloading it for the next batch costs more than it saves.
+            self.master.after(0, self._release_qwen_captioner_if_idle)
 
         threading.Thread(target=caption_thread, daemon=True).start()
 
 
     def caption_single_image(self, img_path):
         """Caption a single image (for regenerate button)"""
+        if getattr(self, "_captioning_running", False):
+            # Two threads generating on one model at once is asking for trouble, and the bulk
+            # job would overwrite this caption moments later anyway.
+            messagebox.showinfo("Captioning in progress",
+                                "A captioning job is running — wait for it to finish (or press "
+                                "Stop) before regenerating a single image.")
+            return
+        if self._caption_model_blocked_by_training():
+            return
         self.update_caption_log(f"Captioning {os.path.basename(img_path)}...\n")
 
         def caption_thread():
-            caption = self.generate_florence_caption(img_path)
+            caption = self._generate_ai_caption(img_path)
             if caption:
                 self.save_caption_with_trigger(img_path, caption)
                 self.master.after(0, lambda: self.update_caption_log(f"✓ Done\n"))
                 self.master.after(0, self.refresh_caption_images)
             else:
                 self.master.after(0, lambda: self.update_caption_log(f"✗ Failed\n"))
+            # Deliberately NOT released here. Regenerating from a thumbnail is an iterative
+            # loop — you click it on several images in a row — and freeing each time would cost
+            # a ~30 s reload per click. Nothing is at risk by holding it: training lives on
+            # another tab, and leaving this one releases it.
 
         threading.Thread(target=caption_thread, daemon=True).start()
 
+    def _set_caption_buttons_running(self, running: bool):
+        """Grey the job-starting buttons while a captioning job is in flight."""
+        state = tk.DISABLED if running else tk.NORMAL
+        for attr in ("caption_all_btn", "caption_static_btn"):
+            btn = getattr(self, attr, None)
+            if btn is not None:
+                try:
+                    btn.configure(state=state)
+                except tk.TclError:
+                    pass
+
     def stop_captioning(self):
-        """Stop the captioning process"""
+        """Stop the captioning process.
+
+        The flag is only read between images, so the one being generated right now still
+        finishes — with Qwen3-VL that can be several seconds, which looks like Stop being
+        ignored unless we say so."""
         self.captioning_stop_flag = True
         self.caption_stop_btn.configure(state=tk.DISABLED)
+        self.update_caption_log("Stopping — finishing the current image first...\n")
 
     def update_caption_progress(self, progress, current, total):
         """Update caption progress bar and label"""
@@ -6164,7 +6899,7 @@ class LoRATrainerGUI:
             return []
 
         results = []
-        txt_files = glob.glob(os.path.join(folder, "*.txt"))
+        txt_files = glob.glob(os.path.join(glob.escape(folder), "*.txt"))
 
         # Compile case-insensitive pattern
         pattern = re.compile(re.escape(find_text), re.IGNORECASE)
@@ -6391,7 +7126,7 @@ class LoRATrainerGUI:
         self.sample_width_var = tk.StringVar(value=str(self.settings["SAMPLE_WIDTH"]))
         self.sample_width_combo = ttk.Combobox(
             prompt_card, textvariable=self.sample_width_var,
-            values=["512", "768", "1024", "1280", "1536"], state="readonly", width=10,
+            values=SAMPLE_RESOLUTIONS, state="readonly", width=10,
         )
         self.sample_width_combo.grid(row=1, column=1, sticky=tk.W, pady=4)
 
@@ -6399,7 +7134,7 @@ class LoRATrainerGUI:
         self.sample_height_var = tk.StringVar(value=str(self.settings["SAMPLE_HEIGHT"]))
         self.sample_height_combo = ttk.Combobox(
             prompt_card, textvariable=self.sample_height_var,
-            values=["512", "768", "1024", "1280", "1536"], state="readonly", width=10,
+            values=SAMPLE_RESOLUTIONS, state="readonly", width=10,
         )
         self.sample_height_combo.grid(row=2, column=1, sticky=tk.W, pady=4)
 
@@ -6441,7 +7176,7 @@ class LoRATrainerGUI:
                  text="Optional — Klein is an edit model, so samples can be conditioned on a real image (they edit "
                       "it rather than generate from scratch). Auto-resized to ~0.20 MP so any size is safe. Leave "
                       "empty for normal samples.",
-                 font=(FONT_FAMILY, 9), fg=COLORS["text_muted"], bg=COLORS["bg_surface"],
+                 font=(FONT_FAMILY, 10), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
                  wraplength=560, justify=tk.LEFT)
         self.sample_ref_note.grid(row=6, column=1, columnspan=2, sticky=tk.W, pady=(0, 4))
 
@@ -6530,7 +7265,7 @@ class LoRATrainerGUI:
             text="Renders previews on the model already training, with the official Turbo LoRA "
                  "switched on just for the render — nothing loaded or moved between epochs. The "
                  "classic mode loads the ~13 GB Turbo checkpoint per preview instead.",
-            font=(FONT_FAMILY, 8, "italic"), fg=COLORS["text_muted"], bg=COLORS["bg_surface"],
+            font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
             wraplength=600, justify=tk.LEFT)
         # Gridded (rows 6-7) / removed by _apply_samples_klein_only; hidden by default (Klein).
 
@@ -6666,6 +7401,49 @@ class LoRATrainerGUI:
         self.sample_cfg_scale_entry.configure(state=state)
         self.sample_cfg_label.configure(foreground=grey)
 
+    def _lora_name_rename_blocked(self) -> bool:
+        """True when the LoRA name must not be touched: a run is live, or one is paused.
+
+        The name is a filename PREFIX, not a label — _detect_latest_state_dir rebuilds
+        f'{name}-NNNNNN-state' from it to find a resumable run, and checkpoint discovery
+        rebuilds '{name}-NNNNNN.safetensors'. Renaming the box would orphan a paused run in a
+        way the user wouldn't notice until they tried to resume it."""
+        proc = getattr(self, "current_process", None)
+        try:
+            if proc is not None and proc.poll() is None:
+                return True
+        except Exception:
+            pass
+        try:
+            return os.path.exists(self._paused_sidecar_path())
+        except Exception:
+            return False
+
+    def _apply_lora_name_suffix(self, arch: str):
+        """Retag the LoRA name for `arch` — myface_k9b -> myface_krea2 and back.
+
+        Only rewrites a trailing tag that is itself a known family suffix, so names that don't
+        follow the convention (bobs_dog, portrait_v2) are never touched. Idempotent: a name that
+        already carries the right suffix is left alone, which is what makes it safe to call both
+        at startup and after every family switch."""
+        entry = self.entries.get("LORA_NAME") if hasattr(self, "entries") else None
+        want = ARCHITECTURES.get(arch, {}).get("lora_name_suffix")
+        if entry is None or not want or self._lora_name_rename_blocked():
+            return
+        try:
+            name = entry.get().strip()
+        except (AttributeError, tk.TclError):
+            return
+        for suffix in LORA_NAME_SUFFIXES:
+            if suffix != want and name.endswith("_" + suffix):
+                new = name[: -len(suffix)] + want
+                try:
+                    entry.delete(0, tk.END)
+                    entry.insert(0, new)
+                except (AttributeError, tk.TclError):
+                    pass
+                return
+
     def _on_architecture_selected(self, event=None):
         """Model-family selector changed — refresh sample defaults + presets + persist."""
         # Snapshot the family we're LEAVING before anything reshapes the tab. The combobox
@@ -6731,6 +7509,14 @@ class LoRATrainerGUI:
                     self.update_console(f"[preset] {_arch_new} selected — applied {_default_name}\n")
             elif _default_name and not self.custom_preset_var.get():
                 self.custom_preset_var.set(_default_name)
+        except Exception:
+            pass
+        # Retag the LoRA name LAST — _apply_preset_values above rewrites every field including
+        # LORA_NAME, so doing this earlier would just be clobbered. On a return visit the
+        # restored name already carries the right suffix and this is a no-op; on a first visit
+        # it converts the outgoing family's name (which the built-in presets don't set).
+        try:
+            self._apply_lora_name_suffix(_arch_new)
         except Exception:
             pass
         try:
@@ -8416,8 +9202,8 @@ class LoRATrainerGUI:
             rb = ttk.Radiobutton(mode_card, text=text, variable=self.prep_mode_var,
                                  value=value, command=self._on_prep_mode_changed)
             rb.pack(anchor=tk.W, pady=(6, 0))
-            lbl = tk.Label(mode_card, text=hint, font=(FONT_FAMILY, 9),
-                           fg=hint_fg or COLORS["text_muted"], bg=COLORS["bg_surface"],
+            lbl = tk.Label(mode_card, text=hint, font=(FONT_FAMILY, 10),
+                           fg=hint_fg or COLORS["text_explain"], bg=COLORS["bg_surface"],
                            wraplength=680, justify=tk.LEFT)
             lbl.pack(anchor=tk.W, padx=(24, 0))
             return rb
@@ -8860,7 +9646,7 @@ class LoRATrainerGUI:
                                              "bias any single photo carries. Same person typically lands "
                                              "30–70% (even the baselines themselves — each is scored "
                                              "against the other two as well as itself).",
-                                   font=(FONT_FAMILY, 9), fg=COLORS["text_muted"], bg=COLORS["bg_deep"],
+                                   font=(FONT_FAMILY, 10), fg=COLORS["text_explain"], bg=COLORS["bg_deep"],
                                    justify=tk.LEFT, anchor="w", wraplength=820)
         self._ff_status.pack(fill=tk.X, padx=14)
 
@@ -9346,7 +10132,7 @@ class LoRATrainerGUI:
     def _get_next_facecrop_index(self, folder):
         """Find next available FaceCrop_NNN index in a folder."""
         import glob as glob_module
-        existing = glob_module.glob(os.path.join(folder, "FaceCrop_*.png"))
+        existing = glob_module.glob(os.path.join(glob_module.escape(folder), "FaceCrop_*.png"))
         max_idx = 0
         for f in existing:
             basename = os.path.splitext(os.path.basename(f))[0]
@@ -10999,8 +11785,8 @@ class LoRATrainerGUI:
                  fg=COLORS["text_primary"], bg=COLORS["bg_surface"]).pack(anchor=tk.W, padx=20, pady=(16, 2))
         tk.Label(custom_card,
                  text="Pick individual blocks to target. Only shown when preset = Custom.",
-                 font=(FONT_FAMILY, 9),
-                 fg=COLORS["text_muted"], bg=COLORS["bg_surface"],
+                 font=(FONT_FAMILY, 10),
+                 fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
                  wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, padx=20, pady=(0, 10))
 
         custom_content = tk.Frame(custom_card, bg=COLORS["bg_surface"])
@@ -11130,7 +11916,7 @@ class LoRATrainerGUI:
         # Family-aware "how long this takes" note (set by _apply_extract_family_ui).
         self.extract_time_note_var = tk.StringVar(value="")
         tk.Label(run_card, textvariable=self.extract_time_note_var,
-                 font=(FONT_FAMILY, 9), fg=COLORS["text_muted"], bg=COLORS["bg_surface"],
+                 font=(FONT_FAMILY, 10), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
                  wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, pady=(8, 0))
 
         # Card 7: Output Log
@@ -11765,13 +12551,35 @@ class LoRATrainerGUI:
             download_url="https://huggingface.co/Comfy-Org/vae-text-encorder-for-flux-klein-9b/blob/main/split_files/text_encoders/qwen_3_8b.safetensors",
             download_note="~15GB single-file safetensors — Qwen3-8B packaged for Klein 9B (Comfy-Org)",
         )
+        # Klein users routinely skip the whole Krea 2 card, and would never learn that one file
+        # in it is a better captioner than Florence-2 for THEIR datasets — captions are just
+        # .txt, so the model family is irrelevant. Worth saying here, where they are already
+        # filling in paths, rather than hoping they read the card below.
+        _qwen_tip = tk.Label(
+            models_card,
+            text="💡 Training Klein only? The Krea 2 Qwen3-VL text encoder below (~8 GB) is still "
+                 "worth downloading — the Captions tab can caption ANY dataset with it, following "
+                 "an instruction you can edit, and it writes better training captions than "
+                 "Florence-2. Nothing else about Krea 2 is needed.",
+            font=(FONT_FAMILY, 9), fg=COLORS["text_secondary"], bg=COLORS["bg_surface"],
+            wraplength=760, justify=tk.LEFT)
+        _qwen_tip.grid(row=next_row, column=0, columnspan=3, sticky=tk.W, pady=(12, 2))
+        next_row += 1
+        self._add_fetch_models_row(
+            models_card, next_row, "klein",
+            "Fetches the four files above (~34 GB) and fills in these paths for you, plus the "
+            "small helper models (Florence-2 captioner, face model for the Look Filter and "
+            "likeness scoring, EN→ZH translator — ~1.6 GB) so nothing stalls to download later. "
+            "Black Forest Labs gate their downloads, so you'll need a free HuggingFace token — "
+            "Fizgig asks for it and tells you which pages to accept the licence on.")
+        next_row += 1
 
         # Card 1b: Krea 2 model paths
         krea_card = self._start_section_card(
             outer, "Model Paths (Krea 2)",
             "Krea 2 LoRA training + inference. Train on RAW; previews and inference use the pre-quant fp8 Turbo "
-            "(8-step, CFG-free). The text encoder must be the bf16 Qwen3-VL-4B — the fp8 ComfyUI variant is not "
-            "loadable for training.",
+            "(8-step, CFG-free). The text encoder can be either Qwen3-VL-4B file — bf16, or the smaller "
+            "fp8_scaled (~3.6 GB less VRAM; its vision tower is bf16 either way).",
         )
         krea_card.columnconfigure(1, weight=1)
         kr = 0
@@ -11794,10 +12602,18 @@ class LoRATrainerGUI:
             download_note="~250MB — Comfy-Org/Krea-2 → vae/qwen_image_vae.safetensors",
         )
         kr = self._add_pref_row(
-            krea_card, kr, "Qwen3-VL TE (bf16):", "krea2_text_encoder",
-            "Qwen3-VL-4B text encoder in bf16 — NOT the fp8 ComfyUI variant (not loadable for training)",
-            download_url="https://huggingface.co/Comfy-Org/Krea-2/blob/main/text_encoders/qwen3vl_4b_bf16.safetensors",
-            download_note="~8GB bf16 — Comfy-Org/Krea-2 → text_encoders/qwen3vl_4b_bf16.safetensors",
+            krea_card, kr, "Qwen3-VL TE:", "krea2_text_encoder",
+            "Qwen3-VL-4B text encoder. fp8_scaled is recommended: it quantises only the language "
+            "layers and ships the same full bf16 vision tower, so reference images and AI "
+            "captioning are unaffected — measured 4.9 GB resident vs 8.3 GB, for captions we "
+            "could not tell apart",
+            download_url="https://huggingface.co/Comfy-Org/Krea-2/blob/main/text_encoders/qwen3vl_4b_fp8_scaled.safetensors",
+            download_label="Download fp8 (recommended)",
+            download_note="~5.2GB fp8_scaled — 3.4 GB less VRAM than bf16, virtually identical output",
+            download_url2="https://huggingface.co/Comfy-Org/Krea-2/blob/main/text_encoders/qwen3vl_4b_bf16.safetensors",
+            download_label2="bf16",
+            download_note2="~8.9GB bf16 — the full-precision original, if you would rather not "
+                           "quantise at all",
         )
         kr = self._add_pref_row(
             krea_card, kr, "Turbo LoRA (rank 64):", "krea2_turbo_lora",
@@ -11807,6 +12623,13 @@ class LoRATrainerGUI:
             download_url="https://huggingface.co/Comfy-Org/Krea-2/blob/main/loras/krea2_turbo_lora_rank_64_bf16.safetensors",
             download_note="~470MB bf16 — Comfy-Org/Krea-2 → loras/krea2_turbo_lora_rank_64_bf16.safetensors",
         )
+        self._add_fetch_models_row(
+            krea_card, kr + 1, "krea2",
+            "Fetches everything above except the Turbo DiT (~32 GB) and fills in these paths for "
+            "you, plus the small helper models (Florence-2 captioner, face model for the Look "
+            "Filter and likeness scoring, EN→ZH translator — ~1.6 GB) so nothing stalls to "
+            "download later. No HuggingFace account needed — none of these are gated. Tick Turbo "
+            "DiT to add it (+13 GB); it's only used by the workbench tools and classic previews.")
 
         # Card 1c: GPU selection — only interesting on multi-GPU hosts, but harmless
         # (and informative) on single-GPU ones.
@@ -11861,8 +12684,11 @@ class LoRATrainerGUI:
             _gpu_hint = "One GPU detected, so there's nothing to choose here. This setting is for multi-GPU machines."
         else:
             _gpu_hint = "No NVIDIA GPU detected (NVML and nvidia-smi both unavailable). Leave this on Auto."
-        tk.Label(gpu_card, text=_gpu_hint, font=(FONT_FAMILY, 9),
-                 fg=COLORS["text_muted"], bg=COLORS["bg_surface"], justify=tk.LEFT).grid(
+        # Explanatory prose, so text_explain + wraplength per the contrast pass in v2.12.0 --
+        # text_muted is reserved for short captions sitting beside a widget ("seed", "W", "H").
+        tk.Label(gpu_card, text=_gpu_hint, font=(FONT_FAMILY, 10),
+                 fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
+                 wraplength=620, justify=tk.LEFT).grid(
             row=1, column=1, sticky=tk.W, padx=5, pady=(0, 4))
 
         # Card 2: Inference Performance
@@ -11949,6 +12775,316 @@ class LoRATrainerGUI:
 
         self._add_youtube_help_button(outer, "preferences")
 
+    def _add_fetch_models_row(self, frame, row, family, blurb):
+        """'Download them all for me' row at the foot of a model-paths card.
+
+        The per-row Download links open a browser and leave you to save the file and paste the
+        path back — five times over, ~32 GB, before Fizgig does anything at all. This does the
+        same job unattended and writes the paths into prefs itself."""
+        bar = tk.Frame(frame, bg=COLORS["bg_surface"])
+        bar.grid(row=row, column=0, columnspan=3, sticky=tk.EW, pady=(14, 2))
+        btn = ttk.Button(bar, text="⬇ Download models for me",
+                         command=lambda f=family: self._start_fetch_models(f))
+        btn.pack(side=tk.LEFT)
+        setattr(self, f"_fetch_btn_{family}", btn)
+        if family == "krea2":
+            self._fetch_krea2_turbo_var = tk.BooleanVar(value=False)
+            ttk.Checkbutton(bar, text="also the Turbo DiT (+13 GB)",
+                            variable=self._fetch_krea2_turbo_var,
+                            style="Surface.TCheckbutton").pack(side=tk.LEFT, padx=(12, 0))
+        status = tk.Label(bar, text="", font=(FONT_FAMILY, 9),
+                          fg=COLORS["text_secondary"], bg=COLORS["bg_surface"])
+        status.pack(side=tk.LEFT, padx=(12, 0))
+        setattr(self, f"_fetch_status_{family}", status)
+        tk.Label(frame, text=blurb, font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"],
+                 bg=COLORS["bg_surface"], wraplength=760, justify=tk.LEFT
+                 ).grid(row=row + 1, column=0, columnspan=3, sticky=tk.W, pady=(0, 2))
+        return row + 2
+
+    _HF_GATED_URLS = [
+        ("Base DiT — accept the licence",
+         "https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9b-fp8"),
+        ("Distilled DiT — accept the licence",
+         "https://huggingface.co/black-forest-labs/FLUX.2-klein-9b-fp8"),
+        ("VAE — accept the licence",
+         "https://huggingface.co/black-forest-labs/FLUX.2-dev"),
+        ("Then create a READ token here",
+         "https://huggingface.co/settings/tokens"),
+    ]
+
+    def _ask_hf_token(self):
+        """Modal token prompt. Returns the token, or '' if cancelled.
+
+        Not simpledialog.askstring: its prompt is a Label, so the four URLs you have to visit
+        would be un-selectable — readable but not copyable, which is useless when the whole
+        point is to go to them. Each URL here is a readonly Entry (selectable, Ctrl+C works)
+        with Copy and Open buttons."""
+        result = {"token": ""}
+        dlg = tk.Toplevel(self.master)
+        dlg.title("HuggingFace token — Klein downloads")
+        dlg.configure(bg=BG_COLOR)
+        dlg.transient(self.master)
+        dlg.resizable(True, False)
+
+        # Buttons packed BOTTOM first so they can never be pushed off the edge (the v2.8.5
+        # caption-dialog fix — same reasoning applies to any dialog with variable content).
+        btn_row = ttk.Frame(dlg)
+        btn_row.pack(side=tk.BOTTOM, pady=(6, 12))
+
+        tk.Label(dlg, text="Black Forest Labs gate the Klein downloads",
+                 font=(FONT_FAMILY, 11, "bold"), fg=COLORS["text_primary"], bg=BG_COLOR
+                 ).pack(anchor=tk.W, padx=14, pady=(14, 2))
+        tk.Label(dlg,
+                 text="They require every user to accept the licence themselves — which is also why "
+                      "Fizgig can't download these for you without a token of your own. Sign in to "
+                      "HuggingFace, accept on all three pages, then paste a read token below. "
+                      "Krea 2 needs none of this; those files aren't gated.",
+                 font=(FONT_FAMILY, 10), fg=COLORS["text_explain"], bg=BG_COLOR,
+                 wraplength=620, justify=tk.LEFT).pack(anchor=tk.W, padx=14, pady=(0, 10))
+
+        rows = tk.Frame(dlg, bg=BG_COLOR)
+        rows.pack(fill=tk.X, padx=14)
+        rows.columnconfigure(0, weight=1)
+
+        def copy(url, btn):
+            self.master.clipboard_clear()
+            self.master.clipboard_append(url)
+            btn.config(text="copied")
+            btn.after(1200, lambda: btn.config(text="Copy"))
+
+        for i, (label, url) in enumerate(self._HF_GATED_URLS):
+            tk.Label(rows, text=label, font=(FONT_FAMILY, 9), fg=COLORS["text_secondary"],
+                     bg=BG_COLOR).grid(row=i * 2, column=0, columnspan=3, sticky=tk.W,
+                                       pady=(6 if i else 0, 0))
+            e = ttk.Entry(rows, width=62)
+            e.insert(0, url)
+            e.config(state="readonly")           # selectable and copyable; not editable
+            e.grid(row=i * 2 + 1, column=0, sticky=tk.EW)
+            cb = ttk.Button(rows, text="Copy", width=8)
+            cb.config(command=lambda u=url, b=cb: copy(u, b))
+            cb.grid(row=i * 2 + 1, column=1, padx=(6, 0))
+            ttk.Button(rows, text="Open", width=8,
+                       command=lambda u=url: webbrowser.open(u)
+                       ).grid(row=i * 2 + 1, column=2, padx=(6, 0))
+
+        ttk.Button(dlg, text="Open all three licence pages",
+                   command=lambda: [webbrowser.open(u) for _, u in self._HF_GATED_URLS[:3]]
+                   ).pack(anchor=tk.W, padx=14, pady=(12, 0))
+
+        tk.Label(dlg, text="Paste your token:", font=(FONT_FAMILY, 10),
+                 fg=COLORS["text_secondary"], bg=BG_COLOR).pack(anchor=tk.W, padx=14, pady=(14, 2))
+        tok = ttk.Entry(dlg, width=62, show="*")
+        tok.pack(anchor=tk.W, padx=14, fill=tk.X)
+        tk.Label(dlg, text="Starts with hf_… Stored only for this download — never written to disk.",
+                 font=(FONT_FAMILY, 8, "italic"), fg=COLORS["text_muted"], bg=BG_COLOR
+                 ).pack(anchor=tk.W, padx=14, pady=(2, 0))
+
+        def ok():
+            result["token"] = tok.get().strip()
+            dlg.destroy()
+
+        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row, text="Download", command=ok).pack(side=tk.LEFT, padx=5)
+        tok.bind("<Return>", lambda e: ok())
+
+        dlg.update_idletasks()
+        tok.focus_set()
+        dlg.grab_set()
+        self.master.wait_window(dlg)
+        return result["token"]
+
+    def _start_fetch_models(self, family):
+        """Run the fetcher in a worker thread, streaming progress into the status label."""
+        if getattr(self, "_fetch_running", False):
+            messagebox.showinfo("Already downloading", "A model download is already running.")
+            return
+        token = ""
+        if family == "klein":
+            # Klein's repos are gated: BFL require each user to accept the licence themselves,
+            # which is exactly why these can't be bundled or pre-fetched on anyone's behalf.
+            token = self._ask_hf_token()
+            if not token:
+                return
+
+        include_optional = (family == "krea2"
+                            and getattr(self, "_fetch_krea2_turbo_var", None) is not None
+                            and self._fetch_krea2_turbo_var.get())
+        btn = getattr(self, f"_fetch_btn_{family}", None)
+        status = getattr(self, f"_fetch_status_{family}", None)
+        if btn:
+            btn.config(state="disabled")
+        self._fetch_running = True
+
+        def worker():
+            import subprocess
+            # Helper models come first and with BOTH families: they're ~1.6 GB against tens of
+            # GB of weights, and whichever button you press you'll hit Florence / the face model
+            # / the translator sooner or later. Fetching them up front means the Captions tab and
+            # Look Filter work immediately, and they survive abandoning the big download.
+            # Re-running is cheap — everything here is a no-op once present.
+            cmd = [sys.executable, "-m", "fizgig.scripts.fetch_models", "--progress",
+                   "--family", "tools", "--family", family]
+            if include_optional:
+                cmd.append("--include-optional")
+            env = dict(os.environ)
+            env["PYTHONPATH"] = os.path.join(FIZGIG_DIR, "src")
+            env["PYTHONUNBUFFERED"] = "1"
+            if token.strip():
+                env["HF_TOKEN"] = token.strip()
+            ok = False
+            try:
+                p = subprocess.Popen(cmd, cwd=FIZGIG_DIR, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, text=True, env=env,
+                                     encoding="utf-8", errors="replace",
+                                     creationflags=(subprocess.CREATE_NO_WINDOW
+                                                    if os.name == "nt" else 0))
+                self._fetch_proc = p
+                for line in p.stdout:
+                    line = line.rstrip()
+                    if line:
+                        self.master.after(0, lambda l=line: self._on_fetch_progress(family, l))
+                ok = (p.wait() == 0)
+            except Exception as e:
+                self.master.after(0, lambda e=e: self._on_fetch_progress(
+                    family, f"failed: {type(e).__name__}: {e}"))
+            self.master.after(0, lambda: self._on_fetch_done(family, ok))
+
+        self._open_fetch_progress_window(family)
+        threading.Thread(target=worker, daemon=True).start()
+        if status:
+            status.config(text="downloading…", fg=COLORS["text_secondary"])
+
+    def _open_fetch_progress_window(self, family):
+        """Unmissable progress for a multi-GB download.
+
+        A status label beside the button was the only feedback, and hf_hub_download's own
+        progress never reached it (tqdm redraws with carriage returns, so a line-reader sees
+        nothing until the transfer ends). The result was an app that looked frozen for ten
+        minutes and then popped up 'done'."""
+        win = tk.Toplevel(self.master)
+        self._fetch_win = win
+        win.title("Downloading models")
+        win.configure(bg=BG_COLOR)
+        win.transient(self.master)
+        win.protocol("WM_DELETE_WINDOW", lambda: None)   # closing must go through Cancel
+        win.resizable(False, False)
+
+        tk.Label(win, text="Downloading models", font=(FONT_FAMILY, 12, "bold"),
+                 fg=COLORS["text_primary"], bg=BG_COLOR).pack(anchor=tk.W, padx=18, pady=(16, 2))
+        self._fetch_file_lbl = tk.Label(win, text="starting…", font=(FONT_FAMILY, 10),
+                                        fg=COLORS["text_secondary"], bg=BG_COLOR,
+                                        wraplength=460, justify=tk.LEFT, anchor="w")
+        self._fetch_file_lbl.pack(anchor=tk.W, padx=18, pady=(0, 8), fill=tk.X)
+
+        self._fetch_bar = ttk.Progressbar(win, length=460, mode="indeterminate")
+        self._fetch_bar.pack(padx=18)
+        self._fetch_bar.start(12)
+        self._fetch_bar_mode = "indeterminate"
+
+        self._fetch_bytes_lbl = tk.Label(win, text="", font=(FONT_FAMILY, 9),
+                                         fg=COLORS["text_muted"], bg=BG_COLOR, anchor="w")
+        self._fetch_bytes_lbl.pack(anchor=tk.W, padx=18, pady=(6, 0), fill=tk.X)
+        tk.Label(win, text="You can leave this running and keep using other tabs. Interrupted "
+                           "downloads resume where they left off.",
+                 font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"], bg=BG_COLOR,
+                 wraplength=460, justify=tk.LEFT).pack(anchor=tk.W, padx=18, pady=(8, 0))
+
+        row = ttk.Frame(win)
+        row.pack(pady=(12, 14))
+        ttk.Button(row, text="Cancel", command=self._cancel_fetch_models).pack()
+        win.update_idletasks()
+
+    def _cancel_fetch_models(self):
+        """Stop the download. Safe: partial files are resumable, prefs are only written on success."""
+        p = getattr(self, "_fetch_proc", None)
+        if p is not None and p.poll() is None:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        if getattr(self, "_fetch_file_lbl", None) is not None:
+            try:
+                self._fetch_file_lbl.config(text="cancelling…")
+            except Exception:
+                pass
+
+    @staticmethod
+    def _fmt_gb(n):
+        return f"{n / 1024 ** 3:.2f} GB"
+
+    def _on_fetch_progress(self, family, line):
+        stripped = line.strip()
+        if stripped.startswith("[progress]"):
+            try:
+                _tag, done, total, name = stripped.split(None, 3)
+                done, total = int(done), int(total)
+            except (ValueError, IndexError):
+                return
+            bar = getattr(self, "_fetch_bar", None)
+            if bar is not None and bar.winfo_exists():
+                if total > 0:
+                    if self._fetch_bar_mode != "determinate":
+                        bar.stop()
+                        bar.config(mode="determinate", maximum=100)
+                        self._fetch_bar_mode = "determinate"
+                    bar["value"] = max(0, min(100, done * 100 / total))
+                self._fetch_file_lbl.config(text=name)
+                self._fetch_bytes_lbl.config(
+                    text=f"{self._fmt_gb(done)} of {self._fmt_gb(total)}"
+                         f"   ({done * 100 // total if total else 0}%)")
+            return
+
+        # Non-progress lines: the [get]/[ok]/[keep]/[gated] narration.
+        status = getattr(self, f"_fetch_status_{family}", None)
+        if status:
+            status.config(text=stripped[:110])
+        lbl = getattr(self, "_fetch_file_lbl", None)
+        if lbl is not None and lbl.winfo_exists() and stripped:
+            lbl.config(text=stripped)
+            bar = getattr(self, "_fetch_bar", None)
+            # A new item that isn't a download (a cache warm, a skip) — back to the pulsing bar
+            # rather than leaving the previous file's percentage sitting there looking stalled.
+            if bar is not None and bar.winfo_exists() and self._fetch_bar_mode == "determinate" \
+                    and not stripped.startswith("[progress]"):
+                bar.config(mode="indeterminate")
+                bar.start(12)
+                self._fetch_bar_mode = "indeterminate"
+                self._fetch_bytes_lbl.config(text="")
+        self.update_console(f"[models] {line}\n")
+
+    def _on_fetch_done(self, family, ok):
+        self._fetch_running = False
+        self._fetch_proc = None
+        win = getattr(self, "_fetch_win", None)
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            self._fetch_win = None
+        btn = getattr(self, f"_fetch_btn_{family}", None)
+        if btn:
+            btn.config(state="normal")
+        # The fetcher wrote prefs.json from another process, so re-read it — otherwise the
+        # entry boxes keep showing the paths from before the download and saving from this
+        # window would write the stale ones straight back over the new ones.
+        try:
+            fresh = load_prefs()
+            for key, var in self.prefs_vars.items():
+                if key in fresh and str(fresh[key]).strip():
+                    var.set(fresh[key])
+            self.prefs.update(fresh)
+        except Exception:
+            pass
+        status = getattr(self, f"_fetch_status_{family}", None)
+        if status:
+            status.config(text="done — paths filled in" if ok else "finished with items missing (see console)",
+                          fg=COLORS["success"] if ok else COLORS["warning"])
+        if ok:
+            messagebox.showinfo("Models ready",
+                                "Downloaded and wired into Preferences.\n\n"
+                                "The paths above are filled in — nothing else to set up.")
+
     def _add_pref_row(self, frame, row, label, pref_key, hint, is_dir=False, download_url=None, download_note=None,
                       download_label="Download", download_url2=None, download_label2="Download", download_note2=None):
         """Add a labeled pref entry with Browse button and hint text. Returns next row index.
@@ -11981,8 +13117,8 @@ class LoRATrainerGUI:
         if _notes:
             hint_text = hint + "  ·  " + "  ·  ".join(_notes)
         tk.Label(frame, text=hint_text,
-                 font=(FONT_FAMILY, 9, "italic"),
-                 fg=COLORS["text_muted"], bg=COLORS["bg_surface"],
+                 font=(FONT_FAMILY, 10, "italic"),
+                 fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
                  wraplength=760, justify=tk.LEFT).grid(
             row=row, column=1, columnspan=2, sticky=tk.W, pady=(0, 6)
         )
@@ -13699,7 +14835,7 @@ class LoRATrainerGUI:
                        "More journey waypoints want more frames to stay smooth.")
         tk.Label(trav, text="Waypoints = seeds in the journey; 🎲 rerolls Start/End. With a reference holding "
                             "the subject, more waypoints = a longer tour through compositions.",
-                 font=(FONT_FAMILY, 8), fg=COLORS["text_muted"], bg=_sbg,
+                 font=(FONT_FAMILY, 9), fg=COLORS["text_explain"], bg=_sbg,
                  wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 6))
 
         _trr = tk.Frame(trav, bg=_sbg); _trr.pack(fill=tk.X, pady=(0, 4))
@@ -13753,7 +14889,7 @@ class LoRATrainerGUI:
         tk.Label(trav, text="Sequential: frame 1 uses your reference, each frame after edits the previous one "
                             "(a feedback chain — compounds and evolves, but can drift over a long run, especially "
                             "at high Strength). Off = every frame uses the same reference: cleaner and more predictable.",
-                 font=(FONT_FAMILY, 8), fg=COLORS["text_muted"], bg=_sbg,
+                 font=(FONT_FAMILY, 9), fg=COLORS["text_explain"], bg=_sbg,
                  wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 4))
         for _v in (self.royale_travel_ref_var, self.royale_travel_use_epoch_ref_var,
                    self.royale_travel_ref_strength_var, self.royale_travel_ref_mp_var,
@@ -13861,7 +14997,7 @@ class LoRATrainerGUI:
         ttk.Button(_pp, text="Insert {x}", command=self._royale_pt_insert_slot).pack(side=tk.LEFT, padx=(6, 0))
         tk.Label(ptrav, text="Type {x} where the travel word goes — e.g.  a portrait of sks man, {x} light. "
                              "No {x}? the word is appended to the end.",
-                 font=(FONT_FAMILY, 8), fg=COLORS["text_muted"], bg=_sbg,
+                 font=(FONT_FAMILY, 9), fg=COLORS["text_explain"], bg=_sbg,
                  wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 8))
 
         # — Travel definition: what the clip morphs through (sits right under the prompt) —
@@ -13873,7 +15009,7 @@ class LoRATrainerGUI:
         self.royale_pt_custom_var = tk.StringVar(value=self.last_used.get("royale_pt_custom", ""))
         ttk.Entry(_pcr, textvariable=self.royale_pt_custom_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
         tk.Label(ptrav, text="Comma-separated — only used when Preset = Custom words.",
-                 font=(FONT_FAMILY, 8), fg=COLORS["text_muted"], bg=_sbg,
+                 font=(FONT_FAMILY, 9), fg=COLORS["text_explain"], bg=_sbg,
                  wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 6))
 
         _prg = tk.Frame(ptrav, bg=_sbg); _prg.pack(fill=tk.X, pady=(0, 0))
@@ -13899,7 +15035,7 @@ class LoRATrainerGUI:
         tk.Label(ptrav, text="Start/End pick which waypoints to span — e.g. start Age at the subject's current age so "
                              "it matches the reference, then travel onward (the loop ping-pongs back). Frames spread "
                              "across that span.",
-                 font=(FONT_FAMILY, 8), fg=COLORS["text_muted"], bg=_sbg,
+                 font=(FONT_FAMILY, 9), fg=COLORS["text_explain"], bg=_sbg,
                  wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 4))
         for _v in (self.royale_pt_start_var, self.royale_pt_end_var):
             _v.trace_add("write", lambda *a: (self._royale_pt_refresh_words(), self._save_last_used_paths()))
@@ -13977,7 +15113,7 @@ class LoRATrainerGUI:
                              "(a feedback chain — the subject smoothly evolves). Anchor to original keeps the "
                              "pristine reference in every frame to stop drift. Recommended: strength ~0.7, "
                              "Max MP ~0.5, anchor 1.0.",
-                 font=(FONT_FAMILY, 8), fg=COLORS["text_muted"], bg=_sbg,
+                 font=(FONT_FAMILY, 9), fg=COLORS["text_explain"], bg=_sbg,
                  wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 4))
         for _v in (self.royale_pt_ref_mp_var, self.royale_pt_seq_ref_var,
                    self.royale_pt_anchor_var, self.royale_pt_anchor_str_var):
@@ -14110,7 +15246,7 @@ class LoRATrainerGUI:
         ToolTip(_lfcb, "Each frame is a fresh 4-step render — more frames = smoother ramp but slower.")
         tk.Label(ltrav, text="0 = base model (no LoRA); 1.0 = trained strength; >1 over-drives it. Uses the Setup "
                              "prompt and seed, fixed — only the LoRA strength changes.",
-                 font=(FONT_FAMILY, 8), fg=COLORS["text_muted"], bg=_sbg,
+                 font=(FONT_FAMILY, 9), fg=COLORS["text_explain"], bg=_sbg,
                  wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 6))
 
         _lsf = tk.Frame(ltrav, bg=_sbg); _lsf.pack(anchor=tk.W, pady=(0, 6))
@@ -14167,7 +15303,7 @@ class LoRATrainerGUI:
                          deflicker=self.royale_lora_deflicker_var.get()))
         tk.Label(ltrav, text="Render once, scrub to review, then save — Speed / Loop / Strength badge / Fizgig tag / "
                              "Deflicker all apply at save, so you can re-save in either format without re-rendering.",
-                 font=(FONT_FAMILY, 8), fg=COLORS["text_muted"], bg=_sbg,
+                 font=(FONT_FAMILY, 9), fg=COLORS["text_explain"], bg=_sbg,
                  wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, pady=(4, 0))
 
         # ----- Comparison sheet (before/after grid) -----
@@ -14263,7 +15399,7 @@ class LoRATrainerGUI:
         tk.Label(cmpc, text="Every cell is a fresh render — rows x columns images — so 3 prompts across 5 epochs "
                             "is 15 renders. Keep the prompt list short the first time. The finished sheet opens "
                             "in a window to review, then you choose whether to save it.",
-                 font=(FONT_FAMILY, 8), fg=COLORS["text_muted"], bg=_sbg,
+                 font=(FONT_FAMILY, 9), fg=COLORS["text_explain"], bg=_sbg,
                  wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, pady=(4, 0))
         for _v in (self.royale_cmp_mode_var, self.royale_cmp_trigger_var, self.royale_cmp_seed_var,
                    self.royale_cmp_w_var, self.royale_cmp_h_var, self.royale_cmp_epochs_var):
@@ -17403,6 +18539,8 @@ class LoRATrainerGUI:
         _check_num("Max Grad Norm", self.entries["MAX_GRAD_NORM"].get(), float, 0)
         _check_num("Network Dropout", self.entries["NETWORK_DROPOUT"].get(), float, 0)
         _check_num("Batch Size (Dataset)", self.dataset_batch_size_var.get(), int, 1)
+        if "KEEP_LAST_N_STATES" in self.entries:
+            _check_num("Keep Last (states)", self.entries["KEEP_LAST_N_STATES"].get(), int, 1)
 
         # Check required paths exist (sources: prefs_vars for model paths, hidden var for dataset)
         dataset_config = self._get_path("DATASET_CONFIG")
@@ -17558,7 +18696,10 @@ class LoRATrainerGUI:
         caption_ext = self.dataset_caption_ext_var.get().strip()
         if image_dir and os.path.isdir(image_dir) and caption_ext:
             import glob as _glob
-            caption_files = _glob.glob(os.path.join(image_dir, "*" + caption_ext))
+            # glob.escape is load-bearing here: a folder like "[subject] photos" made this
+            # find zero captions and block training with "No caption files found", while the
+            # Captions tab (os.listdir) read and wrote that same folder perfectly happily.
+            caption_files = _glob.glob(os.path.join(_glob.escape(image_dir), "*" + caption_ext))
             if not caption_files:
                 errors.append(
                     f"No caption files (*{caption_ext}) found in {image_dir}. "
@@ -17653,6 +18794,12 @@ class LoRATrainerGUI:
 
         # Validate inputs before starting
         if not self.validate_inputs():
+            return
+
+        # Resuming a state that's already at the final epoch trains nothing — the trainer's epoch
+        # loop is empty and it just rewrites the final LoRA. A warning rather than a block,
+        # because that fall-through is exactly how a run paused ON its last epoch gets completed.
+        if not self._confirm_resume_has_epochs_left():
             return
 
         # Clear a stale pause sentinel from a previous session (window close / crash after
@@ -17811,6 +18958,9 @@ class LoRATrainerGUI:
             "COMPILE_BLOCKS": self.compile_blocks_var.get(),
             "GRADIENT_CHECKPOINTING": self.grad_checkpoint_var.get(),
             "FP8_TEXT_ENCODER": self.fp8_text_encoder_var.get(),
+            "SAVE_STATE": self.save_state_var.get(),
+            "SAVE_STATE_ON_TRAIN_END": self.save_state_on_train_end_var.get(),
+            "KEEP_LAST_N_STATES": self.entries["KEEP_LAST_N_STATES"].get(),
             "ENABLE_BUCKET": self.dataset_enable_bucket_var.get(),
             "BUCKET_NO_UPSCALE": self.dataset_no_upscale_var.get(),
         })
@@ -17852,15 +19002,65 @@ class LoRATrainerGUI:
         self.training_state = "running"
         self._refresh_training_buttons()
 
+    def _confirm_resume_has_epochs_left(self):
+        """True to proceed. Warns when the resume state is already at/past Max Train Epochs.
+
+        Deliberately a warning, not a validation error: pausing on the final epoch exits before
+        the final LoRA is written, and resuming that state — with zero epochs left to run — is
+        precisely what completes it. Blocking would break that recovery."""
+        resume_path = (self.entries["RESUME_TRAINING"].get() or "").strip()
+        if not resume_path:
+            return True
+        m = re.search(r"-(\d{6})-state$", os.path.basename(resume_path.rstrip("/\\")))
+        if not m:
+            return True
+        state_epoch = int(m.group(1))
+        try:
+            max_epochs = int(self.entries["MAX_TRAIN_EPOCHS"].get())
+        except (TypeError, ValueError):
+            return True
+        if state_epoch < max_epochs:
+            return True
+        return messagebox.askyesno(
+            "Nothing left to train",
+            f"That state is already at epoch {state_epoch}, and Max Train Epochs is {max_epochs}.\n\n"
+            f"Resuming it will not train anything — it will just write the final LoRA from the "
+            f"restored state. That is what you want if you paused on the last epoch and are "
+            f"finishing the run.\n\n"
+            f"To train further, cancel and raise Max Train Epochs above {state_epoch} first.\n\n"
+            f"Continue anyway?")
+
+    def _state_flags(self):
+        """Save-state CLI flags, shared by both families (the flag names are identical).
+
+        Keep-N is clamped to >= 1 here as well as in the trainer: a blank or zero box must never
+        reach a prune that would take the state just written with it."""
+        flags = []
+        if self.settings.get("SAVE_STATE", True):
+            flags.append("--save_state")
+        if self.settings.get("SAVE_STATE_ON_TRAIN_END", True):
+            flags.append("--save_state_on_train_end")
+        if flags:
+            try:
+                keep_n = max(1, int(str(self.settings.get("KEEP_LAST_N_STATES", 2)).strip()))
+            except (TypeError, ValueError):
+                keep_n = 2
+            flags += ["--keep_last_n_states", str(keep_n)]
+        return flags
+
     def build_training_command(self, config):
         """Build the training command based on architecture configuration"""
         if config.get("is_krea2"):
             return self._build_krea2_train_command()
         arch = self.settings["ARCHITECTURE"]
-        if os.name == 'nt':
-            accelerate_path = os.path.join(FIZGIG_DIR, "venv", "Scripts", "accelerate.exe")
-        else:
-            accelerate_path = os.path.join(FIZGIG_DIR, "venv", "bin", "accelerate")
+        # Same reasoning as _venv_python: fall back to whatever is on PATH when the bundled venv
+        # is not a sibling of the repo, rather than pointing at a file that is not there.
+        accelerate_path = (os.path.join(FIZGIG_DIR, "venv", "Scripts", "accelerate.exe")
+                           if os.name == 'nt'
+                           else os.path.join(FIZGIG_DIR, "venv", "bin", "accelerate"))
+        if not os.path.isfile(accelerate_path):
+            import shutil as _shutil
+            accelerate_path = _shutil.which("accelerate") or accelerate_path
         train_script_path = self._resolve_script(config, "train_script")
 
         # Auto-detect mixed precision from DiT model filename
@@ -17993,12 +19193,16 @@ class LoRATrainerGUI:
         command.extend([
             "--max_train_epochs", str(self.settings["MAX_TRAIN_EPOCHS"]),
             "--save_every_n_epochs", str(self.settings["SAVE_EVERY_N_EPOCHS"]),
-            "--save_state",
             "--seed", str(self.settings["SEED"]),
             "--output_dir", self.settings["LORA_OUTPUT_DIR"],
             "--output_name", self.settings["LORA_NAME"],
             "--pause_flag_path", os.path.join(self.settings["LORA_OUTPUT_DIR"], ".pause_requested"),
         ])
+
+        # State saving. --save_state used to be passed unconditionally with no UI behind it, which
+        # meant a 55-epoch run silently left 54 state dirs (hundreds of MB each) and never pruned.
+        # Pause still saves state either way — the trainer forces it via --pause_flag_path.
+        command.extend(self._state_flags())
 
         # Optional parameters
         if self.settings["OPTIMIZER_ARGS"]:
@@ -18170,10 +19374,7 @@ class LoRATrainerGUI:
             return self._build_krea2_cache_command("krea2_cache_latents.py",
                                                    "--vae", self._krea2_pref("krea2_vae"))
         arch = self.settings["ARCHITECTURE"]
-        if os.name == 'nt':
-            python_path = os.path.join(FIZGIG_DIR, "venv", "Scripts", "python.exe")
-        else:
-            python_path = os.path.join(FIZGIG_DIR, "venv", "bin", "python")
+        python_path = self._venv_python()
         cache_script_path = self._resolve_script(config, "cache_latents_script")
 
         command = [
@@ -18199,10 +19400,7 @@ class LoRATrainerGUI:
             return self._build_krea2_cache_command("krea2_cache_text.py",
                                                    "--text_encoder", self._krea2_pref("krea2_text_encoder"))
         arch = self.settings["ARCHITECTURE"]
-        if os.name == 'nt':
-            python_path = os.path.join(FIZGIG_DIR, "venv", "Scripts", "python.exe")
-        else:
-            python_path = os.path.join(FIZGIG_DIR, "venv", "bin", "python")
+        python_path = self._venv_python()
         cache_script_path = self._resolve_script(config, "cache_text_script")
 
         command = [
@@ -18232,10 +19430,17 @@ class LoRATrainerGUI:
     # === Krea 2 native command builders ===
 
     def _venv_python(self) -> str:
-        """Absolute path to the bundled venv python."""
-        if os.name == 'nt':
-            return os.path.join(FIZGIG_DIR, "venv", "Scripts", "python.exe")
-        return os.path.join(FIZGIG_DIR, "venv", "bin", "python")
+        """Python to launch training/caching subprocesses with.
+
+        The bundled venv when it exists, otherwise whatever interpreter is running us. Without
+        the fallback, any install where the venv is not a sibling of the repo — conda, a system
+        install, the Docker image (venv lives at /opt/venv) — builds a command pointing at a
+        file that is not there. The subprocess then fails to launch and the run dies silently
+        right after "starting cache preparation", with nothing in the console to say why.
+        """
+        candidate = (os.path.join(FIZGIG_DIR, "venv", "Scripts", "python.exe") if os.name == 'nt'
+                     else os.path.join(FIZGIG_DIR, "venv", "bin", "python"))
+        return candidate if os.path.isfile(candidate) else sys.executable
 
     def _krea2_pref(self, key: str) -> str:
         """Read a Krea 2 model path from Preferences (krea2_raw_dit / krea2_turbo_dit / krea2_vae / krea2_text_encoder)."""
@@ -18313,6 +19518,9 @@ class LoRATrainerGUI:
             "--seed", str(self.settings["SEED"]),
             "--discrete_flow_shift", "2.5",
         ]
+        # State saving. Krea 2 previously wrote state ONLY on Pause, so a crash or a run that
+        # finished too early meant starting over. Pause still saves regardless of these flags.
+        cmd += self._state_flags()
         # Resume from a saved <name>-NNNNNN-state dir (set by the Resume button / pause flow).
         resume_path = (self.settings.get("RESUME_TRAINING") or "").strip()
         if resume_path:
@@ -18368,6 +19576,19 @@ class LoRATrainerGUI:
         _cb = str(self.settings.get("COMPILE_BLOCKS", "auto") or "auto").lower()
         if _cb in ("auto", "on", "off"):
             cmd += ["--compile_blocks", _cb]
+        # torch.compile and block swap are mutually exclusive — compiled graphs assume their
+        # weights stay put, and swap moves them every step, so the trainer ignores compile
+        # whenever swap is active. It says so in its own log, but a user who set compile to On
+        # sees the GUI still reading "On" and reasonably believes it is running.
+        try:
+            _blocks_swap = int(self.settings.get("BLOCKS_SWAP", 0) or 0)
+        except (TypeError, ValueError):
+            _blocks_swap = 0
+        if _cb == "on" and _blocks_swap > 0:
+            self.update_console(
+                f"[compile] ignored this run — block swap is active ({_blocks_swap} blocks), and "
+                "compiled graphs can't tolerate weights moving between CPU and GPU each step. "
+                "Use 4-bit (NF4) instead of swapping if you want compile as well.\n")
         # Output metadata (Other Options → Metadata) — previously visible but never wired
         # for Krea 2; now recorded in the saved LoRA.
         for _mkey, _mflag in (("METADATA_TITLE", "--metadata_title"),
@@ -18385,11 +19606,14 @@ class LoRATrainerGUI:
         # Explicit user choices FIRST — the auto branch used to be tested before them, so
         # unticking "FP8 Base" (an explicit bf16 request) did nothing when auto had chosen
         # INT8.
+        # FP8 Base is hidden for Krea 2 and deliberately ignored here: --no_fp8 means a bf16
+        # base (~28 GB) that no consumer card holds, the swap planner never accounted for it,
+        # and this elif chain used to let it silently cancel the INT8 the planner had chosen.
+        # A value persisted from Klein (or from before it was hidden) must not leak into a
+        # Krea 2 run through a control the user can no longer see.
         _auto_i8 = getattr(self, "_auto_quant_int8", "")
         if self.settings.get("QUANT_4BIT", False):
             cmd.append("--quantize_4bit")
-        elif not self.settings.get("FP8", True):
-            cmd.append("--no_fp8")
         elif _auto_i8:
             # Chosen by the auto strategy when there is VRAM for it: faster than NF4 and ~7x
             # more accurate, with exact gradients.
@@ -18424,6 +19648,17 @@ class LoRATrainerGUI:
                     if hasattr(self, "caption_trigger_var") else "")
             if trig and trig.lower() != "trigger_word":
                 cmd += ["--trigger_word", trig]
+            # Auto-recaption maps its two attempts onto two Captions-tab presets: attempt 1 uses
+            # TRAINING CAPTION, attempt 2 uses EXHAUSTIVE DETAIL — your edited version of each
+            # where you have one, the built-in otherwise. Deliberately not "whatever the tab is
+            # set to": auto-recaption's job is fixed, so leaving the tab on "Short caption" must
+            # not silently change what a training run writes mid-run.
+            _ovr = self._caption_overrides()
+            for _key, _flag in (("training", "--recaption_instruction"),
+                                ("exhaustive", "--recaption_instruction_detailed")):
+                _instr = str(_ovr.get(_key, "") or "").strip()
+                if _instr:
+                    cmd += [_flag, _instr]
         # Caption repair (manual edits from the Problem Images window AND auto-recaption)
         # re-encodes with the Qwen3-VL text encoder. --text_encoder used to be emitted only
         # inside the samples block, so with previews off the trainer had no TE path and every
