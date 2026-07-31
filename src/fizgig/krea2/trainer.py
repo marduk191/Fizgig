@@ -115,6 +115,8 @@ def load_dit_for_training(
     *,
     network_dim: int = 32,
     network_alpha: float = 32,
+    network_type: str = "lora",     # "lora" | "lokr" — the trainable parametrization
+    lokr_factor: int = 8,
     fp8_scaled: bool = True,
     quant_4bit: bool = False,
     quant_int8: str = "",          # "" | "bf16" | "int8" — W8A8 base, grad_mode of the same name
@@ -196,10 +198,26 @@ def load_dit_for_training(
         logger.info(f"context LoRA: {os.path.basename(context_lora_path)} @ {context_lora_strength} (frozen, active)")
         _apply_context_lora(dit, context_lora_path, context_lora_strength, device=device, dtype=dtype)
 
-    network = create_network(None, "lora_unet", 1.0, network_dim, network_alpha, None, [], dit)
+    if network_type == "lokr":
+        from fizgig.networks.lora import LoKRModule
+        logger.info(f"network: LoKR (Kronecker), factor {lokr_factor}, full-matrix w2 — "
+                    "dim/alpha do not apply")
+        network = create_network(None, "lora_unet", 1.0, network_dim, network_alpha, None, [], dit,
+                                 module_class=LoKRModule, module_kwargs={"factor": int(lokr_factor)})
+    else:
+        network = create_network(None, "lora_unet", 1.0, network_dim, network_alpha, None, [], dit)
     network.apply_to(text_encoders=None, unet=dit, apply_text_encoder=False, apply_unet=True)
     network.requires_grad_(True)
     network.to(device=device, dtype=dtype)
+    network._network_type = network_type
+    network._lokr_factor = int(lokr_factor)
+    # Dotted module paths, for the LyCORIS-standard final save (diffusion_model.<path>.lokr_*).
+    # Built from the DiT itself with the same flattening create_modules used, so the reverse
+    # mapping is exact even where module names contain underscores.
+    network._dotted_names = {
+        f"lora_unet_{name.replace('.', '_')}": name
+        for name, m in dit.named_modules() if isinstance(m, torch.nn.Linear)
+    }
 
     # torch.compile LAST — after the LoRAs have patched the forwards, so the compiled graph is
     # the one that actually runs. Per block, not whole-model: the 28 blocks share a graph
@@ -702,15 +720,47 @@ class AdaptiveLR:
         self._snapshot(network, optimizer)
 
 
-def _save_lora(network, path, network_dim, network_alpha, dtype, extra_metadata=None):
-    metadata = {
-        "ss_network_module": "fizgig.krea2 (lora_unet, all-Linear)",
-        "ss_network_dim": str(network_dim),
-        "ss_network_alpha": str(network_alpha),
-        "ss_architecture": ARCHITECTURE_KREA2,
-    }
+def _save_lora(network, path, network_dim, network_alpha, dtype, extra_metadata=None,
+               comfy_format=False):
+    """Save the trainable network. `comfy_format` (final artifact only) rewrites a LoKR's keys
+    to the LyCORIS standard (`diffusion_model.<dotted>.lokr_*`) — the format every ComfyUI LoKR
+    in the wild uses. Internal saves (state dirs, preview temps) stay in native state_dict
+    naming so resume's load_state_dict and the preview reload path work unchanged; our own
+    loader ingests both via ensure_kohya_lora_state_dict."""
+    is_lokr = getattr(network, "_network_type", "lora") == "lokr"
+    if is_lokr:
+        metadata = {
+            "ss_network_module": "fizgig.krea2 (lokr, all-Linear)",
+            "ss_lokr_factor": str(getattr(network, "_lokr_factor", "")),
+            "ss_architecture": ARCHITECTURE_KREA2,
+        }
+    else:
+        metadata = {
+            "ss_network_module": "fizgig.krea2 (lora_unet, all-Linear)",
+            "ss_network_dim": str(network_dim),
+            "ss_network_alpha": str(network_alpha),
+            "ss_architecture": ARCHITECTURE_KREA2,
+        }
     if extra_metadata:
         metadata.update(extra_metadata)
+    if comfy_format and is_lokr:
+        from fizgig.networks.lora import _precalculate_safetensors_hashes
+        from safetensors.torch import save_file
+        dotted = getattr(network, "_dotted_names", {})
+        sd = {}
+        for k, v in network.state_dict().items():
+            mod, _, suffix = k.partition(".")
+            path_dotted = dotted.get(mod)
+            nk = f"diffusion_model.{path_dotted}.{suffix}" if path_dotted else k
+            v = v.detach().clone().to("cpu")
+            if dtype is not None:
+                v = v.to(dtype)
+            sd[nk] = v
+        model_hash, legacy_hash = _precalculate_safetensors_hashes(sd, metadata)
+        metadata["sshs_model_hash"] = model_hash
+        metadata["sshs_legacy_hash"] = legacy_hash
+        save_file(sd, path, metadata)
+        return
     network.save_weights(path, dtype, metadata)
 
 
@@ -1159,6 +1209,8 @@ def train_krea2(
     *,
     network_dim: int = 32,
     network_alpha: float = 32,
+    network_type: str = "lora",     # "lora" | "lokr" (Kronecker, full-matrix w2)
+    lokr_factor: int = 8,           # LoKR only: w1 is ~factor x factor; dim/alpha unused
     learning_rate: float = 1e-4,
     max_train_epochs: int = 10,
     save_every_n_epochs: int = 0,
@@ -1268,7 +1320,19 @@ def train_krea2(
     if str(compile_blocks).lower() == "auto":
         from fizgig.utils.capabilities import should_compile
         _steps_est = group.num_train_items * max_train_epochs
-        _do_compile, _why = should_compile(_steps_est, quant_4bit, quant_int8, blocks_to_swap)
+        # The largest ACTUAL bucket, not the Target Megapixels box — bucket_no_upscale can land
+        # buckets well below the target, and it's the real token count that sets compiled-path
+        # VRAM. Batch rides along because it multiplies tokens per step the same way. Unreadable
+        # values fall back to the defaults, i.e. the pre-shape-aware behaviour.
+        _mp_max, _batch_max = 0.25, 1
+        try:
+            _mp_max = max(w * h / 1e6 for ds in group.datasets
+                          for (w, h) in ds.batch_manager.bucket_resos)
+            _batch_max = max(int(ds.batch_size) for ds in group.datasets)
+        except Exception:
+            pass
+        _do_compile, _why = should_compile(_steps_est, quant_4bit, quant_int8, blocks_to_swap,
+                                           mp=_mp_max, batch=_batch_max)
         logger.info("[compile] auto: %s — %s", "ENABLED" if _do_compile else "off", _why)
 
     # Preview setup: pre-encode prompts (frees the 8GB encoder) + load the VAE BEFORE the RAW DiT,
@@ -1302,6 +1366,7 @@ def train_krea2(
 
     dit, network, turbo_net, turbo_diffb = load_dit_for_training(
         raw_path, network_dim=network_dim, network_alpha=network_alpha,
+        network_type=network_type, lokr_factor=lokr_factor,
         fp8_scaled=fp8_scaled, quant_4bit=quant_4bit, quant_int8=quant_int8,
         blocks_to_swap=blocks_to_swap, compile_blocks=_do_compile,
         context_lora_path=context_lora_path, context_lora_strength=context_lora_strength,
@@ -1652,6 +1717,13 @@ def train_krea2(
                 move_nf4_to_device(dit, device)
             dit.train()
 
+    # Return the load-time transients (quantise staging, resume's optimizer-state copy) to the
+    # driver before stepping. Fresh runs with Sample at Start got this for free from the
+    # preview's empty_cache; resumed runs skip that preview and sat ~4 GB high until the first
+    # epoch-boundary preview cleared it (issue #24). Unconditional so every path starts clean.
+    gc.collect()
+    torch.cuda.empty_cache()
+
     progress_bar = tqdm(total=steps_per_epoch * max_train_epochs, initial=global_step,
                         desc="steps", smoothing=0)
     pending_accum = 0  # micro-batches backward'd since the last optimizer step
@@ -1765,8 +1837,10 @@ def train_krea2(
 
         state_saved_this_epoch = False
         if save_every_n_epochs and (epoch + 1) % save_every_n_epochs == 0 and (epoch + 1) < max_train_epochs:
+            # comfy_format so a user's picked-best epoch is byte-format-identical to the final
+            # artifact (LoKR: LyCORIS-standard keys). No-op for standard LoRA.
             _save_lora(network, os.path.join(output_dir, f"{output_name}-{epoch + 1:06d}.safetensors"),
-                       network_dim, network_alpha, dtype)
+                       network_dim, network_alpha, dtype, comfy_format=True)
             # Resumable state rides the checkpoint cadence. Safe to snapshot here: pending_accum
             # was flushed above, the adaptive-LR watcher has already made its call for this epoch,
             # and any queued caption updates are applied — so the optimizer is settled.
@@ -1939,6 +2013,7 @@ def train_krea2(
                      ("modelspec.license", metadata_license), ("modelspec.tags", metadata_tags)):
         if _mv:
             extra[_mk] = str(_mv)
-    _save_lora(network, out, network_dim, network_alpha, dtype, extra_metadata=extra)
+    _save_lora(network, out, network_dim, network_alpha, dtype, extra_metadata=extra,
+               comfy_format=True)
     logger.info(f"saved final LoRA -> {out}")
     return out

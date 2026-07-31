@@ -15,7 +15,8 @@ sys.path.insert(0, os.path.join(REPO, "src"))
 import tkinter as tk
 import lora_trainer_gui as G
 from fizgig.krea2.embedder import (CAPTION_TASKS, DEFAULT_CAPTION_TASK,
-                                   ENCODE_SYSTEM_DESCRIPTOR, CAPTION_INSTRUCTION)
+                                   ENCODE_SYSTEM_DESCRIPTOR, CAPTION_INSTRUCTION,
+                                   SUBJECT_RULE, _strip_caption_preamble)
 
 G.LAST_USED_FILE = os.path.join(os.environ["TEMP"], "nope", ".last_used.json")
 
@@ -55,8 +56,10 @@ g.caption_model_var.set(G.QWEN_CAPTION_MODEL)
 g._on_caption_model_changed()
 root.update()
 qwen_tasks = list(g.caption_task_combo.cget("values"))
-ck("Qwen selected -> 4 presets + Custom", len(qwen_tasks) == 5 and qwen_tasks[-1] == G.QWEN_CUSTOM_TASK,
+ck("Qwen selected -> every shipped preset + Custom",
+   len(qwen_tasks) == len(CAPTION_TASKS) + 1 and qwen_tasks[-1] == G.QWEN_CUSTOM_TASK,
    qwen_tasks)
+ck("  the style preset is offered", CAPTION_TASKS["style"][0] in qwen_tasks, qwen_tasks)
 ck("  default task is the doctrine one",
    g.caption_task_var.get() == CAPTION_TASKS[DEFAULT_CAPTION_TASK][0], g.caption_task_var.get())
 ck("  Edit instructions button shown", bool(g.caption_edit_instr_btn.winfo_manager()))
@@ -105,6 +108,38 @@ ck("  edited flag is per preset",
    g._caption_task_is_edited(_TR) and not g._caption_task_is_edited(_SH))
 ck("  builtin_only always returns the shipped text",
    g._caption_instruction_for_task(_TR, builtin_only=True) == CAPTION_TASKS["training"][1])
+
+# --- 3c. the style preset says the opposite of the identity ones ---------------------------
+# These guard against one accident: writing the style preset by copy-pasting an identity one.
+# SUBJECT_RULE can only produce 'a woman'/'a man'/'a girl'/'a boy', which is wrong for a dataset
+# of landscapes and objects; and lighting must NOT be captioned for a style, or the look only
+# fires under the lighting it was trained on. The identity presets ask for lighting correctly —
+# there it varies and you want it steerable — so the two rules genuinely coexist.
+_STYLE = CAPTION_TASKS["style"][1]
+ck("  'style' does not use the person-only subject rule", SUBJECT_RULE not in _STYLE)
+ck("  'style' never asks for lighting", "lighting" not in _STYLE.lower())
+ck("  'style' excludes the style itself", "zero references to the image style" in _STYLE)
+ck("  'style' asks for the contents", "factual contents of what is depicted" in _STYLE)
+# The brevity is the finding, not an oversight. A four-fragment rule stack scored better on leak
+# counting (1 caption in 9 vs 7) and trained worse on real runs across both Krea 2 and Klein: the
+# short form yields ~2.4x richer captions, and a style word appearing in 7 of 9 behaves like a tag
+# rather than the noise a 4-in-9 split creates. Anyone re-stacking rules here trips this.
+ck("  'style' stays short", len(_STYLE.split()) <= 30, len(_STYLE.split()))
+# Those richer captions run ~70 words; at the ~90 tokens the old presets used, every caption on
+# the test set was cut off mid-word.
+ck("  'style' has budget to finish its sentences", CAPTION_TASKS["style"][2] >= 160,
+   CAPTION_TASKS["style"][2])
+# Nothing is appended to a style caption, so the whole look rides on the trigger word the GUI
+# prepends — which lands in front of the caption, where _strip_caption_preamble looks. It must
+# leave a real caption alone and only remove an actual preamble.
+ck("  a captioned style line survives preamble stripping",
+   _strip_caption_preamble("a red car parked on a street") == "a red car parked on a street")
+ck("  ...whereas a LEADING 'the image is a' would have been stripped",
+   not _strip_caption_preamble("the image is a watercolour of a red car").startswith("the image"))
+# 'short' is excluded: it is a single clause (subject, action, setting) and never asked for
+# lighting in the first place — nothing to preserve there.
+for _k in ("training", "detailed", "exhaustive"):
+    ck(f"  identity preset '{_k}' still asks for lighting", "lighting" in CAPTION_TASKS[_k][1])
 
 # auto-recaption maps attempt 1 -> Training caption, attempt 2 -> Exhaustive detail.
 # Never "whatever the tab is set to".

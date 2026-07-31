@@ -170,7 +170,8 @@ def load_qwen3(
             qwen3.to(dtype)
 
     logger.info(f"Loading tokenizer from {tokenizer_id}")
-    tokenizer = Qwen2Tokenizer.from_pretrained(tokenizer_id)
+    from fizgig.utils.hf_cache import from_pretrained_cache_first
+    tokenizer = from_pretrained_cache_first(Qwen2Tokenizer, tokenizer_id)
     return tokenizer, qwen3
 
 

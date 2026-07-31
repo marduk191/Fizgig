@@ -65,6 +65,10 @@ jobs:
           context: .
           file: docker/Dockerfile
           push: true
+          # Baked in so the running container can report which image it is, which a mutable tag
+          # otherwise makes impossible to determine from the outside.
+          build-args: |
+            FIZGIG_IMAGE_VERSION=${{ steps.meta.outputs.version }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

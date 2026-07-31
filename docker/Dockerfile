@@ -1,4 +1,4 @@
-# Fizgig on a headless GPU box (RunPod, Vast, or any Docker host with an NVIDIA GPU).
+# Fizgig on a headless GPU box — RunPod, or any Docker host with an NVIDIA GPU.
 #
 # Fizgig is a Tkinter desktop app: it needs a display, and there is no web UI to expose. So the
 # image runs a virtual screen (Xvfb) with a light window manager on it, and streams that screen
@@ -141,7 +141,18 @@ ENV VIRTUAL_ENV=/opt/venv PATH="/opt/venv/bin:$PATH"
 # Everything the user creates lives here so a RunPod network volume keeps it across pods:
 # models, datasets, output LoRAs, latent cache, and the HuggingFace/InsightFace caches — which
 # would otherwise re-download Florence-2 and the face model on every single boot.
-ENV FIZGIG_HOME=/workspace \
+# Stamped by CI from the release tag. The app shows it next to the app's own commit, because the
+# two deliberately diverge: the image is pinned in the RunPod template while Fizgig itself updates
+# from git at every pod start. Without this, "which image are you on?" is unanswerable, which is
+# exactly the failure mode that makes a mutable :latest tag risky.
+ARG FIZGIG_IMAGE_VERSION=dev
+ENV FIZGIG_IMAGE_VERSION=${FIZGIG_IMAGE_VERSION}
+
+# FIZGIG_POD is what the app keys off to show its RunPod controls instead of the "run on a rented
+# GPU" advert. Our own marker rather than RUNPOD_POD_ID: a provider's variable names are theirs
+# to change, and another host would set different ones entirely.
+ENV FIZGIG_POD=1 \
+    FIZGIG_HOME=/workspace \
     HF_HOME=/workspace/.cache/huggingface \
     INSIGHTFACE_HOME=/workspace/.insightface \
     XDG_CACHE_HOME=/workspace/.cache
@@ -193,6 +204,9 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # noVNC over HTTP — the only port that needs exposing. 5900 stays internal on purpose: raw VNC
 # is unencrypted, and the host's HTTPS proxy is what makes this safe to reach over the internet.
-EXPOSE 6080 8080
+# 8081 is reserved for the app to serve on (a phone-facing run monitor). Declaring it here
+# is documentation — RunPod exposes what the TEMPLATE lists — but it keeps the ports in
+# one place and works for a plain `docker run -p`.
+EXPOSE 6080 8080 8081
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

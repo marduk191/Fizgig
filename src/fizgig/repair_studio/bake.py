@@ -12,8 +12,13 @@ Supports:
   and alphas are fully baked in.
   Verification: `baked_up @ baked_down` equals the live inference sum
   `mp * scale_p * up_p @ down_p + md * scale_d * up_d @ down_d`.
-- LyCORIS primary or donor: refused with `UnsupportedLoRAFormat`. Phase E will
-  add SVD-merge fallback for LyCORIS-involved bakes.
+- LyCORIS (LoKR / LoHa): baked LOSSLESSLY in native format. Both forms are
+  linear in their first factor — `m·kron(w1,w2) == kron(m·w1,w2)` and
+  `(m·W1)⊙W2 == m·(W1⊙W2)` — so a slider multiplier absorbs into w1 exactly
+  like it absorbs into lora_up, and a LoKR in stays a LoKR out. The ONLY case
+  that still SVDs to standard LoRA is a donor blend on the same block
+  (Kronecker/Hadamard products don't rank-concatenate), and only for the
+  blocks actually blended. GLoRA is still refused.
 """
 
 import json
@@ -76,7 +81,35 @@ def _module_alpha(mod_keys: Dict[str, torch.Tensor], fallback_rank: int) -> floa
         return float(fallback_rank)
 
 
-_ALPHA_SENTINEL_THRESHOLD = 1e8  # Comfy-Realtime-Lora sentinel: alpha > 1e8 means scale=1.0
+def _bake_single_lycoris_contribution(
+    mod_keys: Dict[str, torch.Tensor], multiplier: float,
+) -> Optional[Dict[str, torch.Tensor]]:
+    """Bake a multiplier into a LoKR/LoHa module IN NATIVE FORMAT — no SVD, no loss.
+
+    Both forms are linear in their first factor, so `multiplier * scale` absorbs into
+    lokr_w1 (or lokr_w1_a / hada_w1_a) the way _bake_single_contribution absorbs into
+    lora_up. Output alpha is the >=1e6 sentinel meaning "scale already baked in"
+    (the LyCORIS analogue of "alpha = rank"). A no-op (factor exactly 1.0) returns the
+    module byte-identical, original alpha included. Returns None if the module isn't a
+    recognised LyCORIS variant.
+    """
+    from fizgig.networks.lora import lycoris_scale_from_keys
+
+    if mod_keys.get("lokr_w1_a") is not None or mod_keys.get("lokr_w1") is not None:
+        first = "lokr_w1_a" if mod_keys.get("lokr_w1_a") is not None else "lokr_w1"
+    elif mod_keys.get("hada_w1_a") is not None:
+        first = "hada_w1_a"
+    else:
+        return None
+
+    factor = float(multiplier) * lycoris_scale_from_keys(mod_keys)
+    if factor == 1.0:
+        return dict(mod_keys)
+    out = dict(mod_keys)
+    t = out[first]
+    out[first] = (t.to(torch.float32) * factor).to(t.dtype).contiguous()
+    out["alpha"] = torch.tensor(1e10)
+    return out
 
 
 def _materialize_lycoris_module(mod_keys: Dict[str, torch.Tensor]) -> Optional[Dict[str, torch.Tensor]]:
@@ -130,21 +163,6 @@ def _materialize_lycoris_module(mod_keys: Dict[str, torch.Tensor]) -> Optional[D
         "lora_down.weight": lora_down.contiguous(),
         "alpha": torch.tensor(float(R), dtype=torch.float16),
     }
-
-
-def _materialize_lycoris_modules(modules: Dict[str, Dict[str, torch.Tensor]]) -> int:
-    """In-place: replace any LoKR/LoHa modules with SVD-materialized standard LoRA.
-    Returns the number of modules converted."""
-    count = 0
-    for mod_name, mod_keys in list(modules.items()):
-        # Skip if already standard LoRA
-        if mod_keys.get("lora_up.weight") is not None:
-            continue
-        result = _materialize_lycoris_module(mod_keys)
-        if result is not None:
-            modules[mod_name] = result
-            count += 1
-    return count
 
 
 def _bake_single_contribution(
@@ -215,15 +233,10 @@ def save_repaired_lora(
     modules_p = _group_by_module(sd_p)
     modules_d = _group_by_module(sd_d) if sd_d is not None else {}
 
-    # Materialize any LyCORIS modules (LoKR/LoHa) to standard LoRA via SVD
+    # LyCORIS modules are NOT converted up front any more — drop / rescale / pass-through all
+    # bake losslessly in native format. SVD happens per-module inside the blend branch, the one
+    # place rank-concat genuinely needs standard up/down, and nowhere else.
     lycoris_converted = 0
-    if fmt_p in ("lokr", "loha"):
-        lycoris_converted += _materialize_lycoris_modules(modules_p)
-        logger.info("Bake: materialized %d LyCORIS primary modules to standard LoRA via SVD", lycoris_converted)
-    if sd_d is not None and fmt_d in ("lokr", "loha"):
-        n = _materialize_lycoris_modules(modules_d)
-        lycoris_converted += n
-        logger.info("Bake: materialized %d LyCORIS donor modules to standard LoRA via SVD", n)
 
     all_modules = sorted(set(modules_p) | set(modules_d))
 
@@ -267,9 +280,21 @@ def save_repaired_lora(
             continue
 
         if p_on and d_on:
-            # Rank-concat: both contributions baked and concatenated.
-            p_baked = _bake_single_contribution(modules_p[mod_name], bs.primary_strength)
-            d_baked = _bake_single_contribution(modules_d[mod_name], bs.donor_strength)
+            # Rank-concat: both contributions baked and concatenated. A LyCORIS side can't
+            # rank-concat, so it (and only it, and only here) is SVD-materialized first.
+            p_keys, d_keys = modules_p[mod_name], modules_d[mod_name]
+            if p_keys.get("lora_up.weight") is None:
+                mat = _materialize_lycoris_module(p_keys)
+                if mat is not None:
+                    p_keys = mat
+                    lycoris_converted += 1
+            if d_keys.get("lora_up.weight") is None:
+                mat = _materialize_lycoris_module(d_keys)
+                if mat is not None:
+                    d_keys = mat
+                    lycoris_converted += 1
+            p_baked = _bake_single_contribution(p_keys, bs.primary_strength)
+            d_baked = _bake_single_contribution(d_keys, bs.donor_strength)
             if p_baked is None or d_baked is None:
                 # Fall back to whichever side has valid keys (shouldn't happen for well-formed std LoRA).
                 logger.warning(f"Concat bake skipped for {mod_name} — missing up/down in one side")
@@ -311,9 +336,18 @@ def save_repaired_lora(
         elif p_on:
             baked = _bake_single_contribution(modules_p[mod_name], bs.primary_strength)
             if baked is None:
-                # Non-standard module in primary — pass raw keys (future-proofing).
-                for suffix, tensor in modules_p[mod_name].items():
-                    sd_out[f"{mod_name}.{suffix}"] = tensor
+                # LyCORIS module: bake the multiplier in native format — lossless. (The old
+                # code passed the raw keys through here, silently IGNORING the multiplier.)
+                lyc = _bake_single_lycoris_contribution(modules_p[mod_name], bs.primary_strength)
+                if lyc is not None:
+                    for suffix, tensor in lyc.items():
+                        sd_out[f"{mod_name}.{suffix}"] = tensor
+                    if bs.primary_strength != 1.0:
+                        rescaled_blocks.add(block_id)
+                else:
+                    # Genuinely unknown module type — pass raw keys (future-proofing).
+                    for suffix, tensor in modules_p[mod_name].items():
+                        sd_out[f"{mod_name}.{suffix}"] = tensor
                 continue
             new_up, down, rank = baked
             sd_out[f"{mod_name}.lora_up.weight"] = new_up
@@ -325,6 +359,13 @@ def save_repaired_lora(
         elif d_on:
             baked = _bake_single_contribution(modules_d[mod_name], bs.donor_strength)
             if baked is None:
+                # LyCORIS donor module: native-format bake. (The old code hit `continue` here,
+                # silently DROPPING the module from the output.)
+                lyc = _bake_single_lycoris_contribution(modules_d[mod_name], bs.donor_strength)
+                if lyc is not None:
+                    for suffix, tensor in lyc.items():
+                        sd_out[f"{mod_name}.{suffix}"] = tensor
+                    rescaled_blocks.add(block_id)
                 continue
             new_up, down, rank = baked
             sd_out[f"{mod_name}.lora_up.weight"] = new_up
@@ -338,11 +379,17 @@ def save_repaired_lora(
     # changes per-block. Report the actual max rank; per-module alpha == rank (scale 1.0).
     for _stale in ("sshs_model_hash", "sshs_legacy_hash", "modelspec.hash_sha256"):
         metadata.pop(_stale, None)
+    _has_lycoris_out = any(".lokr_" in k or ".hada_" in k for k in sd_out)
     try:
         _ranks = [int(t.shape[0]) for k, t in sd_out.items() if k.endswith(".lora_down.weight")]
         if _ranks:
             metadata["ss_network_dim"] = str(max(_ranks))
             metadata["ss_network_alpha"] = str(float(max(_ranks)))
+        elif _has_lycoris_out:
+            # Pure-LyCORIS output has no rank; inherited dim/alpha would describe a file
+            # this one no longer is.
+            metadata.pop("ss_network_dim", None)
+            metadata.pop("ss_network_alpha", None)
     except Exception:
         pass
 
@@ -363,6 +410,7 @@ def save_repaired_lora(
     sd_out = {k: v.contiguous() if v.is_floating_point() else v for k, v in sd_out.items()}
     save_file(sd_out, out_path, metadata=metadata)
 
+    _has_std_out = any(k.endswith(".lora_down.weight") for k in sd_out)
     summary = {
         "dropped_blocks": sorted(dropped_blocks),
         "rescaled_blocks": sorted(rescaled_blocks - dropped_blocks),
@@ -370,6 +418,11 @@ def save_repaired_lora(
         "keys_in": keys_in,
         "keys_out": len(sd_out),
         "donor_path": donor_path,
+        # What the OUTPUT file is, so the GUI can say "saved natively as LoKR" vs warn
+        # about the SVD a blend forced.
+        "format_out": ("mixed" if (_has_lycoris_out and _has_std_out)
+                       else "lycoris" if _has_lycoris_out else "standard"),
+        "lycoris_converted": lycoris_converted,
     }
     logger.info(
         "save_repaired_lora: primary_in=%d donor_in=%d out=%d dropped=%d rescaled=%d blended=%d → %s",

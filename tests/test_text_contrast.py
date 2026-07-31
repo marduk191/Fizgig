@@ -87,9 +87,19 @@ prose_left = [c for c in muted if "wraplength" in c]
 
 # wraplength is the tell: you only set it on multi-line explanatory copy. Widget captions
 # ("seed", "W", "H", "Ref") never do.
+# The detail has to survive text= being a VARIABLE, not a literal — the one real failure this
+# ever caught was `text=line`, and the regex returning None turned a legible FAIL into a
+# traceback that hid which label was at fault.
+def _snippet(c):
+    m = re.search(r'text="([^"]{0,40})', c)
+    return m.group(1) if m else " ".join(c.split())[:60]
+
+
 ck("no prose label left on text_muted", len(prose_left) == 0,
-   [re.search(r'text="([^"]{0,40})', c).group(1) for c in prose_left[:3]] if prose_left else "")
-ck("widget captions were NOT swept up", len([c for c in muted if "wraplength" not in c]) == 93,
+   [_snippet(c) for c in prose_left[:3]] if prose_left else "")
+# Lower bound, not equality: the point is that the sweep did not drag captions onto the bright
+# tier, and new one-word captions get added over time. A DROP here means something was swept up.
+ck("widget captions were NOT swept up", len([c for c in muted if "wraplength" not in c]) >= 93,
    len([c for c in muted if "wraplength" not in c]))
 ck("explanatory labels moved across", len([c for c in calls if "text_explain" in c]) >= 34,
    len([c for c in calls if "text_explain" in c]))

@@ -653,7 +653,8 @@ BUILT_IN_PRESETS = {
 # those land in the per-architecture preset folder and appear alongside this one.
 KREA2_BUILT_IN_PRESETS = {
     "✨ Krea 2 Defaults (rank 32, full model)": {
-        "NETWORK_DIM": 32, "NETWORK_ALPHA": 32, "LEARNING_RATE": 1e-4,
+        "NETWORK_DIM": 32, "NETWORK_ALPHA": 32, "NETWORK_TYPE": "LoRA (standard)",
+        "LEARNING_RATE": 1e-4,
         "MAX_TRAIN_EPOCHS": 30, "SAVE_EVERY_N_EPOCHS": 1, "SEED": 42,
         "ADAPTIVE_LR": False, "ADAPTIVE_LR_MIN": "1e-4", "ADAPTIVE_LR_MAX": "4e-4",
         "TARGET_LAYERS": "Full Model", "MIN_TIMESTEP": "", "MAX_TIMESTEP": "",
@@ -674,7 +675,8 @@ KREA2_BUILT_IN_PRESETS = {
     # Rank 8 + Adaptive LR at an aggressive floor: fewer epochs to a usable LoRA. Everything
     # else identical to Krea 2 Defaults (which stays the preset applied on family switch).
     "✨ Krea 2 Ultra Fast (rank 8, adaptive LR)": {
-        "NETWORK_DIM": 8, "NETWORK_ALPHA": 8, "LEARNING_RATE": 1e-4,
+        "NETWORK_DIM": 8, "NETWORK_ALPHA": 8, "NETWORK_TYPE": "LoRA (standard)",
+        "LEARNING_RATE": 1e-4,
         "MAX_TRAIN_EPOCHS": 20, "SAVE_EVERY_N_EPOCHS": 1, "SEED": 42,
         "ADAPTIVE_LR": True, "ADAPTIVE_LR_MIN": "2e-4", "ADAPTIVE_LR_MAX": "4e-4",
         "TARGET_LAYERS": "Full Model", "MIN_TIMESTEP": "", "MAX_TIMESTEP": "",
@@ -704,7 +706,8 @@ KREA2_BUILT_IN_PRESETS = {
     # generations dragging toward the training set's COMPOSITIONS, not just its look —
     # so save every epoch and scrub for the sweet spot in LoRA Royale.
     "✨ Krea 2 Style (rank 16, gentle LR)": {
-        "NETWORK_DIM": 16, "NETWORK_ALPHA": 16, "LEARNING_RATE": 1e-4,
+        "NETWORK_DIM": 16, "NETWORK_ALPHA": 16, "NETWORK_TYPE": "LoRA (standard)",
+        "LEARNING_RATE": 1e-4,
         "MAX_TRAIN_EPOCHS": 15, "SAVE_EVERY_N_EPOCHS": 1, "SEED": 42,
         "ADAPTIVE_LR": True, "ADAPTIVE_LR_MIN": "5e-5", "ADAPTIVE_LR_MAX": "2e-4",
         "TARGET_LAYERS": "Full Model", "MIN_TIMESTEP": "", "MAX_TIMESTEP": "",
@@ -890,6 +893,18 @@ DEFAULT_PREFS = {
     # Absolute paths (may live anywhere); empty = no default (last folder).
     "input_lora_dir": "",
     "input_ref_dir": "",
+    # Where the Start tab's training-folder Browse opens. On a pod the entrypoint seeds this to
+    # /workspace/datasets so Browse lands where the uploads are, rather than at cwd.
+    "input_dataset_dir": "",
+    # Stop the RunPod pod when a training run finishes cleanly. Off by default: a rented GPU bills
+    # by the hour, so a run that ends at 4am otherwise bills until someone notices — but stopping
+    # a machine out from under someone has to be something they asked for.
+    "runpod_stop_when_done": "0",
+    # An account API key that can stop pods. Stored here rather than expected as a template env
+    # var because a PUBLIC template hands its variables to everyone who deploys it — one person's
+    # key would end up controlling their account from strangers' containers. Kept on the user's
+    # own volume, entered in the RunPod card, masked in the UI.
+    "runpod_api_key": "",
     # GPU selection for multi-GPU hosts. Stored as the picker's whole label; only the
     # leading integer is meaningful (see _parse_gpu_index) so the label can be re-derived
     # from whatever hardware is present at the next launch. "Auto (first GPU)" means
@@ -968,6 +983,50 @@ def _persist_disabled() -> bool:
     settings / Fizgig_train.toml (traced vars auto-save on write, so a test setting
     image_folder_var would otherwise clobber the remembered training folder)."""
     return bool(os.environ.get("FIZGIG_NO_PERSIST"))
+
+
+def _running_on_pod() -> bool:
+    """True when this is the Docker pod image (RunPod, or any rented box).
+
+    Keyed off OUR marker, set in docker/entrypoint.sh, rather than RunPod's RUNPOD_POD_ID: the
+    hosting provider's variable names are theirs to change, and another host would set different
+    ones entirely. The pod id below is read separately and only used for display and for targeting
+    a stop — everything degrades if it is absent."""
+    return os.environ.get("FIZGIG_POD", "0") not in ("0", "", None)
+
+
+def _pod_id() -> str:
+    """The provider's id for this pod, or "" if it doesn't advertise one."""
+    for key in ("RUNPOD_POD_ID", "HOSTNAME"):
+        v = (os.environ.get(key) or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _app_commit() -> str:
+    """Short git commit of the running checkout, or "".
+
+    On a pod this is the interesting half of the version: the IMAGE is pinned in the RunPod
+    template while the app pulls master at every boot, so the two are meant to differ and a bug
+    report needs both."""
+    try:
+        import subprocess as _sp
+        r = _sp.run(["git", "-C", FIZGIG_DIR, "rev-parse", "--short", "HEAD"],
+                    capture_output=True, text=True, timeout=8,
+                    creationflags=(0x08000000 if os.name == "nt" else 0))
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _pod_stop_key_env() -> str:
+    """A stop-capable key from the environment, or "".
+
+    NOT RunPod's injected RUNPOD_API_KEY — that one is pod-scoped and 403s on every pod-management
+    call (verified on a live pod, and a documented RunPod limitation). Stopping a pod needs an
+    account key, which is why this reads a separate variable rather than falling back."""
+    return (os.environ.get("RUNPOD_STOP_API_KEY") or "").strip()
 
 
 def save_prefs(prefs: dict) -> None:
@@ -1191,6 +1250,10 @@ class LoRATrainerGUI:
             "LORA_LR_RATIO": 1,
             "NETWORK_DIM": 4,
             "NETWORK_ALPHA": 4,
+            # Krea 2 only (Klein hides it and trains standard). LoRA default; LoKR is the
+            # quality pick (validated 31 Jul: highest likeness measured here, no skin sheen).
+            "NETWORK_TYPE": "LoRA (standard)",
+            "LOKR_FACTOR": 8,
             "MAX_TRAIN_EPOCHS": 12,
             "SAVE_EVERY_N_EPOCHS": 1,
             "SEED": 42,
@@ -1426,7 +1489,17 @@ class LoRATrainerGUI:
     # ── Global log + status indicator ───────────────────────────────────
 
     def _append_global_log(self, text):
-        """Append text to the global log buffer and push to popup if open."""
+        """Append text to the global log buffer and push to popup if open.
+
+        Thread-safe by marshalling: several workers (profiler, extract, engine loads) log
+        from their own threads, and writing the console popup's Text widget off the main
+        thread is a Tcl panic — a hard process crash no try/except can catch. That is how
+        clicking the IDLE/BUSY light during a model load killed the app: the click queued,
+        the popup opened as the load returned, and the next worker log write hit it."""
+        import threading
+        if threading.current_thread() is not threading.main_thread():
+            self.master.after(0, self._append_global_log, text)
+            return
         self._log_buffer.append(text)
         if len(self._log_buffer) > 50000:
             self._log_buffer = self._log_buffer[-40000:]
@@ -2403,10 +2476,14 @@ class LoRATrainerGUI:
         return banner
 
     def _add_youtube_help_button(self, parent, tab_key="start", prominent=False):
-        """Add a 'Get help on YouTube' button at the bottom of a tab's outer frame.
+        """Add a 'Tutorial' button at the bottom of a tab's outer frame.
+
+        Labelled just "Tutorial" rather than "Get help on YouTube": the play glyph and the red
+        already say where it goes, and "get help" reads as troubleshooting when these are walk-
+        throughs. Shorter also keeps the Start tab's button row on one line.
 
         `tab_key` selects the URL from help.json's `youtube_urls` dict.
-        `prominent=True` uses a larger button with a hint about per-tab help (for the Start tab).
+        `prominent=True` uses a larger button and the Start tab's extra buttons alongside.
         """
         # Used only when help.json is missing or unreadable — point it at the real guide
         # rather than the old joke URL, since that path fires on a genuine error.
@@ -2422,7 +2499,7 @@ class LoRATrainerGUI:
         row = tk.Frame(btn_frame, bg=COLORS["bg_deep"])
         row.pack(anchor=tk.W)
         btn = tk.Button(
-            row, text="\u25b6  Get help on YouTube",
+            row, text="\u25b6  Tutorial",
             font=(FONT_FAMILY, 12 if prominent else 10, "bold"),
             fg="#FFFFFF", bg="#CC0000", activeforeground="#FFFFFF", activebackground="#990000",
             relief="flat", bd=0, padx=20 if prominent else 16,
@@ -2440,6 +2517,17 @@ class LoRATrainerGUI:
                     "https://buymeacoffee.com/lorasandlenses"),
             )
             coffee.pack(side=tk.LEFT, padx=(12, 0))
+            # Shown on a pod too, deliberately: the Preferences card already tells a pod user they
+            # are on one, and a user who is happy renting is exactly who might send the link on.
+            # RunPod's own violet, so it reads as theirs rather than as another Fizgig action.
+            runpod = tk.Button(
+                row, text="⚡  Deploy on RunPod",
+                font=(FONT_FAMILY, 12, "bold"),
+                fg="#FFFFFF", bg="#7C3AED", activeforeground="#FFFFFF", activebackground="#6D28D9",
+                relief="flat", bd=0, padx=20, pady=6, cursor="hand2",
+                command=lambda: __import__("webbrowser").open(self._runpod_deploy_url()),
+            )
+            runpod.pack(side=tk.LEFT, padx=(12, 0))
             about = tk.Button(
                 row, text="About",
                 font=(FONT_FAMILY, 12, "bold"),
@@ -2841,8 +2929,14 @@ class LoRATrainerGUI:
         self._add_youtube_help_button(scrollable_frame, "start", prominent=True)
 
     def _browse_image_folder(self):
-        """Folder picker for the Start tab (unified image folder)."""
-        folder = filedialog.askdirectory(initialdir=self.image_folder_var.get() or os.getcwd())
+        """Folder picker for the Start tab (unified image folder).
+
+        Falls back through: the folder you last used, then the Preferences default (which the pod
+        image seeds to /workspace/datasets so Browse opens where uploads land), then cwd."""
+        folder = filedialog.askdirectory(
+            initialdir=(self.image_folder_var.get()
+                        or self._pref_initialdir("input_dataset_dir")
+                        or os.getcwd()))
         if folder:
             self.image_folder_var.set(folder)
 
@@ -3001,6 +3095,54 @@ class LoRATrainerGUI:
         self._add_field_to_section(training_content, "MAX_TRAIN_EPOCHS", "Max Epochs", "int", 7)
         self._add_field_to_section(training_content, "SAVE_EVERY_N_EPOCHS", "Save Every N Epochs", "int", 8)
         self._add_field_to_section(training_content, "SEED", "Seed", "int", 9)
+
+        # Network Type (Krea 2 only): standard LoRA or LoKR (Kronecker). Rows 18/19 sit between
+        # the Target Megapixels hint (17) and the Krea 2 loss-watch block (20). LoKR replaces
+        # rank/alpha with a single Factor dial, so the rows swap with the selection.
+        _nt_label = tk.Label(training_content, text="Network Type:", font=(FONT_FAMILY, 10),
+                             fg=COLORS["text_secondary"], bg=COLORS["bg_surface"])
+        _nt_label.grid(row=18, column=0, sticky=tk.W, padx=(12, 8), pady=4)
+        self.labels["NETWORK_TYPE"] = _nt_label
+        # Widget + hint share a row frame so the hint hugs the control instead of being
+        # pushed to the far column edge by the full-width rows above.
+        self._network_type_rowf = tk.Frame(training_content, bg=COLORS["bg_surface"])
+        self._network_type_rowf.grid(row=18, column=1, columnspan=2, sticky=tk.W, padx=5, pady=4)
+        self.entries["NETWORK_TYPE"] = ttk.Combobox(
+            self._network_type_rowf, values=["LoRA (standard)", "LoKR (Kronecker)"],
+            state="readonly", width=18)
+        self.entries["NETWORK_TYPE"].set(self.settings.get("NETWORK_TYPE", "LoRA (standard)"))
+        self.entries["NETWORK_TYPE"].pack(side=tk.LEFT)
+        self.entries["NETWORK_TYPE"].bind("<<ComboboxSelected>>",
+                                          lambda e: self._on_network_type_changed())
+        self._network_type_hint = tk.Label(
+            self._network_type_rowf,
+            text="LoKR: slightly higher quality · LoRA: slightly faster",
+            font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
+            justify=tk.LEFT)
+        self._network_type_hint.pack(side=tk.LEFT, padx=(10, 0))
+        # rows entry is the FRAME (the gridded thing show_row/hide_row must toggle).
+        self.rows["NETWORK_TYPE"] = {"row": 18, "label": _nt_label,
+                                     "entry": self._network_type_rowf,
+                                     "browse": None, "parent": training_content}
+
+        _lf_label = tk.Label(training_content, text="LoKR Factor:", font=(FONT_FAMILY, 10),
+                             fg=COLORS["text_secondary"], bg=COLORS["bg_surface"])
+        _lf_label.grid(row=19, column=0, sticky=tk.W, padx=(12, 8), pady=4)
+        self.labels["LOKR_FACTOR"] = _lf_label
+        self._lokr_factor_rowf = tk.Frame(training_content, bg=COLORS["bg_surface"])
+        self._lokr_factor_rowf.grid(row=19, column=1, columnspan=2, sticky=tk.W, padx=5, pady=4)
+        self.entries["LOKR_FACTOR"] = ttk.Entry(self._lokr_factor_rowf, width=8)
+        self.entries["LOKR_FACTOR"].insert(0, str(self.settings.get("LOKR_FACTOR", 8)))
+        self.entries["LOKR_FACTOR"].pack(side=tk.LEFT)
+        self._lokr_factor_hint = tk.Label(
+            self._lokr_factor_rowf,
+            text="8 is the sweet spot · lower = stronger & bigger files · higher = smaller",
+            font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
+            justify=tk.LEFT)
+        self._lokr_factor_hint.pack(side=tk.LEFT, padx=(10, 0))
+        self.rows["LOKR_FACTOR"] = {"row": 19, "label": _lf_label,
+                                    "entry": self._lokr_factor_rowf,
+                                    "browse": None, "parent": training_content}
 
         # Model Area to Train dropdown (blocks + timestep auto-fill)
         self._modelarea_label = ttk.Label(training_content, text="Model Area to Train:")
@@ -3796,7 +3938,8 @@ class LoRATrainerGUI:
     # current family doesn't offer (cross-family last-train leak, withdrawn LR floors,
     # removed optimizers) must NOT be .set() onto them — readonly Comboboxes accept any
     # value without complaint, and the bad name then dies (or misbehaves) at launch.
-    _STRICT_COMBO_KEYS = {"OPTIMIZER_TYPE", "ADAPTIVE_LR_MIN", "ADAPTIVE_LR_MAX", "LR_SCHEDULER"}
+    _STRICT_COMBO_KEYS = {"OPTIMIZER_TYPE", "ADAPTIVE_LR_MIN", "ADAPTIVE_LR_MAX", "LR_SCHEDULER",
+                          "NETWORK_TYPE"}
 
     def _apply_preset_values(self, preset):
         """Apply preset values to the UI (shared by load_default_preset and load_custom_preset)"""
@@ -4471,8 +4614,19 @@ class LoRATrainerGUI:
                   self._krea2_autorecap_cb, self._krea2_warmuplook_cb,
                   self._krea2_losswatch_hint,
                   # torch.compile is wired into krea2_train only.
-                  self._compile_blocks_label, self.compile_blocks_check, self._compile_blocks_hint):
+                  self._compile_blocks_label, self.compile_blocks_check, self._compile_blocks_hint,
+                  # Network Type (LoRA/LoKR) is a krea2_train flag; Klein trains standard only.
+                  # The row frame carries the combo + hint together.
+                  self.labels["NETWORK_TYPE"], self._network_type_rowf):
             self._set_widget_visible(w, is_krea2)
+        if is_krea2:
+            # Restore the rank/alpha <-> factor row swap for the current selection.
+            self._on_network_type_changed()
+        else:
+            # Klein always shows rank/alpha and never the factor, whatever the combo holds.
+            self.show_row("NETWORK_DIM")
+            self.show_row("NETWORK_ALPHA")
+            self.hide_row("LOKR_FACTOR")
 
         # Custom block picker: always hidden under Krea 2; under Klein, let the Model-Area
         # dropdown decide (only shown when the preset is "Custom").
@@ -5103,6 +5257,16 @@ class LoRATrainerGUI:
                 _rk = int(self.entries["NETWORK_DIM"].get().strip() or 32)
             except (ValueError, KeyError, AttributeError):
                 _rk = 32
+            # LoKR: the hidden rank box is meaningless (baseline it at 32) and the factor
+            # carries the real state cost — params scale 1/factor², so factor 4 is ~+4 GB
+            # the budget must know about on tight cards.
+            _ntype = "lokr" if self._network_type_is_lokr() else "lora"
+            if _ntype == "lokr":
+                _rk = 32
+            try:
+                _lf = int(self.entries["LOKR_FACTOR"].get().strip() or 8)
+            except (ValueError, KeyError, AttributeError):
+                _lf = 8
             # If the user pinned the 4-bit control, the plan must be built AROUND that choice —
             # otherwise the swap count is sized for a quantisation that will not run. That
             # exact mismatch (fp8 given NF4's swap-0 plan) OOM'd 16 GB cards; reproduced and
@@ -5114,7 +5278,8 @@ class LoRATrainerGUI:
             # briefly making Off mean plain fp8 cost 20 GB+ cards the fastest path for nothing.
             _force = self._krea2_force_quant() if hasattr(self, "quant_4bit_mode_var") else None
             plan = recommend_krea2_strategy(caps=caps, mp=_mp, batch=_bs, rank=_rk,
-                                            force_quant=_force)
+                                            force_quant=_force,
+                                            network_type=_ntype, lokr_factor=_lf)
         except Exception:
             self._auto_quant_int8 = ""   # no strategy ran — a stale INT8 pick must not leak
             return self._auto_krea2_blocks_swap()
@@ -5398,6 +5563,25 @@ class LoRATrainerGUI:
             row_info["entry"].grid_remove()
             if row_info["browse"]:
                 row_info["browse"].grid_remove()
+
+    def _network_type_is_lokr(self) -> bool:
+        try:
+            return str(self.entries["NETWORK_TYPE"].get()).startswith("LoKR")
+        except (KeyError, tk.TclError):
+            return False
+
+    def _on_network_type_changed(self):
+        """LoKR has no rank/alpha — a single Factor dial replaces them, so the rows swap.
+        Only meaningful under Krea 2; the arch-visibility pass calls this on family switch."""
+        if self._network_type_is_lokr():
+            self.hide_row("NETWORK_DIM")
+            self.hide_row("NETWORK_ALPHA")
+            self.show_row("LOKR_FACTOR")   # hint lives inside the row frame, rides along
+        else:
+            self.show_row("NETWORK_DIM")
+            self.show_row("NETWORK_ALPHA")
+            self.hide_row("LOKR_FACTOR")
+        self._save_last_used_paths()
 
     def toggle_scaled(self):
         """Enable or disable the Scaled checkbox based on FP8 checkbox state"""
@@ -6338,7 +6522,9 @@ class LoRATrainerGUI:
             self.update_caption_log("Loading processor...\n")
             self.master.update_idletasks()
 
-            self.florence_processor = AutoProcessor.from_pretrained(
+            from fizgig.utils.hf_cache import from_pretrained_cache_first
+            self.florence_processor = from_pretrained_cache_first(
+                AutoProcessor,
                 model_name,
                 trust_remote_code=True
             )
@@ -6350,7 +6536,8 @@ class LoRATrainerGUI:
             # accesses self.language_model — but transformers 4.50+ reads it during
             # __init__ before language_model exists, causing AttributeError.
             # attn_implementation="eager" bypasses the SDPA check entirely.
-            self.florence_model = AutoModelForCausalLM.from_pretrained(
+            self.florence_model = from_pretrained_cache_first(
+                AutoModelForCausalLM,
                 model_name,
                 torch_dtype=torch.float16 if device == "cuda" else torch.float32,
                 trust_remote_code=True,
@@ -6440,9 +6627,11 @@ class LoRATrainerGUI:
             import torch as _torch
             from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
             device = "cuda" if _torch.cuda.is_available() else "cpu"
+            from fizgig.utils.hf_cache import from_pretrained_cache_first
             model_id = "Helsinki-NLP/opus-mt-en-zh"
-            self._translator_tokenizer = AutoTokenizer.from_pretrained(model_id)
-            self._translator_model = AutoModelForSeq2SeqLM.from_pretrained(
+            self._translator_tokenizer = from_pretrained_cache_first(AutoTokenizer, model_id)
+            self._translator_model = from_pretrained_cache_first(
+                AutoModelForSeq2SeqLM,
                 model_id,
                 torch_dtype=_torch.float16 if device == "cuda" else _torch.float32,
             ).to(device)
@@ -10145,7 +10334,12 @@ class LoRATrainerGUI:
         return max_idx + 1
 
     def _log(self, text):
-        """Append text to the convert log (preserves user scroll position)."""
+        """Append text to the convert log (preserves user scroll position). Marshals to the
+        main thread — Tk widget writes from a worker are a hard crash, not an exception."""
+        import threading
+        if threading.current_thread() is not threading.main_thread():
+            self.master.after(0, self._log, text)
+            return
         self._append_global_log(text)
         try:
             at_bottom = self.convert_log.yview()[1] >= 0.999
@@ -10976,17 +11170,8 @@ class LoRATrainerGUI:
                     return
             self._explorer_engine.load_primary(path)
             n_active = len(self._explorer_engine.primary_block_ids)
-            # Detect format for user info
-            from safetensors.torch import load_file as _lf
-            from fizgig.networks.lora import ensure_kohya_lora_state_dict as _ek, detect_lora_format as _df
-            _fmt = _df(_ek(_lf(path)))
-            if _fmt in ("lokr", "loha"):
-                messagebox.showinfo("LyCORIS LoRA loaded",
-                    f"This is a {_fmt.upper()} LoRA (LyCORIS format). "
-                    f"Preview and profiling work normally.\n\n"
-                    f"If you save, each block will be converted to standard LoRA via SVD. "
-                    f"This may take a minute or two for large LoRAs (GPU-accelerated when available). "
-                    f"The result is a slight approximation of the original.")
+            # LyCORIS loads and saves natively — nothing to announce on open; the save
+            # dialog states the format.
             self.explorer_status_var.set(
                 f"Loaded: {os.path.basename(path)} ({n_active}/32 blocks). Click Re-roll to start exploring.")
             # Initialize baseline state with user-specified LoRA strength
@@ -11103,10 +11288,18 @@ class LoRATrainerGUI:
             # Generate baseline (full forward, populates activation cache)
             engine._changed_blocks = set(baseline_state.blocks.keys())
             baseline_img = engine.generate_preview(baseline_state)
+            # Show the baseline the moment it exists — the image the user actually loaded
+            # must not wait behind four variant renders. Picking stays disabled until
+            # _explorer_on_results flips _explorer_generating, so early display is safe.
+            self.master.after(0, lambda: (
+                self._explorer_show_baseline(baseline_img),
+                self._explorer_update_state_text(baseline_state),
+                self._explorer_progress_var.set("Baseline ready — generating variant 1/4...")))
 
             # Generate 4 variants — each runs a full forward (invalidate activation
             # cache between variants so they don't contaminate each other).
             # The prompt cache is still shared, saving ~300-500ms per variant.
+            # Each variant appears in the gallery as soon as it renders.
             variant_images = []
             for i, vs in enumerate(variant_states):
                 self.master.after(0, lambda i=i: self._explorer_progress_var.set(
@@ -11115,6 +11308,7 @@ class LoRATrainerGUI:
                 engine._changed_blocks = set(vs.blocks.keys())
                 img = engine.generate_preview(vs)
                 variant_images.append(img)
+                self.master.after(0, lambda i=i, im=img: self._explorer_show_variant(i, im))
 
             self.master.after(0, lambda: self._explorer_on_results(
                 baseline_state, baseline_img, variant_states, variant_images))
@@ -11582,22 +11776,7 @@ class LoRATrainerGUI:
         if not lora_path:
             return
 
-        # Warn if LyCORIS — saving will require SVD materialization
-        try:
-            from safetensors.torch import load_file as _lf
-            from fizgig.networks.lora import ensure_kohya_lora_state_dict as _ek, detect_lora_format as _df
-            _fmt = _df(_ek(_lf(lora_path)))
-            if _fmt in ("lokr", "loha"):
-                proceed = messagebox.askyesno(
-                    "LyCORIS LoRA",
-                    f"This is a {_fmt.upper()} LoRA. Preview and editing work normally, "
-                    f"but saving will require SVD conversion (may take a minute).\n\n"
-                    f"Consider using the Extract tab to convert to standard LoRA first "
-                    f"for faster saves.\n\nContinue anyway?")
-                if not proceed:
-                    return
-        except Exception:
-            pass
+        # LyCORIS files now save natively (lossless) — the old SVD-warning gate is gone.
 
         baseline = self._explorer_baseline_state
 
@@ -11678,8 +11857,11 @@ class LoRATrainerGUI:
         from fizgig.networks.lora import UnsupportedLoRAFormat
         try:
             summary = save_repaired_lora(primary_path, self._explorer_baseline_state, out)
+            _fmt_note = ("\n\nSaved natively in LyCORIS format — lossless, no conversion."
+                         if summary.get('format_out') == 'lycoris' else "")
             messagebox.showinfo("Explored LoRA saved",
-                                f"Saved: {out}\n\nKeys: {summary['keys_in']} -> {summary['keys_out']}")
+                                f"Saved: {out}\n\nKeys: {summary['keys_in']} -> {summary['keys_out']}"
+                                + _fmt_note)
         except UnsupportedLoRAFormat as ex:
             messagebox.showerror("Unsupported LoRA format", str(ex))
         except Exception:
@@ -12127,7 +12309,12 @@ class LoRATrainerGUI:
             self._update_extract_output_name()
 
     def _extract_log(self, text):
-        """Append to extract log (preserves user scroll position)."""
+        """Append to extract log (preserves user scroll position). Marshals to the main
+        thread — the extract worker calls this from its own thread."""
+        import threading
+        if threading.current_thread() is not threading.main_thread():
+            self.master.after(0, self._extract_log, text)
+            return
         self._append_global_log(text)
         self._smart_text_insert(self.extract_log, text)
 
@@ -12625,11 +12812,10 @@ class LoRATrainerGUI:
         )
         self._add_fetch_models_row(
             krea_card, kr + 1, "krea2",
-            "Fetches everything above except the Turbo DiT (~32 GB) and fills in these paths for "
-            "you, plus the small helper models (Florence-2 captioner, face model for the Look "
-            "Filter and likeness scoring, EN→ZH translator — ~1.6 GB) so nothing stalls to "
-            "download later. No HuggingFace account needed — none of these are gated. Tick Turbo "
-            "DiT to add it (+13 GB); it's only used by the workbench tools and classic previews.")
+            "Fetches every file above (~45 GB) and fills in these paths for you, plus the small "
+            "helper models (Florence-2 captioner, face model for the Look Filter and likeness "
+            "scoring, EN→ZH translator — ~1.6 GB) so nothing stalls to download later. No "
+            "HuggingFace account needed — none of these are gated.")
 
         # Card 1c: GPU selection — only interesting on multi-GPU hosts, but harmless
         # (and informative) on single-GPU ones.
@@ -12765,6 +12951,10 @@ class LoRATrainerGUI:
                                     "Default folder for loading LoRAs — Repair Studio, LoRA the Explorer, and the Context LoRA picker", is_dir=True)
         in_row = self._add_pref_row(in_card, in_row, "Reference images:", "input_ref_dir",
                                     "Default folder for reference images — Repair Studio and LoRA the Explorer", is_dir=True)
+        in_row = self._add_pref_row(in_card, in_row, "Training images:", "input_dataset_dir",
+                                    "Default folder the Start tab's Browse opens in", is_dir=True)
+
+        self._add_runpod_card(outer)
 
         # Card 4: Actions
         actions_card = self._start_section_card(outer, "Actions", None)
@@ -12774,6 +12964,242 @@ class LoRATrainerGUI:
         ttk.Button(action_row, text="Open prefs.json", command=self._open_prefs_file).pack(side=tk.LEFT)
 
         self._add_youtube_help_button(outer, "preferences")
+
+    # Flip to True only when the RunPod template is public AND the URL below is the real one.
+    # Until then the desktop card says "coming soon" instead of offering a button that goes
+    # nowhere — so this can ship long before the template does. test_runpod_card.py refuses to
+    # let LIVE be True while the URL is still the placeholder.
+    RUNPOD_TEMPLATE_LIVE = True
+    RUNPOD_GUIDE_URL = ("https://github.com/shootthesound/Fizgig/blob/master/docker/README.md")
+    # Pre-selects an RTX 5090: it is the cheapest card that clears Fizgig's 32 GB
+    # no-block-swap threshold for Krea 2, so the default lands people on the fastest
+    # sensible option rather than the biggest or the cheapest.
+    RUNPOD_DEPLOY_URL = ("https://console.runpod.io/deploy"
+                         "?type=GPU&gpu=RTX+5090&count=1&template=faoq8ed6um")
+    RUNPOD_REFERRAL = "vkb387ep"
+
+    def _runpod_deploy_url(self) -> str:
+        u = self.RUNPOD_DEPLOY_URL
+        return f"{u}&ref={self.RUNPOD_REFERRAL}" if self.RUNPOD_REFERRAL else u
+
+    def _add_runpod_card(self, outer):
+        """One card, two audiences.
+
+        On a pod it is the control panel for things only a rented machine has — an hourly bill, a
+        volume that fills up, and a browser tab people assume is holding the run up. On the desktop
+        it is how someone finds out Fizgig runs on rented hardware at all."""
+        if _running_on_pod():
+            self._build_pod_controls(outer)
+        else:
+            self._build_pod_advert(outer)
+
+    def _build_pod_controls(self, outer):
+        card = self._start_section_card(
+            outer, "RunPod",
+            "Fizgig is running on a rented GPU. These settings only appear here.")
+        self._runpod_card = card
+
+        # The money one. A finished run on an idle rented GPU bills until someone notices.
+        ttk.Checkbutton(
+            card,
+            text="Stop this pod when a training run finishes",
+            variable=self.prefs_vars["runpod_stop_when_done"], onvalue="1", offvalue="0",
+            style="Surface.TCheckbutton").pack(anchor=tk.W)
+        tk.Label(card,
+                 text="Only after a run completes on its own — never after a Pause, a Stop, or a "
+                      "failure, since those are exactly the times you want the machine alive. You "
+                      "get a two-minute countdown you can cancel. This stops the pod, it never "
+                      "terminates it, so your files are still here when you start it again.",
+                 font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"],
+                 bg=COLORS["bg_surface"], wraplength=760,
+                 justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 2))
+        # The key field. Better here than as a template variable: a public template hands its
+        # variables to everyone who deploys it, so nobody can safely ship a key in one.
+        key_row = tk.Frame(card, bg=COLORS["bg_surface"])
+        key_row.pack(anchor=tk.W, fill=tk.X, pady=(2, 0))
+        tk.Label(key_row, text="RunPod API key:", font=(FONT_FAMILY, 10),
+                 fg=COLORS["text_secondary"], bg=COLORS["bg_surface"]).pack(side=tk.LEFT,
+                                                                            padx=(0, 8))
+        self._pod_key_entry = ttk.Entry(key_row, textvariable=self.prefs_vars["runpod_api_key"],
+                                        width=44, show="•")
+        self._pod_key_entry.pack(side=tk.LEFT)
+        ttk.Button(key_row, text="Clear", width=7,
+                   command=lambda: self.prefs_vars["runpod_api_key"].set("")).pack(side=tk.LEFT,
+                                                                                    padx=(6, 0))
+        self._pod_key_status = tk.Label(key_row, text="", font=(FONT_FAMILY, 9),
+                                        bg=COLORS["bg_surface"])
+        self._pod_key_status.pack(side=tk.LEFT, padx=(10, 0))
+
+        tk.Label(card,
+                 text="Make one at RunPod → Settings → API Keys. The key RunPod gives a pod "
+                      "automatically is pod-scoped and cannot stop pods, which is a RunPod "
+                      "limitation rather than a Fizgig one. Saved to prefs.json on your volume, so "
+                      "it persists across pods — and stays out of any shared template.",
+                 font=(FONT_FAMILY, 9), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
+                 wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, pady=(4, 12))
+
+        self.prefs_vars["runpod_api_key"].trace_add(
+            "write", lambda *a: self._refresh_pod_key_status())
+        self._refresh_pod_key_status()
+
+        # Storage — the thing that silently ends a run at 3am.
+        self._pod_storage_lbl = tk.Label(card, text="", font=(FONT_FAMILY, 10),
+                                         fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
+                                         justify=tk.LEFT, anchor="w")
+        self._pod_storage_lbl.pack(anchor=tk.W, fill=tk.X)
+        self._refresh_pod_storage()
+
+        tk.Label(card,
+                 text="Your files: datasets in /workspace/datasets, models in /workspace/models, "
+                      "finished LoRAs in /workspace/output_loras. Everything under /workspace "
+                      "survives stopping and restarting the pod — anything outside it does not. "
+                      "On the default Volume Disk it goes when you TERMINATE the pod, so stop "
+                      "rather than terminate between sessions; a Network Volume survives that too. "
+                      "Drag files in and out with the file manager on port 8080.",
+                 font=(FONT_FAMILY, 9), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
+                 wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, pady=(10, 0))
+
+        # Asked constantly by anyone new to a remote desktop, and the answer is reassuring.
+        tk.Label(card,
+                 text="Closing this browser tab does not stop training. Fizgig runs on the pod, "
+                      "not in your browser — shut the tab, come back later, and the run is still "
+                      "going.",
+                 font=(FONT_FAMILY, 10, "bold"), fg=COLORS["success"], bg=COLORS["bg_surface"],
+                 wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, pady=(10, 0))
+
+        # Image version AND app commit: the template pins the image while the app updates itself
+        # from git at every boot, so they diverge by design and "what are you running?" needs both.
+        bits = []
+        _img = (os.environ.get("FIZGIG_IMAGE_VERSION") or "").strip()
+        if _img:
+            bits.append(f"image {_img}")
+        _sha = _app_commit()
+        if _sha:
+            bits.append(f"app {_sha}")
+        _pid = _pod_id()
+        if _pid:
+            bits.append(f"pod {_pid}")
+        if bits:
+            _gpu = (os.environ.get("RUNPOD_GPU_NAME") or "").replace("+", " ").strip()
+            line = "  ·  ".join(bits) + (f"  ·  {_gpu}" if _gpu else "")
+            # Readable tier despite being a footer: this is the one line a user is asked to
+            # transcribe into a bug report, so 8pt at 2.54:1 was exactly backwards.
+            tk.Label(card, text=line, font=(FONT_FAMILY, 9), fg=COLORS["text_explain"],
+                     bg=COLORS["bg_surface"], wraplength=760,
+                     justify=tk.LEFT).pack(anchor=tk.W, pady=(10, 0))
+
+    def _build_pod_advert(self, outer):
+        card = self._start_section_card(
+            outer, "Run Fizgig on a rented GPU",
+            "Train on whatever card you like, with as much VRAM as you want, billed by the hour. "
+            "Nothing to install, and your own machine stays free while it trains.")
+        self._runpod_card = card
+        tk.Label(card,
+                 text="Fizgig ships as a ready-made image: the full app in your browser, your "
+                      "models and datasets on persistent storage, and drag-and-drop file transfer. "
+                      "Rent a big card for an afternoon instead of buying one.",
+                 font=(FONT_FAMILY, 10), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
+                 wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 10))
+
+        if self.RUNPOD_TEMPLATE_LIVE:
+            row = tk.Frame(card, bg=COLORS["bg_surface"])
+            row.pack(anchor=tk.W)
+            _btn = tk.Button(row, text="  Deploy on RunPod  ",
+                             font=(FONT_FAMILY, 10, "bold"), fg="#FFFFFF", bg="#673AB7",
+                             activebackground="#5E35B1", activeforeground="#FFFFFF",
+                             relief="flat", bd=0, cursor="hand2", padx=16, pady=6,
+                             command=lambda: self._open_url(self._runpod_deploy_url()))
+            _btn.pack(side=tk.LEFT)
+
+            tk.Label(card,
+                     text="Deploying through this link supports Fizgig's development, at no extra "
+                          "cost to you.",
+                     font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"],
+                     bg=COLORS["bg_surface"]).pack(anchor=tk.W, pady=(6, 0))
+        else:
+            # Shipped before the template is public. A button that goes nowhere is worse than no
+            # button, and saying so plainly is better than hiding the section and surprising
+            # people with it later.
+            tk.Label(card, text="Coming soon",
+                     font=(FONT_FAMILY, 11, "bold"), fg=COLORS["warning"],
+                     bg=COLORS["bg_surface"]).pack(anchor=tk.W)
+            tk.Label(card,
+                     text="The one-click image is built and being tested. This section will get a "
+                          "Deploy button once it is published — nothing to do in the meantime.",
+                     font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"],
+                     bg=COLORS["bg_surface"], wraplength=760,
+                     justify=tk.LEFT).pack(anchor=tk.W, pady=(2, 6))
+
+        # The guide, in both states: while it says Coming soon this is the only way to read about
+        # it, and once it is live it is where the storage and cost decisions are explained.
+        _guide = tk.Label(card, text="Read the guide: running Fizgig on a rented GPU",
+                          font=(FONT_FAMILY, 10, "underline"), fg=COLORS["accent_hover"],
+                          bg=COLORS["bg_surface"], cursor="hand2")
+        _guide.pack(anchor=tk.W, pady=(4, 0))
+        _guide.bind("<Button-1>", lambda e: self._open_url(self.RUNPOD_GUIDE_URL))
+        tk.Label(card,
+                 text="When Fizgig is running on a pod, this section turns into its controls — "
+                      "stop the pod automatically when training finishes, check storage, and see "
+                      "where your files live.",
+                 font=(FONT_FAMILY, 9), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
+                 wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, pady=(10, 0))
+
+    def _pod_stop_key(self) -> str:
+        """The key to stop this pod with: the one saved in Preferences, else a template env var.
+
+        Prefs first because that is the route that scales — a public template cannot carry anyone's
+        key, since template variables are handed to every container deployed from it."""
+        try:
+            k = self.prefs_vars["runpod_api_key"].get().strip()
+        except Exception:
+            k = ""
+        return k or _pod_stop_key_env()
+
+    def _refresh_pod_key_status(self):
+        lbl = getattr(self, "_pod_key_status", None)
+        if lbl is None or not lbl.winfo_exists():
+            return
+        if self._pod_stop_key():
+            lbl.config(text="auto-stop ready", fg=COLORS["success"])
+        else:
+            lbl.config(text="needed for auto-stop", fg=COLORS["warning"])
+
+    def _refresh_pod_storage(self):
+        """Free space on the volume, refreshed while the tab is open."""
+        lbl = getattr(self, "_pod_storage_lbl", None)
+        if lbl is None or not lbl.winfo_exists():
+            return
+        try:
+            import shutil as _sh
+            usage = _sh.disk_usage("/workspace")
+            free_gb, total_gb = usage.free / 1024 ** 3, usage.total / 1024 ** 3
+            colour = COLORS["text_explain"]
+            if total_gb > 10000:
+                # A network volume does not expose its quota to the container — the kernel reports
+                # the host's whole backing pool, so this read said "431035 GB free of 1430281 GB"
+                # for a 100 GB volume. Printing that verbatim looks broken and, worse, implies
+                # there is room when your quota might be nearly full. Say what we actually know.
+                txt = ("Storage: /workspace is a network volume. Its size is set in RunPod and "
+                       "isn't visible from in here — check usage in the RunPod dashboard.")
+            elif total_gb < 60:
+                # This small means the volume never mounted and /workspace is container disk,
+                # which RunPod wipes when the pod stops — a 32 GB model download would evaporate.
+                txt = (f"Storage: only {free_gb:.0f} GB free of {total_gb:.0f} GB — that looks like "
+                       f"container disk, not your volume. Check the template's volume mount path "
+                       f"is /workspace, or your files will vanish when the pod stops.")
+                colour = COLORS["warning"]
+            else:
+                txt = f"Storage: {free_gb:.0f} GB free of {total_gb:.0f} GB on /workspace"
+                if free_gb < 40:
+                    colour = COLORS["warning"]
+            lbl.config(text=txt, fg=colour)
+        except Exception:
+            lbl.config(text="Storage: unavailable")
+        lbl.after(30000, self._refresh_pod_storage)
+
+    def _open_url(self, url):
+        """Open a link. Central so the pod image's browser handling stays in one place."""
+        webbrowser.open(url)
 
     def _add_fetch_models_row(self, frame, row, family, blurb):
         """'Download them all for me' row at the foot of a model-paths card.
@@ -12787,11 +13213,6 @@ class LoRATrainerGUI:
                          command=lambda f=family: self._start_fetch_models(f))
         btn.pack(side=tk.LEFT)
         setattr(self, f"_fetch_btn_{family}", btn)
-        if family == "krea2":
-            self._fetch_krea2_turbo_var = tk.BooleanVar(value=False)
-            ttk.Checkbutton(bar, text="also the Turbo DiT (+13 GB)",
-                            variable=self._fetch_krea2_turbo_var,
-                            style="Surface.TCheckbutton").pack(side=tk.LEFT, padx=(12, 0))
         status = tk.Label(bar, text="", font=(FONT_FAMILY, 9),
                           fg=COLORS["text_secondary"], bg=COLORS["bg_surface"])
         status.pack(side=tk.LEFT, padx=(12, 0))
@@ -12906,9 +13327,6 @@ class LoRATrainerGUI:
             if not token:
                 return
 
-        include_optional = (family == "krea2"
-                            and getattr(self, "_fetch_krea2_turbo_var", None) is not None
-                            and self._fetch_krea2_turbo_var.get())
         btn = getattr(self, f"_fetch_btn_{family}", None)
         status = getattr(self, f"_fetch_status_{family}", None)
         if btn:
@@ -12924,8 +13342,6 @@ class LoRATrainerGUI:
             # Re-running is cheap — everything here is a no-op once present.
             cmd = [sys.executable, "-m", "fizgig.scripts.fetch_models", "--progress",
                    "--family", "tools", "--family", family]
-            if include_optional:
-                cmd.append("--include-optional")
             env = dict(os.environ)
             env["PYTHONPATH"] = os.path.join(FIZGIG_DIR, "src")
             env["PYTHONUNBUFFERED"] = "1"
@@ -13336,7 +13752,12 @@ class LoRATrainerGUI:
             webbrowser.open(self._profiler_report_path)
 
     def _profiler_log(self, text):
-        """Append to profiler log (preserves user scroll position)."""
+        """Append to profiler log (preserves user scroll position). Marshals to the main
+        thread — the profiler worker calls this from its own thread."""
+        import threading
+        if threading.current_thread() is not threading.main_thread():
+            self.master.after(0, self._profiler_log, text)
+            return
         self._append_global_log(text)
         self._smart_text_insert(self.profiler_results, text)
 
@@ -17293,18 +17714,11 @@ class LoRATrainerGUI:
         try:
             self.repair_status_var.set("Loading primary LoRA…")
             self.master.update_idletasks()
-            # Detect format for user info
-            from safetensors.torch import load_file as _lf
-            from fizgig.networks.lora import ensure_kohya_lora_state_dict as _ek, detect_lora_format as _df
-            _fmt = _df(_ek(_lf(path)))
             self.repair_engine.load_primary(path)
             self._refresh_block_slider_activity()
             n_active = len(self.repair_engine.primary_block_ids)
-            if _fmt in ("lokr", "loha"):
-                messagebox.showinfo("LyCORIS LoRA loaded",
-                    f"This is a {_fmt.upper()} LoRA. Live preview works normally.\n\n"
-                    f"If you save, blocks will be converted to standard LoRA via SVD "
-                    f"(slight approximation).")
+            # LyCORIS loads and saves natively — no popup on open; the save dialog
+            # states the format (and the donor-blend SVD case warns at donor load).
             # Look up a matching Profiler sidecar by content hash and render
             # the inline info panel if one exists.
             self._find_repair_profile_match()
@@ -17332,17 +17746,9 @@ class LoRATrainerGUI:
         try:
             self.repair_status_var.set("Loading donor LoRA…")
             self.master.update_idletasks()
-            from safetensors.torch import load_file as _lf
-            from fizgig.networks.lora import ensure_kohya_lora_state_dict as _ek, detect_lora_format as _df
-            _fmt_d = _df(_ek(_lf(path)))
             self.repair_engine.load_donor(path)
-            if _fmt_d in ("lokr", "loha"):
-                messagebox.showinfo("LyCORIS donor loaded",
-                    f"This donor is a {_fmt_d.upper()} LoRA (LyCORIS format). "
-                    f"Live preview works normally.\n\n"
-                    f"If you save with blended blocks, they will be converted to standard "
-                    f"LoRA via SVD. This may take a minute or two for large LoRAs "
-                    f"(GPU-accelerated when available).")
+            # No popup on open (LyCORIS donors save natively; only blended blocks SVD, and
+            # the save dialog reports exactly how many were).
             self._repair_donor_loaded = True
             # Show donor sub-rows + master section toggles + enable the "Donor" master target radio
             for vars_ in self.repair_block_vars.values():
@@ -17756,6 +18162,11 @@ class LoRATrainerGUI:
             )
             if summary['blended_blocks']:
                 msg += "\n\nNote: blended blocks have rank = rank_primary + rank_donor. File size grows proportionally."
+            if summary.get('format_out') == 'lycoris':
+                msg += "\n\nSaved natively in LyCORIS format (LoKR/LoHa) — lossless, no conversion."
+            elif summary.get('lycoris_converted'):
+                msg += (f"\n\n{summary['lycoris_converted']} blended LyCORIS module(s) were "
+                        f"converted to standard LoRA via SVD; everything else stayed native.")
             messagebox.showinfo("Repaired LoRA saved", msg)
         except UnsupportedLoRAFormat as ex:
             messagebox.showerror("Bake not supported for this LoRA format", str(ex))
@@ -17825,15 +18236,7 @@ class LoRATrainerGUI:
             from safetensors.torch import load_file as _lf
             from fizgig.networks.lora import ensure_kohya_lora_state_dict as _ek, detect_lora_format as _df
             _fmt = _df(_ek(_lf(lora_path)))
-            if _fmt in ("lokr", "loha"):
-                proceed = messagebox.askyesno(
-                    "LyCORIS LoRA",
-                    f"This is a {_fmt.upper()} LoRA. Explorer preview works normally, "
-                    f"but saving will require SVD conversion (may take a minute).\n\n"
-                    f"Consider using the Extract tab to convert to standard LoRA first "
-                    f"for faster saves.\n\nContinue anyway?")
-                if not proceed:
-                    return
+            # LyCORIS saves natively now (lossless) — no SVD gate needed on the handoff.
         except Exception:
             pass
 
@@ -18531,6 +18934,8 @@ class LoRATrainerGUI:
             _check_num("Learning Rate", self.entries["LEARNING_RATE"].get(), float, 0)
         _check_num("Network Dim (Rank)", self.entries["NETWORK_DIM"].get(), int, 1)
         _check_num("Network Alpha", self.entries["NETWORK_ALPHA"].get(), float, 0)
+        if self._network_type_is_lokr():
+            _check_num("LoKR Factor", self.entries["LOKR_FACTOR"].get(), int, 2)
         _check_num("Max Train Epochs", self.entries["MAX_TRAIN_EPOCHS"].get(), int, 1)
         _check_num("Save Every N Epochs", self.entries["SAVE_EVERY_N_EPOCHS"].get(), int, 1)
         _check_num("Seed", self.entries["SEED"].get(), int)
@@ -18720,7 +19125,12 @@ class LoRATrainerGUI:
         env["PYTHONUNBUFFERED"] = "1"  # flush stdout/stderr line-by-line so log output streams live
 
         if os.name == 'nt':
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+            # BELOW_NORMAL: Windows weights GPU scheduling by process priority class, and the
+            # desktop compositor renders on the same card that training saturates. Below-normal
+            # gives DWM the preemption slices it needs (fixes juddery mouse/desktop during a run)
+            # and costs training ~1% — it only yields when something else actually wants time.
+            creationflags = (subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+                             | subprocess.BELOW_NORMAL_PRIORITY_CLASS)
             preexec_fn = None
         else:
             creationflags = 0
@@ -18800,6 +19210,9 @@ class LoRATrainerGUI:
         # loop is empty and it just rewrites the final LoRA. A warning rather than a block,
         # because that fall-through is exactly how a run paused ON its last epoch gets completed.
         if not self._confirm_resume_has_epochs_left():
+            return
+
+        if not self._confirm_disk_headroom():
             return
 
         # Clear a stale pause sentinel from a previous session (window close / crash after
@@ -18906,6 +19319,8 @@ class LoRATrainerGUI:
             "LORA_LR_RATIO": int(self.entries["LORA_LR_RATIO"].get()),
             "NETWORK_DIM": int(self.entries["NETWORK_DIM"].get()),
             "NETWORK_ALPHA": float(self.entries["NETWORK_ALPHA"].get()),
+            "NETWORK_TYPE": self.entries["NETWORK_TYPE"].get(),
+            "LOKR_FACTOR": int(self.entries["LOKR_FACTOR"].get() or 8),
             "MAX_TRAIN_EPOCHS": int(self.entries["MAX_TRAIN_EPOCHS"].get()),
             "SAVE_EVERY_N_EPOCHS": int(self.entries["SAVE_EVERY_N_EPOCHS"].get()),
             "SEED": int(self.entries["SEED"].get()),
@@ -19001,6 +19416,39 @@ class LoRATrainerGUI:
         # Mark as running for the pause/resume state machine
         self.training_state = "running"
         self._refresh_training_buttons()
+
+    DISK_WARN_GB = 15
+
+    def _confirm_disk_headroom(self):
+        """True to proceed. Warns when the output drive is nearly full.
+
+        A threshold plus the REAL figure rather than a predicted requirement: what a run actually
+        writes depends on rank, epochs, save cadence and keep-N, and a confidently wrong estimate
+        is worse than showing someone the number and letting them judge. Running out of disk four
+        hours into a run costs the whole run."""
+        out_dir = (self.settings.get("LORA_OUTPUT_DIR") or "").strip()
+        if not out_dir:
+            return True
+        probe = out_dir
+        while probe and not os.path.isdir(probe):
+            parent = os.path.dirname(probe)
+            if parent == probe:
+                return True
+            probe = parent
+        try:
+            import shutil as _sh
+            free_gb = _sh.disk_usage(probe).free / 1024 ** 3
+        except Exception:
+            return True                      # never block a run over a failed disk probe
+        if free_gb >= self.DISK_WARN_GB:
+            return True
+        return messagebox.askyesno(
+            "Low disk space",
+            f"Only {free_gb:.1f} GB free where your LoRAs are saved:\n{probe}\n\n"
+            f"A run writes a checkpoint every few epochs, plus resumable state dirs (a few hundred "
+            f"MB each) and sample images. Running out part-way through loses the run.\n\n"
+            f"Free some space, or lower Save Every N Epochs and Keep Last.\n\n"
+            f"Start training anyway?")
 
     def _confirm_resume_has_epochs_left(self):
         """True to proceed. Warns when the resume state is already at/past Max Train Epochs.
@@ -19518,6 +19966,11 @@ class LoRATrainerGUI:
             "--seed", str(self.settings["SEED"]),
             "--discrete_flow_shift", "2.5",
         ]
+        # LoKR (Kronecker) — dim/alpha still ride along above but the trainer ignores them;
+        # the factor is the dial. Klein's builder never reads NETWORK_TYPE (standard only).
+        if str(self.settings.get("NETWORK_TYPE", "")).startswith("LoKR"):
+            cmd += ["--network_type", "lokr",
+                    "--lokr_factor", str(self.settings.get("LOKR_FACTOR", 8))]
         # State saving. Krea 2 previously wrote state ONLY on Pause, so a crash or a run that
         # finished too early meant starting over. Pause still saves regardless of these flags.
         cmd += self._state_flags()
@@ -19846,8 +20299,121 @@ class LoRATrainerGUI:
         candidates.sort(reverse=True)
         return os.path.join(out_dir, candidates[0][1])
 
+    POD_STOP_COUNTDOWN = 120   # seconds
+
+    def _maybe_stop_pod_after_training(self):
+        """Offer to stop a rented pod once a run has finished on its own.
+
+        Never silent and never immediate: the point is to stop billing on an UNATTENDED finish, so
+        anyone actually sitting there must be able to stop it happening. A countdown they can
+        cancel does both."""
+        if not _running_on_pod():
+            return
+        if str(self.prefs_vars.get("runpod_stop_when_done", tk.StringVar()).get()).strip() != "1":
+            return
+
+        win = tk.Toplevel(self.master)
+        win.title("Training finished — stopping pod")
+        win.configure(bg=BG_COLOR)
+        win.transient(self.master)
+        win.protocol("WM_DELETE_WINDOW", lambda: None)
+        win.resizable(False, False)
+
+        # Cancel packed BOTTOM first so a long message can never push it off the edge (v2.8.5).
+        row = ttk.Frame(win)
+        row.pack(side=tk.BOTTOM, pady=(6, 14))
+
+        tk.Label(win, text="Training finished", font=(FONT_FAMILY, 12, "bold"),
+                 fg=COLORS["text_primary"], bg=BG_COLOR).pack(anchor=tk.W, padx=18, pady=(16, 2))
+        msg = tk.Label(win, text="", font=(FONT_FAMILY, 10), fg=COLORS["text_explain"],
+                       bg=BG_COLOR, wraplength=460, justify=tk.LEFT)
+        msg.pack(anchor=tk.W, padx=18, pady=(0, 6))
+        tk.Label(win,
+                 text="Your LoRA and everything else under /workspace is on the persistent volume "
+                      "and will still be there next time.",
+                 font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"], bg=BG_COLOR,
+                 wraplength=460, justify=tk.LEFT).pack(anchor=tk.W, padx=18)
+
+        state = {"left": self.POD_STOP_COUNTDOWN, "cancelled": False}
+
+        def cancel():
+            state["cancelled"] = True
+            self.update_console("[pod] auto-stop cancelled — pod left running.\n")
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        ttk.Button(row, text="Keep the pod running", command=cancel).pack()
+
+        def tick():
+            if state["cancelled"]:
+                return
+            if state["left"] <= 0:
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+                self._stop_this_pod()
+                return
+            msg.config(text=f"Stopping this pod in {state['left']}s to stop it billing.\n"
+                            f"Cancel below if you want to keep working.")
+            state["left"] -= 1
+            win.after(1000, tick)
+
+        tick()
+        try:
+            win.update_idletasks()
+            win.grab_set()
+        except Exception:
+            pass
+
+    def _stop_this_pod(self):
+        """Stop this pod through RunPod's API. Reports what happened either way.
+
+        Uses the GraphQL endpoint directly rather than runpodctl: runpodctl tries to sync SSH keys
+        as a side effect of being configured, which fails noisily and has nothing to do with
+        stopping a machine.
+
+        The key RunPod injects as RUNPOD_API_KEY is POD-SCOPED and cannot manage pods — verified
+        on a live pod, where `runpodctl pod list` returns 403 both before and after configuring
+        with it. So this needs an account key the user supplies themselves."""
+        key = self._pod_stop_key()
+        pid = os.environ.get("RUNPOD_POD_ID", "").strip() or _pod_id()
+        if not key:
+            self.update_console(
+                "[pod] auto-stop is on but no API key is set, so the pod is still running.\n"
+                "[pod] Add RUNPOD_STOP_API_KEY to your template (RunPod > Settings > API Keys).\n"
+                "[pod] The key RunPod provides automatically is pod-scoped and cannot stop pods.\n")
+            return
+        self.update_console(f"[pod] stopping pod {pid or '(unknown id)'}…\n")
+        try:
+            import json as _json
+            import urllib.request as _u
+            body = _json.dumps({
+                "query": "mutation($id: String!) { podStop(input: {podId: $id}) "
+                         "{ id desiredStatus } }",
+                "variables": {"id": pid},
+            }).encode()
+            req = _u.Request(f"https://api.runpod.io/graphql?api_key={key}", data=body,
+                             headers={"Content-Type": "application/json"})
+            with _u.urlopen(req, timeout=45) as resp:
+                payload = _json.loads(resp.read().decode())
+            if payload.get("errors"):
+                msg = payload["errors"][0].get("message", "unknown error")
+                self.update_console(f"[pod] RunPod refused the stop: {msg}\n"
+                                    f"[pod] Stop it from the dashboard to stop billing.\n")
+            else:
+                self.update_console("[pod] stop requested — this pod is shutting down.\n")
+        except Exception as e:
+            self.update_console(f"[pod] auto-stop failed ({type(e).__name__}: {e}). "
+                                f"Stop it from the dashboard to stop billing.\n")
+
     def _on_training_subprocess_exited(self, return_code: int):
         """Called from check_process when the training subprocess ends. Routes to paused or idle."""
+        # Captured BEFORE the branches below rewrite it — a pause is the one case that exits 0,
+        # and telling it apart from a completed run is the whole basis of the auto-stop decision.
+        was_state = getattr(self, "training_state", "idle")
         # Clean up pause flag if still present
         try:
             flag = self._pause_flag_path()
@@ -19855,6 +20421,11 @@ class LoRATrainerGUI:
                 os.remove(flag)
         except Exception:
             pass
+        # Only a run that finished on its own. Pause exits 0 too (state "pausing"); Stop and
+        # crashes arrive non-zero. Each of the three conditions excludes a real case, and getting
+        # it wrong shuts the machine down under someone who is still using it.
+        if return_code == 0 and was_state == "running":
+            self._maybe_stop_pod_after_training()
         if getattr(self, "training_state", "idle") == "pausing" and return_code == 0:
             # Successful graceful exit — record paused state
             state_dir = self._detect_latest_state_dir()

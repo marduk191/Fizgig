@@ -64,8 +64,13 @@ ck("pref keys match what the GUI reads",
                                                      "krea2_turbo_lora"})
 ck("Klein is flagged gated, Krea 2 is not",
    any(w.gated for w in F.FAMILIES["klein"]) and not any(w.gated for w in F.FAMILIES["krea2"]))
-ck("the 13 GB Turbo DiT is optional (workbench-only)",
-   weight("krea2", "krea2_turbo_dit").optional)
+# Nothing in a family is optional any more. "Download models for me" that silently omits a model
+# is the wrong shape: you find out weeks later when Repair Studio will not open, with no obvious
+# link back to a tickbox you did not tick.
+ck("no Krea 2 model is optional — the button gets everything",
+   not any(w.optional for w in F.FAMILIES["krea2"]))
+ck("  including the Turbo DiT the workbench needs",
+   not weight("krea2", "krea2_turbo_dit").optional)
 
 # --- a user's own choice must survive ------------------------------------------------------
 smaller = os.path.join(BASE, "krea2_raw_fp8_scaled.safetensors")

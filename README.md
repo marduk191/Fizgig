@@ -6,7 +6,12 @@
 </p>
 
 <p align="center">
+  <a href="https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=faoq8ed6um&ref=vkb387ep"><img src="https://img.shields.io/badge/⚡%20Deploy%20on%20RunPod-673AB7?style=for-the-badge&logoColor=white" alt="Deploy Fizgig on RunPod"></a>
   <a href="https://buymeacoffee.com/lorasandlenses"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee"></a>
+</p>
+<p align="center">
+  <sub>No GPU, or want a bigger one? Fizgig runs on rented hardware — one click, nothing to install.<br>
+  Deploying through that link supports Fizgig's development at no extra cost to you.</sub>
 </p>
 
 <p align="center">
@@ -23,11 +28,11 @@
 </p>
 
 > ### 📰 Latest news
-> - **Never lose a run** (v2.11) — training state now saves at every checkpoint *and* at the end of a run, so a crash costs you nothing and a **finished LoRA can be trained further**: raise the epoch count, resume, and it carries on with the optimizer and learning-rate history intact. Old states are pruned automatically so they don't fill your disk.
+> - **Fizgig 3.0 trains LoKR.** LoKR (LyCORIS Kronecker) covers the whole weight matrix with structure instead of a thin low-rank slice — in our validation runs it produced the **highest likeness we have ever measured** with this app's own scorer, with noticeably more natural skin and light than standard LoRA on the same dataset and settings. Pick it from the **Network Type** dropdown on the Krea 2 Training tab: one **Factor** dial replaces rank and alpha, output loads straight into ComfyUI, and Repair Studio / LoRA the Explorer edit and save LoKR **natively — lossless, no conversion**. The short version of the trade: LoKR is slightly higher quality, standard LoRA slightly faster. [Training ↓](#training)
+> - **One-click cloud training on RunPod** — no GPU, or want a 5090 for the afternoon? The official Fizgig template deploys the full app to a rented GPU in your browser: nothing to install, your files persist until you terminate the pod, and the in-app RunPod panel can even **auto-stop the pod when your run finishes** so an idle GPU never bills overnight. [**⚡ Deploy →**](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=faoq8ed6um&ref=vkb387ep) · [Guide](docker/README.md)
 > - **Krea 2 trains on 8 GB** — confirmed by users running nothing but the stock preset defaults at batch size 1, with everything left on Auto. 10–12 GB cards do the same with headroom to spare. [VRAM guidance ↓](#vram-guidance)
-> - **Caption with the model that trains your LoRA** (v2.10) — the Captions tab can use **Qwen3-VL**, the same vision-language model that conditions Krea 2 training, and picks it by default when you have that text encoder. Four tasks, each an **editable preset**: rewrite the instruction the model is given, save it, reset to the built-in anytime. Works for Klein datasets too — captions are just `.txt`.
-> - **Bring your own text encoder** (v2.10) — the Qwen3-VL slot takes **fp8_scaled** (4.9 GB resident vs 8.3 GB, output we couldn't tell apart — now the recommended download) and **community fine-tunes or abliterated builds**. Since that model writes your captions, swapping it changes how your dataset gets described.
-> - **Faster Krea 2 training** (v2.8.3) — a community bug report ([#18](https://github.com/shootthesound/Fizgig/issues/18) — thanks!) led to a fix for a hidden all-core CPU burn. It was meant to quiet the CPU; it sped up training steps too, up to **~1.6×** measured. Previews also now render **on the training model itself** via the official Turbo LoRA, instead of loading a 13 GB checkpoint every time.
+> - **Never lose a run** (v2.11) — training state saves at every checkpoint *and* at run end, so a crash costs nothing and a **finished LoRA can be trained further**: raise the epoch count, resume, and it carries on with optimizer and learning-rate history intact.
+> - **Caption with the model that trains your LoRA** (v2.10) — the Captions tab can use **Qwen3-VL**, the same vision-language model that conditions Krea 2 training. Every task is an **editable preset** — including a style-LoRA preset validated on real training runs. The slot takes fp8_scaled builds and community fine-tunes; since that model writes your captions, swapping it changes how your dataset gets described.
 
 > **Two model families, one workbench.** Everything here works with both **Flux 2 Klein 9B** and **Krea 2 (12.9B)** — Repair Studio, Explorer, Royale, Profiler, Extract, plus Context LoRA, Adaptive LR and Pause/Resume. [Krea 2 details ↓](#krea-2--second-model-family)
 
@@ -121,7 +126,8 @@ You can also edit any caption yourself mid-run from the Problem Images window �
 
 The foundation: fast, light, and tuned for one model.
 
-- **Proven presets** for rank 4–16, single subject through multi-character — or roll your own.
+- **LoKR training (Krea 2)** — the LyCORIS Kronecker parametrization the community rates highest for likeness, trainable with the loss watch, adaptive LR and auto-recaption attached. Pick it from the **Network Type** dropdown: one **Factor** dial replaces rank/alpha (lower factor ≈ more capacity, bigger file: factor 8 ≈ 400 MB, 16 ≈ 100 MB). Output is standard LyCORIS format — drops straight into ComfyUI — and Repair Studio / Explorer edit and re-save it natively, lossless. Our testing in short: LoKR slightly higher quality, standard LoRA slightly faster.
+- **Proven presets** for single subject through multi-character — or roll your own.
 - **Context LoRA** — load an existing LoRA as a frozen *active* layer so the new one learns to coexist. Train a face on top of a style and they stop fighting at inference; train an outfit on top of a character and the clothes drape correctly. No other trainer does this.
 - **Distilled training samples** — 4-step previews that match ComfyUI output closely (a separate Distilled DiT, ComfyUI Euler Simple schedule). On by default; toggle on the Samples tab. On tight cards the sample model auto-swaps its own blocks by VRAM so 4-step previews keep working on 16 GB. On 24 GB+ it stays resident and is cached in system RAM between epochs (RAM-checked, saves ~3–4 s/epoch).
 - **Reference-conditioned samples** — Klein is an edit model, so previews can *edit* a reference photo instead of generating from scratch. Auto-resized to ~0.20 MP so it can't OOM; works on Base and Distilled samples.
@@ -149,15 +155,35 @@ The browser gallery of training samples now *measures* the run instead of just s
 - **Training Run Visualiser** — scrub the current run epoch by epoch, Royale-style: a slider carousel per sample prompt, play/pause with ping-pong looping, likeness score inline, and share-ready export — a WebM clip with the epoch ticker and Fizgig tag burned in, or full-res PNG frames. It's a taste of the **LoRA Royale** tab, right in the browser.
 
 ### Dataset prep
-- **AI captioning, with the captioner that trains your model** — if you have Krea 2's Qwen3-VL text encoder, the Captions tab uses it by default. It's the same vision-language model that conditions training, so it captions to the doctrine that actually matters for LoRAs: name the camera viewpoint, say whether the face is visible, describe what's there instead of hedging. Four tasks (training caption / short / detailed / exhaustive) — and **every one of them is an editable preset, not a fixed mode**. Open the instruction the model is actually given, rewrite it in plain English, and save it; each preset keeps its own wording, your edits persist between sessions, and a Reset button restores the built-in whenever you want it back. Tune one preset for products and another for portraits and just switch between them. The trainer's mid-run auto-recaption picks up your edited wording too, so a caption style you settle on is the style the run keeps writing. **Florence-2** remains the zero-setup option, downloading itself on first use. Either way it's bulk-generate in one click, with your trigger word prepended.
+- **AI captioning, with the captioner that trains your model** — if you have Krea 2's Qwen3-VL text encoder, the Captions tab uses it by default. It's the same vision-language model that conditions training, so it captions to the doctrine that actually matters for LoRAs: name the camera viewpoint, say whether the face is visible, describe what's there instead of hedging. Five tasks — and **every one of them is an editable preset, not a fixed mode**.
+
+  Four are for training a subject: **training caption** (the default — viewpoint-aware), **short**, **detailed** and **exhaustive**. The fifth, **Style**, is for training a *look*, and it works the opposite way round: it describes the contents of each image in detail and never the style itself, so your trigger word is the only thing every caption has in common and the look binds to it. Set a trigger word, pick **Style**, caption the folder, train. Tested on real runs across Klein and Krea 2 — the style comes through fast.
+ Open the instruction the model is actually given, rewrite it in plain English, and save it; each preset keeps its own wording, your edits persist between sessions, and a Reset button restores the built-in whenever you want it back. Tune one preset for products and another for portraits and just switch between them. The trainer's mid-run auto-recaption picks up your edited wording too, so a caption style you settle on is the style the run keeps writing. **Florence-2** remains the zero-setup option, downloading itself on first use. Either way it's bulk-generate in one click, with your trigger word prepended.
 
   The text encoder slot is **open**: bf16, the smaller **fp8_scaled** (recommended — 4.9 GB resident vs 8.3 GB, output we couldn't tell apart), or a **community fine-tune / abliterated build**. Because the same model writes your captions, swapping it changes how your dataset gets described — useful when a stock instruct model hedges on or refuses your subject matter.
 - **Bilingual captions** — optionally append Chinese via Helsinki-NLP. Klein's Qwen3 text encoder has deep Chinese training, so bilingual captions act as text-level data augmentation, improving visual quality without changing loss. In a controlled A/B (same data, seed, and hyperparameters — captions the only change) the loss curves stayed within ±0.001/epoch, yet the bilingual run produced visibly more skin detail and faster visual convergence.
-- **Image Prep** — batch resize, PNG conversion, and InsightFace face-crop derivatives, with optional **gender targeting** (largest male/female face) so it locks onto your subject in group shots. Pairing a tight crop with a full shot adds a lot to a character dataset. Training defaults to ~512² (0.25 MP) and resizes in-cache, so any resolution or aspect ratio just works — nothing has to be square or pre-sized.
+- **Image Prep** — batch resize, PNG conversion, and InsightFace face-crop derivatives, with optional **gender targeting** (largest male/female face) so it locks onto your subject in group shots. Pairing a tight crop with a full shot adds a lot to a character dataset — at the default 0.25 MP a face in a wide shot reaches the model as only a handful of latent pixels, while a crop of the same face gets the whole frame (~40× the face area), which is what keeps likeness sharp without raising the resolution. Training defaults to ~512² (0.25 MP) and resizes in-cache, so any resolution or aspect ratio just works — nothing has to be square or pre-sized.
 - **Look Consistency Filter** — the final prep stage, built for **synthetic-heavy datasets**: the subtly off-look near-misses that drag a likeness down are *easy* for the model to reconstruct, so a loss curve never sees them — but face-embedding distance does. Pick the **3 images that best nail the look** and every image is scored against all three, averaged (close-up faces included — detection pads-and-retries). Worst matches surface first with colour-coded verdicts; mark drifters by click or let **Auto-Suggest** flag the statistical outliers, then move them out of the dataset in one go (to a subfolder — nothing is deleted, and moving them back re-admits them). The scores save with your dataset and drive the trainer's **look-outlier warm-up**.
 
 ### Compatibility
-Loads kohya, PEFT, OneTrainer (OMI + legacy), AI-Toolkit, and LyCORIS (LoKR / LoHa) — all auto-converted on load. LoKR and LoHa run **natively at inference** — no pre-conversion — anywhere in the app: as a primary or donor in Repair Studio, in the Profiler, in Extract, even as a Context LoRA. **Bake** materialises them to a standard LoRA via GPU-accelerated SVD. Output is kohya-style `.safetensors` that drop straight into ComfyUI Klein nodes. Every tab links to the relevant section of the walkthrough video.
+Loads kohya, PEFT, OneTrainer (OMI + legacy), AI-Toolkit, and LyCORIS (LoKR / LoHa) — all auto-converted on load. LoKR and LoHa run **natively at inference** — no pre-conversion — anywhere in the app: as a primary or donor in Repair Studio, in the Profiler, in Extract, even as a Context LoRA. Fizgig also **trains** LoKR on Krea 2, and Repair Studio / Explorer **save LoKR as LoKR** — edits bake losslessly into the Kronecker factors; SVD conversion only happens for donor-blended blocks, where it's mathematically unavoidable. Output is `.safetensors` that drops straight into ComfyUI. Every tab links to the relevant section of the walkthrough video.
+
+---
+
+## No GPU? Rent one
+
+Fizgig ships as a ready-made cloud image, so you can train on a card far bigger than the one in
+your machine — or keep your own GPU free while a run goes on somewhere else.
+
+**It's the whole app, not a cut-down web version.** Training, Repair Studio, LoRA the Explorer,
+LoRA Royale, Profiler, Extract and the sample gallery, in a browser tab. Drag datasets in and
+finished LoRAs out with a built-in file manager, download models in one click, and optionally have
+the pod **shut itself down when training finishes** so an overnight run doesn't bill until morning.
+
+Your models and datasets live on persistent storage, so you download them once and every future
+session picks up where you left off.
+
+**[⚡ Deploy on RunPod →](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=faoq8ed6um&ref=vkb387ep)**  ·  [Read the guide first](docker/README.md)
 
 ---
 
@@ -282,6 +308,10 @@ Krea 2 is a bigger model, so the numbers differ — but Fizgig **auto-sizes bloc
 
 - **Training** runs on the RAW fp8 base (~14 GB resident); block swap auto-detects from VRAM (32 GB → none, scaling up to maximum on sub-16 GB cards). The **4-bit (NF4)** toggle drops the base to ~5.6 GB (base + LoRA ~8.3 GB), fitting a **10–12 GB card with no swap** and an 8 GB card with the swap Auto sizes for it. You don't need to pick: Auto budgets from your *free* VRAM and the console explains its choice.
 - **In-training previews** default to the **RAW + Turbo LoRA** engine: they render on the model already training, so previews add almost nothing on top of the training footprint — no checkpoint load, no CPU↔GPU shuffling between epochs. The **workbench** (Repair Studio / Explorer / Royale) and the classic preview mode run on the fp8 Turbo checkpoint, which peaks ~22.6 GB unswapped — Fizgig auto-swaps it to fit your GPU (≈17 GB at swap 12; 16 GB cards swap enough to fit). If a preview still can't fit, it **auto-disables and training keeps running and saving** — evaluate the LoRA in ComfyUI.
+
+### Desktop feels juddery while training? (Windows)
+
+If your mouse or video playback stutters during a run — even with CPU, RAM and VRAM all showing plenty free — turn off **Hardware-accelerated GPU scheduling**: Windows Settings → System → Display → Graphics → *Default graphics settings*, then reboot. Training and your desktop share the same GPU, and with that setting on, Windows can't prioritise between them; with it off, Fizgig runs training at low priority so your desktop stays smooth and training speed is unaffected.
 
 ---
 

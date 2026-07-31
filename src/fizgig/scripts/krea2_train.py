@@ -53,6 +53,11 @@ def setup_parser() -> argparse.ArgumentParser:
     p.add_argument("--output_name", required=True)
     p.add_argument("--network_dim", type=int, default=32)
     p.add_argument("--network_alpha", type=float, default=32)
+    p.add_argument("--network_type", default="lora", choices=["lora", "lokr"],
+                   help="Trainable parametrization: standard LoRA, or LoKR (Kronecker, "
+                        "full-matrix w2 — dim/alpha unused, --lokr_factor is the dial)")
+    p.add_argument("--lokr_factor", type=int, default=8,
+                   help="LoKR only: Kronecker split factor (w1 is ~factor x factor)")
     p.add_argument("--learning_rate", type=float, default=1e-4)
     p.add_argument("--max_train_epochs", type=int, default=10)
     p.add_argument("--save_every_n_epochs", type=int, default=0)
@@ -166,6 +171,7 @@ def main():
     train_krea2(
         args.dit, args.dataset_config, args.output_dir, args.output_name,
         network_dim=args.network_dim, network_alpha=args.network_alpha,
+        network_type=args.network_type, lokr_factor=args.lokr_factor,
         learning_rate=args.learning_rate, max_train_epochs=args.max_train_epochs,
         save_every_n_epochs=args.save_every_n_epochs, fp8_scaled=not args.no_fp8,
         save_state=args.save_state, save_state_on_train_end=args.save_state_on_train_end,

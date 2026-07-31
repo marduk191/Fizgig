@@ -201,9 +201,10 @@ def load_qwen3_vl_conditioner(
 ) -> "Qwen3VLConditioner":
     """Load the Qwen3-VL-4B conditioner used by K2: weights from ``model_path`` (safetensors),
     tokenizer from ``tokenizer_repo`` (Hub id or local dir)."""
+    from fizgig.utils.hf_cache import from_pretrained_cache_first
     qwen = _load_qwen3_vl_model(model_path, dtype=dtype, device=device, disable_mmap=disable_mmap)
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_repo, max_length=max_length)
-    processor = Qwen2TokenizerFast.from_pretrained(tokenizer_repo, max_length=max_length)
+    tokenizer = from_pretrained_cache_first(AutoTokenizer, tokenizer_repo, max_length=max_length)
+    processor = from_pretrained_cache_first(Qwen2TokenizerFast, tokenizer_repo, max_length=max_length)
     conditioner = Qwen3VLConditioner(qwen, tokenizer, processor, max_length=max_length,
                                      select_layers=select_layers, tokenizer_repo=tokenizer_repo)
     return conditioner.eval().requires_grad_(False)
@@ -285,6 +286,35 @@ DETAILED_DESCRIPTION_INSTRUCTION = (
     "State only what is visible — no speculation, no names, no style commentary."
 )
 
+# --- style captioning ------------------------------------------------------------------------
+# The identity instructions above are written for a dataset where the subject is a person and the
+# lighting, viewpoint and clothing all VARY — you name them so they stay steerable. A style dataset
+# inverts that: the look is the constant you are training, and the subject is whatever happens to
+# be in front of it. So the caption takes the content and leaves the style unnamed, which is what
+# lets the LoRA bind the look to the trigger word the GUI prepends.
+#
+# This instruction is deliberately SHORT, and that is the finding, not an oversight. Earlier
+# versions of this preset stacked four rule fragments — name the subject specifically, no preamble,
+# describe it as if it were a real place, never mention medium/technique/grade — and by the obvious
+# metric they won easily: on a layered paper-cut set they leaked style words into 1 caption in 9,
+# where this one-liner leaks into 7. But the one-liner is what trains better, tested on real runs
+# across both Krea 2 and Klein, and it is not close.
+#
+# The likely reason is worth keeping, because it cuts against the instinct to keep adding rules:
+#   - Leaking CONSISTENTLY is not the same failure as leaking half the time. A word in 7 captions
+#     of 9 behaves like a style tag; a word in 4 of 9 teaches the model that some of these images
+#     have a property the others lack. The rule stack was tuned against the wrong number.
+#   - The short instruction produces captions roughly 2.4x richer (~70 words vs ~30). More content
+#     named means more of the image accounted for, which leaves the style as the cleaner residual.
+#     The rules were buying leak-purity with detail, and detail is what the LoRA works from.
+#
+# Token budget is 160 rather than the ~90 the length implies: at 90 every caption on the test set
+# was cut off mid-word.
+STYLE_CAPTION_INSTRUCTION = (
+    "Describe the image with zero references to the image style, just the factual contents of "
+    "what is depicted."
+)
+
 # The task menu the Captions tab offers for this model. Lives here rather than in the GUI so the
 # trainer's auto-recaption and the GUI read the same text — the instruction is part of the
 # captioning contract, not a piece of UI.
@@ -297,6 +327,10 @@ CAPTION_TASKS = {
     "short":      ("Short caption", SHORT_CAPTION_INSTRUCTION, 60),
     "detailed":   ("Detailed description", DETAILED_DESCRIPTION_INSTRUCTION, 160),
     "exhaustive": ("Exhaustive detail", DETAILED_CAPTION_INSTRUCTION, 240),
+    # Style last: the four above are the identity path, which is the common case and the one
+    # auto-recaption uses.
+    "style":      ("Style — contents only (trigger word names the style)",
+                   STYLE_CAPTION_INSTRUCTION, 160),
 }
 DEFAULT_CAPTION_TASK = "training"
 
@@ -457,8 +491,9 @@ class Qwen3VLConditioner(torch.nn.Module):
         so text-only training never pays for it."""
         if self._image_processor is None:
             from transformers import AutoProcessor
+            from fizgig.utils.hf_cache import from_pretrained_cache_first
             repo = self.tokenizer_repo or QWEN3_VL_4B_INSTRUCT_REPO_ID
-            self._image_processor = AutoProcessor.from_pretrained(repo)
+            self._image_processor = from_pretrained_cache_first(AutoProcessor, repo)
         return self._image_processor
 
     @staticmethod

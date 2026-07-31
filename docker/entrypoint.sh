@@ -22,10 +22,25 @@ mkdir -p /workspace/.cache /workspace/.insightface
 # generate one and print it, rather than leaving it open — a random password in the logs is
 # recoverable; an open port is not fixable after the fact.
 if [ -z "${VNC_PASSWORD:-}" ]; then
-  VNC_PASSWORD="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12)"
+  # NOT `tr -dc ... </dev/urandom | head -c 12`. head exits at 12 bytes and closes the pipe, tr
+  # is still reading an infinite file, takes SIGPIPE and returns 141 — which `pipefail` makes the
+  # pipeline's status and `set -e` turns into an instant exit, before the first log line. The
+  # container then dies and restarts forever. It only bites when no password is set, so it
+  # survived every test where one was, and shipped as the default path in the public template.
+  # Reading a FIXED number of bytes means nothing exits early and no pipe is ever broken.
+  _rand="$(head -c 512 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9')"
+  VNC_PASSWORD="${_rand:0:12}"
+  unset _rand
   log "No VNC_PASSWORD set — generated one for this pod: ${VNC_PASSWORD}"
   log "Set VNC_PASSWORD in the template to choose your own."
 fi
+# Exported so Fizgig itself can authenticate against the same password — anything the app serves
+# on its own port (a phone-facing run monitor, say) should ask for the credential the user already
+# has, not invent a second one. Without this, a password the ENTRYPOINT generated is only a shell
+# variable and never reaches the app, which is the default case now that the public template ships
+# no VNC_PASSWORD at all.
+export VNC_PASSWORD
+
 mkdir -p /root/.vnc
 # KasmVNC authenticates the WEB session against its own user db, not a VNC-protocol password.
 # -w gives write (input) permission; without it you get a read-only desktop you cannot click.
@@ -66,10 +81,66 @@ for key, path in (("lora_output_dir", "/workspace/output_loras"),
                   ("cache_dir",       "/workspace/cache")):
     prefs.setdefault(key, path)
     os.makedirs(prefs[key], exist_ok=True)
+# Where the Start tab's Browse opens. setdefault, not assignment: if the user picked their own
+# folder we leave it alone.
+prefs.setdefault("input_dataset_dir", "/workspace/datasets")
 os.makedirs("/workspace/models", exist_ok=True)
 json.dump(prefs, open(p, "w", encoding="utf-8"), indent=2)
 print("[fizgig] output dirs on /workspace")
 PY
+
+# An obvious place to put training images. Created here rather than committed to the repo: in the
+# repo it would land inside the git clone (the one directory that gets reset --hard on every boot)
+# and every desktop user would get a stray pod-only folder they have no use for. Top level puts it
+# beside models/ and output_loras/ in the file manager, which is where someone looks first.
+mkdir -p /workspace/datasets
+if [ ! -f /workspace/datasets/README.txt ]; then
+    cat > /workspace/datasets/README.txt <<'NOTE'
+Put your training images here.
+
+Make one folder per LoRA, e.g.  /workspace/datasets/my_subject/
+and put the images and their .txt caption files in it together.
+
+Upload by dragging a folder into the file manager on port 8080, then on Fizgig's
+Start tab click Browse and pick your folder under /workspace/datasets.
+
+Everything under /workspace lives on your persistent volume, so it survives
+stopping and restarting the pod. Anything outside /workspace does not.
+NOTE
+fi
+
+# fetch_models defaults to <repo>/models, which puts 32 GB of weights INSIDE the git clone that
+# this script runs `git reset --hard` on every boot. Point it at /workspace/models instead, next
+# to the datasets and outputs, so it survives a re-clone and is where anyone would look for it.
+if [ ! -L "$APP_DIR/models" ]; then
+    if [ -d "$APP_DIR/models" ] && [ -n "$(ls -A "$APP_DIR/models" 2>/dev/null)" ]; then
+        # Models already downloaded to the old location — move rather than orphan them.
+        log "Moving existing models to /workspace/models"
+        mv "$APP_DIR/models"/* /workspace/models/ 2>/dev/null || true
+    fi
+    rm -rf "$APP_DIR/models"
+    ln -s /workspace/models "$APP_DIR/models"
+fi
+
+# Report the disk the models actually land on. Getting this wrong is expensive and silent: if the
+# volume is not mounted, /workspace is the CONTAINER disk — which RunPod erases when the pod stops,
+# so a 32 GB download evaporates on every restart. The failure mode is a "no space left on device"
+# part-way through a download, which reads like a Fizgig bug rather than a template setting.
+_avail_kb=$(df -Pk /workspace | awk 'NR==2{print $4}')
+_avail_gb=$(( _avail_kb / 1024 / 1024 ))
+_total_gb=$(( $(df -Pk /workspace | awk 'NR==2{print $2}') / 1024 / 1024 ))
+if [ "$_total_gb" -gt 10000 ]; then
+    # A network volume does not expose its quota in here — the kernel reports the host's whole
+    # backing pool, so a 100 GB volume reads as ~1.4 PB. Printing that looks broken.
+    log "Storage: /workspace is a network volume (size is set in RunPod, not visible from here)"
+else
+    log "Storage: /workspace has ${_avail_gb} GB free of ${_total_gb} GB"
+fi
+if [ "$_total_gb" -lt 60 ]; then
+    log "  WARN: that looks like the CONTAINER disk, not a volume. Krea 2 alone needs ~32 GB,"
+    log "        and container disk is wiped when the pod stops. Check the template has a"
+    log "        Volume Disk of 100 GB+ AND a mount path of /workspace."
+fi
 
 # ---------------------------------------------------------------- optional model prefetch
 # Off by default. Downloading tens of GB unasked spends the user's money and may fetch the

@@ -4,10 +4,10 @@ Replaces the hand-download: five files across four HuggingFace repos, then five 
 into Preferences by hand. Run this instead and it fetches what's missing, verifies it, and
 writes the paths into prefs.json for you.
 
-    python -m fizgig.scripts.fetch_models --family krea2      # ~32 GB, no HF account needed
+    python -m fizgig.scripts.fetch_models --family krea2      # ~45 GB, no HF account needed
     python -m fizgig.scripts.fetch_models --family klein      # ~34 GB, needs an HF token
     python -m fizgig.scripts.fetch_models --family tools      # ~1.6 GB helper models
-    python -m fizgig.scripts.fetch_models --all --include-optional
+    python -m fizgig.scripts.fetch_models --all
 
 Two kinds of asset, handled differently:
 
@@ -65,8 +65,7 @@ FAMILIES = {
                "Turbo LoRA — in-training previews"),
         Weight("krea2_turbo_dit", "Comfy-Org/Krea-2",
                "diffusion_models/krea2_turbo_fp8_scaled.safetensors", 13.0,
-               "Turbo DiT — only for the workbench tools and classic previews",
-               optional=True),
+               "Turbo DiT — Repair Studio, Explorer, Royale and classic previews"),
     ],
     "klein": [
         Weight("base_dit", "black-forest-labs/FLUX.2-klein-base-9b-fp8",
