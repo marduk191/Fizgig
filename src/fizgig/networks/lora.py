@@ -340,6 +340,103 @@ def _lokr_forward_update(x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor,
     return Y.transpose(-1, -2).reshape(*orig, a * c)           # (..., M=a·c)
 
 
+def factorization(n: int, factor: int) -> tuple:
+    """Split n into (small, large) with small * large == n and small the LARGEST divisor
+    of n that is <= factor — the LyCORIS convention, so a trained file's shapes look like
+    every other LoKR in the wild. A prime n degenerates to (1, n), which is still a valid
+    Kronecker factor (w1 becomes a row/column), not an error.
+    """
+    if factor < 1:
+        factor = 1
+    small = 1
+    for cand in range(min(factor, n), 0, -1):
+        if n % cand == 0:
+            small = cand
+            break
+    return small, n // small
+
+
+class LoKRModule(torch.nn.Module):
+    """TRAINABLE LoKR (Kronecker-product) module — the training-side counterpart of
+    LoKRInfModule below, full-matrix flavour: w1 (a,b) small, w2 (c,d) large, delta =
+    multiplier · scale · kron(w1, w2), never materialized (see _lokr_forward_update).
+
+    Where LoRA covers the weight with a rank-r slice, kron(w1, w2) tiles it with structure —
+    the reason for LoKR's likeness-per-megabyte reputation. Full-matrix w2 is the quality
+    configuration; `factor` is the single dial (w1 is ~factor x factor).
+
+    Contract notes (create_modules calls all module classes identically):
+    - signature matches LoRAModule positionally; `lora_dim`/`alpha` args are accepted and
+      IGNORED — factor rules. `.lora_dim` is set to factor so logs stay meaningful.
+    - alpha buffer is 1.0 and scale is 1.0: the one value that means the same thing under
+      LoKRInfModule.__init__ (full-matrix path: dim 1 → scale = alpha) and
+      lycoris_scale_from_keys — so the saved file renders identically everywhere.
+    - init mirrors LoRAModule's zeroed lora_up: w1 kaiming, w2 zeros → delta exactly 0 at
+      step 0, and grads flow to BOTH factors from step 1 (d/dw2 kron(w1,w2) ≠ 0 when w1 ≠ 0).
+    - `apply_to` must `del self.org_module`, or the frozen base Linear's weight would be
+      registered as a submodule — saved into the LoRA file and cast/moved by network.to().
+    """
+
+    def __init__(
+        self,
+        lora_name,
+        org_module: torch.nn.Module,
+        multiplier=1.0,
+        lora_dim=4,
+        alpha=1,
+        dropout=None,
+        rank_dropout=None,
+        module_dropout=None,
+        factor=8,
+    ):
+        super().__init__()
+        self.lora_name = lora_name
+
+        if org_module.__class__.__name__ == "Conv2d":
+            raise ValueError(f"LoKR training supports Linear modules only, got Conv2d at {lora_name}")
+        in_dim = org_module.in_features
+        out_dim = org_module.out_features
+
+        self.factor = int(factor)
+        a, c = factorization(out_dim, self.factor)   # out = a·c, a small
+        b, d = factorization(in_dim, self.factor)    # in  = b·d, b small
+        self.a, self.b, self.c, self.d = a, b, c, d
+
+        self.lokr_w1 = torch.nn.Parameter(torch.empty(a, b))
+        self.lokr_w2 = torch.nn.Parameter(torch.empty(c, d))
+        torch.nn.init.kaiming_uniform_(self.lokr_w1, a=math.sqrt(5))
+        torch.nn.init.zeros_(self.lokr_w2)
+
+        self.register_buffer("alpha", torch.tensor(1.0))
+        self.scale = 1.0
+        self.multiplier = multiplier
+        self.enabled = True
+        self.lora_dim = self.factor  # for create_modules' verbose log; not a rank
+        self.split_dims = None
+        self.org_module = org_module  # remove in applying
+
+        # rank/neuron dropout act on a rank axis kron doesn't have; module_dropout still applies.
+        if dropout is not None or rank_dropout is not None:
+            logger.warning(f"LoKR: dropout/rank_dropout are not applicable and ignored ({lora_name})")
+        self.module_dropout = module_dropout
+
+    def apply_to(self):
+        self.org_forward = self.org_module.forward
+        self.org_module.forward = self.forward
+        del self.org_module
+
+    def forward(self, x):
+        org_forwarded = self.org_forward(x)
+        if not self.enabled or self.multiplier == 0.0:
+            return org_forwarded
+        if self.module_dropout is not None and self.training:
+            if torch.rand(1) < self.module_dropout:
+                return org_forwarded
+        update = _lokr_forward_update(x, self.lokr_w1, self.lokr_w2,
+                                      self.a, self.b, self.c, self.d)
+        return org_forwarded + update * self.multiplier * self.scale
+
+
 class LoKRInfModule(torch.nn.Module):
     """Inference-time LoKR module. Stores w1 (a,b) and w2 (c,d) — or their
     low-rank factors w1_a (a,k1) w1_b (k1,b) / w2_a (c,k2) w2_b (k2,d) —

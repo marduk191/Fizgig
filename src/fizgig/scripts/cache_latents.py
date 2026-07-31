@@ -96,7 +96,15 @@ def encode_datasets(datasets, encode_fn, args):
             all_cache_paths.extend([item.latent_cache_path for item in batch])
 
             if args.skip_existing:
-                batch = [item for item in batch if not os.path.exists(item.latent_cache_path)]
+                # "Existing" must mean existing AT THIS RESOLUTION: the filename encodes the
+                # original image size, so a cache from a different Target Megapixels looks
+                # identical by name. Re-encode (overwrite) whenever the contained latent
+                # doesn't match the current bucket — that is the wipe-on-resolution-change.
+                from fizgig.dataset.image_dataset import ImageDataset as _ID
+                batch = [item for item in batch
+                         if not os.path.exists(item.latent_cache_path)
+                         or _ID.latent_cache_matches_reso(item.latent_cache_path,
+                                                          item.bucket_size) is not True]
                 if not batch:
                     continue
 

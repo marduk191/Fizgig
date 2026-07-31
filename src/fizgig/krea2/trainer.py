@@ -34,7 +34,7 @@ from fizgig.krea2.sampling import gather_valid_text, prepare
 from fizgig.modules.sdpa import consider_training_backend as _consider_training_backend
 from fizgig.networks.lora import create_network
 from fizgig.training.metadata import ARCHITECTURE_KREA2
-from fizgig.training.train_utils import LossRecorder
+from fizgig.training.train_utils import LossRecorder, prune_state_dirs
 
 logger = logging.getLogger(__name__)
 
@@ -71,11 +71,65 @@ def _batch_is_reg(item_keys, reg_keys) -> bool:
     return all(str(k) in reg_keys for k in item_keys)
 
 
+def _apply_turbo_lora(dit, path, *, device, dtype):
+    """Stage the Turbo distillation LoRA (rank 64) on the TRAINING DiT, disabled.
+
+    RAW + this LoRA at strength 1.0 behaves as the Turbo model, so previews can render on the
+    resident training DiT with the exact settings the Turbo path uses (8-step, CFG-free,
+    mu=1.15). Between previews the net is disabled (a disabled module's forward is one flag
+    check) and its params live on CPU, so training pays nothing for it.
+
+    The file also carries `diff_b` BIAS deltas the kohya conversion cannot represent — on the
+    I/O layers (first, last.linear, tmlp, tproj, txtmlp), the timestep embedding among them,
+    where much of the 8-step distillation plausibly lives. They are resolved to the actual
+    bias Parameters here, at setup, so a bad key fails loudly now rather than mid-run; the
+    preview path applies them by exact snapshot/restore (bf16 `+=` then `-=` is not
+    bit-clean; `copy_` of a clone is), so training weights are never altered.
+
+    Returns (net, diffb) where diffb is a list of (bias_param, delta_cpu) pairs.
+    """
+    from safetensors.torch import load_file
+    from fizgig.networks.lora import create_network_from_weights, ensure_kohya_lora_state_dict
+
+    raw_sd = load_file(path)
+    diffb = []
+    for key in sorted(raw_sd):
+        if not key.endswith(".diff_b"):
+            continue
+        mod_path = key[:-len(".diff_b")]
+        if mod_path.startswith("diffusion_model."):
+            mod_path = mod_path[len("diffusion_model."):]
+        delta = raw_sd[key]
+        try:
+            bias = dit.get_submodule(mod_path).bias
+            if bias is None or tuple(bias.shape) != tuple(delta.shape):
+                raise AttributeError("no bias / shape mismatch")
+        except AttributeError as e:
+            logger.warning("[turbo-lora] diff_b %s has no matching model bias (%s) — skipped", key, e)
+            continue
+        diffb.append((bias, delta.detach().to("cpu").clone()))
+
+    sd = ensure_kohya_lora_state_dict(raw_sd)
+    net = create_network_from_weights(None, 1.0, sd, None, dit, for_inference=True)
+    net.apply_to(text_encoders=None, unet=dit, apply_text_encoder=False, apply_unet=True)
+    # Structure only until this lands — without it the LoRA sits at zero init and the
+    # "turbo" previews would silently render the undistilled RAW at 8 steps (mush).
+    net.load_state_dict(sd, strict=False)
+    net.to(device="cpu", dtype=dtype).eval()
+    net.requires_grad_(False)
+    net.set_enabled(False)
+    logger.info("[turbo-lora] %s staged on the training DiT: %d LoRA modules + %d bias deltas "
+                "(disabled outside previews)", os.path.basename(path), len(net.unet_loras), len(diffb))
+    return net, diffb
+
+
 def load_dit_for_training(
     raw_path: str,
     *,
     network_dim: int = 32,
     network_alpha: float = 32,
+    network_type: str = "lora",     # "lora" | "lokr" — the trainable parametrization
+    lokr_factor: int = 8,
     fp8_scaled: bool = True,
     quant_4bit: bool = False,
     quant_int8: str = "",          # "" | "bf16" | "int8" — W8A8 base, grad_mode of the same name
@@ -84,6 +138,7 @@ def load_dit_for_training(
     compile_blocks: bool = False,   # resolved by the caller; load_dit_ takes a plain bool
     context_lora_path: str = None,
     context_lora_strength: float = 1.0,
+    turbo_lora_path: str = None,    # Turbo distillation LoRA — staged disabled, for on-DiT previews
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
     fp8_fast: bool = False,
@@ -139,23 +194,53 @@ def load_dit_for_training(
     if gradient_checkpointing:
         dit.enable_gradient_checkpointing()
 
+    # Stacking order (deliberate): Turbo LoRA innermost, then Context, then the trainable LoRA
+    # outermost. The deltas are additive so the sum is order-independent, but this order tells
+    # the deployment story: base+turbo ≈ the Turbo model, context rides on that, and the LoRA
+    # being trained samples on top of the whole stack — exactly how it will be used.
+
+    # Turbo distillation LoRA (rank 64): staged DISABLED on the training DiT so previews can
+    # render on the resident model (RAW + turbo@1.0 ≈ Turbo, same 8-step CFG-free settings)
+    # instead of loading the ~13 GB Turbo checkpoint and parking the trainer to CPU.
+    turbo_net = turbo_diffb = None
+    if turbo_lora_path:
+        turbo_net, turbo_diffb = _apply_turbo_lora(dit, turbo_lora_path, device=device, dtype=dtype)
+
     # Context LoRA: frozen + active on the base BEFORE the trainable LoRA, so the trainable
     # one wraps the context-included forward (both additive; grads only flow to the trainable).
     if context_lora_path:
         logger.info(f"context LoRA: {os.path.basename(context_lora_path)} @ {context_lora_strength} (frozen, active)")
         _apply_context_lora(dit, context_lora_path, context_lora_strength, device=device, dtype=dtype)
 
-    network = create_network(None, "lora_unet", 1.0, network_dim, network_alpha, None, [], dit)
+    if network_type == "lokr":
+        from fizgig.networks.lora import LoKRModule
+        logger.info(f"network: LoKR (Kronecker), factor {lokr_factor}, full-matrix w2 — "
+                    "dim/alpha do not apply")
+        network = create_network(None, "lora_unet", 1.0, network_dim, network_alpha, None, [], dit,
+                                 module_class=LoKRModule, module_kwargs={"factor": int(lokr_factor)})
+    else:
+        network = create_network(None, "lora_unet", 1.0, network_dim, network_alpha, None, [], dit)
     network.apply_to(text_encoders=None, unet=dit, apply_text_encoder=False, apply_unet=True)
     network.requires_grad_(True)
     network.to(device=device, dtype=dtype)
+    network._network_type = network_type
+    network._lokr_factor = int(lokr_factor)
+    # Dotted module paths, for the LyCORIS-standard final save (diffusion_model.<path>.lokr_*).
+    # Built from the DiT itself with the same flattening create_modules used, so the reverse
+    # mapping is exact even where module names contain underscores.
+    network._dotted_names = {
+        f"lora_unet_{name.replace('.', '_')}": name
+        for name, m in dit.named_modules() if isinstance(m, torch.nn.Linear)
+    }
 
-    # torch.compile LAST — after the LoRA has patched the forwards, so the compiled graph is the
-    # one that actually runs. Per block, not whole-model: the 28 blocks share a graph signature so
-    # inductor compiles once and reuses, and a failure is contained to one block.
+    # torch.compile LAST — after the LoRAs have patched the forwards, so the compiled graph is
+    # the one that actually runs. Per block, not whole-model: the 28 blocks share a graph
+    # signature so inductor compiles once and reuses, and a failure is contained to one block.
+    # With a turbo net staged, its enabled flag becomes a dynamo guard: the first preview
+    # compiles a second graph variant (enabled=True), after which both states are cached.
     if compile_blocks:
         _compile_blocks(dit, blocks_to_swap)
-    return dit, network
+    return dit, network, turbo_net, turbo_diffb
 
 
 class _CheckpointedBlock(torch.nn.Module):
@@ -448,7 +533,16 @@ def _save_training_state(output_dir, output_name, network, optimizer, *, epoch, 
 def _load_training_state(state_dir, network, optimizer, *, device):
     """Restore network + optimizer + RNG from a state dir. Returns (start_epoch, global_step, meta)."""
     from safetensors.torch import load_file
-    network.load_state_dict(load_file(os.path.join(state_dir, "lora.safetensors")), strict=False)
+    # strict=False tolerates benign key drift, but if NOTHING matched the LoRA silently stays at
+    # its zero init and the run "succeeds" while training from scratch — then overwrites the
+    # finished LoRA with a no-op. That's most reachable via resume-a-finished-run, so refuse it.
+    _incompat = network.load_state_dict(load_file(os.path.join(state_dir, "lora.safetensors")), strict=False)
+    _missing = getattr(_incompat, "missing_keys", [])
+    if _missing and len(_missing) >= len(network.state_dict()):
+        raise RuntimeError(
+            f"[state] {state_dir} matched none of this network's {len(network.state_dict())} keys — "
+            f"refusing to resume into a zero-initialised LoRA. The state was almost certainly saved "
+            f"with a different network config (rank/alpha/target modules or a different Context LoRA).")
     opt_path = os.path.join(state_dir, "optimizer.pt")
     if os.path.exists(opt_path):
         optimizer.load_state_dict(torch.load(opt_path, map_location=device))
@@ -728,15 +822,47 @@ def _save_full_checkpoint(rotator, raw_path: str, path: str, extra_metadata=None
     gc.collect()
 
 
-def _save_lora(network, path, network_dim, network_alpha, dtype, extra_metadata=None):
-    metadata = {
-        "ss_network_module": "fizgig.krea2 (lora_unet, all-Linear)",
-        "ss_network_dim": str(network_dim),
-        "ss_network_alpha": str(network_alpha),
-        "ss_architecture": ARCHITECTURE_KREA2,
-    }
+def _save_lora(network, path, network_dim, network_alpha, dtype, extra_metadata=None,
+               comfy_format=False):
+    """Save the trainable network. `comfy_format` (final artifact only) rewrites a LoKR's keys
+    to the LyCORIS standard (`diffusion_model.<dotted>.lokr_*`) — the format every ComfyUI LoKR
+    in the wild uses. Internal saves (state dirs, preview temps) stay in native state_dict
+    naming so resume's load_state_dict and the preview reload path work unchanged; our own
+    loader ingests both via ensure_kohya_lora_state_dict."""
+    is_lokr = getattr(network, "_network_type", "lora") == "lokr"
+    if is_lokr:
+        metadata = {
+            "ss_network_module": "fizgig.krea2 (lokr, all-Linear)",
+            "ss_lokr_factor": str(getattr(network, "_lokr_factor", "")),
+            "ss_architecture": ARCHITECTURE_KREA2,
+        }
+    else:
+        metadata = {
+            "ss_network_module": "fizgig.krea2 (lora_unet, all-Linear)",
+            "ss_network_dim": str(network_dim),
+            "ss_network_alpha": str(network_alpha),
+            "ss_architecture": ARCHITECTURE_KREA2,
+        }
     if extra_metadata:
         metadata.update(extra_metadata)
+    if comfy_format and is_lokr:
+        from fizgig.networks.lora import _precalculate_safetensors_hashes
+        from safetensors.torch import save_file
+        dotted = getattr(network, "_dotted_names", {})
+        sd = {}
+        for k, v in network.state_dict().items():
+            mod, _, suffix = k.partition(".")
+            path_dotted = dotted.get(mod)
+            nk = f"diffusion_model.{path_dotted}.{suffix}" if path_dotted else k
+            v = v.detach().clone().to("cpu")
+            if dtype is not None:
+                v = v.to(dtype)
+            sd[nk] = v
+        model_hash, legacy_hash = _precalculate_safetensors_hashes(sd, metadata)
+        metadata["sshs_model_hash"] = model_hash
+        metadata["sshs_legacy_hash"] = legacy_hash
+        save_file(sd, path, metadata)
+        return
     network.save_weights(path, dtype, metadata)
 
 
@@ -813,7 +939,8 @@ def _remove_claimed_queue(path: str) -> None:
 def _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_swap, loss_watch, epoch,
                            *, auto_recaption=False, trigger_word=None, trigger_position="start",
                            recaptioned=None,
-                           image_dir=None, caption_ext=".txt"):
+                           image_dir=None, caption_ext=".txt", recaption_instruction=None,
+                           recaption_instruction_detailed=None):
     """Live caption repair (Problem Images window). Consume <output_dir>/loss_log/caption_updates.json
     ({item_key: new_caption}), re-encode each caption with Qwen3-VL, and OVERWRITE the item's
     text-embedding cache file — the collate re-reads that file from disk every step, so the very
@@ -828,6 +955,13 @@ def _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_sw
     exhaustive-detail caption; after that it's permanently human-review. A manual edit already
     queued for a key always wins over the auto path. Both jobs share one DiT park + one
     text-encoder load.
+
+    recaption_instruction / recaption_instruction_detailed: the Captions tab's Training-caption
+    and Exhaustive-detail instructions, sent only when the user has edited that preset. Attempt 1
+    uses the training one, attempt 2 the exhaustive one — so the escalation to exhaustive detail
+    (the point of a second attempt, and what makes the two-attempt protocol a causal test
+    separating caption-fixable images from entropy-limited ones) is preserved whether the user
+    edited those presets or not. Either being None just means "use the built-in".
 
     The GUI separately rewrites the .txt for manual edits; the auto path writes the .txt itself
     (image_dir + caption_ext from the dataset TOML) so fixes survive future re-caches. The 8 GB
@@ -923,9 +1057,20 @@ def _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_sw
         # fine-tuning): the name is the subject, not an afterthought. trigger_position="end"
         # restores the weaker trailing claim, which suits a conditional trigger on a LoRA.
         # Attempt 2 (the first caption demonstrably failed) goes exhaustive-detail.
+        if recaption_instruction or recaption_instruction_detailed:
+            _which = " + ".join(
+                w for w, v in (("Training caption", recaption_instruction),
+                               ("Exhaustive detail", recaption_instruction_detailed)) if v)
+            logger.info("[auto-recaption] using your edited instruction for: %s", _which)
         for k, img_path, attempt in auto_todo:
             try:
-                cap = generate_caption(encoder, img_path, detailed=(attempt >= 2))
+                # Attempt 1 uses the Training-caption instruction, attempt 2 the Exhaustive one —
+                # the user's edited version of each where they have one, the built-in otherwise.
+                # The escalation to exhaustive detail is preserved either way.
+                _instr = (recaption_instruction_detailed if attempt >= 2
+                          else recaption_instruction) or None
+                cap = generate_caption(encoder, img_path, detailed=(attempt >= 2),
+                                       instruction=_instr)
                 if trigger_word:
                     cap = (f"{cap}, {trigger_word}" if str(trigger_position) == "end"
                            else f"{trigger_word}, {cap}")
@@ -1050,10 +1195,8 @@ def sample_previews(turbo_path, ae, encoded_prompts, lora_sd, out_dir, epoch, *,
     Filenames follow the Fizgig samples-gallery pattern
     `{name}_e{epoch:06d}_{idx:02d}_{timestamp:14d}_{seed}.png` so the live preview gallery
     (which parses that exact format) picks them up — same as the Klein training path."""
-    import datetime
     from fizgig.krea2.utils import load_krea2_dit
     from fizgig.networks.lora import create_network_from_weights
-    from fizgig.krea2 import sampling
 
     _ld = "cpu" if blocks_to_swap > 0 else device
     turbo = load_krea2_dit(turbo_path, device=device, dtype=torch.bfloat16,
@@ -1089,6 +1232,20 @@ def sample_previews(turbo_path, ae, encoded_prompts, lora_sd, out_dir, epoch, *,
         turbo.move_to_device_except_swap_blocks(torch.device(device))
         turbo.switch_block_swap_for_inference()
     turbo.eval()
+    paths = _render_prompt_set(turbo, ae, encoded_prompts, out_dir, epoch,
+                               output_name=output_name, steps=steps, cfg_scale=cfg_scale,
+                               neg=neg, width=width, height=height, seed=seed, device=device)
+    del turbo, net, ctx_net
+    torch.cuda.empty_cache()
+    return paths
+
+
+def _render_prompt_set(model, ae, encoded_prompts, out_dir, epoch, *, output_name, steps,
+                       cfg_scale, neg, width, height, seed, device):
+    """Shared preview render loop — identical settings (mu=1.15 pinned) and the exact gallery
+    filename pattern for both the Turbo-model path and the turbo-LoRA-on-training-DiT path."""
+    import datetime
+    from fizgig.krea2 import sampling
     os.makedirs(out_dir, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")  # 14-digit timestamp
     paths = []
@@ -1098,15 +1255,57 @@ def sample_previews(turbo_path, ae, encoded_prompts, lora_sd, out_dir, epoch, *,
         _untxt, _untxtmask = neg
     for i, (txt, txtmask) in enumerate(encoded_prompts):
         with torch.no_grad():
-            imgs = sampling.sample(turbo, ae, txt, txtmask, untxt=_untxt, untxtmask=_untxtmask,
+            imgs = sampling.sample(model, ae, txt, txtmask, untxt=_untxt, untxtmask=_untxtmask,
                                    device=device, dtype=torch.bfloat16, width=width, height=height,
                                    steps=steps, cfg_scale=cfg_scale, mu=1.15, seed=seed + i)
         p = os.path.join(out_dir, f"{output_name}_e{epoch:06d}_{i:02d}_{ts}_{seed + i}.png")
         imgs[0].save(p)
         paths.append(p)
-    del turbo, net, ctx_net
-    torch.cuda.empty_cache()
     return paths
+
+
+def sample_previews_on_dit(dit, turbo_net, turbo_diffb, ae, encoded_prompts, out_dir, epoch, *,
+                           output_name="krea2", steps=8, cfg_scale=1.0, neg=None,
+                           width=512, height=512, seed=42, blocks_to_swap=0, device="cuda"):
+    """Render previews on the RESIDENT training DiT with the Turbo LoRA enabled at 1.0 —
+    no Turbo checkpoint load, no parking the trainer to CPU.
+
+    Stack order at render time is turbo (innermost) -> context -> trainable, i.e. the model
+    behaves as Turbo, the context rides on it, and the LoRA being trained samples on top —
+    matching deployment. The trainable network is live, so previews reflect current weights
+    with no save/reload round-trip.
+
+    Everything is reverted in the finally: turbo net disabled + back to CPU, bias deltas
+    undone by exact snapshot restore, block swap returned to training mode, train() mode
+    re-entered. Training state is untouched whether the render succeeds or raises.
+
+    `blocks_to_swap` here is the TRAINING swap setting (this is the training model), not the
+    preview-model swap the Turbo-checkpoint path uses.
+    """
+    saved_biases = []
+    was_training = dit.training
+    try:
+        dit.eval()
+        if blocks_to_swap > 0:
+            dit.switch_block_swap_for_inference()
+        turbo_net.to(device=device)
+        turbo_net.set_enabled(True)
+        for bias, delta in turbo_diffb:
+            saved_biases.append((bias, bias.detach().clone()))
+            bias.data.add_(delta.to(device=bias.device, dtype=bias.dtype))
+        return _render_prompt_set(dit, ae, encoded_prompts, out_dir, epoch,
+                                  output_name=output_name, steps=steps, cfg_scale=cfg_scale,
+                                  neg=neg, width=width, height=height, seed=seed, device=device)
+    finally:
+        for bias, snap in saved_biases:
+            bias.data.copy_(snap)
+        turbo_net.set_enabled(False)
+        turbo_net.to(device="cpu")
+        if blocks_to_swap > 0:
+            dit.switch_block_swap_for_training()
+        if was_training:
+            dit.train()
+        torch.cuda.empty_cache()
 
 
 def train_krea2(
@@ -1117,9 +1316,16 @@ def train_krea2(
     *,
     network_dim: int = 32,
     network_alpha: float = 32,
+    network_type: str = "lora",     # "lora" | "lokr" (Kronecker, full-matrix w2)
+    lokr_factor: int = 8,           # LoKR only: w1 is ~factor x factor; dim/alpha unused
     learning_rate: float = 1e-4,
     max_train_epochs: int = 10,
     save_every_n_epochs: int = 0,
+    # Resumable state dirs. Pause/Resume saves state regardless of these — they only govern the
+    # automatic saves. Each dir is LoRA + optimizer moments (~474 MB at rank 32), hence keep_n.
+    save_state: bool = False,
+    save_state_on_train_end: bool = False,
+    keep_last_n_states: int = 2,
     fp8_scaled: bool = True,
     fast_ft: bool = False,
     reg_lr_multiplier: float = 0.2,
@@ -1142,9 +1348,11 @@ def train_krea2(
     lr_decay_steps: int = 0,
     lr_scheduler_num_cycles: int = 1,
     lr_scheduler_power: float = 1.0,
-    # in-training previews (sample the fp8 Turbo with the live LoRA)
+    # in-training previews (sample the fp8 Turbo with the live LoRA — or, when
+    # turbo_lora_path is set, the resident training DiT with the Turbo LoRA @1.0)
     sample_prompts: list = None,
     turbo_path: str = None,
+    turbo_lora_path: str = None,
     vae_path: str = None,
     te_path: str = None,
     sample_every_n_epochs: int = 0,
@@ -1163,6 +1371,10 @@ def train_krea2(
     auto_recaption: bool = False,
     warmup_look_outliers: bool = False,
     trigger_word: str = None,
+    # Captions-tab instructions for auto-recaption: the Training-caption preset for attempt 1,
+    # the Exhaustive-detail preset for attempt 2. Each sent only when the user edited that preset.
+    recaption_instruction: str = None,
+    recaption_instruction_detailed: str = None,
     resume_state_dir: str = None,
     context_lora_path: str = None,
     context_lora_strength: float = 1.0,
@@ -1208,6 +1420,22 @@ def train_krea2(
     logger.info(f"Krea 2 training: {group.num_train_items} items, {max_train_epochs} epochs")
 
     ft_rotation = max(0, int(finetune_rotation or 0))
+
+    # Fine-tune trains the BASE weights — the LoRA/LoKR network is built but inert, so a LoKR
+    # request would only burn VRAM on parameters that are never trained or saved. Coerce with a
+    # loud log (the GUI also hides the Network Type control under fine-tune).
+    if ft_rotation and network_type == "lokr":
+        logger.warning("[ft-rotation] --network_type lokr is ignored under base-model "
+                       "fine-tuning (the adapter is inert) — proceeding as standard.")
+        network_type = "lora"
+    # Resume restores an INERT LoRA + an optimizer that may not even exist under fused
+    # backward — it would silently restart the base from RAW while looking like a resume.
+    # The full checkpoints are the continuation point: swap --dit to the saved checkpoint.
+    if ft_rotation and resume_state_dir:
+        raise RuntimeError(
+            "--resume is not supported in fine-tune mode: state dirs hold the (inert) LoRA, "
+            "not the base weights. To continue a fine-tune, point --dit at your last saved "
+            "checkpoint — it is structurally identical to the RAW base.")
 
     # Auto window mode: size the rotation window to the free VRAM. Resolved here rather than
     # in the GUI so headless runs get it too, and so it reads the VRAM actually available at
@@ -1308,7 +1536,19 @@ def train_krea2(
     if str(compile_blocks).lower() == "auto":
         from fizgig.utils.capabilities import should_compile
         _steps_est = group.num_train_items * max_train_epochs
-        _do_compile, _why = should_compile(_steps_est, quant_4bit, quant_int8, blocks_to_swap)
+        # The largest ACTUAL bucket, not the Target Megapixels box — bucket_no_upscale can land
+        # buckets well below the target, and it's the real token count that sets compiled-path
+        # VRAM. Batch rides along because it multiplies tokens per step the same way. Unreadable
+        # values fall back to the defaults, i.e. the pre-shape-aware behaviour.
+        _mp_max, _batch_max = 0.25, 1
+        try:
+            _mp_max = max(w * h / 1e6 for ds in group.datasets
+                          for (w, h) in ds.batch_manager.bucket_resos)
+            _batch_max = max(int(ds.batch_size) for ds in group.datasets)
+        except Exception:
+            pass
+        _do_compile, _why = should_compile(_steps_est, quant_4bit, quant_int8, blocks_to_swap,
+                                           mp=_mp_max, batch=_batch_max)
         logger.info("[compile] auto: %s — %s", "ENABLED" if _do_compile else "off", _why)
     if _do_compile and ft_rotation:
         # Rotation flips requires_grad and swaps weights between the bf16 master and the GPU
@@ -1321,10 +1561,19 @@ def train_krea2(
     # Preview setup: pre-encode prompts (frees the 8GB encoder) + load the VAE BEFORE the RAW DiT,
     # so the encoder never coexists with the resident base.
     # sample_at_first counts as wanting previews even without a per-epoch cadence.
-    # Skipped entirely under a full fine-tune: previews apply a LoRA to the Turbo and there is
-    # no LoRA here, so loading the encoder and VAE would be pure waste.
+    # A missing turbo-LoRA file must be caught BEFORE prompts are encoded, so the fallback
+    # decision (Turbo checkpoint, or no previews at all) is made once, up front.
+    if turbo_lora_path and not os.path.isfile(turbo_lora_path):
+        logger.warning("[preview] turbo LoRA not found at %s — %s", turbo_lora_path,
+                       "falling back to the Turbo checkpoint" if turbo_path
+                       else "previews need it or a Turbo checkpoint; disabling previews")
+        turbo_lora_path = None
     do_previews = bool((sample_every_n_epochs or sample_at_first)
-                       and sample_prompts and turbo_path and vae_path and te_path)
+                       and sample_prompts and (turbo_path or turbo_lora_path)
+                       and vae_path and te_path)
+    # Skipped entirely under a full fine-tune: previews apply a LoRA (turbo or checkpoint) and
+    # there is no trainable LoRA here, so loading the encoder and VAE would be pure waste.
+    # MUST stay after every other do_previews decision — the FT kill wins.
     if do_previews and ft_rotation:
         logger.info("[ft-rotation] in-training previews are disabled — evaluate saved "
                     "checkpoints in ComfyUI instead.")
@@ -1365,12 +1614,18 @@ def train_krea2(
                         "the fp8 GEMM requires; the scale change alone is 1.10x. "
                         "Set FIZGIG_FP8_DIAG=1 to see per-Linear SCALED/DEQUANT decisions.")
 
-    dit, network = load_dit_for_training(
+    dit, network, turbo_net, turbo_diffb = load_dit_for_training(
         raw_path, network_dim=network_dim, network_alpha=network_alpha,
+        network_type=network_type, lokr_factor=lokr_factor,
         fp8_scaled=fp8_scaled, quant_4bit=quant_4bit, quant_int8=quant_int8,
         blocks_to_swap=blocks_to_swap, compile_blocks=_do_compile, fp8_fast=fast_ft,
         context_lora_path=context_lora_path, context_lora_strength=context_lora_strength,
+        turbo_lora_path=(turbo_lora_path if do_previews else None),
         device=device, dtype=dtype)
+    if turbo_net is not None:
+        logger.info("[preview] turbo-LoRA mode: previews render on the resident training DiT "
+                    "(RAW + Turbo LoRA @1.0, same 8-step CFG-free settings) — the Turbo "
+                    "checkpoint is not loaded and the trainer is never parked to CPU")
     if blocks_to_swap > 0 and not quant_4bit and not quant_int8:
         from fizgig.krea2.offloading import BlockSwapConfig
         dit.enable_block_swap(blocks_to_swap, BlockSwapConfig(torch.device(device), supports_backward=True))
@@ -1567,6 +1822,14 @@ def train_krea2(
                         f"stability_triggered={adaptive.stability_triggered}")
         logger.info(f"[resume] from {resume_state_dir}: continuing at epoch {start_epoch + 1}/{max_train_epochs} "
                     f"(global_step {global_step})")
+        # Nothing left to train: the epoch loop below is empty and we fall through to writing the
+        # final LoRA. That fall-through is deliberate — pausing ON the last epoch exits before the
+        # final LoRA is written, so Resume is what completes it — hence a loud log, not an error.
+        if start_epoch >= max_train_epochs:
+            logger.warning(
+                f"[resume] state is at epoch {start_epoch} of {max_train_epochs} — nothing left to "
+                f"train. Writing the final LoRA from the restored state. To train further, raise "
+                f"Max Train Epochs above {start_epoch} and resume again.")
     try:
         steps_per_epoch = len(loader)
     except TypeError:
@@ -1787,7 +2050,21 @@ def train_krea2(
             loss_watch.resume_from_jsonl(up_to_epoch=start_epoch, resets=_resets)
     # Sample at Start: an epoch-0 preview (base model + zero-init LoRA) so the run's
     # starting point is on record. Fresh runs only — a resume already has samples.
-    if sample_at_first and do_previews and start_epoch == 0:
+    if sample_at_first and do_previews and start_epoch == 0 and turbo_net is not None:
+        # Turbo-LoRA mode: render on the resident training DiT (live network — no save/reload,
+        # no parking). sample_previews_on_dit reverts everything in its finally.
+        logger.info("rendering epoch-0 preview (Sample at Start, on training DiT)...")
+        try:
+            _seed0 = sample_seed if sample_seed != 0 else random.randint(1, 2**31 - 1)
+            sample_previews_on_dit(dit, turbo_net, turbo_diffb, sample_ae, encoded_prompts,
+                                   sample_dir, 0, output_name=output_name, steps=sample_steps,
+                                   cfg_scale=sample_cfg_scale, neg=encoded_negative,
+                                   width=sample_width, height=sample_height, seed=_seed0,
+                                   blocks_to_swap=blocks_to_swap, device=device)
+        except Exception as _e0:
+            logger.warning(f"[preview] Sample at Start failed ({type(_e0).__name__}) — training "
+                           f"continues; per-epoch previews will still be attempted.")
+    elif sample_at_first and do_previews and start_epoch == 0:
         from safetensors.torch import load_file as _lf0
         _tmp0 = os.path.join(output_dir, "_sample_lora.safetensors")
         _save_lora(network, _tmp0, network_dim, network_alpha, dtype)
@@ -1827,8 +2104,17 @@ def train_krea2(
                 move_nf4_to_device(dit, device)
             dit.train()
 
+    # Return the load-time transients (quantise staging, resume's optimizer-state copy) to the
+    # driver before stepping. Fresh runs with Sample at Start got this for free from the
+    # preview's empty_cache; resumed runs skip that preview and sat ~4 GB high until the first
+    # epoch-boundary preview cleared it (issue #24). Unconditional so every path starts clean.
+    gc.collect()
+    torch.cuda.empty_cache()
+
     # VRAM probe: capture what the load phase alone cost, then zero the high-water mark so the
     # training figure is training's own. Answers "is the peak the model coming in, or the steps?"
+    # AFTER the cleanup above on purpose: the probe should read the settled figure, not the
+    # transients that were about to be freed anyway.
     _probe_load_gb = 0.0
     if int(os.environ.get("FIZGIG_VRAM_PROBE", "0") or 0) and torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -2013,17 +2299,74 @@ def train_krea2(
                                auto_recaption=auto_recaption, trigger_word=trigger_word,
                                trigger_position=trigger_position,
                                recaptioned=recaptioned, image_dir=ar_image_dir,
-                               caption_ext=ar_caption_ext)
+                               caption_ext=ar_caption_ext,
+                               recaption_instruction=recaption_instruction,
+                               recaption_instruction_detailed=recaption_instruction_detailed)
 
+        state_saved_this_epoch = False
         if save_every_n_epochs and (epoch + 1) % save_every_n_epochs == 0 and (epoch + 1) < max_train_epochs:
             if rotator is not None:
+                # The full checkpoint IS the resumable state under fine-tuning: the LoRA is
+                # inert and the optimizer may be None (fused backward), so a state dir would
+                # snapshot nothing real. To continue a fine-tune, point --dit at the saved
+                # checkpoint (structurally identical to the RAW base).
                 _save_full_checkpoint(rotator, raw_path,
                                       os.path.join(output_dir, f"{output_name}-{epoch + 1:06d}.safetensors"))
+                if save_state:
+                    logger.info("[ft-rotation] state dirs are skipped — the full checkpoint "
+                                "is the state; swap the base to continue training.")
             else:
+                # comfy_format so a user's picked-best epoch is byte-format-identical to the final
+                # artifact (LoKR: LyCORIS-standard keys). No-op for standard LoRA.
                 _save_lora(network, os.path.join(output_dir, f"{output_name}-{epoch + 1:06d}.safetensors"),
-                           network_dim, network_alpha, dtype)
+                           network_dim, network_alpha, dtype, comfy_format=True)
+                # Resumable state rides the checkpoint cadence. Safe to snapshot here: pending_accum
+                # was flushed above, the adaptive-LR watcher has already made its call for this epoch,
+                # and any queued caption updates are applied — so the optimizer is settled.
+                if save_state:
+                    _save_training_state(output_dir, output_name, network, optimizer,
+                                         epoch=epoch + 1, global_step=global_step,
+                                         network_dim=network_dim, network_alpha=network_alpha, dtype=dtype,
+                                         extra={"adaptive_lr_state": adaptive.state_dict()} if adaptive else None)
+                    state_saved_this_epoch = True
+                    prune_state_dirs(output_dir, output_name, keep_last_n_states)
 
-        if do_previews and sample_every_n_epochs and (epoch + 1) % sample_every_n_epochs == 0:
+        if (do_previews and sample_every_n_epochs and (epoch + 1) % sample_every_n_epochs == 0
+                and turbo_net is not None):
+            # Turbo-LoRA mode: live network, resident DiT, no parking. The override TE encode
+            # is the one VRAM risk (the ~8 GB Qwen3-VL loads alongside the resident trainer,
+            # where the parked path had the DiT out of the way) — the except keeps an OOM from
+            # killing the run, same as the Turbo-checkpoint path.
+            logger.info(f"rendering previews (epoch {epoch + 1}) on the training DiT + Turbo LoRA...")
+            try:
+                ov = _read_sample_override(output_dir)
+                if ov:
+                    logger.info(f"[sample override] active — '{ov['prompt'][:60]}' "
+                                f"seed={ov['seed']} {ov['width']}x{ov['height']}"
+                                f"{' +ref' if ov.get('ref_image') else ''}")
+                    prev_enc = encode_sample_prompts(te_path, [ov["prompt"]],
+                                                     ref_image=ov.get("ref_image") or None, device=device)
+                    prev_w, prev_h, prev_seed = ov["width"], ov["height"], ov["seed"]
+                else:
+                    prev_enc, prev_w, prev_h, prev_seed = encoded_prompts, sample_width, sample_height, sample_seed
+                if prev_seed == 0:
+                    prev_seed = random.randint(1, 2**31 - 1)
+                    logger.info(f"[sample] seed 0 -> random {prev_seed}")
+                sample_previews_on_dit(dit, turbo_net, turbo_diffb, sample_ae, prev_enc,
+                                       sample_dir, epoch + 1, output_name=output_name,
+                                       steps=sample_steps, cfg_scale=sample_cfg_scale,
+                                       neg=encoded_negative, width=prev_w, height=prev_h,
+                                       seed=prev_seed, blocks_to_swap=blocks_to_swap, device=device)
+            except Exception as _prev_err:
+                _oom = "out of memory" in str(_prev_err).lower()
+                logger.warning(
+                    f"[preview] epoch {epoch + 1} preview failed "
+                    f"({'CUDA OOM' if _oom else type(_prev_err).__name__}); "
+                    f"disabling previews for the rest of the run. Training continues and LoRAs still save normally."
+                )
+                do_previews = False
+            network.train()
+        elif do_previews and sample_every_n_epochs and (epoch + 1) % sample_every_n_epochs == 0:
             from safetensors.torch import load_file
             tmp = os.path.join(output_dir, "_sample_lora.safetensors")
             _save_lora(network, tmp, network_dim, network_alpha, dtype)
@@ -2100,11 +2443,20 @@ def train_krea2(
         # state at this epoch boundary and exit cleanly so the GPU frees. The GUI detects the
         # clean exit, records the paused state, and offers Resume. Same contract as Klein.
         if os.path.exists(pause_flag):
-            logger.info(f"[pause] requested — saving state at epoch {epoch + 1} and exiting cleanly")
-            _save_training_state(output_dir, output_name, network, optimizer,
-                                 epoch=epoch + 1, global_step=global_step,
-                                 network_dim=network_dim, network_alpha=network_alpha, dtype=dtype,
-                                 extra={"adaptive_lr_state": adaptive.state_dict()} if adaptive else None)
+            # Pause ALWAYS saves state, regardless of the save-state settings — that's the whole
+            # contract of the button. But if the cadence already wrote this epoch's state above,
+            # don't re-dump ~0.5 GB into the same dir: _save_training_state overwrites in place,
+            # so a crash during the rewrite would destroy the very state we're pausing to keep.
+            # The flag (not os.path.isdir) is the right check — a stale dir left by an earlier
+            # run with the same name would wrongly suppress a real pause save.
+            if state_saved_this_epoch:
+                logger.info(f"[pause] requested — state for epoch {epoch + 1} already saved; exiting cleanly")
+            else:
+                logger.info(f"[pause] requested — saving state at epoch {epoch + 1} and exiting cleanly")
+                _save_training_state(output_dir, output_name, network, optimizer,
+                                     epoch=epoch + 1, global_step=global_step,
+                                     network_dim=network_dim, network_alpha=network_alpha, dtype=dtype,
+                                     extra={"adaptive_lr_state": adaptive.state_dict()} if adaptive else None)
             try:
                 os.remove(pause_flag)
             except Exception:
@@ -2116,6 +2468,19 @@ def train_krea2(
     progress_bar.close()
     if loss_watch is not None:
         loss_watch.close()
+
+    # End-of-run state, so a finished LoRA can be trained further by raising max_train_epochs.
+    # Skipped when the run trained nothing (resumed from a state already at the final epoch) —
+    # the only dir we'd write is the one we resumed FROM, and the save overwrites in place.
+    # No state dir under fine-tuning: the LoRA is inert, the optimizer may be None (fused
+    # backward), and the full checkpoint below IS the continuation point.
+    if save_state_on_train_end and max_train_epochs > start_epoch and rotator is None:
+        _save_training_state(output_dir, output_name, network, optimizer,
+                             epoch=max_train_epochs, global_step=global_step,
+                             network_dim=network_dim, network_alpha=network_alpha, dtype=dtype,
+                             extra={"adaptive_lr_state": adaptive.state_dict()} if adaptive else None)
+        prune_state_dirs(output_dir, output_name, keep_last_n_states)
+
     out = os.path.join(output_dir, f"{output_name}.safetensors")
     # Record the context LoRA in metadata so users know to pair it at the same strength at
     # inference (the trained LoRA is context-dependent — same contract as Klein).
@@ -2134,6 +2499,7 @@ def train_krea2(
         _save_full_checkpoint(rotator, raw_path, out, extra_metadata=extra)
         logger.info(f"saved fine-tuned checkpoint -> {out}")
         return out
-    _save_lora(network, out, network_dim, network_alpha, dtype, extra_metadata=extra)
+    _save_lora(network, out, network_dim, network_alpha, dtype, extra_metadata=extra,
+               comfy_format=True)
     logger.info(f"saved final LoRA -> {out}")
     return out

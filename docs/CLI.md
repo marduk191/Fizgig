@@ -159,6 +159,8 @@ A dataset is just a folder of images with caption sidecars — no manifest, no s
 
 The GUI's Image Prep tab (batch resize, PNG conversion, face-crop detection) is convenience, not requirement — anything that produces ordinary image files works.
 
+**Likeness at 0.25 MP: face crops are what make it work.** Training defaults to 0.25 MP (a 512×512 area in whatever aspect the image has), and the VAE compresses a further 8× on each axis — so a face that fills ~80 px of a full-body shot reaches the model as roughly 10×10 latent pixels, carrying almost no identity signal. A face crop of the same photo gives that face the entire frame instead — about **40× the face area** for the model to learn from. So if likeness is coming out soft, the first fix isn't raising the megapixels: add tight face crops alongside the wider shots (Image Prep's face-crop mode makes them in one pass). The crops feed identity, the wide shots teach body and context, and you keep 0.25 MP's fast steps. Raising the MP target helps too but costs speed and VRAM on every image — crops put the resolution only where the identity lives.
+
 ### Caption modes
 
 One `.txt` file per image, same basename (`portrait_012.png` → `portrait_012.txt`), plain text. The GUI's Captions tab offers three modes; all three produce plain sidecar files you can equally write yourself headless:
@@ -171,6 +173,7 @@ Captioning rules that come from real runs:
 
 - **Caption anything the model's prior would call a lie** — viewpoint especially. A profile shot captioned like a frontal portrait teaches the model to fight itself; caption it `..., profile view from the left`. On Krea 2 this matters doubly: caption-viewpoint mismatches are the single most common thing the per-image loss watch convicts.
 - That rule includes the trigger itself: if the subject isn't actually recognizable in a shot (back of head, extreme distance), consider leaving the trigger out of that caption.
+- **For a style dataset, caption the contents and never the style itself.** Describe what's in each image — the subject, the setting, the colours of the things themselves — and say nothing about medium, brushwork, texture, colour grade or lighting. Then the trigger word is the only thing every caption has in common, which is exactly what you want the look to bind to. Lighting is the one people get wrong: caption it and the style only fires under the lighting it saw. Describe generously — richer captions account for more of the image and leave the look as the cleaner remainder. The GUI's *Style* preset does this for you.
 - Changed captions require re-running the text-cache step. (During a Krea 2 run, `--auto_recaption` handles stuck images' captions for you, including the re-encode.)
 
 ### Dataset sidecar files (Krea 2 intelligence)
@@ -283,7 +286,11 @@ Loads the existing LoRA frozen-but-active on the base, so your new LoRA learns t
 **Checkpoints / state**
 
 - `--save_every_n_epochs 1` + `--save_state` — per-epoch LoRA checkpoints plus resumable state dirs (`<name>-NNNNNN-state/`). State is what makes pause/resume and epoch-scrubbing possible; keep it on.
+- `--save_state_on_train_end` — write a state dir when the run finishes, so a completed LoRA can be trained further later by raising `--max_train_epochs` and resuming. Without it, a finished run leaves only the LoRA and can't be continued.
+- `--keep_last_n_states 2` — keep only the N newest state dirs. Each is the LoRA plus optimizer moments (~470 MB at rank 32), so an unpruned 55-epoch run leaves tens of GB behind. Only dirs matching the current `--output_name` are touched, and the newest is always kept (values below 1 are clamped).
 - `--resume <path-to-state-dir>` — continue a run (see [Pause and resume](#pause-and-resume)).
+
+Both trainers write the same `<name>-NNNNNN-state/` layout, where `NNNNNN` is the number of completed epochs. Pause always writes state regardless of the flags above.
 
 ---
 
@@ -338,6 +345,7 @@ The Krea 2 parser is small enough to know in full: run `krea2_train.py --help`. 
 
 **Core**
 
+- `--network_type lokr` + `--lokr_factor N` — train **LoKR** (LyCORIS Kronecker) instead of standard LoRA (the GUI's Network Type dropdown, headless here). One dial: the factor sets the Kronecker split, and dim/alpha are ignored. Lower factor ≈ more capacity and bigger files (factor 8 ≈ 400 MB, 16 ≈ 100 MB); **8 is the validated default, and going above it isn't worth it** — measured head-to-head, higher factors keep LoKR's ~20% step-time cost over standard LoRA while losing the quality edge that justifies it. Want smaller/faster? Use standard LoRA at low rank instead. Output is standard LyCORIS format (`diffusion_model.*.lokr_*`) — loads directly in ComfyUI and back into every Fizgig tool, where Repair Studio and Explorer save it natively (lossless; SVD only on donor-blended blocks). In our validation runs LoKR at factor 8 hit the highest likeness we've ever measured, with noticeably more natural skin than standard LoRA on the same data.
 - `--no_fp8` — train the base in bf16 instead of dynamic fp8 (needs a lot more VRAM; fp8 is the validated default).
 - `--quantize_4bit` — NF4 4-bit frozen base, ~5.6 GB DiT residency, fits 10-12 GB cards (block swap forced off).
 - `--quant_int8 bf16` — INT8 W8A8 frozen base: ~18.6 GB, so it needs a 24 GB card, and in exchange it is both the fastest option measured (0.637 s/it vs NF4's 0.709 on an RTX 5090) and ~7× more accurate than NF4 in forward error, since 8 bits beat 4. `bf16` keeps gradients exact; `int8` quantises the backward too — faster again, lossier. The GUI picks this automatically when there is free VRAM for it; on the CLI it is opt-in. Mutually exclusive with `--quantize_4bit`. Block swap is force-zeroed under INT8 (the staged quantise makes the model fully resident anyway).
@@ -415,6 +423,14 @@ python src/fizgig/scripts/krea2_train.py ... --resume ./output_loras/my_subject/
 ```
 
 The epoch number is parsed from the dir name; optimizer, scheduler, RNG, dataloader state, adaptive-LR scalars, and (Krea 2) the full per-image watch history are all restored. Pass the same flags as the original run plus `--resume`.
+
+**Training a finished LoRA further.** Resume its end-of-run state and raise `--max_train_epochs` in the same command — the state records how many epochs are already done, so a run resumed at its final epoch has nothing left to do and simply rewrites the final LoRA (the trainer says so plainly in the log rather than pretending it trained). Raising the ceiling is what gives it epochs to run:
+
+```bash
+# LoRA finished at 30 epochs; take it to 45
+python src/fizgig/scripts/krea2_train.py ... --max_train_epochs 45 \
+    --resume ./output_loras/my_subject/my_subject-000030-state
+```
 
 ---
 

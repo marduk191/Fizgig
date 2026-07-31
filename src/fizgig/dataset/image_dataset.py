@@ -634,10 +634,10 @@ class ImageDataset(torch.utils.data.Dataset):
     # -- cache paths -------------------------------------------------------
 
     def get_all_latent_cache_files(self) -> list[str]:
-        return glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
+        return glob.glob(os.path.join(glob.escape(self.cache_directory), f"*_{self.architecture}.safetensors"))
 
     def get_all_text_encoder_output_cache_files(self) -> list[str]:
-        return glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}_te.safetensors"))
+        return glob.glob(os.path.join(glob.escape(self.cache_directory), f"*_{self.architecture}_te.safetensors"))
 
     def get_latent_cache_path(self, item_info: ItemInfo) -> str:
         w, h = item_info.original_size
@@ -790,11 +790,38 @@ class ImageDataset(torch.utils.data.Dataset):
 
     # -- training preparation (after caching) ------------------------------
 
+    @staticmethod
+    def latent_cache_matches_reso(cache_file: str, bucket_reso: Tuple[int, int]) -> Optional[bool]:
+        """Does the cached latent inside `cache_file` match `bucket_reso` (pixel w, h)?
+
+        The cache FILENAME encodes the original image size, which never changes — so a cache
+        written at one Target Megapixels setting is indistinguishable by name from one written
+        at another, and __getitem__ maps whatever `latent_*` key the file holds onto `latents`.
+        Without this check a resolution change trains silently at the OLD resolution wherever
+        re-encoding is skipped. Header-only read (safe_open.keys()); returns None if the file
+        can't be read or holds no parseable latent key — callers choose their own failure mode.
+        """
+        try:
+            from safetensors import safe_open
+            with safe_open(cache_file, framework="pt") as f:
+                keys = list(f.keys())
+        except Exception:
+            return None
+        expected = {int(bucket_reso[0]) // 8, int(bucket_reso[1]) // 8}
+        for k in keys:
+            if k.startswith("latent_") and not k.startswith("latent_control_"):
+                try:
+                    a, b = k[len("latent_"):].split("x")
+                    return {int(a), int(b)} == expected
+                except Exception:
+                    return None
+        return None
+
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
         """Build the BucketBatchManager from cached latent files on disk."""
         bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale)
 
-        latent_cache_files = glob.glob(os.path.join(self.cache_directory, f"*_{self.architecture}.safetensors"))
+        latent_cache_files = glob.glob(os.path.join(glob.escape(self.cache_directory), f"*_{self.architecture}.safetensors"))
 
         # The training set is built from CACHE files, not from the image folder — so stale cache
         # entries get silently TRAINED ON: an image deleted from the dataset lingers as its cache,
@@ -808,6 +835,7 @@ class ImageDataset(torch.utils.data.Dataset):
                           if os.path.splitext(f)[1].lower() in _exts}   # images only — a leftover
             #                                       caption .txt must not keep a deleted image alive
         skipped_stale = 0
+        skipped_wrong_reso = 0
 
         bucketed: dict[Tuple[int, int], list[ItemInfo]] = {}
         for cache_file in latent_cache_files:
@@ -827,6 +855,12 @@ class ImageDataset(torch.utils.data.Dataset):
                 continue
 
             bucket_reso = bucket_selector.get_bucket_resolution(image_size)
+            # A cache written at a different Target Megapixels has the SAME filename (it encodes
+            # the original size, not the bucket) — training on it would silently run at the old
+            # resolution. Skip it and tell the user to re-run cache preparation.
+            if self.latent_cache_matches_reso(cache_file, bucket_reso) is False:
+                skipped_wrong_reso += 1
+                continue
             item_info = ItemInfo(item_key, "", image_size, bucket_reso, latent_cache_path=cache_file)
             item_info.text_encoder_output_cache_path = te_cache
 
@@ -840,6 +874,11 @@ class ImageDataset(torch.utils.data.Dataset):
                 f"[dataset] ignored {skipped_stale} stale cache file(s) in {self.cache_directory} "
                 f"with no matching image in {self.image_directory} — deleted images or another "
                 f"dataset's leftovers. They are NOT trained on; delete them to silence this.")
+        if skipped_wrong_reso:
+            logger.warning(
+                f"[dataset] ignored {skipped_wrong_reso} cache file(s) written at a DIFFERENT "
+                f"resolution than this run's Target Megapixels — re-run cache preparation "
+                f"(latent + text) to train at the current setting.")
 
         self.batch_manager = BucketBatchManager(bucketed, self.batch_size, num_timestep_buckets=num_timestep_buckets)
         self.batch_manager.show_bucket_info()

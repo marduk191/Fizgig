@@ -141,7 +141,11 @@ def detect() -> Capabilities:
 # The budget is FREE VRAM, not the number on the box: a "16 GB" card reports ~15.9 GiB total
 # and may have several GB already held by a browser or a running ComfyUI. Deciding from total
 # is how 16 GB cards ended up 4.4x slower — the config looked like it fit, and didn't.
-_FP8_PEAK_GB = 17.7
+# 18.7 is MEASURED, not derived: the real trainer on a real dataset under a ballast-constrained
+# 14.5 GB budget gave 13.66 / 12.08 / 10.28 GB at swap 12 / 16 / 20, a straight line whose swap-0
+# intercept is 18.7. The old 17.7 was a whole-GPU reading minus an assumed 2.4 GB desktop, and
+# being 1 GB light is what made the auto plan choose 12 blocks where 12 does not actually fit.
+_FP8_PEAK_GB = 18.7
 _NF4_PEAK_GB = 11.4
 # INT8 keeps the full 12.9B at one byte per weight, so it is ~5 GB above NF4 — measured 18.6 GB
 # whole-GPU, ~16.2 GB training-only. It buys ~11% speed AND ~7x lower forward error than NF4
@@ -163,14 +167,54 @@ _BATCH_GB_PER_IMAGE = 2.4
 _RES_GB_PER_MP = 0.25
 _RANK_GB_PER_RANK = 0.015
 
+# Block swap: GB of peak removed per swapped block, measured on the real trainer under an
+# emulated 16 GB budget (fp8, 0.25 MP, batch 1, rank 32; ballast-constrained 5090, 28 Jul):
+#
+#     swap 12 -> 13.66 GB     swap 16 -> 12.08 GB     swap 20 -> 10.28 GB
+#
+# A straight line through those: peak ~= 18.7 - 0.42 * swap, which also predicted the swap-16
+# point to 0.1 GB before it was run. Krea 2 has 28 main blocks and the offloader keeps 2
+# resident, so 26 is the ceiling.
+_SWAP_GB_PER_BLOCK = 0.42
+_MAX_SWAP_KREA2 = 26
+
+
+def swap_for_budget(need_gb: float, free_gb: float, headroom_gb: float = None) -> int:
+    """Fewest swapped blocks that fit `need_gb` into `free_gb`, keeping `headroom_gb` spare.
+
+    Deliberately the FEWEST: every swapped block is a PCIe round-trip per step (~4x step time
+    at heavy swap), so over-swapping is a real speed cost, not free safety. Returns 0 when it
+    already fits, and the ceiling when even max swap cannot get there (the caller warns).
+    """
+    headroom = _HEADROOM_GB if headroom_gb is None else headroom_gb
+    budget = free_gb - headroom
+    if need_gb <= budget:
+        return 0
+    import math
+    return min(_MAX_SWAP_KREA2, int(math.ceil((need_gb - budget) / _SWAP_GB_PER_BLOCK)))
+
+
+def _lokr_extra_gb(factor: int) -> float:
+    """Trainable-state cost of LoKR beyond the rank-32 LoRA baseline the peak constants were
+    measured with. Full-matrix LoKR params scale ~1/factor² (measured: factor 8 ≈ 200M params,
+    a 400 MB bf16 file on Krea 2's 264 Linears); param + grad (bf16) + two 8-bit Adam states
+    ≈ 6 bytes/param. The baseline already carries ~0.6 GB of rank-32 LoRA state, so only the
+    excess counts — zero at factor 16+, ~0.6 GB at the default factor 8, ~4 GB at factor 4,
+    which is exactly the size that breaks a 16 GB NF4 fit if unmodelled."""
+    f = int(factor) if factor and int(factor) >= 1 else 8
+    params_m = 200.0 * (8.0 / f) ** 2
+    return max(0.0, params_m * 6.0 / 1000.0 - 0.6)
+
 
 def estimate_krea2_peak(base_gb: float, mp: float = 0.25, batch: int = 1,
-                        rank: int = 32) -> float:
+                        rank: int = 32, network_type: str = "lora",
+                        lokr_factor: int = 8) -> float:
     """Peak VRAM estimate for a Krea 2 run of this shape (base measured at 0.25 MP, b1, r32)."""
     return (base_gb
             + _BATCH_GB_PER_IMAGE * max(0, int(batch) - 1)
             + _RES_GB_PER_MP * max(0.0, float(mp) - 0.25)
-            + _RANK_GB_PER_RANK * max(0, int(rank) - 32))
+            + _RANK_GB_PER_RANK * max(0, int(rank) - 32)
+            + (_lokr_extra_gb(lokr_factor) if network_type == "lokr" else 0.0))
 
 
 @dataclass
@@ -247,7 +291,10 @@ def recommend_ft_rotation(free_gb: Optional[float] = None):
 def recommend_krea2_strategy(vram_gb: Optional[float] = None,
                              caps: Optional[Capabilities] = None,
                              mp: float = 0.25, batch: int = 1,
-                             rank: int = 32) -> MemoryStrategy:
+                             rank: int = 32,
+                             force_quant: Optional[str] = None,
+                             network_type: str = "lora",
+                             lokr_factor: int = 8) -> MemoryStrategy:
     """Pick quantisation + swap for Krea 2 training on this machine.
 
     Preference: INT8 no-swap > NF4 no-swap > fp8 no-swap > swapping.
@@ -273,12 +320,63 @@ def recommend_krea2_strategy(vram_gb: Optional[float] = None,
     if not caps.has_cuda:
         return MemoryStrategy(False, 0, "no CUDA device — settings left alone")
 
+    # The user pinned the quantisation (the 4-bit control is not on Auto). Plan swap for the
+    # footprint that will ACTUALLY run — the whole point, because the ladder below used to pick
+    # a quant, size the swap for it, and then have the caller discard the quant and keep the
+    # swap. That shipped fp8 (17.7 GB) on NF4's swap-0 plan and OOM'd 16 GB cards (issue #18).
+    if force_quant:
+        # A card without int8 tensor cores cannot run the INT8 path at all, so an explicit
+        # INT8 request degrades to fp8 rather than launching something that will fail.
+        if force_quant == "int8" and not caps.int8_matmul_train:
+            force_quant = "fp8"
+        # "no_4bit" prices as fp8 up front, then the branch below upgrades it to INT8 when that
+        # fits — the fp8 figure is the fallback, not the decision. (Legacy: the old 4-bit
+        # control's "Off". The Base-precision dropdown asks for int8/fp8 explicitly now.)
+        _bases = {"nf4": _NF4_PEAK_GB, "int8": _INT8_PEAK_GB,
+                  "fp8": _FP8_PEAK_GB, "no_4bit": _FP8_PEAK_GB}
+        _base = _bases.get(force_quant)
+        if _base is not None:
+            need = estimate_krea2_peak(_base, mp, batch, rank, network_type, lokr_factor)
+            if force_quant == "nf4":
+                # NF4 cannot block-swap: the weights live in `_nf4_packed`, which the offloader
+                # cannot move, and the trainer force-zeroes blocks_to_swap under 4-bit.
+                fits = need + _HEADROOM_GB <= vram
+                return MemoryStrategy(
+                    True, 0,
+                    f"NF4 4-bit as you set it (~{need:.0f} GB needed, {vram:.1f} GB free)"
+                    + ("" if fits else " — this does NOT fit, and NF4 cannot block-swap; "
+                                       "switch the 4-bit control to Auto or free some VRAM"))
+            # "no_4bit" = the user turned the *4-bit* control off. That is a vote against NF4,
+            # NOT against all quantisation: INT8 is 8-bit, faster than NF4 and ~7x more
+            # accurate, so it still leads wherever it fits. Only when INT8 doesn't fit (or the
+            # card lacks int8 cores) does this fall through to fp8.
+            if force_quant == "no_4bit":
+                _i8 = estimate_krea2_peak(_INT8_PEAK_GB, mp, batch, rank, network_type, lokr_factor)
+                if caps.int8_matmul_train and vram >= _i8 + _HEADROOM_GB:
+                    return MemoryStrategy(
+                        False, 0,
+                        f"INT8 W8A8, no block swap (~{_i8:.0f} GB needed at this run shape, "
+                        f"{vram:.1f} GB free) — 4-bit is off as you set it, and INT8 is the "
+                        "fastest thing that fits (8-bit, exact gradients)",
+                        quant_int8="bf16")
+                need = estimate_krea2_peak(_FP8_PEAK_GB, mp, batch, rank, network_type, lokr_factor)
+
+            swap = swap_for_budget(need, vram)
+            label = "INT8 W8A8" if force_quant == "int8" else "fp8"
+            reason = (f"{label} as you set it (~{need:.0f} GB needed at this run shape, "
+                      f"{vram:.1f} GB free) — "
+                      + (f"{swap} blocks swapped to fit" if swap else "no block swap needed"))
+            if swap >= _MAX_SWAP_KREA2 and need - swap * _SWAP_GB_PER_BLOCK + _HEADROOM_GB > vram:
+                reason += " — even max swap may not fit; consider 4-bit on Auto"
+            return MemoryStrategy(False, swap, reason,
+                                  quant_int8="bf16" if force_quant == "int8" else "")
+
     # INT8 first where it fits: faster than NF4 *and* far more accurate, with exact gradients.
     # Needs int8 tensor cores, which torch._int_mm requires — present from Turing, so this is
     # not Blackwell-only (unlike fp8 _scaled_mm, which needs sm_89+).
-    _int8_need = estimate_krea2_peak(_INT8_PEAK_GB, mp, batch, rank)
-    _nf4_need = estimate_krea2_peak(_NF4_PEAK_GB, mp, batch, rank)
-    _fp8_need = estimate_krea2_peak(_FP8_PEAK_GB, mp, batch, rank)
+    _int8_need = estimate_krea2_peak(_INT8_PEAK_GB, mp, batch, rank, network_type, lokr_factor)
+    _nf4_need = estimate_krea2_peak(_NF4_PEAK_GB, mp, batch, rank, network_type, lokr_factor)
+    _fp8_need = estimate_krea2_peak(_FP8_PEAK_GB, mp, batch, rank, network_type, lokr_factor)
     if caps.int8_matmul_train and vram >= _int8_need + _HEADROOM_GB:
         return MemoryStrategy(
             False, 0,
@@ -297,7 +395,10 @@ def recommend_krea2_strategy(vram_gb: Optional[float] = None,
             False, 0, f"fp8, no block swap (~{_fp8_need:.0f} GB needed at this run shape, {vram:.1f} GB free)")
 
     if not caps.bitsandbytes:
-        swap = 12 if vram >= 22 else (20 if vram >= 15 else 26)
+        # Sized from the measured curve rather than coarse VRAM tiers: the old table gave a
+        # 16 GB card 20 blocks where 16 fits with 2.4 GB to spare, and every extra block is a
+        # PCIe round-trip per step.
+        swap = swap_for_budget(_fp8_need, vram)
         return MemoryStrategy(
             False, swap,
             f"fp8 with {swap} blocks swapped — bitsandbytes is missing, so NF4 (which would "
@@ -308,7 +409,7 @@ def recommend_krea2_strategy(vram_gb: Optional[float] = None,
     # recommendation here was a configuration that cannot exist: on a 12 GB card it was
     # the only reachable tier, leaving the auto path with no working configuration at all.
     # fp8 + heavy swap is the one combination that actually runs at this size.
-    swap = 20 if vram >= 11 else 26
+    swap = swap_for_budget(_fp8_need, vram)
     return MemoryStrategy(
         False, swap,
         f"fp8 with {swap} blocks swapped — {vram:.1f} GB free is below what Krea 2 needs "
@@ -330,13 +431,35 @@ _COMPILE_SAVING_S = {"int8": 0.300, "nf4": 0.153}
 _COMPILE_MARGIN = 2.0
 # INT8 + compile peaked at 21.7 GB against 17.8 GB for INT8 alone. NF4 + compile is VRAM-neutral
 # (12.9 GB vs 13.6 GB) and completes under a hard 15.5 GB cap, so it fits a 16 GB card.
+# BOTH figures are 0.25 MP measurements — see _COMPILE_GB_PER_MP for what happens above that.
 _INT8_COMPILE_PEAK_GB = 20.0
+_NF4_COMPILE_PEAK_GB = 13.0
+# Resolution scaling UNDER COMPILE, and it is nothing like the eager path's 0.25 GB/MP.
+# Eager, gradient checkpointing absorbs resolution (measured +0.15 GB from 0.25 -> 1.05 MP).
+# Compiled, inductor's partitioner saves activations between the forward and backward graphs,
+# and those scale with token count: a real 0.98 MP INT8+compile run on a 32 GB card reached
+# 30.8 GB reserved and OOM'd on the first backward — implying >= ~12.6 GB/MP over the 0.25 MP
+# baseline, and an OOM only bounds the true peak from BELOW. 15 adds slack in the only safe
+# direction: over-declining runs uncompiled (slower), under-declining repeats the OOM.
+# The NF4 figure is EXTRAPOLATED from that INT8 data point (the saved
+# activations are bf16 either way, so the slope shouldn't depend on the weight format) — being
+# wrong here declines compile and the run proceeds uncompiled, which costs speed, never the run.
+_COMPILE_GB_PER_MP = 15.0
 
 
 def should_compile(total_steps: int, quant_4bit: bool, quant_int8: str,
                    blocks_to_swap: int, vram_gb: Optional[float] = None,
-                   caps: Optional[Capabilities] = None) -> tuple:
-    """Decide whether torch.compile pays for itself on this run. Returns (bool, reason)."""
+                   caps: Optional[Capabilities] = None, mp: float = 0.25,
+                   batch: int = 1) -> tuple:
+    """Decide whether torch.compile pays for itself on this run. Returns (bool, reason).
+
+    `mp` is the run's largest bucket in megapixels, `batch` its batch size. What compiled
+    activation stashes scale with is tokens PER STEP, and batch multiplies tokens exactly as
+    resolution does — so the load term is mp x batch, priced at _COMPILE_GB_PER_MP over the
+    0.25 baseline. At the defaults (0.25 MP, batch 1) the term is exactly zero, so the
+    extensively-validated behaviour there cannot shift; eager checkpointing absorbs both knobs,
+    which is why only the compile gate needs them at this strength.
+    """
     caps = caps or detect()
     vram = vram_gb if vram_gb is not None else (caps.vram_free_gb or caps.vram_gb)
 
@@ -351,9 +474,18 @@ def should_compile(total_steps: int, quant_4bit: bool, quant_int8: str,
     kind = "nf4" if quant_4bit else ("int8" if quant_int8 else None)
     if kind is None:
         return False, "only measured for the quantised paths (NF4 / INT8); not enabled for fp8 or bf16"
-    if kind == "int8" and vram < _INT8_COMPILE_PEAK_GB + _HEADROOM_GB:
-        return False, (f"INT8 + compile peaks near {_INT8_COMPILE_PEAK_GB:.0f} GB and only "
-                       f"{vram:.1f} GB is free — INT8 alone still fits, compile does not")
+    _step_mp = float(mp) * max(1, int(batch))       # MP of latents per step
+    _res_gb = _COMPILE_GB_PER_MP * max(0.0, _step_mp - 0.25)
+    _shape = (f" at {mp:.2f} MP" + (f" x batch {batch}" if batch > 1 else "")) if _res_gb else ""
+    _fix = (" (lower Target Megapixels or batch size to compile)" if _res_gb else "")
+    if kind == "int8" and vram < _INT8_COMPILE_PEAK_GB + _res_gb + _HEADROOM_GB:
+        return False, (f"INT8 + compile peaks near {_INT8_COMPILE_PEAK_GB + _res_gb:.0f} GB{_shape} "
+                       f"and only {vram:.1f} GB is free — INT8 alone still fits, compile does not"
+                       + _fix)
+    if kind == "nf4" and _res_gb and vram < _NF4_COMPILE_PEAK_GB + _res_gb + _HEADROOM_GB:
+        return False, (f"NF4 + compile peaks near {_NF4_COMPILE_PEAK_GB + _res_gb:.0f} GB{_shape} "
+                       f"and only {vram:.1f} GB is free — NF4 alone still fits, compile does not"
+                       + _fix)
 
     needed = int(_COMPILE_WARMUP_S / _COMPILE_SAVING_S[kind] * _COMPILE_MARGIN)
     if total_steps < needed:

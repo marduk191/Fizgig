@@ -1,14 +1,14 @@
 {
     "youtube_urls": {
-        "start": "https://youtu.be/sH-kGR8yzBU",
-        "image_prep": "https://youtu.be/sH-kGR8yzBU?t=69",
-        "captions": "https://youtu.be/sH-kGR8yzBU?t=182",
-        "samples": "https://youtu.be/sH-kGR8yzBU?t=312",
-        "training": "https://youtu.be/sH-kGR8yzBU?t=364",
-        "profiler": "https://youtu.be/sH-kGR8yzBU?t=611",
-        "repair_studio": "https://youtu.be/sH-kGR8yzBU?t=655",
-        "explorer": "https://youtu.be/sH-kGR8yzBU?t=902",
-        "extract": "https://youtu.be/sH-kGR8yzBU?t=1106",
-        "preferences": "https://youtu.be/sH-kGR8yzBU?t=1217"
+        "start": "https://www.youtube.com/watch?v=yrz0l6URGGk",
+        "image_prep": "https://www.youtube.com/watch?v=yrz0l6URGGk",
+        "captions": "https://www.youtube.com/watch?v=yrz0l6URGGk",
+        "samples": "https://www.youtube.com/watch?v=yrz0l6URGGk",
+        "training": "https://www.youtube.com/watch?v=yrz0l6URGGk",
+        "profiler": "https://www.youtube.com/watch?v=yrz0l6URGGk",
+        "repair_studio": "https://www.youtube.com/watch?v=yrz0l6URGGk",
+        "explorer": "https://www.youtube.com/watch?v=yrz0l6URGGk",
+        "extract": "https://www.youtube.com/watch?v=yrz0l6URGGk",
+        "preferences": "https://www.youtube.com/watch?v=yrz0l6URGGk"
     }
 }

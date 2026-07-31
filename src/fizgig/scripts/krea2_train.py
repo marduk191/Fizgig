@@ -27,6 +27,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 if not os.environ.get("PYTORCH_CUDA_ALLOC_CONF") and os.environ.get("FIZGIG_NO_EXPANDABLE") != "1":
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+# OpenMP wait policy, before torch loads libiomp: Intel OpenMP keeps every pool thread
+# actively spinning for 200 ms after each parallel region, so the small per-step CPU ops
+# re-arm an all-core busy-spin for the whole run (issue #18 — 100% CPU on every core while
+# the actual training is on the GPU). BLOCKTIME=0 measured: 14.8 spinning cores -> 0, no
+# step-time cost. The GUI sets this too; this covers headless runs. setdefault, so an
+# explicit user value wins.
+os.environ.setdefault("KMP_BLOCKTIME", "0")
+os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+
 from fizgig.krea2.trainer import train_krea2
 from fizgig.training.optimizers import available_optimizers
 
@@ -41,9 +50,22 @@ def setup_parser() -> argparse.ArgumentParser:
     p.add_argument("--output_name", required=True)
     p.add_argument("--network_dim", type=int, default=32)
     p.add_argument("--network_alpha", type=float, default=32)
+    p.add_argument("--network_type", default="lora", choices=["lora", "lokr"],
+                   help="Trainable parametrization: standard LoRA, or LoKR (Kronecker, "
+                        "full-matrix w2 — dim/alpha unused, --lokr_factor is the dial)")
+    p.add_argument("--lokr_factor", type=int, default=8,
+                   help="LoKR only: Kronecker split factor (w1 is ~factor x factor)")
     p.add_argument("--learning_rate", type=float, default=1e-4)
     p.add_argument("--max_train_epochs", type=int, default=10)
     p.add_argument("--save_every_n_epochs", type=int, default=0)
+    p.add_argument("--save_state", action="store_true",
+                   help="Write a resumable <name>-NNNNNN-state/ dir at every checkpoint.")
+    p.add_argument("--save_state_on_train_end", action="store_true",
+                   help="Write a resumable state dir when the run finishes, so a completed LoRA "
+                        "can be trained further by raising --max_train_epochs.")
+    p.add_argument("--keep_last_n_states", type=int, default=2,
+                   help="Keep only the N newest state dirs (each is LoRA + optimizer, hundreds "
+                        "of MB). Clamped to >= 1.")
     p.add_argument("--no_fp8", action="store_true", help="Train the base in bf16 instead of dynamic fp8")
     p.add_argument("--quantize_4bit", action="store_true",
                    help="QLoRA-style 4-bit (NF4) frozen base — ~5.6 GB DiT, fits 10-12 GB cards (no block swap)")
@@ -55,6 +77,10 @@ def setup_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=42)
     # previews (sample the fp8 Turbo with the live LoRA)
     p.add_argument("--turbo_dit", default=None, help="Pre-quant fp8 Turbo for previews")
+    p.add_argument("--turbo_lora", default=None,
+                   help="Turbo distillation LoRA (rank 64) — previews render on the resident "
+                        "training DiT with this at strength 1.0 instead of loading the Turbo "
+                        "checkpoint (no CPU parking; same 8-step CFG-free settings)")
     p.add_argument("--vae", default=None, help="Qwen-Image VAE (for preview decode)")
     p.add_argument("--text_encoder", default=None, help="bf16 Qwen3-VL-4B (for preview prompt encode)")
     p.add_argument("--sample_prompts", default=None, help="Sample-prompts file (one prompt per line)")
@@ -144,10 +170,16 @@ def setup_parser() -> argparse.ArgumentParser:
                    help="LR warm-up (x0.4->x1.0 over first epochs) for Look Filter outlier images "
                         "(reads <dataset>/fizgig_look_scores.json from the Image Prep Look Filter)")
     p.add_argument("--trigger_word", default=None,
-                   help="Trigger word added to auto-generated captions")
+                   help="Trigger word added to auto-generated captions (see --trigger_position)")
     p.add_argument("--trigger_position", default="start", choices=["start", "end"],
                    help="Where the trigger goes in auto-generated captions. start (default) matches "
                         "the Captions tab and suits a real-name trigger; end is a weaker claim")
+    p.add_argument("--recaption_instruction", default=None,
+                   help="Instruction for auto-recaption attempt 1 (the Captions tab's edited "
+                        "Training-caption preset). Omit to use the built-in")
+    p.add_argument("--recaption_instruction_detailed", default=None,
+                   help="Instruction for auto-recaption attempt 2 (the Captions tab's edited "
+                        "Exhaustive-detail preset). Omit to use the built-in")
     return p
 
 
@@ -165,11 +197,15 @@ def main():
     train_krea2(
         args.dit, args.dataset_config, args.output_dir, args.output_name,
         network_dim=args.network_dim, network_alpha=args.network_alpha,
+        network_type=args.network_type, lokr_factor=args.lokr_factor,
         learning_rate=args.learning_rate, max_train_epochs=args.max_train_epochs,
         save_every_n_epochs=args.save_every_n_epochs, fp8_scaled=not args.no_fp8,
+        save_state=args.save_state, save_state_on_train_end=args.save_state_on_train_end,
+        keep_last_n_states=args.keep_last_n_states,
         quant_4bit=args.quantize_4bit, quant_int8=args.quant_int8,
         blocks_to_swap=args.blocks_to_swap, shift=args.discrete_flow_shift, seed=args.seed,
-        sample_prompts=prompts, turbo_path=args.turbo_dit, vae_path=args.vae, te_path=args.text_encoder,
+        sample_prompts=prompts, turbo_path=args.turbo_dit, turbo_lora_path=args.turbo_lora,
+        vae_path=args.vae, te_path=args.text_encoder,
         sample_every_n_epochs=args.sample_every_n_epochs,
         sample_width=args.sample_width, sample_height=args.sample_height,
         sample_steps=args.sample_steps, sample_cfg_scale=args.sample_cfg_scale,
@@ -205,6 +241,8 @@ def main():
         warmup_look_outliers=args.warmup_look_outliers,
         trigger_word=args.trigger_word,
         trigger_position=args.trigger_position,
+        recaption_instruction=args.recaption_instruction,
+        recaption_instruction_detailed=args.recaption_instruction_detailed,
     )
 
 
