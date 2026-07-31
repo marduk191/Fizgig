@@ -1,7 +1,7 @@
 <h1 align="center">Fizgig — Klein 9B & Krea 2 LoRA Studio</h1>
 
 <p align="center">
-  <strong>Fix broken LoRAs without retraining. Remix any LoRA into new variations in seconds.</strong><br>
+  <strong>Train LoRAs, LoKRs — or the base model itself. Fix broken LoRAs without retraining. Remix any LoRA in seconds.</strong><br>
   A train · repair · explore workbench built end-to-end for <strong>Flux 2 Klein 9B</strong> and <strong>Krea 2</strong>.
 </p>
 
@@ -28,13 +28,12 @@
 </p>
 
 > ### 📰 Latest news
+> - **🧪 NEW — Full fine-tuning: train the Krea 2 base model itself, on one consumer GPU.** No adapter, no rank bottleneck — full-rank updates that change how the model *represents* a concept instead of filtering its output. One checkbox (**⚗ Fine-tune the BASE MODEL** on the Training tab) applies the whole recommended recipe; the **Window** setting's Auto sizes the rotating trainable slice to your card (32 GB runs the full-quality component mode; 24 GB runs streamed block mode). All the trainer's intelligence — problem-image detection, auto-recaptioning, live throttling — runs on the fine-tune too. When you're done, the built-in **Checkpoint to LoRA** utility diffs your fine-tune against the base and extracts an ordinary, shareable LoRA at any rank — the quality of a full fine-tune, in a file ComfyUI already knows how to use. Experimental. [Details ↓](#full-fine-tuning-krea-2--experimental)
 > - **Fizgig 3.0 trains LoKR.** LoKR (LyCORIS Kronecker) covers the whole weight matrix with structure instead of a thin low-rank slice — in our validation runs it produced the **highest likeness we have ever measured** with this app's own scorer, with noticeably more natural skin and light than standard LoRA on the same dataset and settings. Pick it from the **Network Type** dropdown on the Krea 2 Training tab: one **Factor** dial replaces rank and alpha, output loads straight into ComfyUI, and Repair Studio / LoRA the Explorer edit and save LoKR **natively — lossless, no conversion**. The short version of the trade: LoKR is higher quality, standard LoRA trains ~20% faster — and keep the factor at 8 (or below), where LoKR earns its cost. [Training ↓](#training)
 > - **One-click cloud training on RunPod** — no GPU, or want a 5090 for the afternoon? The official Fizgig template deploys the full app to a rented GPU in your browser: nothing to install, your files persist until you terminate the pod, and the in-app RunPod panel can even **auto-stop the pod when your run finishes** so an idle GPU never bills overnight. [**⚡ Deploy →**](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=faoq8ed6um&ref=vkb387ep) · [Guide](docker/README.md)
-> - **Krea 2 trains on 8 GB** — confirmed by users running nothing but the stock preset defaults at batch size 1, with everything left on Auto. 10–12 GB cards do the same with headroom to spare. [VRAM guidance ↓](#vram-guidance)
+> - **Krea 2 LoRAs train on 8 GB** — confirmed by users running nothing but the stock preset defaults at batch size 1, with everything left on Auto. 10–12 GB cards do the same with headroom to spare. (Full fine-tuning needs more — see its section.) [VRAM guidance ↓](#vram-guidance)
 > - **Never lose a run** (v2.11) — training state saves at every checkpoint *and* at run end, so a crash costs nothing and a **finished LoRA can be trained further**: raise the epoch count, resume, and it carries on with optimizer and learning-rate history intact.
 > - **Caption with the model that trains your LoRA** (v2.10) — the Captions tab can use **Qwen3-VL**, the same vision-language model that conditions Krea 2 training. Every task is an **editable preset** — including a style-LoRA preset validated on real training runs. The slot takes fp8_scaled builds and community fine-tunes; since that model writes your captions, swapping it changes how your dataset gets described.
-
-> **🧪 On this branch — full fine-tuning, not just LoRAs.** Fizgig can now train the **Krea 2 base model itself** on a single 32 GB card, by keeping most of the model fp8-frozen and rotating which slice is trainable. Then a small **Checkpoint to LoRA** utility turns the result back into an ordinary, shareable LoRA. Experimental, and living on this branch only. [Details ↓](#full-fine-tuning-krea-2--experimental)
 
 > **Two model families, one workbench.** Everything here works with both **Flux 2 Klein 9B** and **Krea 2 (12.9B)** — Repair Studio, Explorer, Royale, Profiler, Extract, plus Context LoRA, Adaptive LR and Pause/Resume. [Krea 2 details ↓](#krea-2--second-model-family)
 
@@ -54,6 +53,7 @@ Every trainer makes LoRAs. Fizgig is built around what you do with them **afterw
 
 Under that workbench sits a fast, light trainer tuned for its models — and tuned to **fit your GPU**, not a datacenter's. Because everything is built natively for Klein 9B and Krea 2 instead of bolted onto a dozen models, Fizgig can do things the generalists can't:
 
+- **Train beyond LoRAs.** Standard LoRA, **LoKR**, or the **full base model itself** — pick per run. A fine-tune comes back as a normal checkpoint, and **Checkpoint to LoRA** distils it into a shareable LoRA at any rank.
 - **Big models on modest cards.** A full **Klein 9B** LoRA trains on a **16 GB card** — and the 12.9B **Krea 2** trains on **8 GB**, confirmed by users running nothing but the stock preset defaults at batch size 1 with everything on Auto. That's the 4-bit (NF4) base doing the work (~8 GB resident, QLoRA-style: the base is 4-bit, your LoRA still trains in bf16 on top). Block swap, quantisation and previews **size themselves to your VRAM automatically** — nothing to configure — and if a preview can't fit, it steps aside so **training keeps running and saving**. You don't need a 4090 to train on the newest 12.9B model.
 - **A workbench nobody else has.** Repair broken LoRAs block-by-block, evolve new ones like a game, and crossfade every epoch of a run to find the sweet spot — then the tools **read each other's output** (profile → repair → explore → compare, one closed loop).
 - **It just works on your files.** Loads kohya / PEFT / OneTrainer / AI-Toolkit / LyCORIS, auto-converted; saves kohya `.safetensors` that drop straight into ComfyUI.
