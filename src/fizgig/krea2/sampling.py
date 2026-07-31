@@ -73,6 +73,25 @@ def gather_valid_text(txt, mask):
     return out, newmask
 
 
+def patchify_block(img, patch, frame=0.0):
+    """One image block -> (tokens, pos, mask), positions on the 3-axis RoPE grid.
+
+    `frame` writes the FIRST RoPE axis (32 head-dims are allocated to it; every existing path
+    uses 0). In-context conditioning places a clean reference at frame=1 — the convention the
+    krea2_edit ecosystem trained (source distinguished from target purely by this axis)."""
+    b, _, h, w = img.shape
+    h_, w_ = h // patch, w // patch
+    imgids = torch.zeros((h_, w_, 3), device=img.device)
+    if frame:
+        imgids[..., 0] = float(frame)
+    imgids[..., 1] = torch.arange(h_, device=img.device)[:, None]
+    imgids[..., 2] = torch.arange(w_, device=img.device)[None, :]
+    imgpos = repeat(imgids, "h w three -> b (h w) three", b=b, three=3)
+    imgmask = torch.ones(b, h_ * w_, device=img.device, dtype=torch.bool)
+    tokens = rearrange(img, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch, pw=patch)
+    return tokens, imgpos, imgmask
+
+
 def prepare(img, txtlen, patch, txtmask):
     """Patchify the latent and build the combined image+text position / mask tensors.
 
@@ -80,19 +99,12 @@ def prepare(img, txtlen, patch, txtmask):
     ([img (all valid), text (valid prefix + padding)]), which the shared attention's
     varlen / cu_seqlens path requires. Returns (img_tokens, pos, mask).
     """
-    b, _, h, w = img.shape
-    h_, w_ = h // patch, w // patch
-    imgids = torch.zeros((h_, w_, 3), device=img.device)
-    imgids[..., 1] = torch.arange(h_, device=img.device)[:, None]
-    imgids[..., 2] = torch.arange(w_, device=img.device)[None, :]
-    imgpos = repeat(imgids, "h w three -> b (h w) three", b=b, three=3)
-    imgmask = torch.ones(b, h_ * w_, device=img.device, dtype=torch.bool)
-    img = rearrange(img, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch, pw=patch)
-
+    b = img.shape[0]
+    tokens, imgpos, imgmask = patchify_block(img, patch)
     txtpos = torch.zeros(b, txtlen, 3, device=img.device)
     mask = torch.cat((imgmask, txtmask), dim=1)
     pos = torch.cat((imgpos, txtpos), dim=1)
-    return img, pos, mask
+    return tokens, pos, mask
 
 
 def timesteps(seq_len, steps, x1, x2, y1=0.5, y2=1.15, sigma=1.0, mu=None):

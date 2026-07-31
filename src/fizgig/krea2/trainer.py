@@ -388,7 +388,8 @@ def _get_lin_function(x1, y1, x2, y2):
 _KREA2_MU = _get_lin_function(256, 0.5, 6400, 1.15)
 
 
-def sample_krea2_timesteps(bsize: int, num_img_tokens: int, device, sigmoid_scale: float = 1.0) -> torch.Tensor:
+def sample_krea2_timesteps(bsize: int, num_img_tokens: int, device, sigmoid_scale: float = 1.0,
+                           min_timestep: float = 0.0, max_timestep: float = 1.0) -> torch.Tensor:
     """Krea 2 'krea2_shift' timestep sampling — a faithful port of the musubi krea2_train recipe.
 
     The base t is **logit-normal** (sigmoid of a standard normal), so timesteps concentrate near the
@@ -403,16 +404,29 @@ def sample_krea2_timesteps(bsize: int, num_img_tokens: int, device, sigmoid_scal
     mu = _KREA2_MU(num_img_tokens)
     shift = math.exp(mu)
     t = (torch.randn(bsize, device=device) * sigmoid_scale).sigmoid()
-    return (t * shift) / (1.0 + (shift - 1.0) * t)
+    t = (t * shift) / (1.0 + (shift - 1.0) * t)
+    # Optional timestep window (0-1 scale; t near 1 = high noise / structure, near 0 = detail).
+    # Rescale INTO the window rather than clamp — clamping piles probability mass onto the two
+    # endpoints, which trains those exact t values disproportionately.
+    if min_timestep > 0.0 or max_timestep < 1.0:
+        lo, hi = max(0.0, float(min_timestep)), min(1.0, float(max_timestep))
+        t = lo + t * max(hi - lo, 1e-6)
+    return t
 
 
 def compute_loss(dit, latent, hidden_states, attention_mask, *, shift=2.5, dtype=torch.bfloat16,
-                 device=None):
+                 device=None, control_latent=None,
+                 min_timestep=0.0, max_timestep=1.0):
     """Flow-matching training loss for Krea 2.
 
     latent:        (B, 16, h, w)         — cached Qwen-Image VAE latent
     hidden_states: (B, seq, layers, dim) — cached Qwen3-VL multi-layer stack
     attention_mask:(B, seq) bool         — cached validity mask
+    control_latent: optional (B, 16, h, w) — a CLEAN in-context reference (paired-image
+        training, e.g. the source frame of a temporal-displacement pair). Injected as extra
+        image tokens at RoPE frame=1 — the krea2_edit ecosystem's convention: the model tells
+        source from target purely by that axis. Never noised; loss on target tokens only; the
+        mu schedule stays on the target token count. Klein's control path is the template.
 
     `shift` is kept for signature compatibility but no longer used: krea2_shift derives the flow
     shift from the image resolution (see sample_krea2_timesteps), matching the musubi reference.
@@ -431,17 +445,38 @@ def compute_loss(dit, latent, hidden_states, attention_mask, *, shift=2.5, dtype
     # (latent grid // patch). Replaces the old uniform-u sampler that over-weighted high-noise t
     # and inflated the loss.
     num_img_tokens = (latent.shape[-2] // patch) * (latent.shape[-1] // patch)
-    t = sample_krea2_timesteps(B, num_img_tokens, device)
+    t = sample_krea2_timesteps(B, num_img_tokens, device,
+                               min_timestep=min_timestep, max_timestep=max_timestep)
     t_ = t.view(B, 1, 1, 1).to(dtype)
     noised = (1.0 - t_) * latent + t_ * noise
     target = noise - latent  # flow-matching velocity
 
     txt, txtmask = gather_valid_text(hidden_states.to(device=device, dtype=dtype), attention_mask.to(device))
-    img_tokens, pos, mask = prepare(noised, txt.shape[1], patch, txtmask)
-    target_tokens, _, _ = prepare(target, txt.shape[1], patch, txtmask)
+
+    if control_latent is None:
+        img_tokens, pos, mask = prepare(noised, txt.shape[1], patch, txtmask)
+        target_tokens, _, _ = prepare(target, txt.shape[1], patch, txtmask)
+        n_tgt = None
+    else:
+        # Paired-image (edit-style) sequence: [noisy target @ frame 0 | clean source @ frame 1
+        # | text @ zeros]. Image tokens stay a contiguous all-valid prefix (the varlen
+        # invariant); imglen inside the DiT covers target+source, so its output includes source
+        # rows — sliced off below before the loss.
+        from fizgig.krea2.sampling import patchify_block
+        src = control_latent.to(device=device, dtype=dtype)
+        tgt_tokens, tgt_pos, tgt_mask = patchify_block(noised, patch, frame=0.0)
+        src_tokens, src_pos, src_mask = patchify_block(src, patch, frame=1.0)
+        txtpos = torch.zeros(B, txt.shape[1], 3, device=device)
+        img_tokens = torch.cat((tgt_tokens, src_tokens), dim=1)
+        pos = torch.cat((tgt_pos, src_pos, txtpos), dim=1)
+        mask = torch.cat((tgt_mask, src_mask, txtmask), dim=1)
+        target_tokens, _, _ = patchify_block(target, patch, frame=0.0)
+        n_tgt = tgt_tokens.shape[1]
 
     with torch.autocast(device_type=torch.device(device).type, dtype=dtype):
         pred = dit(img=img_tokens, context=txt, t=t.to(dtype), pos=pos, mask=mask)
+    if n_tgt is not None:
+        pred = pred[:, :n_tgt]  # loss on target tokens only — source rows carry no target
     # Return the mean drawn timestep alongside the loss so the passive per-image loss logger can
     # normalize for noise level (the caller ignores it when logging is off).
     return F.mse_loss(pred.float(), target_tokens.float()), float(t.mean().item())
@@ -1333,6 +1368,11 @@ def train_krea2(
     quant_int8: str = "",
     blocks_to_swap: int = 0,
     shift: float = 2.5,
+    # Timestep window (0-1 scale): restrict training to a noise band. High-t-only training
+    # teaches structure/layout without touching the detail-rendering regime — the quality
+    # protection when training on low-res data (e.g. temporal-displacement pairs).
+    min_timestep: float = 0.0,
+    max_timestep: float = 1.0,
     max_grad_norm: float = 1.0,
     seed: int = 42,
     # Effective batch = batch_size (1) x this. Grads accumulate over N micro-batches, then one
@@ -2182,7 +2222,9 @@ def train_krea2(
                 continue
             loss, t_used = compute_loss(dit, batch["latents"], batch["hidden_states"], batch["attention_mask"],
                                         device=device,
-                                        shift=shift, dtype=dtype)
+                                        shift=shift, dtype=dtype,
+                                        control_latent=batch.get("latents_control_0"),
+                                        min_timestep=min_timestep, max_timestep=max_timestep)
             # Per-image LR: scale THIS step's gradient by the image's multiplier (throttle stuck
             # images, boost healthy learned ones). Raw loss is still what gets recorded/averaged below,
             # so avr_loss and the global adaptive-LR watcher see unscaled numbers.

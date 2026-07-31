@@ -74,6 +74,11 @@ def setup_parser() -> argparse.ArgumentParser:
                         "bf16 gradients; 'int8' = both quantised (faster, lossier)")
     p.add_argument("--blocks_to_swap", type=int, default=0)
     p.add_argument("--discrete_flow_shift", type=float, default=2.5)
+    p.add_argument("--min_timestep", type=float, default=0.0,
+                   help="Timestep window floor (0-1). Restricts training to a noise band; high-t "
+                        "only (e.g. 0.4-1.0) trains structure without touching detail rendering")
+    p.add_argument("--max_timestep", type=float, default=1.0,
+                   help="Timestep window ceiling (0-1); see --min_timestep")
     p.add_argument("--seed", type=int, default=42)
     # previews (sample the fp8 Turbo with the live LoRA)
     p.add_argument("--turbo_dit", default=None, help="Pre-quant fp8 Turbo for previews")
@@ -204,6 +209,7 @@ def main():
         keep_last_n_states=args.keep_last_n_states,
         quant_4bit=args.quantize_4bit, quant_int8=args.quant_int8,
         blocks_to_swap=args.blocks_to_swap, shift=args.discrete_flow_shift, seed=args.seed,
+        min_timestep=args.min_timestep, max_timestep=args.max_timestep,
         sample_prompts=prompts, turbo_path=args.turbo_dit, turbo_lora_path=args.turbo_lora,
         vae_path=args.vae, te_path=args.text_encoder,
         sample_every_n_epochs=args.sample_every_n_epochs,
