@@ -70,6 +70,32 @@ lB, _ = compute_loss(dit, latent, hid, mask, device="cpu", dtype=torch.bfloat16,
 ck("the source is READ: different source -> different prediction",
    abs(lA.item() - lB.item()) > 1e-9, f"|d|={abs(lA.item() - lB.item()):.2e}")
 
+# --- 2b. motion-weighted loss -------------------------------------------------------------
+# Weights come from the CLEAN pair diff, are renormalized to per-sample mean 1, and m=0 is
+# byte-identical to the unweighted path. A fully-static pair must degrade to uniform weights
+# (the renorm rescues (1-m) back to 1), so weighting can never change a no-motion loss.
+torch.manual_seed(11)
+lw0, _ = compute_loss(dit, latent, hid, mask, device="cpu", dtype=torch.bfloat16,
+                      control_latent=src, motion_weight=0.0)
+torch.manual_seed(11)
+lw7, _ = compute_loss(dit, latent, hid, mask, device="cpu", dtype=torch.bfloat16,
+                      control_latent=src, motion_weight=0.7)
+ck("motion weight finite and CHANGES the loss when the pair moves",
+   torch.isfinite(lw7).item() and abs(lw7.item() - lw0.item()) > 1e-9,
+   f"|d|={abs(lw7.item() - lw0.item()):.2e}")
+lw7.backward()
+ck("weighted path grads flow",
+   any(p.grad is not None and p.grad.abs().sum() > 0 for p in dit.parameters()))
+
+torch.manual_seed(13)
+ls0, _ = compute_loss(dit, latent, hid, mask, device="cpu", dtype=torch.bfloat16,
+                      control_latent=latent.clone(), motion_weight=0.0)
+torch.manual_seed(13)
+ls7, _ = compute_loss(dit, latent, hid, mask, device="cpu", dtype=torch.bfloat16,
+                      control_latent=latent.clone(), motion_weight=0.7)
+ck("static pair: weighted == unweighted (uniform-degrade invariant)",
+   abs(ls7.item() - ls0.item()) < 1e-6, f"|d|={abs(ls7.item() - ls0.item()):.2e}")
+
 # --- 3. control-latent caching ------------------------------------------------------------
 from fizgig.krea2.caching import save_latent_cache_krea2  # noqa: E402
 from fizgig.dataset.image_dataset import ItemInfo  # noqa: E402

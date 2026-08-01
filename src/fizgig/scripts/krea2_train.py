@@ -79,6 +79,9 @@ def setup_parser() -> argparse.ArgumentParser:
                         "only (e.g. 0.4-1.0) trains structure without touching detail rendering")
     p.add_argument("--max_timestep", type=float, default=1.0,
                    help="Timestep window ceiling (0-1); see --min_timestep")
+    p.add_argument("--motion_weighted_loss", type=float, default=0.0,
+                   help="Paired-image runs: upweight target tokens where source and target "
+                        "differ (0-1; ~0.7 strong). Kills the copy shortcut on static regions")
     p.add_argument("--seed", type=int, default=42)
     # previews (sample the fp8 Turbo with the live LoRA)
     p.add_argument("--turbo_dit", default=None, help="Pre-quant fp8 Turbo for previews")
@@ -210,6 +213,7 @@ def main():
         quant_4bit=args.quantize_4bit, quant_int8=args.quant_int8,
         blocks_to_swap=args.blocks_to_swap, shift=args.discrete_flow_shift, seed=args.seed,
         min_timestep=args.min_timestep, max_timestep=args.max_timestep,
+        motion_weighted_loss=args.motion_weighted_loss,
         sample_prompts=prompts, turbo_path=args.turbo_dit, turbo_lora_path=args.turbo_lora,
         vae_path=args.vae, te_path=args.text_encoder,
         sample_every_n_epochs=args.sample_every_n_epochs,

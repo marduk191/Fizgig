@@ -426,7 +426,7 @@ def sample_krea2_timesteps(bsize: int, num_img_tokens: int, device, sigmoid_scal
 
 def compute_loss(dit, latent, hidden_states, attention_mask, *, shift=2.5, dtype=torch.bfloat16,
                  device=None, control_latent=None,
-                 min_timestep=0.0, max_timestep=1.0):
+                 min_timestep=0.0, max_timestep=1.0, motion_weight=0.0):
     """Flow-matching training loss for Krea 2.
 
     latent:        (B, 16, h, w)         — cached Qwen-Image VAE latent
@@ -437,6 +437,12 @@ def compute_loss(dit, latent, hidden_states, attention_mask, *, shift=2.5, dtype
         image tokens at RoPE frame=1 — the krea2_edit ecosystem's convention: the model tells
         source from target purely by that axis. Never noised; loss on target tokens only; the
         mu schedule stays on the target token count. Klein's control path is the template.
+    motion_weight: 0..1 (paired path only) — upweight target tokens where the CLEAN pair
+        actually differs (|x0 - source| per token). Uniform MSE rewards copying the source:
+        most of a frame is static, so the copy shortcut wins the gradient. At m the per-token
+        weight is (1-m) + m * diff/mean(diff), capped at 8x and renormalized to per-sample
+        mean 1 — a fully static pair degrades to uniform weights and avr_loss stays on the
+        same scale either way. 0 (default) = exact previous behaviour.
 
     `shift` is kept for signature compatibility but no longer used: krea2_shift derives the flow
     shift from the image resolution (see sample_krea2_timesteps), matching the musubi reference.
@@ -489,6 +495,16 @@ def compute_loss(dit, latent, hidden_states, attention_mask, *, shift=2.5, dtype
         pred = pred[:, :n_tgt]  # loss on target tokens only — source rows carry no target
     # Return the mean drawn timestep alongside the loss so the passive per-image loss logger can
     # normalize for noise level (the caller ignores it when logging is off).
+    if control_latent is not None and motion_weight > 0.0:
+        # Motion comes from the CLEAN latents (x0 vs source) — the velocity target carries
+        # noise and would randomize the weights.
+        diff_tokens, _, _ = patchify_block((latent - src).abs(), patch, frame=0.0)
+        d = diff_tokens.float().mean(dim=-1)                                # (B, N)
+        r = (d / d.mean(dim=1, keepdim=True).clamp_min(1e-8)).clamp(max=8.0)
+        w = (1.0 - float(motion_weight)) + float(motion_weight) * r
+        w = w / w.mean(dim=1, keepdim=True).clamp_min(1e-8)                 # per-sample mean 1
+        se = (pred.float() - target_tokens.float()).pow(2).mean(dim=-1)     # (B, N)
+        return (se * w).mean(), float(t.mean().item())
     return F.mse_loss(pred.float(), target_tokens.float()), float(t.mean().item())
 
 
@@ -1383,6 +1399,9 @@ def train_krea2(
     # protection when training on low-res data (e.g. temporal-displacement pairs).
     min_timestep: float = 0.0,
     max_timestep: float = 1.0,
+    # Paired-image runs only: upweight target tokens where source and target actually differ
+    # (kills the copy shortcut on mostly-static pairs). 0 = off; ~0.7 is a strong setting.
+    motion_weighted_loss: float = 0.0,
     max_grad_norm: float = 1.0,
     seed: int = 42,
     # Effective batch = batch_size (1) x this. Grads accumulate over N micro-batches, then one
@@ -2234,7 +2253,8 @@ def train_krea2(
                                         device=device,
                                         shift=shift, dtype=dtype,
                                         control_latent=batch.get("latents_control_0"),
-                                        min_timestep=min_timestep, max_timestep=max_timestep)
+                                        min_timestep=min_timestep, max_timestep=max_timestep,
+                                        motion_weight=motion_weighted_loss)
             # Per-image LR: scale THIS step's gradient by the image's multiplier (throttle stuck
             # images, boost healthy learned ones). Raw loss is still what gets recorded/averaged below,
             # so avr_loss and the global adaptive-LR watcher see unscaled numbers.
