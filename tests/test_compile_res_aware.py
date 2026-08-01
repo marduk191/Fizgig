@@ -136,6 +136,39 @@ ck("fp8/bf16 still declines regardless of mp", not ok and "quantised paths" in w
 ok, why = sc("int8", 30.0, mp=0.25, steps=100)
 ck("short runs still decline on payback at the default", not ok and "too short" in why, why)
 
+# --- 4. no C compiler -> decline, never crash (the RunPod InductorError) ------------------
+# The pod image ships no toolchain; inductor/triton need a host cc for their runtime stubs, so
+# compile-on there died with "Failed to find C compiler" 90 s into the run. The gate must turn
+# that into a clean decline. Windows is exempt: cl.exe hides outside PATH and the trainer's
+# vcvars import finds it later — a PATH check here would false-negative every Windows box.
+from unittest import mock  # noqa: E402
+import fizgig.utils.capabilities as _caps_mod  # noqa: E402
+from fizgig.utils.capabilities import has_host_c_compiler  # noqa: E402
+
+with mock.patch.object(_caps_mod.shutil, "which", return_value=None):
+    ck("posix, no cc/gcc/clang -> no compiler", not has_host_c_compiler(platform="posix"))
+    ck("windows exempt even with empty PATH", has_host_c_compiler(platform="nt"))
+with mock.patch.object(_caps_mod.shutil, "which",
+                       side_effect=lambda c: "/usr/bin/gcc" if c == "gcc" else None):
+    ck("posix with gcc on PATH -> ok", has_host_c_compiler(platform="posix"))
+
+with mock.patch.object(_caps_mod, "has_host_c_compiler", return_value=False):
+    ok, why = sc("int8", 30.0)  # would compile on every other gate
+    ck("should_compile declines when no compiler, with the apt hint",
+       not ok and "C compiler" in why and "apt install gcc" in why, why)
+with mock.patch.object(_caps_mod, "has_host_c_compiler", return_value=True):
+    ok, why = sc("int8", 30.0)
+    ck("compiler present -> the decision is unchanged", ok, why)
+
+# The trainer's forced-on path routes through the same check (POSIX branch of
+# _find_host_compiler) — pin the wiring so a refactor can't silently drop it.
+import inspect  # noqa: E402
+from fizgig.krea2.trainer import _find_host_compiler, _compile_blocks  # noqa: E402
+ck("_find_host_compiler consults has_host_c_compiler on posix",
+   "has_host_c_compiler" in inspect.getsource(_find_host_compiler))
+ck("_compile_blocks gates on _find_host_compiler",
+   "_find_host_compiler()" in inspect.getsource(_compile_blocks))
+
 print()
 print("ALL PASS" if not FAILS else f"{len(FAILS)} FAILED: {FAILS}")
 sys.exit(1 if FAILS else 0)

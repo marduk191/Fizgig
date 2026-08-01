@@ -51,12 +51,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-venv \
       python3-tk \
       git curl ca-certificates \
+      gcc libc6-dev \
       xvfb openbox x11-utils wmctrl \
       libxfont2 libgbm1 libgl1-mesa-dri libegl1 \
       libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
       fonts-dejavu-core fonts-liberation fontconfig unzip \
       xdg-utils pcmanfm dbus-x11 \
     && rm -rf /var/lib/apt/lists/*
+# gcc + libc6-dev are RUNTIME dependencies, not builder leftovers: torch.compile has
+# inductor/triton build small host-side C stubs while training runs, and without a compiler
+# every compiled run died with "Failed to find C compiler". The app now declines compile
+# cleanly when no cc exists, but shipping one is what makes compile actually WORK on pods —
+# it's a real speed win on the INT8/NF4 paths. Not build-essential: g++/make/dpkg-dev would
+# triple the size for nothing.
 # pcmanfm is what makes the "Open folder" buttons work: _open_in_file_manager shells out to
 # xdg-open, which needs something to hand the folder to.
 #
@@ -132,8 +139,9 @@ RUN curl -fsSL https://github.com/microsoft/Selawik/releases/download/1.01/Selaw
       > /etc/fonts/conf.d/99-segoe-selawik.conf \
     && fc-cache -f
 # python3-tk is the one that is easy to miss and fatal: without it Tkinter is absent and the GUI
-# cannot start at all. The libgl/libglib set is what opencv needs on a headless box. No
-# build-essential here — it was only ever needed to compile insightface in the builder.
+# cannot start at all. The libgl/libglib set is what opencv needs on a headless box.
+# build-essential stays out — the full toolchain was only ever needed to compile insightface in
+# the builder; the runtime carries just gcc for torch.compile (see above).
 
 COPY --from=builder /opt/venv /opt/venv
 ENV VIRTUAL_ENV=/opt/venv PATH="/opt/venv/bin:$PATH"
