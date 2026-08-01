@@ -104,7 +104,8 @@ def encode_datasets(datasets, encode_fn, args):
                 batch = [item for item in batch
                          if not os.path.exists(item.latent_cache_path)
                          or _ID.latent_cache_matches_reso(item.latent_cache_path,
-                                                          item.bucket_size) is not True]
+                                                          item.bucket_size,
+                                                          dataset.architecture) is not True]
                 if not batch:
                     continue
 

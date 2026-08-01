@@ -75,3 +75,8 @@ docs/PHONE_MONITOR_PLAN.md
 
 # Written by launch.pyw when the app fails to start
 launch_error.log
+
+# Internal-only: debugging test harnesses + template setup notes (local, never public)
+# (upstream also ignores tests/ here — this fork keeps them tracked on purpose, as the
+# only assertion coverage for verifying upstream merges, so that entry is omitted)
+docs/RUNPOD_TEMPLATE.md

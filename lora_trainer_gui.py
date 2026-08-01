@@ -3116,7 +3116,7 @@ class LoRATrainerGUI:
                                           lambda e: self._on_network_type_changed())
         self._network_type_hint = tk.Label(
             self._network_type_rowf,
-            text="LoKR: slightly higher quality · LoRA: slightly faster",
+            text="LoKR: higher quality · LoRA: ~20% faster training",
             font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
             justify=tk.LEFT)
         self._network_type_hint.pack(side=tk.LEFT, padx=(10, 0))
@@ -3136,7 +3136,7 @@ class LoRATrainerGUI:
         self.entries["LOKR_FACTOR"].pack(side=tk.LEFT)
         self._lokr_factor_hint = tk.Label(
             self._lokr_factor_rowf,
-            text="8 is the sweet spot · lower = stronger & bigger files · higher = smaller",
+            text="8 is the sweet spot · 4 = stronger, bigger files · above 8: just use LoRA",
             font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
             justify=tk.LEFT)
         self._lokr_factor_hint.pack(side=tk.LEFT, padx=(10, 0))
@@ -12302,7 +12302,8 @@ class LoRATrainerGUI:
     def _browse_extract_source(self):
         filepath = filedialog.askopenfilename(
             title="Select source LoRA",
-            filetypes=[("SafeTensors", "*.safetensors")]
+            filetypes=[("SafeTensors", "*.safetensors"), ("All files", "*.*")],
+            initialdir=self._lora_initialdir(),
         )
         if filepath:
             self.extract_source_var.set(filepath)
@@ -13733,7 +13734,8 @@ class LoRATrainerGUI:
     def _browse_profiler_lora(self):
         filepath = filedialog.askopenfilename(
             title="Select LoRA file",
-            filetypes=[("SafeTensors", "*.safetensors")]
+            filetypes=[("SafeTensors", "*.safetensors"), ("All files", "*.*")],
+            initialdir=self._lora_initialdir(),
         )
         if filepath:
             self.profiler_lora_var.set(filepath)
@@ -14906,10 +14908,28 @@ class LoRATrainerGUI:
             return ""
         return d if d and os.path.isdir(d) else ""
 
+    def _lora_initialdir(self) -> str:
+        """Start folder for every LoRA-loading Browse dialog: the input_lora_dir pref
+        when set, else wherever trained LoRAs are written. Without the fallback a fresh
+        session's dialog opens in the process cwd — on a pod that's the git clone, which
+        contains no .safetensors and made the picker look broken (found on RunPod)."""
+        d = self._pref_initialdir("input_lora_dir")
+        if d:
+            return d
+        out = ""
+        try:
+            if hasattr(self, "entries") and "LORA_OUTPUT_DIR" in self.entries:
+                out = self.entries["LORA_OUTPUT_DIR"].get().strip()
+        except Exception:
+            out = ""
+        out = out or (self.settings.get("LORA_OUTPUT_DIR", "") or "")
+        return out if out and os.path.isdir(out) else ""
+
     def _browse_repair_lora(self, var):
         filepath = filedialog.askopenfilename(
-            title="Select LoRA file", filetypes=[("SafeTensors", "*.safetensors")],
-            initialdir=self._pref_initialdir("input_lora_dir"),
+            title="Select LoRA file",
+            filetypes=[("SafeTensors", "*.safetensors"), ("All files", "*.*")],
+            initialdir=self._lora_initialdir(),
         )
         if filepath:
             var.set(filepath)
@@ -18886,7 +18906,7 @@ class LoRATrainerGUI:
         path = filedialog.askopenfilename(
             title="Select Context LoRA",
             filetypes=[("SafeTensors", "*.safetensors"), ("All files", "*.*")],
-            initialdir=self._pref_initialdir("input_lora_dir"),
+            initialdir=self._lora_initialdir(),
         )
         if path:
             self.entries["CONTEXT_LORA_PATH"].delete(0, tk.END)

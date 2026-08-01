@@ -120,6 +120,8 @@ def load_krea2_dit(
         + (" (fp8 scaled)" if fp8_scaled else "")
         + (f" (+{len(lora_weights)} LoRA merged)" if has_lora else "")
     )
+    from fizgig.utils.safetensors import warm_file_cache
+    warm_file_cache(dit_path)
     with torch.device("meta"):
         dit = SingleStreamDiT(config, attn_mode=attn_mode, split_attn=split_attn)
 

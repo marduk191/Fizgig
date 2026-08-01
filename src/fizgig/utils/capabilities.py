@@ -17,10 +17,22 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
+import shutil
 from dataclasses import dataclass, field
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+def has_host_c_compiler(platform: Optional[str] = None) -> bool:
+    """POSIX: is a C compiler on PATH? inductor/triton build small host-side stubs with one at
+    runtime, so torch.compile without it dies with "Failed to find C compiler" — which is what
+    happened on RunPod, where the runtime image ships no toolchain. Windows always returns True
+    here: MSVC lives outside PATH by design and the trainer's vcvars import handles it."""
+    if (platform or os.name) == "nt":
+        return True
+    return any(shutil.which(c) for c in ("cc", "gcc", "clang"))
 
 
 @dataclass
@@ -407,6 +419,10 @@ def should_compile(total_steps: int, quant_4bit: bool, quant_int8: str,
         import triton  # noqa: F401
     except Exception:
         return False, "triton is not installed (pip install triton-windows on Windows)"
+    if not has_host_c_compiler():
+        return False, ("no C compiler on this system — inductor/triton build host-side stubs "
+                       "with one at runtime (on Debian/Ubuntu: apt install gcc); "
+                       "running uncompiled")
 
     kind = "nf4" if quant_4bit else ("int8" if quant_int8 else None)
     if kind is None:

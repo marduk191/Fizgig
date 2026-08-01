@@ -252,6 +252,8 @@ def load_dit(
     load_weight_dtype = None if (use_scaled_mm or keep_fp8_resident) else dit_weight_dtype
 
     logger.info(f"Loading DiT model from {dit_path}, device={loading_device}")
+    from fizgig.utils.safetensors import warm_file_cache
+    warm_file_cache(dit_path)
     sd = load_safetensors_with_lora_and_fp8(
         model_files=dit_path,
         lora_weights_list=lora_weights_list,

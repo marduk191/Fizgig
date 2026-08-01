@@ -13,6 +13,46 @@ from safetensors.torch import load_file
 
 from fizgig.utils.device import synchronize_device
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+def warm_file_cache(path: str) -> None:
+    """Stream a model file once so the safetensors mmap hits page cache.
+
+    Pod-only (FIZGIG_POD=1): RunPod container disks read ~600 MB/s sequentially but serve
+    mmap page-faults at high per-request latency, so loading a 26 GB DiT through mmap took
+    20+ minutes and looked like a hang. One sequential pass fills the page cache (~45 s cold,
+    ~2 s if already cached) and the mmap load behind it becomes memory-speed. On desktops the
+    pref is a no-op — local NVMe serves mmap faults fine and the extra read would only cost.
+    Never fatal: any error just falls through to the normal load path.
+    """
+    if os.environ.get("FIZGIG_POD") != "1":
+        return
+    try:
+        size = os.path.getsize(path)
+        chunk = 64 * 1024 * 1024
+        logged = 0
+        import time as _time
+        t0 = _time.time()
+        with open(path, "rb", buffering=0) as f:
+            done = 0
+            while True:
+                b = f.read(chunk)
+                if not b:
+                    break
+                done += len(b)
+                if done - logged >= 8 * chunk:  # every ~512 MB
+                    logged = done
+                    logger.info(f"[warm] caching model file {done / 1e9:.1f}/{size / 1e9:.1f} GB")
+        dt = _time.time() - t0
+        if dt > 2.0:
+            logger.info(f"[warm] {size / 1e9:.1f} GB cached in {dt:.0f} s "
+                        f"({size / 1e9 / max(dt, 0.001):.1f} GB/s) — load follows from RAM")
+    except Exception as e:  # a failed warm must never block the real load
+        logger.warning(f"[warm] skipped ({e}) — loading directly")
+
 
 def mem_eff_save_file(tensors: Dict[str, torch.Tensor], filename: str, metadata: Dict[str, Any] = None):
     """Memory-efficient save to safetensors format.

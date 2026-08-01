@@ -250,19 +250,29 @@ class _CheckpointedBlock(torch.nn.Module):
         return self.block(x, vec, freqs, attn_params)
 
 
-def _find_msvc_env() -> bool:
-    """Put MSVC on PATH for torch.compile, if it is installed but not in this shell.
+def _find_host_compiler() -> bool:
+    """Make sure a host C/C++ compiler exists before torch.compile runs; never crash the run.
 
-    On Windows, inductor generates C++ for the host-side wrapper around the Triton kernels and
-    needs `cl.exe` to build it. Visual Studio installs it but only exposes it inside a developer
-    prompt, so launching Fizgig normally leaves torch.compile dead on arrival with a traceback out
-    of `get_cpp_compiler`. Running vcvars64.bat and importing the environment it sets is what a
-    developer prompt does; doing it here means the user does not have to know any of this.
+    Inductor/triton build small host-side stubs at runtime, so compile without a compiler dies
+    with "Failed to find C compiler". POSIX: check PATH for cc/gcc/clang — the RunPod image
+    shipped without a toolchain, which crashed every compiled run there. Windows: `cl.exe` is
+    installed by Visual Studio but only exposed inside a developer prompt, so launching Fizgig
+    normally leaves compile dead on arrival — running vcvars64.bat and importing the environment
+    it sets is what a developer prompt does; doing it here means the user does not have to know
+    any of this.
     """
     import shutil
     import subprocess
 
-    if os.name != "nt" or shutil.which("cl"):
+    if os.name != "nt":
+        from fizgig.utils.capabilities import has_host_c_compiler
+        if has_host_c_compiler():
+            return True
+        logger.warning("[compile] no C compiler found — torch.compile needs one to build "
+                       "inductor/triton host-side stubs (on Debian/Ubuntu: apt install gcc). "
+                       "Training continues uncompiled.")
+        return False
+    if shutil.which("cl"):
         return True
 
     vswhere = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
@@ -328,7 +338,7 @@ def _compile_blocks(dit, blocks_to_swap: int) -> None:
         logger.warning("[compile] ignored — triton is not installed (pip install triton-windows "
                        "on Windows, triton on Linux)")
         return
-    if not _find_msvc_env():
+    if not _find_host_compiler():
         return
     import torch._dynamo
     # Raises the recompile ceiling (default 8, which a bucketed dataset exhausts immediately —
