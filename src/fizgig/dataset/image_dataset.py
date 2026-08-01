@@ -53,6 +53,11 @@ if find_spec("pillow_jxl") is not None:
 
 RESOLUTION_STEPS = 16  # Klein 9B resolution step
 
+# Pixel -> stored-latent spatial factor per architecture. Klein's FLUX.2 AE packs 2x2
+# space-to-channel after its /8 encoder, so cached latents are pixel/16; Krea 2's
+# Qwen-Image VAE stores plain /8 latents.
+LATENT_SPATIAL_FACTOR = {"klein9b": 16, "krea2": 8}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -791,23 +796,31 @@ class ImageDataset(torch.utils.data.Dataset):
     # -- training preparation (after caching) ------------------------------
 
     @staticmethod
-    def latent_cache_matches_reso(cache_file: str, bucket_reso: Tuple[int, int]) -> Optional[bool]:
+    def latent_cache_matches_reso(cache_file: str, bucket_reso: Tuple[int, int],
+                                  architecture: str) -> Optional[bool]:
         """Does the cached latent inside `cache_file` match `bucket_reso` (pixel w, h)?
 
         The cache FILENAME encodes the original image size, which never changes — so a cache
         written at one Target Megapixels setting is indistinguishable by name from one written
         at another, and __getitem__ maps whatever `latent_*` key the file holds onto `latents`.
         Without this check a resolution change trains silently at the OLD resolution wherever
-        re-encoding is skipped. Header-only read (safe_open.keys()); returns None if the file
-        can't be read or holds no parseable latent key — callers choose their own failure mode.
+        re-encoding is skipped. The pixel->latent factor is per-architecture
+        (LATENT_SPATIAL_FACTOR): Klein stores packed pixel/16 latents, Krea 2 plain pixel/8 —
+        comparing both against /8 rejected every valid Klein cache (issue #27).
+        Header-only read (safe_open.keys()); returns None if the file can't be read, holds no
+        parseable latent key, or the architecture is unknown — callers choose their own
+        failure mode.
         """
+        factor = LATENT_SPATIAL_FACTOR.get(architecture)
+        if factor is None:
+            return None
         try:
             from safetensors import safe_open
             with safe_open(cache_file, framework="pt") as f:
                 keys = list(f.keys())
         except Exception:
             return None
-        expected = {int(bucket_reso[0]) // 8, int(bucket_reso[1]) // 8}
+        expected = {int(bucket_reso[0]) // factor, int(bucket_reso[1]) // factor}
         for k in keys:
             if k.startswith("latent_") and not k.startswith("latent_control_"):
                 try:
@@ -858,7 +871,7 @@ class ImageDataset(torch.utils.data.Dataset):
             # A cache written at a different Target Megapixels has the SAME filename (it encodes
             # the original size, not the bucket) — training on it would silently run at the old
             # resolution. Skip it and tell the user to re-run cache preparation.
-            if self.latent_cache_matches_reso(cache_file, bucket_reso) is False:
+            if self.latent_cache_matches_reso(cache_file, bucket_reso, self.architecture) is False:
                 skipped_wrong_reso += 1
                 continue
             item_info = ItemInfo(item_key, "", image_size, bucket_reso, latent_cache_path=cache_file)
