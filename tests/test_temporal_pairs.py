@@ -87,7 +87,7 @@ with tempfile.TemporaryDirectory() as td:
     # master's reso-guard must keep reading the MAIN latent, not the control
     from fizgig.dataset.image_dataset import ImageDataset  # noqa: E402
     ck("reso-guard reads the main latent (control excluded)",
-       ImageDataset.latent_cache_matches_reso(item.latent_cache_path, (448, 256)) is True)
+       ImageDataset.latent_cache_matches_reso(item.latent_cache_path, (448, 256), "krea2") is True)
 
 # --- 4. timestep window -------------------------------------------------------------------
 torch.manual_seed(1)
