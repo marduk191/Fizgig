@@ -143,6 +143,11 @@ def setup_parser() -> argparse.ArgumentParser:
                         "Needs SM 8.9+ and an fp8 base; ignored otherwise. Costs ~1.5x the "
                         "per-Linear forward error of the default path (3.7e-02 vs 2.5e-02), "
                         "mostly from the fp8 activations the GEMM requires.")
+    p.add_argument("--finetune_start_window", type=int, default=0,
+                   help="Rotation FT resume: 0-based window to start the schedule at. When "
+                        "resuming an interrupted cycle via --dit <checkpoint>, set this to the "
+                        "number of epochs already completed (with --finetune_rotate_every 1) so "
+                        "the remaining components train instead of the cycle restarting at attn.")
     p.add_argument("--finetune_fused_backward", action="store_true",
                    help="Step each parameter inside backward and free its grad immediately "
                         "(rotation FT only) — cuts the gradient footprint, disables clipping")
@@ -236,6 +241,7 @@ def main():
         finetune_rotation=args.finetune_rotation,
         finetune_rotate_every=args.finetune_rotate_every,
         finetune_rotation_mode=args.finetune_rotation_mode,
+        finetune_start_window=args.finetune_start_window,
         finetune_fused_backward=args.finetune_fused_backward,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         max_grad_norm=args.max_grad_norm,

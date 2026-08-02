@@ -40,12 +40,17 @@ class RotationSchedule:
 
     def __init__(self, n_blocks: int, active: int = 4, rotate_every: int = 1,
                  order: Optional[Sequence[int]] = None, mode: str = "block",
-                 components: Sequence[str] = ("attn", "mlp.gate", "mlp.up", "mlp.down")):
+                 components: Sequence[str] = ("attn", "mlp.gate", "mlp.up", "mlp.down"),
+                 start_window: int = 0):
         if n_blocks <= 0:
             raise ValueError("n_blocks must be positive")
         self.n_blocks = int(n_blocks)
         self.active = max(1, min(int(active), self.n_blocks))
         self.rotate_every = max(1, int(rotate_every))
+        # A resumed FT run is a fresh process: without an offset it restarts the cycle at
+        # window 0, retraining early windows and starving late ones. start_window shifts the
+        # whole schedule so "resume for the last epoch" can mean "train the last component".
+        self.start_window = int(start_window)
         self.order = list(order) if order is not None else list(range(self.n_blocks))
         if sorted(self.order) != list(range(self.n_blocks)):
             raise ValueError("order must be a permutation of range(n_blocks)")
@@ -74,7 +79,7 @@ class RotationSchedule:
 
     def window_at(self, epoch: int) -> int:
         """0-based window index for a 0-based epoch (wraps after a full cycle)."""
-        return (int(epoch) // self.rotate_every) % self.n_windows
+        return ((int(epoch) // self.rotate_every) + self.start_window) % self.n_windows
 
     def active_at(self, epoch: int):
         """Block indices (block mode) or component name prefixes (component mode)."""

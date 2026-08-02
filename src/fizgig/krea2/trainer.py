@@ -1402,6 +1402,9 @@ def train_krea2(
     # Paired-image runs only: upweight target tokens where source and target actually differ
     # (kills the copy shortcut on mostly-static pairs). 0 = off; ~0.7 is a strong setting.
     motion_weighted_loss: float = 0.0,
+    # Rotation FT resume: 0-based window the schedule starts at. A resumed run is a fresh
+    # process, so without this it re-runs window 0 (attn) instead of the next unfinished one.
+    finetune_start_window: int = 0,
     max_grad_norm: float = 1.0,
     seed: int = 42,
     # Effective batch = batch_size (1) x this. Grads accumulate over N micro-batches, then one
@@ -1716,7 +1719,11 @@ def train_krea2(
             rotator.activate_always("txtfusion", dit.txtfusion)
         rot_schedule = RotationSchedule(len(dit.blocks), active=ft_rotation,
                                         rotate_every=finetune_rotate_every,
-                                        mode=finetune_rotation_mode)
+                                        mode=finetune_rotation_mode,
+                                        start_window=finetune_start_window)
+        if finetune_start_window:
+            logger.info(f"[ft-rotation] resuming mid-cycle: schedule starts at window "
+                        f"{rot_schedule.window_at(0)} of {rot_schedule.n_windows}")
         if rot_schedule.mode == "component" and ft_stream_frozen:
             # Every block holds trainable Linears in component mode, so nothing can be
             # streamed out — there is no frozen block left to evict.
