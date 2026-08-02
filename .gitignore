@@ -75,3 +75,7 @@ docs/PHONE_MONITOR_PLAN.md
 
 # Written by launch.pyw when the app fails to start
 launch_error.log
+
+# Internal-only: debugging test harnesses + template setup notes (local, never public)
+tests/
+docs/RUNPOD_TEMPLATE.md
