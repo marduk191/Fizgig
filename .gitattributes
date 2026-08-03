@@ -6,3 +6,7 @@
 docker/entrypoint.sh text eol=lf
 Dockerfile text eol=lf
 docker/Dockerfile text eol=lf
+
+# Bundled tokenizer files must stay byte-exact — merges.txt is parsed line-by-line and a
+# CRLF checkout would poison the slow-tokenizer merges. -text disables all eol conversion.
+src/fizgig/assets/qwen3vl_tokenizer/** -text

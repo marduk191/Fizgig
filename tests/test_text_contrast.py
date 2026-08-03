@@ -83,7 +83,6 @@ def label_calls(src, needle="tk.Label("):
 
 calls = label_calls(SRC)
 muted = [c for c in calls if "text_muted" in c]
-prose_left = [c for c in muted if "wraplength" in c]
 
 # wraplength is the tell: you only set it on multi-line explanatory copy. Widget captions
 # ("seed", "W", "H", "Ref") never do.
@@ -95,7 +94,19 @@ def _snippet(c):
     return m.group(1) if m else " ".join(c.split())[:60]
 
 
-ck("no prose label left on text_muted", len(prose_left) == 0,
+# ...but wraplength alone over-reaches. The training queue renders one summary line per queued
+# job (`text=summary`, `text=summary.split("\n")[0]`) and wraps it so a long job name truncates
+# inside the card. That is RUNTIME DATA being displayed, not authored explanatory copy, and the
+# muted tier is the right home for a secondary data line. Authored prose is always written as a
+# literal in the source, so require that too — otherwise every wrapped data label in a card gets
+# dragged onto the bright explanatory tier, which is not what the v2.12.0 sweep was about.
+def _is_authored_prose(c):
+    return "wraplength" in c and re.search(r'text=(f?")', c) is not None
+
+
+prose_left = [c for c in muted if _is_authored_prose(c)]
+
+ck("no authored prose left on text_muted", len(prose_left) == 0,
    [_snippet(c) for c in prose_left[:3]] if prose_left else "")
 # Lower bound, not equality: the point is that the sweep did not drag captions onto the bright
 # tier, and new one-word captions get added over time. A DROP here means something was swept up.
@@ -117,8 +128,21 @@ for helper, marker in (("_start_section_card", "wraplength=760"),
 explain_fonts = re.findall(r'font=\(FONT_FAMILY, (\d+)(?:, "([a-z]+)")?\)[^)]*?text_explain'
                            r'|text_explain[^)]*?font=\(FONT_FAMILY, (\d+)(?:, "([a-z]+)")?\)',
                            SRC, re.S)
-sizes = {int(a or c) for a, _b, c, _d in explain_fonts if (a or c)}
-ck("no explanatory text left at 8pt", 8 not in sizes, sorted(sizes))
+sizes = sorted(int(a or c) for a, _b, c, _d in explain_fonts if (a or c))
+
+# The original rule was "8pt is gone entirely". That held while text_explain lived only on card
+# and banner prose, which the v2.12.0 sweep took to 9pt+. Since then text_explain has also been
+# adopted for the Training tab's inline hints (the "when do changes take effect" note, the queue
+# window's explainer), and that surface has its own established house style of 8pt italic -- see
+# _krea2_losswatch_hint, which sits directly beside them at 8pt. Forcing those two to 9pt would
+# make them inconsistent with the hint they are stacked against.
+#
+# So the floor moves to 8pt rather than 9, and a second assertion carries the weight the first
+# one used to: the 9pt+ tier must still dominate. A wholesale shrink of card prose back to the
+# old smallest size fails that, which is the regression the check exists to catch.
+ck("no explanatory text below 8pt", min(sizes) >= 8, sizes[:6])
+ck("9pt+ is still the dominant explanatory tier",
+   len([s for s in sizes if s >= 9]) >= 50, len([s for s in sizes if s >= 9]))
 
 # --- 5. it all still builds -------------------------------------------------------------------
 import tkinter as tk  # noqa: E402

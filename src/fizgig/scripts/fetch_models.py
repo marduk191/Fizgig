@@ -88,6 +88,11 @@ TOOLS = [
     ("MiaoshouAI/Florence-2-base-PromptGen", 1.0, "Florence-2 captioner"),
     ("Helsinki-NLP/opus-mt-en-zh", 0.3, "EN->ZH translator (bilingual captions)"),
     ("insightface:buffalo_l", 0.3, "Face model — Look Filter + likeness scoring"),
+    # Tokenizer/processor configs only (hf-config: skips the weights — those load from the
+    # user's own safetensors). A few MB each, and the difference between "captioning and text
+    # encoding work offline" and "the first use needs internet for a vocab file".
+    ("hf-config:Qwen/Qwen3-VL-4B-Instruct", 0.02, "Qwen3-VL tokenizer — Krea 2 offline"),
+    ("hf-config:Qwen/Qwen3-8B", 0.02, "Qwen3 tokenizer — Klein offline"),
 ]
 
 
@@ -291,6 +296,13 @@ def fetch_tool(spec, log=print, dry_run=False):
                                allowed_modules=["detection", "genderage"],
                                providers=["CPUExecutionProvider"])
             app.prepare(ctx_id=-1)
+        elif model_id.startswith("hf-config:"):
+            # Tokenizer vocab + processor/config json only — NEVER the weights. The weights
+            # repos here are multi-GB and the user already has them as local safetensors;
+            # a bare snapshot_download would pull the whole thing.
+            from huggingface_hub import snapshot_download
+            snapshot_download(repo_id=model_id.split(":", 1)[1],
+                              allow_patterns=["*.json", "*.txt", "*.model"])
         else:
             from huggingface_hub import snapshot_download
             snapshot_download(repo_id=model_id)

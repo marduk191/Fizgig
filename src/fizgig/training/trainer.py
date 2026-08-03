@@ -54,7 +54,10 @@ from fizgig.klein.model_utils import (
 )
 from fizgig.klein.position import prc_img, prc_txt, scatter_ids, pack_control_latent
 from fizgig.modules.schedulers import FlowMatchDiscreteScheduler, RexLR
-from fizgig.training.metadata import build_metadata, ARCHITECTURE_KLEIN_9B, ARCHITECTURE_KLEIN_9B_FULL
+from fizgig.training.metadata import (
+    build_metadata, latest_sample_image, thumbnail_data_uri, resolve_title,
+    ARCHITECTURE_KLEIN_9B, ARCHITECTURE_KLEIN_9B_FULL,
+)
 from fizgig.training.train_utils import (
     LossRecorder,
     get_epoch_ckpt_name,
@@ -1823,6 +1826,10 @@ class KleinTrainer:
             img_path = os.path.join(save_dir, save_path + ".png")
             pil_image.save(img_path)
             logger.info(f"  Saved sample: {img_path}")
+            # Tracked so a checkpoint saved after this can default modelspec.description to
+            # the prompt that made its thumbnail, instead of shipping blank — same idea as the
+            # thumbnail itself, which is already whatever sample happens to be newest on disk.
+            self._last_sample_prompt = prompt
 
             if wandb_tracker is not None and wandb is not None:
                 wandb_tracker.log({f"sample_{prompt_idx}": wandb.Image(img_path)}, step=steps)
@@ -2316,13 +2323,22 @@ class KleinTrainer:
 
             metadata_to_save = minimum_metadata if args.no_metadata else metadata
 
-            title = args.metadata_title if args.metadata_title is not None else args.output_name
+            title = (args.metadata_title if args.metadata_title is not None
+                     else resolve_title(args.output_name, args.metadata_trigger_phrase))
             if args.min_timestep is not None or args.max_timestep is not None:
                 min_ts = args.min_timestep if args.min_timestep is not None else 0
                 max_ts = args.max_timestep if args.max_timestep is not None else 1000
                 md_timesteps = (min_ts, max_ts)
             else:
                 md_timesteps = None
+
+            thumb_arg = args.metadata_thumbnail
+            if thumb_arg and thumb_arg.lower() in ("off", "none"):
+                thumb_source = None
+            elif thumb_arg:
+                thumb_source = thumb_arg
+            else:
+                thumb_source = latest_sample_image(args.output_dir)
 
             sai_metadata = build_metadata(
                 None,
@@ -2331,10 +2347,13 @@ class KleinTrainer:
                 title,
                 args.metadata_reso,
                 args.metadata_author,
-                args.metadata_description,
+                (args.metadata_description if args.metadata_description is not None
+                 else getattr(self, "_last_sample_prompt", None)),
                 args.metadata_license,
                 args.metadata_tags,
                 timesteps=md_timesteps,
+                trigger_phrase=args.metadata_trigger_phrase,
+                thumbnail=thumbnail_data_uri(thumb_source),
             )
 
             metadata_to_save.update(sai_metadata)
@@ -3201,6 +3220,11 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--metadata_tags", type=str, default=None)
     parser.add_argument("--metadata_reso", type=str, default=None)
     parser.add_argument("--metadata_arch", type=str, default=None)
+    parser.add_argument("--metadata_trigger_phrase", type=str, default=None,
+                        help="Trigger word(s) recorded as modelspec.trigger_phrase")
+    parser.add_argument("--metadata_thumbnail", type=str, default=None,
+                        help="Path to an image to embed as modelspec.thumbnail. Omit to "
+                             "auto-use the latest sample preview; pass 'off' to disable.")
 
     # ---- Model paths ----
     parser.add_argument("--dit", type=str, help="Path to DiT checkpoint (.safetensors)")

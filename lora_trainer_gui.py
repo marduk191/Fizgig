@@ -591,6 +591,9 @@ PRESETS_DIR = os.path.join(os.path.dirname(__file__), "presets")
 
 # Snapshot of settings from the most recent training launch — restorable via "Load Last Train" button
 LAST_TRAIN_FILE = os.path.join(PRESETS_DIR, ".last_train_settings.json")
+# Training queue: full settings snapshots waiting to run back-to-back. Survives restart;
+# never auto-starts on launch (a queue found at startup waits for the user's first Start).
+QUEUE_FILE = os.path.join(PRESETS_DIR, "training_queue.json")
 
 # Built-in presets — always available in the Load Preset dropdown, prefixed with ✨ to distinguish
 # from user-saved presets. Defined in code so they ship with the app and can't be deleted accidentally.
@@ -808,6 +811,26 @@ _FIZGIG_DIR = os.path.dirname(os.path.abspath(__file__))
 # file comes from, not who it is for.
 FLORENCE_DEFAULT_MODEL = "MiaoshouAI/Florence-2-base-PromptGen"
 FLORENCE_MODELS = [FLORENCE_DEFAULT_MODEL, "microsoft/Florence-2-base", "microsoft/Florence-2-large"]
+# Florence-2 isn't a native transformers architecture, so loading it means trust_remote_code=True
+# — downloading and EXECUTING whatever Python is currently on that repo's default branch, with no
+# pin. Pinned here to the commit each was audited against, so a compromised account (or a repo
+# that just changes later) can't silently change what gets executed on someone's next first-run.
+# To refresh a pin: check https://huggingface.co/api/models/<repo> for the current "sha".
+FLORENCE_REVISIONS = {
+    "MiaoshouAI/Florence-2-base-PromptGen": "da7ac9f3deac56a928e2fd4d94d8bb985d231299",
+    "microsoft/Florence-2-base": "5ca5edf5bd017b9919c05d08aebef5e4c7ac3bac",
+    "microsoft/Florence-2-large": "21a599d414c4d928c9032694c424fb94458e3594",
+}
+# PromptGen's config doesn't carry its own modeling code — its auto_map points at
+# "microsoft/Florence-2-base-ft--modeling_florence2...", so transformers fetches the code that
+# actually EXECUTES from that second, different repo. Our `revision` above only pins PromptGen
+# itself; transformers only carries it over to the code repo automatically when the two repos
+# are the same one (they aren't here), so the redirected repo needs its own explicit pin via
+# code_revision or it silently stays on "main". The two microsoft/ models don't redirect
+# (their auto_map has no repo prefix, just the module path), so they don't need an entry here.
+FLORENCE_CODE_REVISIONS = {
+    "MiaoshouAI/Florence-2-base-PromptGen": "f6c1a25888ffc1d945ee8a1a77ac833c7303d46e",  # microsoft/Florence-2-base-ft
+}
 FLORENCE_TASKS = ["<CAPTION>", "<DETAILED_CAPTION>", "<MORE_DETAILED_CAPTION>"]
 QWEN_CAPTION_MODEL = "Qwen3-VL 4B (Krea 2 text encoder)"
 QWEN_CUSTOM_TASK = "Custom…"
@@ -1092,7 +1115,7 @@ class LoRATrainerGUI:
     def __init__(self, master):
         self.master = master
         master.title("Fizgig — Klein 9B & Krea 2 LoRA Studio")
-        master.geometry("1360x1124")  # wide enough that the IDLE/BUSY light clears the last tab ("Preferences"); +100 height for the bottom status bar
+        master.geometry("1450x1124")  # wide enough that the IDLE/BUSY light clears the last tab ("Preferences") with the Metadata tab in the strip; +100 height for the bottom status bar
         master.minsize(1180, 900)  # keeps the tab row clear of the status light + tab content not cut off
         master.configure(bg=BG_COLOR)
         # Closing the window must not orphan a training subprocess: Tk's default destroy
@@ -1292,6 +1315,8 @@ class LoRATrainerGUI:
             "METADATA_DESCRIPTION": "",
             "METADATA_LICENSE": "",
             "METADATA_TAGS": "",
+            "METADATA_TRIGGER_PHRASE": "",
+            "METADATA_THUMBNAIL": "",
             "FP8": True,  # Default FP8 setting (--fp8_base)
             "SCALED": True,  # Default Scaled setting (--fp8_scaled, recommended with fp8_base)
             "QUANT_4BIT": False,  # 4-bit NF4 base (low-VRAM); supersedes fp8 when on
@@ -1334,6 +1359,10 @@ class LoRATrainerGUI:
         # Override with last-used LoRA output directory if available
         if self.last_used.get("lora_output_dir"):
             self.settings["LORA_OUTPUT_DIR"] = self.last_used["lora_output_dir"]
+
+        # Training queue — loaded before any UI so the status-bar button can show its count.
+        # A queue restored from a previous session waits for the user; it never auto-starts.
+        self.training_queue = self._load_training_queue()
 
         # Klein's trainer resolves these itself (name-or-module-path). Krea 2 goes through
         # fizgig.training.optimizers, which offers a different set — filtered to what's actually
@@ -1407,6 +1436,10 @@ class LoRATrainerGUI:
         self.extract_tab.bind("<Button-1>", self.remove_focus)
         self.notebook.add(self.extract_tab, text="Extract")
 
+        self.metadata_tab = ttk.Frame(self.notebook)
+        self.metadata_tab.bind("<Button-1>", self.remove_focus)
+        self.notebook.add(self.metadata_tab, text="Metadata")
+
         self.prefs_tab = ttk.Frame(self.notebook)
         self.prefs_tab.bind("<Button-1>", self.remove_focus)
         self.notebook.add(self.prefs_tab, text="Preferences")
@@ -1425,6 +1458,7 @@ class LoRATrainerGUI:
         self.create_explorer_tab()
         self.create_lora_royale_tab()
         self.create_extract_tab()
+        self.create_metadata_tab()
         self.create_prefs_tab()
         # Restore remembered Repair Studio / Explorer Setup fields + attach save traces.
         # After ALL tabs exist: restoring fires their traces, which touch other tabs' widgets.
@@ -1472,8 +1506,22 @@ class LoRATrainerGUI:
         self.image_folder_var.trace_add("write", self._on_caption_folder_changed)
 
         # Prevent mousewheel from accidentally changing Combobox/Spinbox values
-        self.master.bind_class("TCombobox", "<MouseWheel>", lambda e: "break")
-        self.master.bind_class("TSpinbox", "<MouseWheel>", lambda e: "break")
+        # ONE global wheel router instead of per-panel bind_all tug-of-wars (which broke in
+        # both directions: an open tool window stole the main window's wheel, and a stray
+        # <Leave> killed the tool window's). The router sends the wheel wherever the POINTER
+        # is: a Text (console) or Listbox scrolls itself natively; otherwise the nearest
+        # scrollable Canvas up the ancestry scrolls — an inner panel when hovered, the tab's
+        # main scrollbar everywhere else. Button-4/5 are the X11 wheel (pods).
+        for _seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.master.bind_all(_seq, self._route_mousewheel)
+            # Dropdowns/spinboxes must NEVER change value on wheel (an accidental flick over
+            # the LR box mid-scroll is how a run gets silently mis-configured) — but they
+            # must not be dead zones either: route the scroll to the page, then break so
+            # the widget's own value-spin binding never runs. The old bare-"break" bindings
+            # covered <MouseWheel> only, leaving X11 pods spinning values via Button-4/5.
+            self.master.bind_class("TCombobox", _seq, self._wheel_over_dropdown)
+            self.master.bind_class("TSpinbox", _seq, self._wheel_over_dropdown)
+            self.master.bind_class("Spinbox", _seq, self._wheel_over_dropdown)
 
         # Start status indicator polling
         self._update_status_indicator()
@@ -1522,6 +1570,53 @@ class LoRATrainerGUI:
             '_royale_lora_running', '_royale_exporting', '_royale_scoring',
             '_royale_cmp_running'))
 
+    @staticmethod
+    def _wheel_units(event):
+        """Scroll units from either wheel encoding: Windows <MouseWheel> delta (±120 per
+        notch, high-res mice send smaller values) or X11 Button-4/5 (pods)."""
+        num = getattr(event, "num", 0)
+        if num == 4:
+            return -3
+        if num == 5:
+            return 3
+        d = getattr(event, "delta", 0)
+        if not d:
+            return 0
+        return int(-1 * (d / 120)) if abs(d) >= 120 else (-1 if d > 0 else 1)
+
+    def _route_mousewheel(self, event):
+        """Global wheel dispatch — see the install site for the routing rules."""
+        try:
+            w = self.master.winfo_containing(event.x_root, event.y_root)
+        except Exception:
+            w = None
+        if w is None:
+            return
+        units = self._wheel_units(event)
+        if not units:
+            return
+        node, hops = w, 0
+        while node is not None and hops < 40:
+            # Native scrollers own the wheel while hovered — their class bindings already
+            # scroll them, and routing the page underneath as well would double-scroll.
+            if isinstance(node, (tk.Text, tk.Listbox, ttk.Treeview)):
+                return
+            if isinstance(node, tk.Canvas):
+                try:
+                    if node.cget("yscrollcommand"):
+                        node.yview_scroll(units, "units")
+                        return "break"
+                except tk.TclError:
+                    pass
+            node = getattr(node, "master", None)
+            hops += 1
+        return
+
+    def _wheel_over_dropdown(self, event):
+        """Wheel over a Combobox/Spinbox: scroll the page, never the value."""
+        self._route_mousewheel(event)
+        return "break"
+
     def _is_render_busy(self):
         """In-process GPU render on a tab that unloads its engine on switch (Repair
         Studio / Explorer / Royale). Switching tabs here would reset a busy engine and
@@ -1543,6 +1638,8 @@ class LoRATrainerGUI:
             return True
         if getattr(self, '_translating', False):
             return True
+        if getattr(self, '_fetch_running', False):
+            return True   # model download in flight — a queued run must not read partial files
         if getattr(self, '_repair_preview_in_flight', False):
             return True
         if getattr(self, '_explorer_generating', False):
@@ -1930,9 +2027,24 @@ class LoRATrainerGUI:
                                      highlightthickness=0)
         self._ram_canvas.pack(side=tk.TOP)
 
+        # --- far right: training-queue button (lower-right corner of the app) ---
+        # Packed BEFORE the override panel so it owns the corner; the override panel's
+        # expand soaks up whatever is left in the middle.
+        qcol = tk.Frame(bar, bg=COLORS["bg_deep"])
+        qcol.pack(side=tk.RIGHT, padx=(0, 14), pady=10)
+        self._queue_btn = tk.Button(
+            qcol, text="📋 Queue", font=(FONT_FAMILY, 9, "bold"),
+            bg=COLORS["bg_surface"], fg=COLORS["text_primary"],
+            activebackground=COLORS["border"], activeforeground=COLORS["text_primary"],
+            relief="flat", bd=0, padx=12, pady=14, cursor="hand2",
+            command=self._open_queue_window)
+        self._queue_btn.pack(fill=tk.BOTH, expand=True)
+        self._refresh_queue_button()
+
         # --- right: live sample override (surface-coloured mini panel) ---
+        # Widths trimmed vs the original layout to make room for the queue button.
         ov = tk.Frame(bar, bg=COLORS["bg_surface"])
-        ov.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 14), pady=10, ipadx=8, ipady=4)
+        ov.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10), pady=10, ipadx=8, ipady=4)
         _sbg = COLORS["bg_surface"]
         r1 = tk.Frame(ov, bg=_sbg); r1.pack(fill=tk.X, padx=8, pady=(4, 0))
         self.sample_override_var = tk.BooleanVar(value=False)
@@ -1940,29 +2052,29 @@ class LoRATrainerGUI:
                         command=self._on_sample_override_changed,
                         style="Surface.TCheckbutton").pack(side=tk.LEFT)
         tk.Label(r1, text="seed", bg=_sbg, fg=COLORS["text_muted"],
-                 font=(FONT_FAMILY, 8)).pack(side=tk.LEFT, padx=(16, 3))
+                 font=(FONT_FAMILY, 8)).pack(side=tk.LEFT, padx=(10, 3))
         self.sample_override_seed_var = tk.StringVar(value="1234")
-        ttk.Entry(r1, textvariable=self.sample_override_seed_var, width=8).pack(side=tk.LEFT)
+        ttk.Entry(r1, textvariable=self.sample_override_seed_var, width=6).pack(side=tk.LEFT)
         # Same list as the Samples tab (SAMPLE_RESOLUTIONS) — these two had drifted, and
         # the override's lower ceiling silently downgraded a 1280/1536 preview.
         _res_vals = SAMPLE_RESOLUTIONS
         tk.Label(r1, text="W", bg=_sbg, fg=COLORS["text_muted"],
-                 font=(FONT_FAMILY, 8)).pack(side=tk.LEFT, padx=(14, 3))
+                 font=(FONT_FAMILY, 8)).pack(side=tk.LEFT, padx=(8, 3))
         self.sample_override_w_var = tk.StringVar(value="768")
         ttk.Combobox(r1, textvariable=self.sample_override_w_var, values=_res_vals,
-                     state="readonly", width=6).pack(side=tk.LEFT)
+                     state="readonly", width=5).pack(side=tk.LEFT)
         tk.Label(r1, text="H", bg=_sbg, fg=COLORS["text_muted"],
-                 font=(FONT_FAMILY, 8)).pack(side=tk.LEFT, padx=(12, 3))
+                 font=(FONT_FAMILY, 8)).pack(side=tk.LEFT, padx=(8, 3))
         self.sample_override_h_var = tk.StringVar(value="768")
         ttk.Combobox(r1, textvariable=self.sample_override_h_var, values=_res_vals,
-                     state="readonly", width=6).pack(side=tk.LEFT)
+                     state="readonly", width=5).pack(side=tk.LEFT)
         # Reference image — auto-capped to ~0.20 MP by the trainer so a big image can't OOM the
         # sample. Shown for BOTH families: Klein uses it as edit conditioning, Krea 2 routes it
         # through the Qwen3-VL vision path. (This comment used to claim it was hidden under
         # Krea 2 — it never was; there is no hide call for these widgets anywhere.)
         self._override_ref_caption = tk.Label(r1, text="Ref", bg=_sbg, fg=COLORS["text_muted"],
                  font=(FONT_FAMILY, 8))
-        self._override_ref_caption.pack(side=tk.LEFT, padx=(14, 3))
+        self._override_ref_caption.pack(side=tk.LEFT, padx=(8, 3))
         self.sample_override_ref_var = tk.StringVar(value="")
         # Compact button so it matches the seed/resolution input height (the
         # default ttk.Button padding is taller and pushes the prompt row down).
@@ -2381,6 +2493,32 @@ class LoRATrainerGUI:
             bordercolor=[("focus", COLORS["border_focus"])]
         )
 
+        # Treeview (the Metadata tab's custom-fields table). Nothing styled this before it —
+        # "clam" falls back to a stock white row background with no matching foreground, so
+        # rows rendered as near-invisible light-grey-on-white against an otherwise dark app.
+        style.configure(
+            "Treeview",
+            background=COLORS["bg_surface"],
+            fieldbackground=COLORS["bg_surface"],
+            foreground=COLORS["text_primary"],
+            bordercolor=COLORS["border"],
+            font=(FONT_FAMILY, 10),
+            rowheight=24,
+        )
+        style.map("Treeview",
+            background=[("selected", COLORS["accent"])],
+            foreground=[("selected", "white")]
+        )
+        style.configure(
+            "Treeview.Heading",
+            background=COLORS["bg_header"],
+            foreground=COLORS["text_primary"],
+            font=(FONT_FAMILY, 10, "bold"),
+        )
+        style.map("Treeview.Heading",
+            background=[("active", COLORS["bg_hover"])]
+        )
+
         # Scrollbar. `background` is the thumb — the part you drag — and it used to be bg_header
         # on a bg_deep trough, which is 1.06:1. Not "subtle": indistinguishable from the track,
         # so on a tall tab there was no visible clue that the panel scrolled at all.
@@ -2442,18 +2580,9 @@ class LoRATrainerGUI:
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-        # Enable mousewheel scrolling
-        def on_mousewheel(event):
-            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        def bind_mousewheel(event):
-            canvas.bind_all("<MouseWheel>", on_mousewheel)
-
-        def unbind_mousewheel(event):
-            canvas.unbind_all("<MouseWheel>")
-
-        scrollable_frame.bind("<Enter>", bind_mousewheel)
-        scrollable_frame.bind("<Leave>", unbind_mousewheel)
+        # Mousewheel: handled by the global router (_route_mousewheel) — it finds this
+        # canvas through the pointer's ancestry, so no per-tab bind_all is needed (the old
+        # Enter/Leave bind_all dance is what made scrollable areas fight each other).
 
         return scrollable_frame, canvas
 
@@ -3329,6 +3458,15 @@ class LoRATrainerGUI:
                        "the scores with your dataset. Batch size 1.",
                   foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
         self._krea2_losswatch_hint.grid(row=24, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
+        # Answers "when do changes take effect?" (issue #40) right where people wonder it.
+        ttk.Label(training_content,
+                  text="When do changes apply? Settings are read when a run launches — changing "
+                       "them mid-run does nothing. Pause → Resume relaunches with your current "
+                       "settings, so these can be changed at a pause. Dataset/caption changes "
+                       "need a fresh run (Resume skips re-caching).",
+                  foreground=COLORS["text_explain"], font=(FONT_FAMILY, 8, "italic"),
+                  justify=tk.LEFT, wraplength=720).grid(
+            row=25, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 6))
 
         # === Optimizer Section (Collapsed by default) ===
         optimizer_section = CollapsibleFrame(outer,"Optimizer", default_expanded=False)
@@ -4147,6 +4285,583 @@ class LoRATrainerGUI:
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load last train settings:\n{e}")
 
+    # ------------------------------------------------------------
+    # Training queue — settings snapshots that run back-to-back
+    # ------------------------------------------------------------
+    # A queue item is everything a run needs that the GUI would otherwise read live:
+    # the preset snapshot (_collect_preset_values), the architecture (presets are
+    # per-arch and deliberately don't carry it), the Start-tab dataset folder, and the
+    # Samples-tab entries (presets deliberately skip those too). Restoring an item is
+    # "load these into the GUI, then press Start" — the queue never bypasses
+    # start_training, so validation, TOML regeneration, snapshotting and the pause
+    # machinery all behave exactly as for a hand-started run.
+
+    def _load_training_queue(self):
+        if _persist_disabled():
+            return []
+        try:
+            with open(QUEUE_FILE, "r", encoding="utf-8") as f:
+                items = json.load(f)
+            if not isinstance(items, list):
+                print(f"[queue] {QUEUE_FILE} does not hold a list — starting with an empty queue")
+                return []
+            good = [i for i in items if self._queue_item_valid(i)]
+            if len(good) != len(items):
+                print(f"[queue] dropped {len(items) - len(good)} unreadable entr(ies) from {QUEUE_FILE}")
+            return good
+        except FileNotFoundError:
+            return []
+        except Exception as e:
+            print(f"[queue] failed to load {QUEUE_FILE}: {e}")
+            return []
+
+    def _save_training_queue(self):
+        if _persist_disabled():
+            return
+        try:
+            os.makedirs(PRESETS_DIR, exist_ok=True)
+            tmp = QUEUE_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.training_queue, f, indent=2, default=str)
+            os.replace(tmp, QUEUE_FILE)
+        except Exception as e:
+            print(f"[queue] failed to save: {e}")
+
+    @staticmethod
+    def _queue_item_valid(item):
+        """Deep-enough validation for anything about to flow into apply/summary/advance.
+        Shallow checks (dict with a dict preset) let hand-edited variants through that then
+        crashed AFTER the item was popped and saved away — losing it before the traceback."""
+        return (isinstance(item, dict)
+                and isinstance(item.get("preset"), dict)
+                and isinstance(item.get("image_folder", ""), str)
+                and isinstance(item.get("architecture", ""), str)
+                and isinstance(item.get("samples", {}), dict))
+
+    def _schedule_queue_advance(self, delay_ms):
+        """The ONE way to arm a queue-advance timer. A generation counter makes every
+        previously-armed timer a no-op: Stop, Pause, a failure-HOLD, or a manual start bumps
+        the generation, so a stale after() callback from before the state change can never
+        fire into a paused/held queue or double-launch across a pipeline phase gap."""
+        gen = getattr(self, "_queue_advance_gen", 0)
+
+        def _tick():
+            if getattr(self, "_queue_advance_gen", 0) == gen:
+                self._start_next_queued()
+        self.master.after(delay_ms, _tick)
+
+    def _cancel_pending_queue_advance(self):
+        self._queue_advance_gen = getattr(self, "_queue_advance_gen", 0) + 1
+
+    _QUEUE_SAMPLE_KEYS = ("SAMPLE_ENABLED", "SAMPLE_WIDTH", "SAMPLE_HEIGHT", "SAMPLE_STEPS",
+                          "SAMPLE_SEED", "SAMPLE_EVERY_N_EPOCHS", "SAMPLE_EVERY_N_STEPS",
+                          "SAMPLE_AT_FIRST", "SAMPLE_FLOW_SHIFT", "SAMPLE_NEGATIVE",
+                          "SAMPLE_CFG_SCALE")
+
+    def _queue_snapshot(self):
+        """Capture the currently configured run as a queue item."""
+        import time as _time
+        samples = {}
+        for k in self._QUEUE_SAMPLE_KEYS:
+            entry = self.entries.get(k)
+            if entry is None:
+                continue
+            try:
+                samples[k] = entry.get()
+            except Exception:
+                pass
+        return {
+            "id": f"q{int(_time.time() * 1000)}",
+            "queued_at": _time.strftime("%Y-%m-%d %H:%M"),
+            "architecture": self.architecture_var.get(),
+            "image_folder": self.image_folder_var.get().strip(),
+            "preset": self._collect_preset_values(),
+            "samples": samples,
+        }
+
+    def _apply_queue_item(self, item):
+        """Load a queue item's settings back into the GUI (arch first — it swaps the UI)."""
+        arch = item.get("architecture", "")
+        if isinstance(arch, str) and arch and arch in ARCHITECTURES and self.architecture_var.get() != arch:
+            self.architecture_var.set(arch)
+            try:
+                self.update_ui_for_architecture()
+            except Exception as e:
+                self.update_console(f"[queue] arch switch to {arch!r} failed: {e}\n")
+        self._apply_preset_values(item.get("preset", {}))
+        folder = str(item.get("image_folder") or "").strip()
+        if folder:
+            self.image_folder_var.set(folder)   # traces regenerate Fizgig_train.toml
+        _samples = item.get("samples")
+        for k, v in (_samples.items() if isinstance(_samples, dict) else ()):
+            entry = self.entries.get(k)
+            if entry is None:
+                continue
+            try:
+                if isinstance(entry, (tk.BooleanVar, tk.StringVar, tk.IntVar, tk.DoubleVar)):
+                    entry.set(v)
+                elif isinstance(entry, ttk.Combobox):
+                    entry.set(str(v))
+                else:
+                    entry.delete(0, tk.END)
+                    entry.insert(0, str(v))
+            except Exception:
+                pass
+
+    @staticmethod
+    def _queue_signature(item):
+        """What makes two queue entries THE SAME RUN: everything except id/queued_at."""
+        try:
+            return json.dumps({k: item.get(k) for k in
+                               ("architecture", "image_folder", "preset", "samples")},
+                              sort_keys=True, default=str)
+        except Exception:
+            return repr(item)
+
+    @staticmethod
+    def _queue_output_key(item):
+        """(output dir, LoRA name) — two runs writing here overwrite each other's files."""
+        p = item.get("preset", {}) if isinstance(item.get("preset"), dict) else {}
+        return (str(p.get("LORA_OUTPUT_DIR", "")).strip().lower().replace("\\", "/").rstrip("/"),
+                str(p.get("LORA_NAME", "")).strip().lower())
+
+    def _queue_current_run(self):
+        """Snapshot the current config to the end of the queue (Start pressed mid-run)."""
+        item = self._queue_snapshot()
+        if not item["image_folder"]:
+            messagebox.showwarning(
+                "Nothing to queue",
+                "Pick a training image folder on the Start tab first — a queued run "
+                "needs to know its dataset.")
+            return
+        # An exact duplicate (same everything) is never useful — it would just train the
+        # identical run twice. Point at the existing entry instead of adding another.
+        sig = self._queue_signature(item)
+        for pos, q in enumerate(self.training_queue):
+            if self._queue_signature(q) == sig:
+                messagebox.showinfo(
+                    "Already queued",
+                    f"This exact run is already in the queue (position {pos + 1}).\n\n"
+                    "Change something — the dataset, the output name, any setting — "
+                    "to queue a different run.")
+                return
+        # Same output dir + name as another queued job (or the run in progress) with
+        # DIFFERENT settings: the later run would overwrite the earlier one's checkpoints,
+        # state dirs and samples. Flag it; queueing anyway is a legitimate choice.
+        okey = self._queue_output_key(item)
+        if okey != ("", ""):
+            clash = next((f"queued job {pos + 1}" for pos, q in enumerate(self.training_queue)
+                          if self._queue_output_key(q) == okey), None)
+            if clash is None:
+                _active = getattr(self, "_active_run_item", None)
+                if (_active is not None
+                        and getattr(self, "training_state", "idle") in ("running", "pausing")
+                        and self._queue_output_key(_active) == okey):
+                    clash = "the run in progress"
+            if clash is not None and not messagebox.askyesno(
+                    "Same output name",
+                    f"This run writes to the same output folder and LoRA name as {clash} — "
+                    f"its checkpoints, state dirs and samples would be overwritten.\n\n"
+                    f"Queue it anyway? (Change the Output Name to keep both.)"):
+                return
+        self.training_queue.append(item)
+        self._save_training_queue()
+        self._refresh_queue_button()
+        self._render_queue_window()
+        name = item["preset"].get("LORA_NAME") or os.path.basename(item["image_folder"])
+        self.update_console(f"[queue] added '{name}' — position {len(self.training_queue)} in the "
+                            f"queue. It starts automatically when the current run finishes.\n")
+
+    def _start_next_queued(self):
+        """Pop the head of the queue into the GUI and start it. Never called while busy."""
+        _proc = getattr(self, "current_process", None)
+        if _proc is not None and _proc.poll() is None:
+            return
+        # Process-gone is NOT idle: between pipeline phases current_process is briefly None
+        # while training_state is still "running", and paused/pausing runs own the GPU's
+        # future. A stale timer or an eager click must not launch into any of those.
+        if getattr(self, "training_state", "idle") in ("running", "pausing", "paused"):
+            return
+        if not self.training_queue:
+            return
+        # A training subprocess isn't the only thing that owns the GPU: a Royale export, a
+        # caption batch, an Extract or a live preview are all in-process threads the process
+        # check can't see. Launching a run on top of them OOMs it (and a failed run HOLDS
+        # the queue — the worst outcome for an unattended batch). Wait and retry — capped,
+        # so a stuck busy flag can't spin forever: after ~10 minutes the queue HOLDs loudly.
+        try:
+            if self._is_any_busy():
+                self._queue_busy_retries = getattr(self, "_queue_busy_retries", 0) + 1
+                if self._queue_busy_retries > 40:
+                    self._queue_busy_retries = 0
+                    self.update_console("[queue] HELD — the app has reported other GPU work "
+                                        "for 10+ minutes. Finish or cancel it, then use "
+                                        "'Start next now' in the queue window.\n")
+                    self._render_queue_window()
+                    return
+                self.update_console("[queue] GPU work in progress elsewhere in the app — "
+                                    "next run retries in 15 s.\n")
+                self._schedule_queue_advance(15000)
+                return
+        except Exception:
+            pass
+        self._queue_busy_retries = 0
+        head = self.training_queue[0]
+        # Malformed item (hand-edited/corrupted queue file): remove it LOUDLY, then move on
+        # to the next — one bad entry must not wedge the whole queue or crash the advance.
+        if not self._queue_item_valid(head):
+            self.training_queue.pop(0)
+            self._save_training_queue()
+            self._refresh_queue_button()
+            self._render_queue_window()
+            self.update_console("[queue] removed an unreadable queue entry (corrupt or "
+                                "hand-edited queue file) — continuing with the next.\n")
+            self._schedule_queue_advance(100)
+            return
+        # Dataset gone (deleted/renamed/moved since queueing): without this check the stale
+        # TOML silently trains the PREVIOUS job's dataset under this job's name. HOLD with
+        # the item still queued so nothing is lost.
+        folder = (head.get("image_folder") or "").strip()
+        if not os.path.isdir(folder):
+            self.update_console(f"[queue] HELD — the next run's image folder no longer exists:\n"
+                                f"        {folder}\n"
+                                f"        Restore the folder (or edit/delete the queued job in "
+                                f"the queue window), then 'Start next now'.\n")
+            self._render_queue_window()
+            return
+        item = self.training_queue.pop(0)
+        self._save_training_queue()
+        self._refresh_queue_button()
+        name = item.get("preset", {}).get("LORA_NAME") or os.path.basename(item.get("image_folder", "?"))
+        self.update_console(f"\n[queue] starting next run: '{name}' "
+                            f"({len(self.training_queue)} still queued)\n")
+        self._apply_queue_item(item)
+        self.start_training()
+        # start_training can decline (validation, disk warning declined). The item's settings
+        # are in the GUI either way; put it back at the head so nothing is silently lost.
+        if getattr(self, "training_state", "idle") != "running":
+            self.training_queue.insert(0, item)
+            self._save_training_queue()
+            self._refresh_queue_button()
+            # Invalidate any timer armed before this decline — otherwise a pending advance
+            # re-pops the same head and repeats the same modal validation error in a loop.
+            self._cancel_pending_queue_advance()
+            self.update_console("[queue] run did not start — it stays at the head of the queue. "
+                                "Fix the issue and use the queue window's 'Start next' button.\n")
+        self._render_queue_window()
+
+    def _refresh_queue_button(self):
+        btn = getattr(self, "_queue_btn", None)
+        if btn is None:
+            return
+        n = len(getattr(self, "training_queue", []))
+        try:
+            btn.config(text=f"📋 Queue ({n})" if n else "📋 Queue",
+                       fg=COLORS["accent"] if n else COLORS["text_primary"])
+        except Exception:
+            pass
+
+    def _queue_thumbnail(self, folder, size=56):
+        """PhotoImage of the first image in `folder`, or None. Caller keeps the reference."""
+        try:
+            from fizgig.dataset.image_dataset import IMAGE_EXTENSIONS
+            exts = {e.lower() for e in IMAGE_EXTENSIONS}
+            first = next((f for f in sorted(os.listdir(folder))
+                          if os.path.splitext(f)[1].lower() in exts), None)
+            if first is None:
+                return None
+            img = Image.open(os.path.join(folder, first))
+            img.thumbnail((size, size), Image.LANCZOS)
+            return ImageTk.PhotoImage(img)
+        except Exception:
+            return None
+
+    def _open_queue_window(self):
+        """The queue manager: one row per queued run — thumbnail, key settings, and the
+        operations (reorder / edit in tab / update from tab / delete / start next)."""
+        win = getattr(self, "_queue_win", None)
+        if win is not None and win.winfo_exists():
+            win.lift()
+            self._render_queue_window()
+            return
+        win = tk.Toplevel(self.master)
+        win.title("Training Queue")
+        win.geometry("860x560")
+        win.configure(bg=COLORS["bg_deep"])
+        self._queue_win = win
+
+        tk.Label(win, text="Training Queue", font=(FONT_FAMILY, 16, "bold"),
+                 bg=COLORS["bg_deep"], fg=COLORS["text_primary"]).pack(anchor=tk.W, padx=16, pady=(14, 0))
+        self._queue_win_status = tk.Label(win, text="", font=(FONT_FAMILY, 9),
+                                          bg=COLORS["bg_deep"], fg=COLORS["text_muted"],
+                                          justify=tk.LEFT)
+        self._queue_win_status.pack(anchor=tk.W, padx=16, pady=(2, 8))
+
+        holder = tk.Frame(win, bg=COLORS["bg_deep"])
+        holder.pack(fill=tk.BOTH, expand=True, padx=16)
+        canvas = tk.Canvas(holder, bg=COLORS["bg_deep"], highlightthickness=0)
+        vsb = ttk.Scrollbar(holder, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        rows = tk.Frame(canvas, bg=COLORS["bg_deep"])
+        cw = canvas.create_window((0, 0), window=rows, anchor="nw")
+        rows.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(cw, width=e.width))
+        # Wheel: global router — scrolls this canvas when the pointer is over the window,
+        # the main app everywhere else, with no bind_all steal in either direction.
+        self._queue_rows_frame = rows
+
+        foot = tk.Frame(win, bg=COLORS["bg_deep"])
+        foot.pack(fill=tk.X, padx=16, pady=12)
+        self._queue_start_next_btn = ttk.Button(foot, text="▶ Start next now",
+                                                command=self._start_next_queued, style="Primary.TButton")
+        self._queue_start_next_btn.pack(side=tk.LEFT)
+        ttk.Button(foot, text="Clear queue", command=self._queue_clear_all).pack(side=tk.LEFT, padx=(12, 0))
+        tk.Label(foot, text="Queued runs start automatically when the current run finishes cleanly. "
+                            "After a failure, a Stop, or an app restart, the queue waits for you.",
+                 font=(FONT_FAMILY, 8), bg=COLORS["bg_deep"], fg=COLORS["text_explain"],
+                 wraplength=420, justify=tk.LEFT).pack(side=tk.RIGHT)
+        self._render_queue_window()
+
+    def _queue_clear_all(self):
+        if self.training_queue and messagebox.askyesno(
+                "Clear queue", f"Remove all {len(self.training_queue)} queued run(s)?"):
+            self.training_queue.clear()
+            self._save_training_queue()
+            self._refresh_queue_button()
+            self._render_queue_window()
+
+    def _queue_row_summary(self, item):
+        p = item.get("preset", {}) if isinstance(item.get("preset"), dict) else {}
+        folder = str(item.get("image_folder") or "")
+        try:
+            from fizgig.dataset.image_dataset import IMAGE_EXTENSIONS
+            _exts = {e.lower() for e in IMAGE_EXTENSIONS}
+            n_imgs = sum(1 for f in os.listdir(folder)
+                         if os.path.splitext(f)[1].lower() in _exts) if os.path.isdir(folder) else 0
+        except Exception:
+            n_imgs = 0
+        name = p.get("LORA_NAME") or os.path.basename(folder) or "(unnamed)"
+        bits = [f"{item.get('architecture', '?')}",
+                f"{os.path.basename(folder) or '?'} ({n_imgs} images)"]
+        for label, key in (("LR", "LEARNING_RATE"), ("epochs", "MAX_TRAIN_EPOCHS"),
+                           ("dim", "NETWORK_DIM"), ("type", "NETWORK_TYPE"),
+                           ("area", "TARGET_LAYERS")):
+            v = p.get(key)
+            if v not in (None, ""):
+                bits.append(f"{label} {v}")
+        return name, "  ·  ".join(str(b) for b in bits) + f"\nqueued {item.get('queued_at', '?')}"
+
+    def _render_queue_window(self):
+        rows = getattr(self, "_queue_rows_frame", None)
+        if rows is None or not rows.winfo_exists():
+            return
+        for w in rows.winfo_children():
+            w.destroy()
+        self._queue_thumb_refs = []
+        _busy = getattr(self, "current_process", None)
+        _busy = _busy is not None and _busy.poll() is None
+        _state = getattr(self, "training_state", "idle")
+        _active = getattr(self, "_active_run_item", None)
+        _show_active = _active is not None and (_busy or _state in ("running", "pausing", "paused"))
+        try:
+            n = len(self.training_queue)
+            # Starting the next run while one is PAUSED would silently abandon the paused
+            # run (its state dir resumes nothing once another run overwrites the GUI), so
+            # paused disables the button just like busy does.
+            _blocked = _busy or _state in ("pausing", "paused")
+            self._queue_start_next_btn.config(
+                state=(tk.DISABLED if (_blocked or not n) else tk.NORMAL))
+            if _busy and _state == "pausing":
+                txt = (f"{n} run(s) queued — the current run is pausing at the epoch end. "
+                       f"A pause HOLDS the queue: Resume from the Training tab, or start the "
+                       f"next run from here after it exits.") if n else \
+                      "The current run is pausing at the epoch end."
+            elif _busy:
+                txt = (f"{n} run(s) queued — a run is active; the queue continues when it "
+                       f"finishes cleanly." if n else
+                       "A run is active and nothing is queued. The Start Training button reads "
+                       "'Queue Train' — click it to add the currently configured run.")
+            elif _state == "paused":
+                txt = (f"{n} run(s) queued — a run is PAUSED. Resume it from the Training tab; "
+                       f"'Start next now' is disabled because it would abandon the paused run."
+                       if n else
+                       "A run is paused — Resume it from the Training tab.")
+            elif n:
+                txt = (f"{n} run(s) queued — nothing is training. The queue HOLDS after a "
+                       f"failure or Stop; use 'Start next now' to begin or continue.")
+            else:
+                txt = ("Queue is empty. While a run is active, the Start Training button "
+                       "becomes 'Queue Train' — click it to add the currently configured run.")
+            self._queue_win_status.config(text=txt)
+        except Exception:
+            pass
+
+        # The run in progress, pinned on top — it isn't a queue item (never saved, can't be
+        # reordered or deleted), but after editing a queued job in the Training tab, its ✎ is
+        # the way BACK to the settings that are actually running.
+        if _show_active:
+            badge = ("⏸ paused" if _state == "paused" else
+                     "⏸ pausing at epoch end" if _state == "pausing" else "▶ training now")
+            card = tk.Frame(rows, bg=COLORS["bg_surface"],
+                            highlightbackground=COLORS["accent"], highlightthickness=2)
+            card.pack(fill=tk.X, pady=(0, 8))
+            thumb = self._queue_thumbnail(_active.get("image_folder", ""))
+            if thumb is not None:
+                self._queue_thumb_refs.append(thumb)
+                tk.Label(card, image=thumb, bg=COLORS["bg_surface"]).pack(side=tk.LEFT, padx=10, pady=8)
+            else:
+                tk.Label(card, text="🖼", font=(FONT_FAMILY, 20), width=3,
+                         bg=COLORS["bg_surface"], fg=COLORS["text_muted"]).pack(side=tk.LEFT, padx=10, pady=8)
+            act = tk.Frame(card, bg=COLORS["bg_surface"])
+            act.pack(side=tk.RIGHT, padx=10, pady=8)
+            name, summary = self._queue_row_summary(_active)
+            txt = tk.Frame(card, bg=COLORS["bg_surface"])
+            txt.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=8)
+            tk.Label(txt, text=f"{badge}  —  {name}", font=(FONT_FAMILY, 11, "bold"),
+                     bg=COLORS["bg_surface"], fg=COLORS["accent"], anchor="w",
+                     wraplength=520, justify=tk.LEFT).pack(anchor=tk.W)
+            tk.Label(txt, text=summary.split("\n")[0], font=(FONT_FAMILY, 8),
+                     bg=COLORS["bg_surface"], fg=COLORS["text_muted"], anchor="w",
+                     wraplength=520, justify=tk.LEFT).pack(anchor=tk.W)
+            abtn = tk.Button(act, text="✎", font=(FONT_FAMILY, 10), width=3,
+                             bg=COLORS["bg_surface"], fg=COLORS["text_primary"],
+                             activebackground=COLORS["border"], relief="flat", bd=0,
+                             cursor="hand2", command=self._queue_restore_active)
+            abtn.pack(side=tk.LEFT, padx=2)
+            ToolTip(abtn, "Load this run's settings back into the Training tab — the way back "
+                          "after editing a queued job")
+            if _busy:
+                cbtn = tk.Button(act, text="■", font=(FONT_FAMILY, 10), width=3,
+                                 bg=COLORS["bg_surface"], fg=COLORS["error"],
+                                 activebackground=COLORS["border"], relief="flat", bd=0,
+                                 cursor="hand2", command=self._queue_cancel_active)
+                cbtn.pack(side=tk.LEFT, padx=2)
+                ToolTip(cbtn, "Stop this run (no save). Queued runs HOLD — they won't "
+                              "auto-start after a cancel")
+
+        if not self.training_queue:
+            return
+        for i, item in enumerate(list(self.training_queue)):
+            # One corrupt entry (hand-edited file, interrupted write) must not take the
+            # whole window down — render it as removable wreckage instead.
+            if not isinstance(item, dict) or not isinstance(item.get("preset"), dict):
+                bad = tk.Frame(rows, bg=COLORS["bg_surface"],
+                               highlightbackground=COLORS["error"], highlightthickness=1)
+                bad.pack(fill=tk.X, pady=(0, 8))
+                tk.Label(bad, text=f"{i + 1}.  ⚠ unreadable queue entry (corrupt or hand-edited "
+                                   f"queue file)", font=(FONT_FAMILY, 10),
+                         bg=COLORS["bg_surface"], fg=COLORS["error"]).pack(side=tk.LEFT, padx=10, pady=10)
+                tk.Button(bad, text="✕", font=(FONT_FAMILY, 10), width=3,
+                          bg=COLORS["bg_surface"], fg=COLORS["text_primary"],
+                          activebackground=COLORS["border"], relief="flat", bd=0, cursor="hand2",
+                          command=lambda i=i: self._queue_delete(i)).pack(side=tk.RIGHT, padx=10)
+                continue
+            card = tk.Frame(rows, bg=COLORS["bg_surface"],
+                            highlightbackground=COLORS["border"], highlightthickness=1)
+            card.pack(fill=tk.X, pady=(0, 8))
+            thumb = self._queue_thumbnail(item.get("image_folder", ""))
+            if thumb is not None:
+                self._queue_thumb_refs.append(thumb)
+                tk.Label(card, image=thumb, bg=COLORS["bg_surface"]).pack(side=tk.LEFT, padx=10, pady=8)
+            else:
+                tk.Label(card, text="🖼", font=(FONT_FAMILY, 20), width=3,
+                         bg=COLORS["bg_surface"], fg=COLORS["text_muted"]).pack(side=tk.LEFT, padx=10, pady=8)
+            # Buttons pack FIRST (from the right): pack allocates space in order, so a long
+            # unwrapped summary used to squeeze the ↑↓✎⤓✕ column clean off the card —
+            # "my queued jobs have no delete button".
+            btns = tk.Frame(card, bg=COLORS["bg_surface"])
+            btns.pack(side=tk.RIGHT, padx=10, pady=8)
+            name, summary = self._queue_row_summary(item)
+            txt = tk.Frame(card, bg=COLORS["bg_surface"])
+            txt.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=8)
+            tk.Label(txt, text=f"{i + 1}.  {name}", font=(FONT_FAMILY, 11, "bold"),
+                     bg=COLORS["bg_surface"], fg=COLORS["text_primary"], anchor="w",
+                     wraplength=520, justify=tk.LEFT).pack(anchor=tk.W)
+            tk.Label(txt, text=summary, font=(FONT_FAMILY, 8),
+                     bg=COLORS["bg_surface"], fg=COLORS["text_muted"], anchor="w",
+                     wraplength=520, justify=tk.LEFT).pack(anchor=tk.W)
+
+            def _mk(parent, label, cmd, tip):
+                b = tk.Button(parent, text=label, font=(FONT_FAMILY, 10), width=3,
+                              bg=COLORS["bg_surface"], fg=COLORS["text_primary"],
+                              activebackground=COLORS["border"], relief="flat", bd=0,
+                              cursor="hand2", command=cmd)
+                b.pack(side=tk.LEFT, padx=2)
+                ToolTip(b, tip)
+                return b
+            _mk(btns, "↑", lambda i=i: self._queue_move(i, -1), "Move up")
+            _mk(btns, "↓", lambda i=i: self._queue_move(i, +1), "Move down")
+            _mk(btns, "✎", lambda i=i: self._queue_edit(i),
+                "Load this run's settings into the Training tab to edit them")
+            _mk(btns, "⤓", lambda i=i: self._queue_update_from_tab(i),
+                "Overwrite this queued run with the Training tab's current settings")
+            _mk(btns, "✕", lambda i=i: self._queue_delete(i), "Remove from queue")
+
+    def _queue_move(self, i, delta):
+        j = i + delta
+        if 0 <= i < len(self.training_queue) and 0 <= j < len(self.training_queue):
+            q = self.training_queue
+            q[i], q[j] = q[j], q[i]
+            self._save_training_queue()
+            self._render_queue_window()
+
+    def _queue_delete(self, i):
+        if 0 <= i < len(self.training_queue):
+            self.training_queue.pop(i)
+            self._save_training_queue()
+            self._refresh_queue_button()
+            self._render_queue_window()
+
+    def _queue_cancel_active(self):
+        """Stop the run in progress from the queue window's pinned card. Confirmed first —
+        the Training tab's own Stop button stays instant, but here a misclick between rows
+        would kill hours of work. The existing hold policy applies: queued runs do NOT
+        auto-start after a cancel."""
+        _proc = getattr(self, "current_process", None)
+        if _proc is None or _proc.poll() is not None:
+            self._render_queue_window()
+            return
+        name = (getattr(self, "_active_run_item", None) or {}).get("preset", {}).get("LORA_NAME", "this run")
+        if not messagebox.askyesno(
+                "Stop training?",
+                f"Stop '{name}' now? Progress since the last checkpoint is lost, and queued "
+                f"runs will HOLD rather than auto-start.\n\n(To finish the epoch and save "
+                f"first, use Pause Training on the Training tab instead.)"):
+            return
+        self.stop_training()
+        self._render_queue_window()
+
+    def _queue_restore_active(self):
+        """Put the RUNNING job's settings back into the Training tab (the ✎ on the pinned
+        'training now' card) — the undo for having edited a queued job in the tab."""
+        item = getattr(self, "_active_run_item", None)
+        if item is None:
+            return
+        self._apply_queue_item(item)
+        self.update_console("[queue] Training tab restored to the run in progress.\n")
+
+    def _queue_edit(self, i):
+        """Load the item into the Training tab. The item stays queued — after editing,
+        use ⤓ on the same row to write the changes back."""
+        if not (0 <= i < len(self.training_queue)):
+            return
+        self._apply_queue_item(self.training_queue[i])
+        self.update_console(f"[queue] loaded run {i + 1} into the Training tab — edit, then use "
+                            f"the ⤓ button on its queue row to save the changes back.\n")
+
+    def _queue_update_from_tab(self, i):
+        if not (0 <= i < len(self.training_queue)):
+            return
+        old = self.training_queue[i]
+        item = self._queue_snapshot()
+        item["id"], item["queued_at"] = old.get("id", item["id"]), old.get("queued_at", item["queued_at"])
+        self.training_queue[i] = item
+        self._save_training_queue()
+        self._render_queue_window()
+        self.update_console(f"[queue] run {i + 1} updated from the Training tab's current settings.\n")
+
     # Keys in self.entries that belong to OTHER tabs — skipped when collecting
     # a training-tab preset. Everything else in self.entries is fair game.
     # RESUME_TRAINING is run-specific state, not a preset knob: capturing it baked an
@@ -4768,12 +5483,7 @@ class LoRATrainerGUI:
         rows_id = canvas.create_window((0, 0), window=rows, anchor="nw")
         rows.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(rows_id, width=e.width))
-        # Enter/Leave bind_all swapping (the app-wide pattern): a lifetime bind_all would be
-        # silently clobbered the moment the mouse crosses any main-window scrollable frame.
-        _pw_wheel = lambda e: canvas.yview_scroll(-1 * int(e.delta / 120), "units")
-        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _pw_wheel))
-        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
-        win.bind("<Destroy>", lambda e: canvas.unbind_all("<MouseWheel>") if e.widget is win else None)
+        # Wheel: global router (_route_mousewheel) finds this canvas via the pointer.
         self._problem_rows = rows
         self._problem_canvas = canvas
 
@@ -5821,6 +6531,25 @@ class LoRATrainerGUI:
         self.entries["METADATA_TAGS"].grid(row=row, column=1, sticky=tk.EW, padx=5, pady=2)
         row += 1
 
+        ttk.Label(parent, text="Metadata Trigger Phrase:").grid(row=row, column=0, sticky=tk.W, padx=5, pady=2)
+        self.entries["METADATA_TRIGGER_PHRASE"] = ttk.Entry(parent, width=40)
+        self.entries["METADATA_TRIGGER_PHRASE"].grid(row=row, column=1, sticky=tk.EW, padx=5, pady=2)
+        row += 1
+        ttk.Label(parent, text="Blank uses the Captions tab's trigger word.",
+                  foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic")).grid(
+            row=row, column=0, columnspan=3, sticky=tk.W, padx=5)
+        row += 1
+
+        ttk.Label(parent, text="Metadata Thumbnail:").grid(row=row, column=0, sticky=tk.W, padx=5, pady=2)
+        self.entries["METADATA_THUMBNAIL"] = ttk.Entry(parent, width=40)
+        self.entries["METADATA_THUMBNAIL"].grid(row=row, column=1, sticky=tk.EW, padx=5, pady=2)
+        ttk.Button(parent, text="Browse", command=lambda: self.browse_file("METADATA_THUMBNAIL", "file")).grid(row=row, column=2, sticky=tk.W, padx=5)
+        row += 1
+        ttk.Label(parent, text="Blank auto-embeds the latest sample preview; type 'off' to disable.",
+                  foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic")).grid(
+            row=row, column=0, columnspan=3, sticky=tk.W, padx=5)
+        row += 1
+
         return row
 
     def create_caption_generator(self):
@@ -5880,6 +6609,10 @@ class LoRATrainerGUI:
         self.caption_model_combo.grid(row=3, column=1, sticky=tk.W, pady=4)
         self.caption_model_combo.bind("<<ComboboxSelected>>",
                                       lambda e: self._on_caption_model_changed())
+        self.caption_model_hint_label = tk.Label(
+            settings_card, text=self._qwen_captioner_hint(),
+            font=(FONT_FAMILY, 9), fg=COLORS["text_muted"], bg=COLORS["bg_surface"])
+        self.caption_model_hint_label.grid(row=3, column=2, sticky=tk.W, padx=(10, 0))
         # The Qwen3-VL entry appears as soon as the Krea 2 text encoder path is filled in on
         # Preferences — no restart. It's a captioner for ANY dataset, Klein included; the file
         # just happens to ship with the Krea 2 models.
@@ -5922,6 +6655,12 @@ class LoRATrainerGUI:
         ttk.Checkbutton(
             settings_card, text="Overwrite existing caption files", variable=self.overwrite_captions_var,
         ).grid(row=6, column=0, columnspan=3, sticky=tk.W, pady=(10, 0))
+        tk.Label(settings_card,
+                 text="Untick to caption ONLY images that don't have a .txt yet — e.g. after "
+                      "adding new images or face-cropping, existing captions stay untouched.",
+                 font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"],
+                 bg=COLORS["bg_surface"], wraplength=680, justify=tk.LEFT).grid(
+            row=7, column=0, columnspan=3, sticky=tk.W, pady=(0, 2))
 
         # Card 2: Generate Captions
         actions_card = self._start_section_card(outer, "Generate Captions", None)
@@ -6179,64 +6918,120 @@ class LoRATrainerGUI:
             self.refresh_caption_images()
 
     def show_edit_caption_dialog(self, img_path):
-        """Show dialog to edit caption for an image"""
+        """Live caption editor: no Save button, no confirmation popups. Edits save themselves
+        when you navigate or close; ◀ ▶ (or Ctrl+←/→ — plain arrows stay cursor movement)
+        walk the whole folder without leaving the window. Shaped by user feedback: the old
+        flow was nine clicks per image and people were editing captions in other apps."""
+        folder = os.path.dirname(img_path)
+        from fizgig.dataset.image_dataset import IMAGE_EXTENSIONS
+        _exts = {e.lower() for e in IMAGE_EXTENSIONS}
+        try:
+            files = sorted(f for f in os.listdir(folder)
+                           if os.path.splitext(f)[1].lower() in _exts)
+        except Exception:
+            files = [os.path.basename(img_path)]
+        state = {"path": img_path, "loaded": "", "dirty_grid": False}
+
         dialog = tk.Toplevel(self.master)
-        dialog.title(f"Edit Caption - {os.path.basename(img_path)}")
         dialog.configure(bg=BG_COLOR)
-        # No fixed geometry: content height varies (a portrait thumbnail is up to 300 px tall),
-        # and the old 600x500 clipped the buttons under exactly that case. The dialog sizes to
-        # its content; the button row is packed side=BOTTOM *first*, so pack gives it its space
-        # before anything else and it can never be pushed off the edge.
-        dialog.minsize(600, 360)
+        # No fixed geometry: content height varies (a portrait thumbnail is up to 300 px tall).
+        # The button row packs side=BOTTOM *first* so it can never be clipped off the edge.
+        dialog.minsize(600, 380)
 
         btn_frame = ttk.Frame(dialog)
         btn_frame.pack(side=tk.BOTTOM, pady=10)
+        status = tk.Label(dialog, text="Edits save automatically when you move to another "
+                                       "image or close.", font=(FONT_FAMILY, 9),
+                          fg=COLORS["text_explain"], bg=BG_COLOR)
+        status.pack(side=tk.BOTTOM, pady=(0, 2))
 
-        # Image preview
-        try:
-            with Image.open(img_path) as img:
-                _w, _h = img.size
-                img.thumbnail((300, 300), Image.LANCZOS)
-                photo = ImageTk.PhotoImage(img)
-                img_label = ttk.Label(dialog, image=photo)
-                img_label.image = photo
-                img_label.pack(pady=(10, 2))
-                ttk.Label(dialog, text=f"{_w}×{_h} px",
-                          foreground=COLORS["text_muted"]).pack()
-        except Exception:
-            ttk.Label(dialog, text="Could not load image preview").pack(pady=10)
-
-        # Caption text area
+        img_label = ttk.Label(dialog)
+        img_label.pack(pady=(10, 2))
+        size_label = ttk.Label(dialog, foreground=COLORS["text_muted"])
+        size_label.pack()
         ttk.Label(dialog, text="Caption:").pack(anchor=tk.W, padx=10)
-        caption_text = tk.Text(dialog, height=5, width=60, bg=COLORS["bg_surface"], fg=COLORS["text_primary"], font=(FONT_FAMILY, 10), wrap="word")
+        caption_text = tk.Text(dialog, height=5, width=60, bg=COLORS["bg_surface"],
+                               fg=COLORS["text_primary"], font=(FONT_FAMILY, 10), wrap="word",
+                               insertbackground=COLORS["text_primary"])
         caption_text.pack(padx=10, pady=5, fill=tk.X)
 
-        # Load existing caption
-        caption_path = os.path.splitext(img_path)[0] + ".txt"
-        if os.path.exists(caption_path):
-            try:
-                with open(caption_path, 'r', encoding='utf-8') as f:
-                    caption_text.insert("1.0", f.read())
-            except Exception:
-                pass
+        def _cap_path():
+            return os.path.splitext(state["path"])[0] + ".txt"
 
-        def save_caption():
-            text = caption_text.get("1.0", tk.END).strip()
+        def _load(path):
+            state["path"] = path
+            dialog.title(f"Edit Caption — {os.path.basename(path)}"
+                         + (f"   ({files.index(os.path.basename(path)) + 1} / {len(files)})"
+                            if os.path.basename(path) in files else ""))
             try:
-                with open(caption_path, 'w', encoding='utf-8') as f:
+                with Image.open(path) as img:
+                    _w, _h = img.size
+                    img.thumbnail((300, 300), Image.LANCZOS)
+                    photo = ImageTk.PhotoImage(img)
+                    img_label.configure(image=photo)
+                    img_label.image = photo
+                    size_label.configure(text=f"{_w}×{_h} px")
+            except Exception:
+                img_label.configure(image="")
+                img_label.image = None
+                size_label.configure(text="(image preview unavailable)")
+            caption = ""
+            if os.path.exists(_cap_path()):
+                try:
+                    with open(_cap_path(), 'r', encoding='utf-8-sig', errors="replace") as f:
+                        caption = f.read().strip()
+                except Exception:
+                    pass
+            caption_text.delete("1.0", tk.END)
+            caption_text.insert("1.0", caption)
+            state["loaded"] = caption
+
+        def _save():
+            """Write the caption if it changed. Silent and inline — never a popup."""
+            text = caption_text.get("1.0", tk.END).strip()
+            if text == state["loaded"]:
+                return
+            if not text:
+                status.config(fg="#E74C3C",
+                              text="Caption box is empty — not saved (the previous caption "
+                                   "is kept). Type something or move on.")
+                return
+            try:
+                with open(_cap_path(), 'w', encoding='utf-8') as f:
                     f.write(text)
-                messagebox.showinfo("Saved", "Caption saved successfully")
-                self.refresh_caption_images()
+                state["loaded"] = text
+                state["dirty_grid"] = True
+                status.config(fg="#2ECC71", text=f"Saved ✓  {os.path.basename(_cap_path())}")
             except Exception as e:
-                messagebox.showerror("Error", f"Failed to save caption: {e}")
+                status.config(fg="#E74C3C", text=f"Save failed: {e}")
+
+        def _nav(step):
+            _save()
+            base = os.path.basename(state["path"])
+            if base not in files or len(files) < 2:
+                return
+            _load(os.path.join(folder, files[(files.index(base) + step) % len(files)]))
+
+        def _close():
+            _save()
+            if state["dirty_grid"]:
+                self.refresh_caption_images()   # once, on close — not per save (scroll reset)
+            dialog.destroy()
 
         def regenerate():
+            _save()
             dialog.destroy()
-            self.caption_single_image(img_path)
+            self.caption_single_image(state["path"])
 
-        ttk.Button(btn_frame, text="Save", command=save_caption).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Regenerate (AI)", command=regenerate).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="◀ Prev", command=lambda: _nav(-1)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Next ▶", command=lambda: _nav(+1)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Regenerate (AI)", command=regenerate).pack(side=tk.LEFT, padx=(20, 5))
+        ttk.Button(btn_frame, text="Close", command=_close).pack(side=tk.LEFT, padx=5)
+        # Ctrl+arrows so plain arrows keep moving the text cursor while typing.
+        dialog.bind("<Control-Left>", lambda e: (_nav(-1), "break")[1])
+        dialog.bind("<Control-Right>", lambda e: (_nav(+1), "break")[1])
+        dialog.protocol("WM_DELETE_WINDOW", _close)
+        _load(img_path)
 
     # region Caption model selection (Florence-2 / Qwen3-VL)
 
@@ -6244,6 +7039,17 @@ class LoRATrainerGUI:
         """The Krea 2 text-encoder file, if it's set AND actually on disk — else ""."""
         p = self._krea2_pref("krea2_text_encoder") if hasattr(self, "prefs_vars") else ""
         return p if (p and os.path.isfile(p)) else ""
+
+    def _qwen_captioner_hint(self) -> str:
+        """Small nudge next to the Model dropdown when Qwen3-VL isn't offered -- someone who
+        already has the weights (from ComfyUI, a pod image, wherever) has no other way to
+        learn that this is an unset/broken Preferences path rather than a missing feature."""
+        if self._qwen_captioner_path():
+            return ""
+        raw = self._krea2_pref("krea2_text_encoder") if hasattr(self, "prefs_vars") else ""
+        if raw:
+            return f"(Qwen3-VL path set but not found: {os.path.basename(raw)} — check Preferences)"
+        return "(Already have the Qwen3-VL weights? Set the path in Preferences to caption with it)"
 
     def _caption_model_values(self):
         """Model dropdown contents. Qwen3-VL is offered whenever its file exists — it captions to
@@ -6280,6 +7086,8 @@ class LoRATrainerGUI:
                 # selection that no longer resolves to anything loadable.
                 self.caption_model_var.set(FLORENCE_DEFAULT_MODEL)
                 self._on_caption_model_changed()
+            if hasattr(self, "caption_model_hint_label"):
+                self.caption_model_hint_label.configure(text=self._qwen_captioner_hint())
         except tk.TclError:
             pass
 
@@ -6523,9 +7331,13 @@ class LoRATrainerGUI:
             self.master.update_idletasks()
 
             from fizgig.utils.hf_cache import from_pretrained_cache_first
+            florence_revision = FLORENCE_REVISIONS.get(model_name)
+            florence_code_revision = FLORENCE_CODE_REVISIONS.get(model_name)
             self.florence_processor = from_pretrained_cache_first(
                 AutoProcessor,
                 model_name,
+                revision=florence_revision,
+                code_revision=florence_code_revision,
                 trust_remote_code=True
             )
 
@@ -6539,6 +7351,8 @@ class LoRATrainerGUI:
             self.florence_model = from_pretrained_cache_first(
                 AutoModelForCausalLM,
                 model_name,
+                revision=florence_revision,
+                code_revision=florence_code_revision,
                 torch_dtype=torch.float16 if device == "cuda" else torch.float32,
                 trust_remote_code=True,
                 attn_implementation="eager"
@@ -6832,10 +7646,15 @@ class LoRATrainerGUI:
             self.update_caption_log(f"Qwen3-VL captioner ready on {device}.\n")
             return True
         except Exception as e:
-            self.update_caption_log(
-                f"Could not load the Qwen3-VL captioner: {type(e).__name__}: {e}\n"
-                "Check the Krea 2 text-encoder path in Preferences — Fizgig reads the bf16 and "
-                "fp8_scaled Qwen3-VL-4B files from Comfy-Org/Krea-2.\n")
+            # The embedder's own RuntimeError already carries precise instructions (the offline
+            # sneakernet shopping list) — appending the check-your-path hint to it sent an
+            # offline user hunting through a path that was fine. Only add the path hint for
+            # errors that don't explain themselves.
+            _msg = f"Could not load the Qwen3-VL captioner: {type(e).__name__}: {e}\n"
+            if not isinstance(e, RuntimeError):
+                _msg += ("Check the Krea 2 text-encoder path in Preferences — Fizgig reads the "
+                         "bf16 and fp8_scaled Qwen3-VL-4B files from Comfy-Org/Krea-2.\n")
+            self.update_caption_log(_msg)
             self.qwen_captioner = None
             return False
 
@@ -9850,11 +10669,7 @@ class LoRATrainerGUI:
         rows_id = canvas.create_window((0, 0), window=rows, anchor="nw")
         rows.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(rows_id, width=e.width))
-        # Enter/Leave bind_all swapping (the app-wide pattern — see Problem Images window).
-        _ff_wheel = lambda e: canvas.yview_scroll(-1 * int(e.delta / 120), "units")
-        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _ff_wheel))
-        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
-        win.bind("<Destroy>", lambda e: canvas.unbind_all("<MouseWheel>") if e.widget is win else None)
+        # Wheel: global router (_route_mousewheel) finds this canvas via the pointer.
         self._ff_rows = rows
 
     def _ff_set_status(self, text):
@@ -12685,6 +13500,344 @@ class LoRATrainerGUI:
 
     # endregion
 
+    # region Metadata Tab
+
+    def create_metadata_tab(self):
+        """Create the Metadata tab — view and edit the modelspec metadata on any .safetensors
+        file: LoRAs, DiTs, text encoders, embeddings, whatever — including ones Fizgig didn't
+        train, or trained before these fields existed."""
+        scrollable_frame, _ = self.create_scrollable_frame(self.metadata_tab)
+
+        outer = tk.Frame(scrollable_frame, bg=COLORS["bg_deep"])
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        self._add_tab_banner(
+            outer,
+            "Metadata",
+            "View and edit the SAI ModelSpec metadata embedded in a .safetensors file — title, "
+            "author, description, trigger phrase, thumbnail, and anything else ComfyUI's model "
+            "browser reads. Works on any .safetensors file — LoRA, DiT, text encoder, "
+            "embedding — not just ones Fizgig trained.",
+        )
+
+        self._metadata_editor_path = None
+        self._metadata_editor_thumbnail_uri = None  # current thumbnail data URI, or None
+        self._metadata_editor_custom = {}  # every key outside the standard fields below
+        self._metadata_thumb_photo = None  # keeps the PhotoImage alive; Tk drops it otherwise
+
+        # --- Load ---
+        load_card = self._start_section_card(
+            outer, "File",
+            "Pick any .safetensors file — LoRA, DiT, text encoder, embedding — its current "
+            "metadata loads below.",
+        )
+        load_card.grid_columnconfigure(1, weight=1)
+        ttk.Label(load_card, text="File:").grid(row=0, column=0, sticky=tk.W, padx=(0, 10), pady=4)
+        self.metadata_file_var = tk.StringVar()
+        ttk.Entry(load_card, textvariable=self.metadata_file_var, width=60).grid(
+            row=0, column=1, sticky=tk.EW, pady=4)
+        ttk.Button(load_card, text="Browse", command=self._browse_metadata_file).grid(
+            row=0, column=2, sticky=tk.W, padx=(8, 0), pady=4)
+        self._metadata_status_label = tk.Label(
+            load_card, text="No file loaded.", font=(FONT_FAMILY, 9, "italic"),
+            fg=COLORS["text_muted"], bg=COLORS["bg_surface"])
+        self._metadata_status_label.grid(row=1, column=1, sticky=tk.W, pady=(2, 0))
+
+        # --- Standard fields ---
+        fields_card = self._start_section_card(
+            outer, "Standard Fields",
+            "The fields ComfyUI's model browser (and other spec-aware tools) render specially.",
+        )
+        fields_card.grid_columnconfigure(1, weight=1)
+
+        def _field_row(label_text, row):
+            ttk.Label(fields_card, text=label_text).grid(
+                row=row, column=0, sticky=tk.NW, padx=(0, 10), pady=4)
+            var = tk.StringVar()
+            ttk.Entry(fields_card, textvariable=var, width=60).grid(
+                row=row, column=1, sticky=tk.EW, pady=4)
+            return var
+
+        self.metadata_title_var = _field_row("Title:", 0)
+        self.metadata_author_var = _field_row("Author:", 1)
+        self.metadata_license_var = _field_row("License:", 2)
+        self.metadata_tags_var = _field_row("Tags:", 3)
+        self.metadata_trigger_var = _field_row("Trigger Phrase:", 4)
+        self.metadata_usage_hint_var = _field_row("Usage Hint:", 5)
+
+        ttk.Label(fields_card, text="Description:").grid(
+            row=6, column=0, sticky=tk.NW, padx=(0, 10), pady=4)
+        self.metadata_description_text = tk.Text(
+            fields_card, width=60, height=5, wrap=tk.WORD,
+            bg=COLORS["bg_surface"], fg=COLORS["text_primary"],
+            insertbackground=COLORS["text_primary"], font=(FONT_FAMILY, 10),
+            relief="flat", highlightthickness=1,
+            highlightbackground=COLORS["border"], highlightcolor=COLORS["border_focus"],
+        )
+        self.metadata_description_text.grid(row=6, column=1, sticky=tk.EW, pady=4)
+
+        # --- Thumbnail ---
+        thumb_card = self._start_section_card(
+            outer, "Thumbnail",
+            "The image ComfyUI shows as card art. Fizgig auto-embeds the latest training sample "
+            "when it trains a LoRA — replace or clear it here for any file.",
+        )
+        self._metadata_thumb_label = tk.Label(thumb_card, bg=COLORS["bg_surface"],
+                                              text="(no thumbnail)", fg=COLORS["text_muted"])
+        self._metadata_thumb_label.pack(anchor=tk.W, pady=(0, 8))
+        thumb_btn_row = tk.Frame(thumb_card, bg=COLORS["bg_surface"])
+        thumb_btn_row.pack(anchor=tk.W)
+        ttk.Button(thumb_btn_row, text="Replace...",
+                   command=self._browse_metadata_thumbnail).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(thumb_btn_row, text="Clear",
+                   command=self._clear_metadata_thumbnail).pack(side=tk.LEFT)
+
+        # --- Custom fields ---
+        custom_card = self._start_section_card(
+            outer, "Custom Fields",
+            "Like ID3 tags on an MP3 — the format isn't limited to a fixed list, and a reader "
+            "just ignores whatever it doesn't recognize. Add anything you want: author_email, "
+            "a colorspace profile note, whatever's useful to you. Not part of the SAI ModelSpec "
+            "standard, so tools other than Fizgig won't render these specially, but they're "
+            "stored in the file like any other metadata. Also shows any non-standard keys "
+            "already in the file — nothing gets silently dropped on save.",
+        )
+        tree_frame = tk.Frame(custom_card, bg=COLORS["bg_surface"])
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+        self.metadata_custom_tree = ttk.Treeview(
+            tree_frame, columns=("key", "value"), show="headings", height=6)
+        self.metadata_custom_tree.heading("key", text="Key")
+        self.metadata_custom_tree.heading("value", text="Value")
+        self.metadata_custom_tree.column("key", width=220, anchor=tk.W)
+        self.metadata_custom_tree.column("value", width=420, anchor=tk.W)
+        self.metadata_custom_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tree_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL,
+                                    command=self.metadata_custom_tree.yview)
+        tree_scroll.pack(side=tk.LEFT, fill=tk.Y)
+        self.metadata_custom_tree.configure(yscrollcommand=tree_scroll.set)
+
+        custom_btn_row = tk.Frame(custom_card, bg=COLORS["bg_surface"])
+        custom_btn_row.pack(anchor=tk.W, pady=(8, 0))
+        ttk.Button(custom_btn_row, text="Add field...",
+                   command=self._add_metadata_custom_field).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(custom_btn_row, text="Remove selected",
+                   command=self._remove_metadata_custom_field).pack(side=tk.LEFT)
+
+        # --- Save ---
+        save_row = tk.Frame(outer, bg=COLORS["bg_deep"])
+        save_row.pack(fill=tk.X, padx=36, pady=(0, 20))
+        ttk.Button(save_row, text="Save",
+                   command=lambda: self._save_metadata_file(save_as=False)).pack(
+            side=tk.LEFT, padx=(0, 8))
+        ttk.Button(save_row, text="Save As...",
+                   command=lambda: self._save_metadata_file(save_as=True)).pack(side=tk.LEFT)
+        self._metadata_save_status = tk.Label(
+            save_row, text="", font=(FONT_FAMILY, 9, "italic"),
+            fg=COLORS["text_muted"], bg=COLORS["bg_deep"])
+        self._metadata_save_status.pack(side=tk.LEFT, padx=(16, 0))
+
+    def _browse_metadata_file(self):
+        filepath = filedialog.askopenfilename(
+            title="Select a .safetensors file",
+            filetypes=[("SafeTensors", "*.safetensors"), ("All files", "*.*")],
+            initialdir=self._lora_initialdir(),
+        )
+        if filepath:
+            self.metadata_file_var.set(filepath)
+            self._load_metadata_file(filepath)
+
+    def _load_metadata_file(self, path):
+        from fizgig.training.metadata import load_metadata_from_safetensors
+        try:
+            meta = load_metadata_from_safetensors(path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read metadata:\n{e}")
+            return
+
+        self._metadata_editor_path = path
+        standard = {
+            "modelspec.title": self.metadata_title_var,
+            "modelspec.author": self.metadata_author_var,
+            "modelspec.license": self.metadata_license_var,
+            "modelspec.tags": self.metadata_tags_var,
+            "modelspec.trigger_phrase": self.metadata_trigger_var,
+            "modelspec.usage_hint": self.metadata_usage_hint_var,
+        }
+        for key, var in standard.items():
+            var.set(meta.get(key, "") or "")
+
+        self.metadata_description_text.delete("1.0", tk.END)
+        self.metadata_description_text.insert("1.0", meta.get("modelspec.description", "") or "")
+
+        self._metadata_editor_thumbnail_uri = meta.get("modelspec.thumbnail")
+        self._show_metadata_thumbnail_preview(self._metadata_editor_thumbnail_uri)
+
+        skip_keys = set(standard.keys()) | {"modelspec.description", "modelspec.thumbnail"}
+        self._metadata_editor_custom = {k: v for k, v in meta.items() if k not in skip_keys}
+        self._refresh_metadata_custom_tree()
+
+        n = len(meta)
+        self._metadata_status_label.config(
+            text=f"Loaded — {n} metadata key{'s' if n != 1 else ''} found.",
+            fg=COLORS["text_secondary"])
+        self._metadata_save_status.config(text="")
+
+    def _show_metadata_thumbnail_preview(self, data_uri):
+        if not data_uri or not str(data_uri).startswith("data:image"):
+            self._metadata_thumb_label.config(image="", text="(no thumbnail)")
+            self._metadata_thumb_photo = None
+            return
+        try:
+            import base64
+            from io import BytesIO
+            b64 = data_uri.split(",", 1)[1]
+            img = Image.open(BytesIO(base64.b64decode(b64)))
+            img.thumbnail((256, 256))
+            photo = ImageTk.PhotoImage(img)
+            self._metadata_thumb_photo = photo  # reference kept alive deliberately
+            self._metadata_thumb_label.config(image=photo, text="")
+        except Exception:
+            self._metadata_thumb_label.config(image="", text="(couldn't decode thumbnail)")
+            self._metadata_thumb_photo = None
+
+    def _browse_metadata_thumbnail(self):
+        filepath = filedialog.askopenfilename(
+            title="Select a thumbnail image",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.webp"), ("All files", "*.*")],
+        )
+        if not filepath:
+            return
+        from fizgig.training.metadata import thumbnail_data_uri
+        uri = thumbnail_data_uri(filepath)
+        if not uri:
+            messagebox.showerror("Error", "Could not read that image.")
+            return
+        self._metadata_editor_thumbnail_uri = uri
+        self._show_metadata_thumbnail_preview(uri)
+
+    def _clear_metadata_thumbnail(self):
+        self._metadata_editor_thumbnail_uri = None
+        self._show_metadata_thumbnail_preview(None)
+
+    def _refresh_metadata_custom_tree(self):
+        self.metadata_custom_tree.delete(*self.metadata_custom_tree.get_children())
+        for k, v in sorted(self._metadata_editor_custom.items()):
+            display_v = v if len(str(v)) <= 120 else str(v)[:117] + "..."
+            self.metadata_custom_tree.insert("", tk.END, iid=k, values=(k, display_v))
+
+    def _add_metadata_custom_field(self):
+        dlg = tk.Toplevel(self.master)
+        dlg.title("Add custom field")
+        dlg.configure(bg=BG_COLOR)
+        dlg.transient(self.master)
+        tk.Label(dlg, text="Key:", bg=BG_COLOR, fg=COLORS["text_secondary"]).grid(
+            row=0, column=0, sticky=tk.W, padx=10, pady=(10, 2))
+        key_entry = ttk.Entry(dlg, width=40)
+        key_entry.grid(row=0, column=1, padx=10, pady=(10, 2))
+        tk.Label(dlg, text="Value:", bg=BG_COLOR, fg=COLORS["text_secondary"]).grid(
+            row=1, column=0, sticky=tk.W, padx=10, pady=2)
+        val_entry = ttk.Entry(dlg, width=40)
+        val_entry.grid(row=1, column=1, padx=10, pady=2)
+
+        def ok():
+            k = key_entry.get().strip()
+            v = val_entry.get().strip()
+            if k:
+                self._metadata_editor_custom[k] = v
+                self._refresh_metadata_custom_tree()
+            dlg.destroy()
+
+        btn_row = tk.Frame(dlg, bg=BG_COLOR)
+        btn_row.grid(row=2, column=0, columnspan=2, pady=10)
+        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row, text="Add", command=ok).pack(side=tk.LEFT, padx=5)
+        key_entry.bind("<Return>", lambda e: ok())
+        key_entry.focus_set()
+        dlg.grab_set()
+
+    def _remove_metadata_custom_field(self):
+        for k in self.metadata_custom_tree.selection():
+            self._metadata_editor_custom.pop(k, None)
+        self._refresh_metadata_custom_tree()
+
+    def _save_metadata_file(self, save_as=False):
+        if not self._metadata_editor_path:
+            messagebox.showinfo("No file loaded", "Load a .safetensors file first.")
+            return
+
+        dest = self._metadata_editor_path
+        if save_as:
+            dest = filedialog.asksaveasfilename(
+                title="Save file as",
+                defaultextension=".safetensors",
+                filetypes=[("SafeTensors", "*.safetensors")],
+                initialfile=os.path.basename(self._metadata_editor_path),
+            )
+            if not dest:
+                return
+        elif not messagebox.askyesno(
+                "Overwrite?",
+                f"Save metadata changes to:\n{dest}\n\nThis overwrites the file in place."):
+            return
+
+        try:
+            from safetensors.torch import load_file, save_file
+            # .clone() forces a real copy out of the mmap'd view load_file returns. Without
+            # this, saving back onto the SAME path fails on Windows with "the requested
+            # operation cannot be performed on a file with a user-mapped section open"
+            # (error 1224) — the mapping from this exact load is still active, and Windows
+            # (unlike Linux) refuses to overwrite a file while it's mapped. Cloning breaks
+            # that dependency before we ever try to write.
+            tensors = {k: v.clone() for k, v in load_file(self._metadata_editor_path).items()}
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read the file's tensors:\n{e}")
+            return
+
+        new_meta = dict(self._metadata_editor_custom)
+        field_map = {
+            "modelspec.title": self.metadata_title_var.get().strip(),
+            "modelspec.author": self.metadata_author_var.get().strip(),
+            "modelspec.license": self.metadata_license_var.get().strip(),
+            "modelspec.tags": self.metadata_tags_var.get().strip(),
+            "modelspec.trigger_phrase": self.metadata_trigger_var.get().strip(),
+            "modelspec.usage_hint": self.metadata_usage_hint_var.get().strip(),
+            "modelspec.description": self.metadata_description_text.get("1.0", "end-1c").strip(),
+        }
+        for k, v in field_map.items():
+            if v:
+                new_meta[k] = v
+        if self._metadata_editor_thumbnail_uri:
+            new_meta["modelspec.thumbnail"] = self._metadata_editor_thumbnail_uri
+
+        # A metadata-only edit still goes through a full resave, which isn't guaranteed to be
+        # byte-identical to the original — so hashes computed over the old bytes can no longer
+        # be trusted. Same move bake.py already makes whenever it changes a file's contents.
+        for stale in ("sshs_model_hash", "sshs_legacy_hash", "modelspec.hash_sha256"):
+            new_meta.pop(stale, None)
+
+        # Write to a temp file and swap it in atomically, so a failed/interrupted save can
+        # never leave the original file half-written.
+        tmp_dest = dest + ".tmp"
+        try:
+            save_file(tensors, tmp_dest, metadata=new_meta)
+            os.replace(tmp_dest, dest)
+        except Exception as e:
+            try:
+                if os.path.exists(tmp_dest):
+                    os.remove(tmp_dest)
+            except OSError:
+                pass
+            messagebox.showerror("Error", f"Could not save:\n{e}")
+            return
+
+        self._metadata_save_status.config(text=f"Saved {os.path.basename(dest)}",
+                                          fg=COLORS["text_secondary"])
+        if save_as:
+            self.metadata_file_var.set(dest)
+            self._metadata_editor_path = dest
+
+    # endregion
+
     # region Preferences Tab
 
     def create_prefs_tab(self):
@@ -12817,6 +13970,18 @@ class LoRATrainerGUI:
             "helper models (Florence-2 captioner, face model for the Look Filter and likeness "
             "scoring, EN→ZH translator — ~1.6 GB) so nothing stalls to download later. No "
             "HuggingFace account needed — none of these are gated.")
+        _offline_tip = tk.Label(
+            krea_card,
+            text="💡 Already have these files for ComfyUI? Filling the paths in by hand works "
+                 "perfectly — the download button is a convenience, not a requirement. The first "
+                 "time you caption or train while online, Fizgig quietly fetches a few tiny "
+                 "helper files and keeps them, and from then on everything runs fully offline. "
+                 "Setting up a machine that will never see the internet? Paste a complete "
+                 "HuggingFace model folder into the text encoder field instead of a single file "
+                 "and nothing needs downloading at all.",
+            font=(FONT_FAMILY, 9), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
+            wraplength=760, justify=tk.LEFT)
+        _offline_tip.grid(row=kr + 2, column=0, columnspan=3, sticky=tk.W, pady=(12, 2))
 
         # Card 1c: GPU selection — only interesting on multi-GPU hosts, but harmless
         # (and informative) on single-GPU ones.
@@ -13324,9 +14489,13 @@ class LoRATrainerGUI:
         if family == "klein":
             # Klein's repos are gated: BFL require each user to accept the licence themselves,
             # which is exactly why these can't be bundled or pre-fetched on anyone's behalf.
-            token = self._ask_hf_token()
+            # An HF_TOKEN already in the environment (the container's documented env var for
+            # exactly this) satisfies the gate with no prompt — only ask when there isn't one.
+            token = os.environ.get("HF_TOKEN", "").strip()
             if not token:
-                return
+                token = self._ask_hf_token()
+                if not token:
+                    return
 
         btn = getattr(self, f"_fetch_btn_{family}", None)
         status = getattr(self, f"_fetch_status_{family}", None)
@@ -14209,10 +15378,7 @@ class LoRATrainerGUI:
             self._schedule_repair_preview_redraws()
         outer_canvas.bind("<Configure>", _on_canvas_config)
 
-        def _on_wheel(e):
-            outer_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        outer_canvas.bind("<Enter>", lambda e: outer_canvas.bind_all("<MouseWheel>", _on_wheel))
-        outer_canvas.bind("<Leave>", lambda e: outer_canvas.unbind_all("<MouseWheel>"))
+        # Wheel: global router (_route_mousewheel) finds this canvas via the pointer.
 
         self.repair_outer_canvas = outer_canvas
         return inner
@@ -14688,11 +15854,7 @@ class LoRATrainerGUI:
             canvas.itemconfigure(inner_id, width=e.width)
         canvas.bind("<Configure>", _on_canvas_config)
 
-        # Mousewheel scrolling when hovering the panel
-        def _on_mousewheel(e):
-            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
-        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        # Wheel: global router (_route_mousewheel) finds this canvas via the pointer.
 
         inner.columnconfigure(0, weight=1)
         inner.columnconfigure(1, weight=1)
@@ -14740,10 +15902,7 @@ class LoRATrainerGUI:
         inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(inner_id, width=e.width))
 
-        def _on_mousewheel(e):
-            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
-        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
-        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+        # Wheel: global router (_route_mousewheel) finds this canvas via the pointer.
 
         inner.columnconfigure(0, weight=1)
         inner.columnconfigure(1, weight=1)
@@ -16353,6 +17512,10 @@ class LoRATrainerGUI:
         eng.load_primary(path)
 
     def _royale_unload(self):
+        # Same internal guard as the Repair/Explorer unloads: resetting under a live CUDA
+        # worker hard-hangs, and callers (tab switch, pre-training hygiene) can't know.
+        if self._royale_is_busy():
+            return
         if getattr(self, "royale_engine", None) is not None:
             try:
                 self.royale_engine.reset()
@@ -19119,6 +20282,11 @@ class LoRATrainerGUI:
         # Check caption files exist in the dataset folder
         image_dir = self.image_folder_var.get().strip()
         caption_ext = self.dataset_caption_ext_var.get().strip()
+        # A SET folder that no longer exists is an error, not a skip: the TOML regenerator
+        # early-returns on a missing folder, so proceeding trains whatever dataset the TOML
+        # last pointed at — silently, under this run's name.
+        if image_dir and not os.path.isdir(image_dir):
+            errors.append(f"Training image folder does not exist: {image_dir}")
         if image_dir and os.path.isdir(image_dir) and caption_ext:
             import glob as _glob
             # glob.escape is load-bearing here: a folder like "[subject] photos" made this
@@ -19137,6 +20305,23 @@ class LoRATrainerGUI:
             return False
 
         return True
+
+    @staticmethod
+    def _pipeline_exit_routes_to_state_machine(name, returncode):
+        """Which subprocess exits the pause/queue state machine must hear about.
+
+        Training exits: always (clean finish, failure, stop, pause all carry state).
+        Caching phases ("Cache Preparation" / "Text Encoder Caching"): only NONZERO exits —
+        a clean cache exit continues the pipeline via its callback and the run is still
+        alive. Before this predicate existed, a failed or stopped caching phase left
+        training_state stranded at "running" with no process: the Start button read
+        "Queue Train" but launched, Pause pointed at nothing, the queue window pinned a
+        dead run, and a queued job that died in caching vanished without the HELD notice.
+        """
+        n = (name or "").lower()
+        if "training" in n:
+            return True
+        return "cach" in n and returncode != 0
 
     def run_subprocess(self, cmd, name, callback=None):
         """Run a subprocess and handle its output with UTF-8 encoding"""
@@ -19189,8 +20374,9 @@ class LoRATrainerGUI:
             process.wait()
             self.master.after(0, self.update_console, f"{name} process completed.\n")
             self.current_process = None
-            # Route training-subprocess exit through the pause/resume state machine
-            if name and "training" in name.lower():
+            # Route pipeline exits through the pause/resume state machine (see the predicate
+            # for which ones — a dead caching phase used to strand the app in "running").
+            if self._pipeline_exit_routes_to_state_machine(name, process.returncode):
                 self.master.after(0, self._on_training_subprocess_exited, process.returncode)
             if process.returncode != 0:
                 self.master.after(0, self.update_console,
@@ -19213,11 +20399,9 @@ class LoRATrainerGUI:
         _proc = getattr(self, "current_process", None)
         try:
             if _proc is not None and _proc.poll() is None:
-                messagebox.showinfo(
-                    "Already Running",
-                    "A training/caching run is already active.\n\n"
-                    "Stop it (or let it finish) before starting another."
-                )
+                # A run is active, so Start means QUEUE: capture the currently configured
+                # run and append it. (The button already reads "Queue Train" in this state.)
+                self._queue_current_run()
                 return
         except Exception:
             pass
@@ -19270,10 +20454,23 @@ class LoRATrainerGUI:
 
         # Snapshot current settings for the "Load Last Train" button
         self._save_last_train_settings()
+        # ...and as the queue window's pinned "training now" card: editing a queued job loads
+        # its settings into this tab, so the window needs a way back to the run in progress.
+        self._active_run_item = self._queue_snapshot()
 
         # Unload Florence model to free VRAM before training
         if self.florence_model is not None:
             self.unload_florence_model(silent=True)
+        # ...and the tool-tab engines (Repair Studio / Explorer / Royale, 10-20 GB each).
+        # A manual Start implies a switch to the Training tab, which unloads them via
+        # on_tab_changed — but a queue auto-advance or the queue window's "Start next now"
+        # involves NO tab switch, and training would otherwise launch against a full card.
+        # All three are idle-guarded internally, so this is safe and idempotent.
+        for _unl in ("_unload_repair_studio_models", "_unload_explorer_models", "_royale_unload"):
+            try:
+                getattr(self, _unl)()
+            except Exception:
+                pass
 
         # Start samples watcher for live gallery updates
         if self.sample_enabled_var.get():
@@ -19387,6 +20584,8 @@ class LoRATrainerGUI:
             "METADATA_DESCRIPTION": self.entries["METADATA_DESCRIPTION"].get(),
             "METADATA_LICENSE": self.entries["METADATA_LICENSE"].get(),
             "METADATA_TAGS": self.entries["METADATA_TAGS"].get(),
+            "METADATA_TRIGGER_PHRASE": self.entries["METADATA_TRIGGER_PHRASE"].get(),
+            "METADATA_THUMBNAIL": self.entries["METADATA_THUMBNAIL"].get(),
             "FP8": self.fp8_var.get(),
             "SCALED": self.scaled_var.get(),
             "QUANT_4BIT": self.quant_4bit_var.get(),
@@ -19785,6 +20984,15 @@ class LoRATrainerGUI:
         if metadata_tags:
             command.extend(["--metadata_tags", metadata_tags])
 
+        metadata_trigger_phrase = self.settings["METADATA_TRIGGER_PHRASE"].strip() or \
+            (self.caption_trigger_var.get().strip() if hasattr(self, "caption_trigger_var") else "")
+        if metadata_trigger_phrase and metadata_trigger_phrase.lower() != "trigger_word":
+            command.extend(["--metadata_trigger_phrase", metadata_trigger_phrase])
+
+        metadata_thumbnail = self.settings["METADATA_THUMBNAIL"].strip()
+        if metadata_thumbnail:
+            command.extend(["--metadata_thumbnail", metadata_thumbnail])
+
         if self.settings["RESUME_TRAINING"].strip():
             command.append(f"--resume={self.settings['RESUME_TRAINING']}")
 
@@ -20072,6 +21280,15 @@ class LoRATrainerGUI:
             _mval = str(self.settings.get(_mkey, "") or "").strip()
             if _mval:
                 cmd += [_mflag, _mval]
+        # Trigger phrase falls back to the Captions tab's trigger word — independent of
+        # --trigger_word above, which is only ever sent when auto-recaption is on.
+        _mtrig = self.settings.get("METADATA_TRIGGER_PHRASE", "").strip() or \
+            (self.caption_trigger_var.get().strip() if hasattr(self, "caption_trigger_var") else "")
+        if _mtrig and _mtrig.lower() != "trigger_word":
+            cmd += ["--metadata_trigger_phrase", _mtrig]
+        _mthumb = self.settings.get("METADATA_THUMBNAIL", "").strip()
+        if _mthumb:
+            cmd += ["--metadata_thumbnail", _mthumb]
         # Base weight optimization. 4-bit NF4 supersedes fp8 (mutually exclusive): it quantizes the
         # frozen base to ~5.6 GB so a full LoRA trains on a 10-12 GB card with NO block swap (the
         # trainer forces blocks_to_swap=0 under 4-bit). Otherwise fp8 Base (the default) unless the
@@ -20256,6 +21473,21 @@ class LoRATrainerGUI:
         """Show/hide Pause and Resume buttons based on self.training_state."""
         if not hasattr(self, "training_state"):
             self.training_state = "idle"
+        # While a run is active the Start button queues instead of starting — say so on
+        # the button itself rather than surprising the user with a popup.
+        try:
+            self._start_training_btn.config(
+                text="Queue Train" if self.training_state in ("running", "pausing")
+                else "Start Training")
+        except Exception:
+            pass
+        # Every state transition passes through here, so it's the one hook that keeps an
+        # OPEN queue window truthful (finish, advance, failure-hold, pause) — the render
+        # no-ops when the window isn't up.
+        try:
+            self._render_queue_window()
+        except Exception:
+            pass
         # Pause: visible while running (Krea 2 now saves full state at the epoch boundary, so
         # graceful Pause/Resume works the same as Klein).
         if self.training_state == "running":
@@ -20444,8 +21676,37 @@ class LoRATrainerGUI:
         # Only a run that finished on its own. Pause exits 0 too (state "pausing"); Stop and
         # crashes arrive non-zero. Each of the three conditions excludes a real case, and getting
         # it wrong shuts the machine down under someone who is still using it.
+        # Every run exit invalidates whatever advance/retry timers were armed before it —
+        # a stale tick must never fire into the state this exit is about to establish.
+        self._cancel_pending_queue_advance()
+        _queue_advancing = False
         if return_code == 0 and was_state == "running":
-            self._maybe_stop_pod_after_training()
+            if getattr(self, "training_queue", None):
+                # Queue takes precedence over pod auto-stop: the pod must stay up until the
+                # LAST queued run finishes — that final run's clean exit lands here with an
+                # empty queue and fires the auto-stop as usual.
+                _queue_advancing = True
+                self._queue_busy_retries = 0
+                self.update_console(f"\n[queue] run finished — next of "
+                                    f"{len(self.training_queue)} queued run(s) starts in 5 s.\n")
+                self._schedule_queue_advance(5000)
+            else:
+                self._maybe_stop_pod_after_training()
+        elif getattr(self, "training_queue", None):
+            # Failure, Stop, or Pause with runs still waiting: never cascade into the queue —
+            # a crash loop through N queued runs would burn hours producing nothing. The queue
+            # holds; the user restarts it from the queue window.
+            if was_state == "pausing" and return_code == 0:
+                self.update_console(f"[queue] run paused — {len(self.training_queue)} queued "
+                                    f"run(s) are HELD. Resume the paused run from the Training "
+                                    f"tab first; the queue continues after it finishes.\n")
+            else:
+                self.update_console(
+                    f"[queue] run did not finish cleanly (exit {return_code}) — "
+                    f"{len(self.training_queue)} queued run(s) are HELD. The FAILED run is not "
+                    f"in the queue: its settings are still loaded in the Training tab (fix and "
+                    f"Start Training to retry it), or open the queue (📋, bottom right) and "
+                    f"'Start next now' to skip to the next job.\n")
         if getattr(self, "training_state", "idle") == "pausing" and return_code == 0:
             # Successful graceful exit — record paused state
             state_dir = self._detect_latest_state_dir()
@@ -20507,17 +21768,24 @@ class LoRATrainerGUI:
                 entry.insert(0, state_path)
         except Exception:
             pass
-        # Clean up paused sidecar — we're consuming it
-        try:
-            sidecar = self._paused_sidecar_path()
-            if os.path.exists(sidecar):
-                os.remove(sidecar)
-        except Exception:
-            pass
         self.update_console(f"\n=== RESUMING from {state_path} ===\n\n")
-        self.training_state = "running"
-        self._refresh_training_buttons()
         self.start_training()
+        # Only a start that actually LAUNCHED consumes the pause. start_training can decline
+        # (validation, disk headroom, epochs-left) — destroying the sidecar and flipping the
+        # state beforehand stranded a declinable resume with no way back to the paused run.
+        _proc = getattr(self, "current_process", None)
+        if getattr(self, "training_state", "idle") == "running" and _proc is not None and _proc.poll() is None:
+            try:
+                sidecar = self._paused_sidecar_path()
+                if os.path.exists(sidecar):
+                    os.remove(sidecar)
+            except Exception:
+                pass
+        else:
+            self.training_state = "paused"
+            self._refresh_training_buttons()
+            self.update_console("[resume] start declined — the run is still PAUSED and can be "
+                                "resumed once the issue above is fixed.\n")
 
     def _check_for_paused_state_on_startup(self):
         """On GUI launch, detect a leftover paused state and restore the Resume button."""
@@ -20575,26 +21843,34 @@ class LoRATrainerGUI:
         """Stop the current running process"""
         # Stop samples watcher
         self.stop_samples_watcher()
-
-        if self.current_process and self.current_process.poll() is None:
+        # A user Stop invalidates any armed queue-advance/retry timer immediately — the
+        # exit handler bumps too, but for non-pipeline kills this is the only bump.
+        try:
+            self._cancel_pending_queue_advance()
+        except Exception:
+            pass
+        # Snapshot: check_process's worker nulls self.current_process the instant the kill
+        # lands, racing the .wait(timeout=5) below into an AttributeError on None.
+        _proc = self.current_process
+        if _proc and _proc.poll() is None:
             try:
                 if os.name == 'nt':
                     # CREATE_NO_WINDOW prevents CTRL_BREAK_EVENT from working,
                     # so terminate the process tree via taskkill instead.
                     subprocess.run(
-                        ["taskkill", "/F", "/T", "/PID", str(self.current_process.pid)],
+                        ["taskkill", "/F", "/T", "/PID", str(_proc.pid)],
                         capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW,
                     )
                 else:
-                    os.killpg(os.getpgid(self.current_process.pid), signal.SIGTERM)
+                    os.killpg(os.getpgid(_proc.pid), signal.SIGTERM)
             except Exception as e:
                 self.update_console("Error stopping process: " + str(e) + "\n")
             try:
-                self.current_process.wait(timeout=5)
+                _proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 try:
-                    self.current_process.kill()
-                    self.current_process.wait()
+                    _proc.kill()
+                    _proc.wait()
                 except Exception as e:
                     self.update_console("Error killing process: " + str(e) + "\n")
             self.current_process = None
