@@ -52,6 +52,15 @@ class LoRAModule(torch.nn.Module):
             in_dim = org_module.in_features
             out_dim = org_module.out_features
 
+        # NOTE: rank is NOT capped at min(in, out), even though B@A can never exceed that rank.
+        # A cap was added and then removed (4 Aug) after measuring what it costs: on MiniMax H3's
+        # pruned AdaLN ([96768, 8]) capping rank 32 -> 8 cut that layer's learning to 27% of the
+        # reference trainer's after one matched epoch, and AdaLN carries ~45% of all weight
+        # movement there. The expressible SET is identical either way; the optimisation dynamics
+        # are not — an over-complete factorisation trains markedly faster under Adam (implicit
+        # acceleration of overparameterised linear networks). The extra columns are not dead
+        # weight, they are the gradient path. Keep whatever rank the caller asked for.
+
         self.lora_dim = lora_dim
         self.split_dims = split_dims
 
@@ -837,7 +846,20 @@ class LoRANetwork(torch.nn.Module):
                         module = root_module  # search all modules
 
                     for child_name, child_module in module.named_modules():
-                        is_linear = child_module.__class__.__name__ == "Linear"
+                        # bitsandbytes 4-bit/8-bit linears are Linears for LoRA purposes: they
+                        # expose in_features/out_features and LoRAModule only wraps their
+                        # forward. Needed to LoRA-train on an NF4-quantized frozen base
+                        # (MiniMax H3's 33B DiT), which Fizgig loads as Linear4bit.
+                        # Match by CLASS NAME, so every quantized Linear stand-in must be listed
+                        # here or its modules are silently skipped — a LoRA that trains a
+                        # fraction of what was asked for, with no error. ConvRotInt8Linear /
+                        # Nvfp4Linear (MiniMax H3's int8-ConvRot and nvfp4 bases) were exactly
+                        # that: 58 of 258 modules wrapped. An isinstance(nn.Linear) test would
+                        # be more robust; the name list is kept for Conv2d symmetry, so ADD TO
+                        # IT when introducing a Linear subclass.
+                        is_linear = child_module.__class__.__name__ in (
+                            "Linear", "Linear4bit", "Linear8bitLt",
+                            "ConvRotInt8Linear", "Nvfp4Linear")
                         is_conv2d = child_module.__class__.__name__ == "Conv2d"
                         is_conv2d_1x1 = is_conv2d and child_module.kernel_size == (1, 1)
 

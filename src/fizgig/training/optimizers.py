@@ -111,6 +111,18 @@ def create_optimizer(name: str, params, lr: float, args_str: str = "") -> tuple:
     key = name.lower()
     _warn_lr(key, lr)
 
+    # eps 1e-6, not the library defaults' 1e-8 (matches ai-toolkit, which passes eps=1e-6 to
+    # every Adam-family optimizer). This is a REAL stability bound, not a nicety: the 8-bit
+    # optimizers store the second moment blockwise-quantized, and for heavily structured
+    # gradients the small v entries quantize to ZERO — the update then degrades to lr*m/eps.
+    # Measured on a MiniMax H3 epoch (46 steps @ 1e-4, eps=1e-8): lora_up drift reached 0.81
+    # against an Adam bound of ~0.005 — the optimizer was applying ~100x the configured LR to
+    # the most structured tensors (adaln worst, fc1 next), which presented as melted anatomy
+    # at epoch 1. eps=1e-6 caps that amplification two orders of magnitude lower. Explicit
+    # "eps=..." in Optimizer Args still wins.
+    if "8bit" in key and "lion" not in key or key in ("adamw", "adam"):
+        kwargs.setdefault("eps", 1e-6)
+
     try:
         if key == "adamw8bit":
             opt = _bnb("AdamW8bit")(params, lr=lr, **kwargs)

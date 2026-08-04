@@ -55,7 +55,8 @@ def process_batches(args, datasets, all_files, all_paths, encode_fn):
         logger.info(f"Encoding dataset [{i}]")
         batches = dataset.retrieve_text_encoder_output_cache_batches(num_workers)
 
-        for batch in tqdm(batches):
+        bs_want = args.batch_size if args.batch_size is not None else 16
+        for batch in tqdm(_regroup(batches, bs_want)):
             all_paths[i].update(os.path.normpath(item.text_encoder_output_cache_path) for item in batch)
 
             if args.skip_existing:
@@ -66,6 +67,22 @@ def process_batches(args, datasets, all_files, all_paths, encode_fn):
             bs = args.batch_size if args.batch_size is not None else len(batch)
             for j in range(0, len(batch), bs):
                 encode_fn(batch[j : j + bs])
+
+
+def _regroup(batches, size):
+    """Re-chunk the dataset's batches to `size`.
+
+    The dataset yields groups of its TRAINING batch_size — 1 for MiniMax — which has nothing to
+    do with how many captions a text-encoder forward should take. Without this the encoder is
+    called once per caption no matter what --batch_size says."""
+    buf = []
+    for b in batches:
+        buf.extend(b)
+        while len(buf) >= size:
+            yield buf[:size]
+            buf = buf[size:]
+    if buf:
+        yield buf
 
 
 def post_process(datasets, all_files, all_paths, keep_cache):

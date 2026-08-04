@@ -24,10 +24,12 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/models-Klein%209B%20%2B%20Krea%202-blue?style=for-the-badge" alt="Klein 9B + Krea 2">
+  <img src="https://img.shields.io/badge/models-Klein%209B%20%2B%20Krea%202%20%2B%20MiniMax%20H3%20(experimental)-blue?style=for-the-badge" alt="Klein 9B + Krea 2 + MiniMax H3 (experimental)">
 </p>
 
 > ### 📰 Latest news
+> - **MiniMax H3: Detail Focus** — a new dial that sets which noise levels your run trains on. H3's own setting is tuned for video, and on stills it leaves almost nothing in the range where fine detail is learned — which is why H3 LoRAs were nailing pose and framing while staying soft on skin and eyes. Pick the value that matches your **Target Megapixels** and the tab tells you when the two line up. New defaults ship with it: LoKR 8, 50 epochs, 0.5 MP. Still experimental, still being explored. [Details ↓](#minimax-h3--third-model-family-experimental)
+> - **Experimental: LoRA training for MiniMax H3** — Fizgig trains LoRAs for MiniMax's ~33B H3 video model, from ordinary still-image datasets, on a single consumer GPU. It's the biggest model Fizgig supports, with in-training previews, LoKR, Adaptive LR and Pause/Resume all wired. Pick **MiniMax H3 (experimental)** from the Base Model selector; the three model files it needs have download links on their rows in **Preferences**. [Details ↓](#minimax-h3--third-model-family-experimental)
 > - **Fizgig 3.0 trains LoKR.** LoKR (LyCORIS Kronecker) covers the whole weight matrix with structure instead of a thin low-rank slice — in our validation runs it produced the **highest likeness we have ever measured** with this app's own scorer, with noticeably more natural skin and light than standard LoRA on the same dataset and settings. Pick it from the **Network Type** dropdown on the Krea 2 Training tab: one **Factor** dial replaces rank and alpha, output loads straight into ComfyUI, and Repair Studio / LoRA the Explorer edit and save LoKR **natively — lossless, no conversion**. The short version of the trade: LoKR is higher quality, standard LoRA trains ~20% faster — and keep the factor at 8 (or below), where LoKR earns its cost. [Training ↓](#training)
 > - **One-click cloud training on RunPod** — no GPU, or want a 5090 for the afternoon? The official Fizgig template deploys the full app to a rented GPU in your browser: nothing to install, your files persist until you terminate the pod, and the in-app RunPod panel can even **auto-stop the pod when your run finishes** so an idle GPU never bills overnight. [**⚡ Deploy →**](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=faoq8ed6um&ref=vkb387ep) · [Guide](docker/README.md)
 > - **Krea 2 trains on 8 GB** — confirmed by users running nothing but the stock preset defaults at batch size 1, with everything left on Auto. 10–12 GB cards do the same with headroom to spare. [VRAM guidance ↓](#vram-guidance)
@@ -119,6 +121,34 @@ Four Training-tab toggles turn a run into a live dataset curator — no other tr
 - **Warm up look outliers** — real-but-unusual images (tight angles, profiles, occlusion) that the Look Consistency Filter scored as outliers keep their unique information but **ease in at ×0.4 LR**, ramping to full over the first ~4 epochs — refining the identity instead of fighting it while it forms — and release to full LR early the moment they start improving. Prior-then-evidence: the face-embedding score covers exactly the epochs before the loss watch has a trend to act on.
 
 You can also edit any caption yourself mid-run from the Problem Images window — the trainer re-encodes it at the next epoch boundary, no restart. Once nothing is improving any more, the watch tells you you're **done**: a plateau banner with a best-checkpoint estimate and a suggested epoch window to scrub in LoRA Royale — and it's honest about certainty, distinguishing a *provisional* plateau (images still being adjudicated that may give the run a second wind) from a *confirmed* one. And pausing or restarting loses nothing: a **resumed run replays its own loss log** to restore every verdict, trend, and exclusion exactly where they were.
+
+---
+
+## MiniMax H3 — third model family (experimental)
+
+Fizgig now trains LoRAs for **MiniMax H3**, MiniMax's open-weight ~33B video model — the biggest model Fizgig supports — from **ordinary still-image datasets**, on a single consumer GPU. It's a native port, and the output is a standard `.safetensors` that loads straight into ComfyUI's H3 workflows, including the pruned inference builds.
+
+**How it works:** pick **MiniMax H3 (experimental)** from the Base Model selector at the top of the Training tab, and the usual flow applies — Start-tab folder, Captions, Samples, Training. The base trains frozen and quantized with your LoRA in bf16 on top, so a **32 GB card trains comfortably with everything on defaults**. On smaller cards, leave **Blocks Swap on Auto**: the trainer plans block swap and gradient checkpointing from your card's actual free VRAM at launch (24 GB and 16 GB support is in testing). **Adaptive LR**, **LoKR**, **Pause/Resume** and **in-training previews** are all wired.
+
+One built-in preset ships, applied the moment you pick the family: **✨ MiniMax H3 Defaults** — LoKR factor 8, 50 epochs, learning rate 1e-4 with Adaptive LR off, 0.5 MP, Detail Focus 3.5.
+
+**What it needs** — three files, each with a **Download link on its row in Preferences** (the *Model Paths (MiniMax H3)* card at the bottom):
+
+| Model | Size | Notes |
+|---|---|---|
+| DiT — pruned int8 | ~21 GB | The training base. Use `minimax_h3_fl2va_pruned_int8_convrot.safetensors` — it's the file ComfyUI runs, so your LoRA trains against the weights it'll be deployed on, and it keeps its int8 weights rather than being re-quantized. The ~66 GB bf16 file also works (NF4 at load, ~11 GB resident) |
+| Qwen3-VL-32B text encoder | ~15.7 GB | The **nvfp4** file — the same one ComfyUI uses, so you may already have it. The bf16 file (~51.5 GB) also works; the *int8_convrot* variant is not supported |
+| Video VAE | ~4.9 GB | Used while caching your images, and to decode previews |
+
+The text encoder is loaded for the one-time caching pass then freed — it never shares VRAM with training.
+
+**Detail Focus** — a MiniMax-only dropdown on the Training tab that sets which noise levels the run trains on. H3's own setting for this is tuned for video, and on stills it leaves almost no training in the low-noise range where fine detail is learned. The dropdown gives one recommendation per **Target Megapixels** value, and a note beside it goes green when the two line up. Set your megapixels first, then match it. This is new and still being explored — see the release notes.
+
+**Current caveats — this is deliberately minimal for now:**
+- **Image datasets only.** H3 is an omni audio + video model, but Fizgig trains it from still images only (each treated as a single video frame) — **no video-clip training and no audio training yet**. The LoRAs you get are learned from stills; you can still deploy them in ComfyUI's video workflows.
+- **Previews are single-frame and known to be weaker** than the same checkpoint rendered in ComfyUI. They're useful for tracking a run, not for judging final quality — the trainer saves per-epoch `.safetensors` as usual, so judge those in ComfyUI.
+- **Training only.** The workbench tools (Repair Studio, Explorer, Royale, Profiler, Extract) don't support H3 yet, and Context LoRA isn't wired for it. Pause/Resume and resumable state saving work as on the other families.
+- **Batch size 1**, and the Training tab hides the controls that don't apply — what you see is what's wired.
 
 ---
 

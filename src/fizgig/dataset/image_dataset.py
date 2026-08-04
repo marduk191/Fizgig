@@ -25,7 +25,8 @@ from PIL import Image
 import cv2
 
 from fizgig.utils.safetensors import mem_eff_save_file, MemoryEfficientSafeOpen
-from fizgig.training.metadata import ARCHITECTURE_KLEIN_9B, ARCHITECTURE_KLEIN_9B_FULL
+from fizgig.training.metadata import (ARCHITECTURE_KLEIN_9B, ARCHITECTURE_KLEIN_9B_FULL,
+                                      ARCHITECTURE_MINIMAX)
 
 import logging
 
@@ -89,6 +90,12 @@ if find_spec("pillow_jxl") is not None:
     IMAGE_EXTENSIONS.extend([".jxl", ".JXL"])
 
 RESOLUTION_STEPS = 16  # Klein 9B resolution step
+
+# Per-architecture bucket grid. A bucket edge must be divisible by (VAE spatial factor x DiT
+# spatial patch) or the latent can't be patchified exactly. MiniMax H3 is 16x VAE with a 2x2
+# patch = 32; on a 16 grid, half the buckets produce an odd latent that the trainer then has to
+# crop (losing up to 16 px of edge). The reference trainers bucket at 32 for exactly this reason.
+BUCKET_RESO_STEPS = {ARCHITECTURE_MINIMAX: 32}
 
 # Pixel -> stored-latent spatial factor per architecture. Klein's FLUX.2 AE packs 2x2
 # space-to-channel after its /8 encoder, so cached latents are pixel/16; Krea 2's
@@ -310,10 +317,11 @@ class BucketSelector:
         resolution: Tuple[int, int],
         enable_bucket: bool = True,
         no_upscale: bool = False,
+        reso_steps: int = RESOLUTION_STEPS,
     ):
         self.resolution = resolution
         self.bucket_area = resolution[0] * resolution[1]
-        self.reso_steps = RESOLUTION_STEPS
+        self.reso_steps = reso_steps
 
         if not enable_bucket:
             self.bucket_resolutions = [resolution]
@@ -630,6 +638,7 @@ class ImageDataset(torch.utils.data.Dataset):
         self.cache_directory = cache_directory
         self.debug_dataset = debug_dataset
         self.architecture = architecture
+        self.reso_steps = BUCKET_RESO_STEPS.get(architecture, RESOLUTION_STEPS)
 
         self.seed: Optional[int] = None
         self.current_epoch = 0
@@ -692,7 +701,8 @@ class ImageDataset(torch.utils.data.Dataset):
 
     def retrieve_latent_cache_batches(self, num_workers: int):
         """Yield ``(bucket_key, [ItemInfo])`` batches for latent caching."""
-        bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale)
+        bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale,
+                                        self.reso_steps)
         executor = ThreadPoolExecutor(max_workers=num_workers)
 
         batches: dict[Tuple[int, ...], list[ItemInfo]] = {}
@@ -865,7 +875,8 @@ class ImageDataset(torch.utils.data.Dataset):
 
     def prepare_for_training(self, num_timestep_buckets: Optional[int] = None):
         """Build the BucketBatchManager from cached latent files on disk."""
-        bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale)
+        bucket_selector = BucketSelector(self.resolution, self.enable_bucket, self.bucket_no_upscale,
+                                        self.reso_steps)
 
         latent_cache_files = glob.glob(os.path.join(glob.escape(self.cache_directory), f"*_{self.architecture}.safetensors"))
 

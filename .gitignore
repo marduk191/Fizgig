@@ -72,6 +72,7 @@ docs/bench_krea2_baseline.json
 
 # Internal design notes (not for publication)
 docs/PHONE_MONITOR_PLAN.md
+docs/MINIMAX_REFERENCE_NOTES.md
 
 # Written by launch.pyw when the app fails to start
 launch_error.log
