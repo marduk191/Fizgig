@@ -11,12 +11,17 @@ Asking for [16, 32, 64, 128] costs one SVD per layer, not four, and each result 
 bit-identical to extracting that rank alone.
 
 Architecture-agnostic: keys are flattened to the kohya convention
-(``blocks.0.attn.wq.weight`` -> ``lora_unet_blocks_0_attn_wq``), which is what both Klein
-and Krea 2 LoRA loaders expect.
+(``blocks.0.attn.wq.weight`` -> ``lora_unet_blocks_0_attn_wq``), which is what the Klein,
+Krea 2 and MiniMax H3 LoRA loaders all expect.
+
+Pre-quantized checkpoints are decoded before the diff, not after — see `dense_weight`. That
+matters for MiniMax H3, where 200 of the 264 comparable matrices are stored as int8 ConvRot
+codes rather than weights.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from typing import Callable, Iterable, Optional
@@ -28,6 +33,72 @@ from safetensors.torch import save_file
 # Layers a LoRA meaningfully applies to: 2-D Linear weights, excluding norms/embeddings
 # (1-D or not linear maps, and not what adapters target).
 _SKIP_SUBSTRINGS = ("norm", "embed", "_scale", "modulation")
+
+
+_HADAMARD = {}
+
+
+def _unrotate(x: torch.Tensor, rot_size: int) -> torch.Tensor:
+    """Undo ConvRot's block regular-Hadamard rotation along the last dim.
+
+    The matrix is symmetric and orthogonal, so it is its own inverse — applying it is undoing
+    it. Built in fp32 with entries exactly +-1 through the Kronecker powers, then divided by
+    its power-of-two root, so the construction is exact.
+    """
+    if rot_size <= 1:
+        return x
+    if x.shape[-1] % rot_size:
+        raise RuntimeError(f"last dim {x.shape[-1]} is not a multiple of the rotation block "
+                           f"{rot_size}")
+    key = (rot_size, str(x.device), x.dtype)
+    h = _HADAMARD.get(key)
+    if h is None:
+        r4 = torch.tensor([[1.0, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]],
+                          dtype=torch.float32)
+        h = r4.clone()
+        while h.shape[0] < rot_size:
+            h = torch.kron(h, r4)
+        if h.shape[0] != rot_size:
+            raise RuntimeError(f"convrot group size {rot_size} is not a power of 4")
+        h = (h / rot_size ** 0.5).to(device=x.device, dtype=x.dtype)
+        _HADAMARD[key] = h
+    return torch.matmul(x.reshape(-1, x.shape[-1] // rot_size, rot_size), h).reshape(x.shape)
+
+
+def dense_weight(handle, key: str, keyset, device) -> torch.Tensor:
+    """The real fp32 weight for `key`, decoding pre-quantized storage when it is present.
+
+    MiniMax H3's checkpoints (and any other ComfyUI int8 ConvRot file) do not store weights —
+    they store int8 CODES in a rotated basis, alongside a per-output-row scale and a
+    `comfy_quant` blob describing the rotation. Reading `.weight` straight off such a file and
+    subtracting gives the difference of two sets of quantisation codes, which is not the
+    difference of two models: the codes live in a rotated basis and each file carries its own
+    scales. It does not fail — it produces a confident, meaningless LoRA, which is worse.
+
+    So: decode first, then diff. Files that store ordinary float weights are returned as-is.
+    """
+    w = handle.get_tensor(key)
+    if w.dtype != torch.int8:
+        return w.to(device, torch.float32)
+
+    stem = key[: -len(".weight")]
+    conf_key, scale_key = f"{stem}.comfy_quant", f"{stem}.weight_scale"
+    if conf_key not in keyset or scale_key not in keyset:
+        raise RuntimeError(
+            f"{key} is int8 but has no {os.path.basename(conf_key)} / "
+            f"{os.path.basename(scale_key)} beside it — cannot decode it to real weights, and "
+            f"diffing the raw codes would be meaningless.")
+
+    conf = json.loads(bytes(handle.get_tensor(conf_key).to(torch.uint8).numpy().tobytes())
+                      .decode("utf-8"))
+    if conf.get("format") != "int8_tensorwise":
+        raise RuntimeError(f"{key}: unsupported quantization {conf.get('format')!r}")
+    # Decode ON the target device: the inverse rotation is a matmul per 256-wide block and
+    # fc1 is [28672, 5376] — on CPU that is minutes a layer, across 200 of them.
+    scale = handle.get_tensor(scale_key).to(device, torch.float32).reshape(-1, 1)
+    dense = w.to(device, torch.float32) * scale
+    group = int(conf.get("convrot_groupsize", 256)) if conf.get("convrot") else 1
+    return _unrotate(dense, group)
 
 
 def is_lora_target(key: str, shape) -> bool:
@@ -114,8 +185,8 @@ def extract_diff_loras(
         if should_stop is not None and should_stop():
             say("cancelled")
             return []
-        b = h_base.get_tensor(k).to(dev, torch.float32)
-        d = h_tune.get_tensor(k).to(dev, torch.float32) - b
+        b = dense_weight(h_base, k, base_keys, dev)
+        d = dense_weight(h_tune, k, tune_keys, dev) - b
         del b
         nrm = d.norm().item()
         if nrm < min_norm:
