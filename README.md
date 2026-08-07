@@ -28,8 +28,9 @@
 </p>
 
 > ### 📰 Latest news
-> - **MiniMax H3: Detail Focus** — a new dial that sets which noise levels your run trains on. H3's own setting is tuned for video, and on stills it leaves almost nothing in the range where fine detail is learned — which is why H3 LoRAs were nailing pose and framing while staying soft on skin and eyes. Pick the value that matches your **Target Megapixels** and the tab tells you when the two line up. New defaults ship with it: LoKR 8, 50 epochs, 0.5 MP. Still experimental, still being explored. [Details ↓](#minimax-h3--third-model-family-experimental)
-> - **Experimental: LoRA training for MiniMax H3** — Fizgig trains LoRAs for MiniMax's ~33B H3 video model, from ordinary still-image datasets, on a single consumer GPU. It's the biggest model Fizgig supports, with in-training previews, LoKR, Adaptive LR and Pause/Resume all wired. Pick **MiniMax H3 (experimental)** from the Base Model selector; the three model files it needs have download links on their rows in **Preferences**. [Details ↓](#minimax-h3--third-model-family-experimental)
+> - **MiniMax H3 now hits real likeness.** H3 LoRAs used to nail pose and framing while staying soft on the face; they don't any more. The change that did it was the **optimizer** — MiniMax trains with `adamw` instead of `adamw8bit`, and it's the new default. Alongside it: a single **% of training in low noise** box replacing Detail Focus, a **mid-concentrated** shape toggle, and new defaults (LoKR 8, dim/alpha 16, 60 epochs, 0.5 MP, 60% low noise). Still experimental, but the quality is there now. [Details ↓](#minimax-h3--third-model-family-experimental)
+> - **MiniMax on 24 GB just got ~4× faster** (3.4.1) — the trainer now picks base precision *and* block swap together instead of swap alone. A 24 GB card used to park 38 of 50 blocks on CPU; it now loads the same file 4-bit and swaps nothing. New **Base Precision** dropdown on the Training tab, Auto by default. [Details ↓](#minimax-h3--third-model-family-experimental)
+> - **Experimental: LoRA training for MiniMax H3** — Fizgig trains LoRAs for MiniMax's ~33B H3 video model, from ordinary still-image datasets, on a single consumer GPU. It's the biggest model Fizgig supports, with in-training previews, LoKR, Adaptive LR and Pause/Resume all wired. Pick **MiniMax H3 (experimental)** from the Base Model selector; the model files it needs have download links on their rows in **Preferences**. [Details ↓](#minimax-h3--third-model-family-experimental)
 > - **Fizgig 3.0 trains LoKR.** LoKR (LyCORIS Kronecker) covers the whole weight matrix with structure instead of a thin low-rank slice — in our validation runs it produced the **highest likeness we have ever measured** with this app's own scorer, with noticeably more natural skin and light than standard LoRA on the same dataset and settings. Pick it from the **Network Type** dropdown on the Krea 2 Training tab: one **Factor** dial replaces rank and alpha, output loads straight into ComfyUI, and Repair Studio / LoRA the Explorer edit and save LoKR **natively — lossless, no conversion**. The short version of the trade: LoKR is higher quality, standard LoRA trains ~20% faster — and keep the factor at 8 (or below), where LoKR earns its cost. [Training ↓](#training)
 > - **One-click cloud training on RunPod** — no GPU, or want a 5090 for the afternoon? The official Fizgig template deploys the full app to a rented GPU in your browser: nothing to install, your files persist until you terminate the pod, and the in-app RunPod panel can even **auto-stop the pod when your run finishes** so an idle GPU never bills overnight. [**⚡ Deploy →**](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=faoq8ed6um&ref=vkb387ep) · [Guide](docker/README.md)
 > - **Krea 2 trains on 8 GB** — confirmed by users running nothing but the stock preset defaults at batch size 1, with everything left on Auto. 10–12 GB cards do the same with headroom to spare. [VRAM guidance ↓](#vram-guidance)
@@ -128,21 +129,46 @@ You can also edit any caption yourself mid-run from the Problem Images window �
 
 Fizgig now trains LoRAs for **MiniMax H3**, MiniMax's open-weight ~33B video model — the biggest model Fizgig supports — from **ordinary still-image datasets**, on a single consumer GPU. It's a native port, and the output is a standard `.safetensors` that loads straight into ComfyUI's H3 workflows, including the pruned inference builds.
 
-**How it works:** pick **MiniMax H3 (experimental)** from the Base Model selector at the top of the Training tab, and the usual flow applies — Start-tab folder, Captions, Samples, Training. The base trains frozen and quantized with your LoRA in bf16 on top, so a **32 GB card trains comfortably with everything on defaults**. On smaller cards, leave **Blocks Swap on Auto**: the trainer plans block swap and gradient checkpointing from your card's actual free VRAM at launch (24 GB and 16 GB support is in testing). **Adaptive LR**, **LoKR**, **Pause/Resume** and **in-training previews** are all wired.
+**How it works:** pick **MiniMax H3 (experimental)** from the Base Model selector at the top of the Training tab, and the usual flow applies — Start-tab folder, Captions, Samples, Training. The base trains frozen and quantized with your LoRA in bf16 on top, so a **32 GB card trains comfortably with everything on defaults**. Leave **Blocks Swap** and **Base Precision** on Auto: at launch the trainer reads your **free** VRAM — not your card's size, so close ComfyUI first — and picks the base precision and the block-swap count *together*. Measured, with the shipped defaults:
 
-One built-in preset ships, applied the moment you pick the family: **✨ MiniMax H3 Defaults** — LoKR factor 8, 50 epochs, learning rate 1e-4 with Adaptive LR off, 0.5 MP, Detail Focus 3.5.
+| Free VRAM | What Auto does | Peak |
+|---|---|---|
+| ~30 GB | **int8**, no block swap, up to 1 MP | ~24.5 GB |
+| ~22 GB | **4-bit**, no block swap | ~18 GB |
+| ~14 GB | **4-bit** with block swap | ~13.5 GB |
 
-**What it needs** — three files, each with a **Download link on its row in Preferences** (the *Model Paths (MiniMax H3)* card at the bottom):
+int8 is the checkpoint's own storage and the most accurate base (~0.17% error); 4-bit loads the *same file* at ~10.5 GB instead of ~21, at ~9% error in the frozen base. Auto only reaches for 4-bit when the alternative is most of the model crossing PCIe every step — which is several times slower — and the console tells you when it does. Pin either one from the dropdown and the swap plan is built around your choice. Mileage varies with your dataset and bucket sizes; if you hit an out-of-memory, set **Blocks Swap** to a number to override the planner outright. **Adaptive LR**, **LoKR**, **Pause/Resume** and **in-training previews** are all wired.
+
+**Quality:** H3 LoRAs used to get pose, hair and framing right while staying soft on the face. That's fixed — the fix was the optimizer, and MiniMax now trains with `adamw` rather than `adamw8bit` by default. If you're loading an older preset or your own saved settings, set **Optimizer Type** to `adamw` on the Training tab; it costs about 1.9 GB more VRAM and nothing else.
+
+Two built-in presets ship, the first applied the moment you pick the family:
+
+| Preset | Settings |
+|---|---|
+| **✨ MiniMax H3 Defaults** | LoKR factor 8, dim/alpha 16, 60 epochs, lr 1e-4 with Adaptive LR off, 0.5 MP, 60% low noise + mid-concentrated, `adamw` |
+| **✨ MiniMax H3 Fast** | The same run with Adaptive LR on (2e-4 floor) and 30 epochs — starts around 2.8e-4, so you get a result in roughly half the time |
+
+Use **Defaults** when you're judging a dataset or comparing settings; **Fast** when you want something today. Everything experimental ships off, so Defaults is a clean baseline to compare against.
+
+**What it needs** — three files (plus one optional), each with a **Download link on its row in Preferences** (the *Model Paths (MiniMax H3)* card at the bottom):
 
 | Model | Size | Notes |
 |---|---|---|
 | DiT — pruned int8 | ~21 GB | The training base. Use `minimax_h3_fl2va_pruned_int8_convrot.safetensors` — it's the file ComfyUI runs, so your LoRA trains against the weights it'll be deployed on, and it keeps its int8 weights rather than being re-quantized. The ~66 GB bf16 file also works (NF4 at load, ~11 GB resident) |
 | Qwen3-VL-32B text encoder | ~15.7 GB | The **nvfp4** file — the same one ComfyUI uses, so you may already have it. The bf16 file (~51.5 GB) also works; the *int8_convrot* variant is not supported |
 | Video VAE | ~4.9 GB | Used while caching your images, and to decode previews |
+| DiT — reference *(optional)* | ~21 GB | Only for reference distillation. `minimax_h3_ref2va_pruned_int8_convrot.safetensors` — a different fine-tune, and the only H3 build that accepts reference images. You may already have it if you use ComfyUI's r2v workflow. Leave blank for ordinary training |
 
 The text encoder is loaded for the one-time caching pass then freed — it never shares VRAM with training.
 
-**Detail Focus** — a MiniMax-only dropdown on the Training tab that sets which noise levels the run trains on. H3's own setting for this is tuned for video, and on stills it leaves almost no training in the low-noise range where fine detail is learned. The dropdown gives one recommendation per **Target Megapixels** value, and a note beside it goes green when the two line up. Set your megapixels first, then match it. This is new and still being explored — see the release notes.
+**The noise schedule** — two MiniMax-only controls on the Training tab. H3's own setting is tuned for video, and on stills it leaves almost no training in the range where fine detail is learned.
+
+- **% of training in low noise** — one box. Type the share of the run you want spent at the detailed end. No cap, no table to cross-reference, and it doesn't care what Target Megapixels is set to.
+- **mid-concentrated** — leave this ticked. It decides where that low-noise training lands: on, the bulk sits in the middle of the range where identity is resolved rather than piling up at the near-clean end where there's little left to learn.
+
+60 with mid-concentrated on is the shipped default and comes from real runs on portrait datasets. Treat it as a starting point for anything else, and if a value overbakes, drop the learning rate before writing it off.
+
+**Reference distillation (experimental)** — H3 already renders a person well when you *show* it a photo of them. Tick **Learn identity from my dataset** and your LoRA learns to do the same from the trigger word alone, no reference image needed at generation time. It needs the **ref2va** model set as *DiT (reference)* in Preferences (a different fine-tune — the only H3 build that accepts reference images), and your text cache rebuilt. Teacher weight is the balance: **1.0** learns identity and nothing else — none of your backgrounds or framing — while below 1.0 mixes the real photographs back in for skin and texture, at the cost of an extra pass per step. A distilled LoRA runs on ref2va, not the usual DiT.
 
 **Current caveats — this is deliberately minimal for now:**
 - **Image datasets only.** H3 is an omni audio + video model, but Fizgig trains it from still images only (each treated as a single video frame) — **no video-clip training and no audio training yet**. The LoRAs you get are learned from stills; you can still deploy them in ComfyUI's video workflows.

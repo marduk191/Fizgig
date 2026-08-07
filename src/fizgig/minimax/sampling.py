@@ -137,7 +137,8 @@ def _res_multistep_coeffs(sig_cur, sig_next, sig_prev):
 def sample_image(model, text_embeds, *, width=512, height=512, steps=8, cfg_scale=1.0,
                  uncond_embeds=None, seed=0, shift=12.0, device="cuda",
                  dtype=torch.bfloat16, latent_channels=24, spatial=16, log_steps=False,
-                 sampler="res_multistep", schedule_mode="comfy"):
+                 sampler="res_multistep", schedule_mode="comfy",
+                 ref_latents=None, text_token_tags=None):
     """Denoise one image and return its LATENT [1, 24, 1, H/16, W/16].
 
     Decoding is the caller's business (real VAE decoder, or latent_to_rgb for a rough look) so
@@ -151,6 +152,11 @@ def sample_image(model, text_embeds, *, width=512, height=512, steps=8, cfg_scal
 
     log_steps prints one line per evaluation (step index and the sigma being denoised from),
     so a preview is visible in the console instead of a silent pause.
+
+    ref_latents / text_token_tags drive r2v reference conditioning: the reference latents ride
+    as condition rows in every evaluation, and the tags mark which conditioning rows are the
+    `<Picture i>` vision blocks. Both are passed straight through to the DiT, unchanged across
+    steps — the references are conditioning, not something being denoised.
     """
     lat_h, lat_w = height // spatial, width // spatial
     # The DiT patchifies 2x2, so the latent grid must be even (compute_loss crops for the same
@@ -170,6 +176,15 @@ def sample_image(model, text_embeds, *, width=512, height=512, steps=8, cfg_scal
                                  generator=gen, dtype=torch.float32).to(device)
 
     from fizgig.minimax.model import remap_sigma
+    # Built once: identical for every step, so it never lands in the hot loop.
+    _ref_kw = {}
+    if ref_latents:
+        _ref_kw["ref_latents"] = ref_latents
+        _ref_kw["seed"] = int(seed)
+    if text_token_tags is not None:
+        _ref_kw["text_token_tags"] = text_token_tags
+    # the uncond prompt has its own length, so it must NOT carry the cond prompt's tags
+    _ref_uncond_kw = {k: v for k, v in _ref_kw.items() if k != "text_token_tags"}
     use_cfg = cfg_scale > 1.0 and uncond_embeds is not None
     sigmas = sample_schedule(steps, shift=shift, mode=schedule_mode)
     n_eval = len(sigmas) - 1                            # the terminal 0 is not an evaluation
@@ -182,20 +197,22 @@ def sample_image(model, text_embeds, *, width=512, height=512, steps=8, cfg_scal
         t = torch.tensor([1.0 - s_curr], device=device)     # the DiT is conditioned on cleanness
         if joint_audio:
             out, a_out = model(x.to(dtype), t, text_embeds,
-                               audio_rows=audio_rows, return_audio=True)
+                               audio_rows=audio_rows, return_audio=True, **_ref_kw)
             out = out.float()
             if use_cfg:
+                # NOTE the unconditional pass keeps the reference rows: they are conditioning
+                # the workflow supplies, not part of the prompt being dropped.
                 out_u, _ = model(x.to(dtype), t, uncond_embeds,
-                                 audio_rows=audio_rows, return_audio=True)
+                                 audio_rows=audio_rows, return_audio=True, **_ref_uncond_kw)
                 out = out_u.float() + cfg_scale * (out - out_u.float())
             # audio Euler step on ITS schedule (shift 3, coupled by the closed-form remap)
             sa_curr = float(remap_sigma(torch.tensor(float(s_curr))))
             sa_next = float(remap_sigma(torch.tensor(float(s_next))))
             audio_rows = audio_rows + (sa_curr - sa_next) * a_out.float()
         else:
-            out = model(x.to(dtype), t, text_embeds).float()
+            out = model(x.to(dtype), t, text_embeds, **_ref_kw).float()
             if use_cfg:
-                out_u = model(x.to(dtype), t, uncond_embeds).float()
+                out_u = model(x.to(dtype), t, uncond_embeds, **_ref_uncond_kw).float()
                 out = out_u + cfg_scale * (out - out_u)
         # `out` is the head's x0 - noise, so the denoised estimate is x + sigma*out (one step
         # from sigma to 0). Euler is x + (sigma - sigma_next)*out, identical to comfy's

@@ -641,50 +641,150 @@ LAST_TRAIN_FILE = os.path.join(PRESETS_DIR, ".last_train_settings.json")
 # never auto-starts on launch (a queue found at startup waits for the user's first Start).
 QUEUE_FILE = os.path.join(PRESETS_DIR, "training_queue.json")
 
-# MiniMax H3 — training noise-level density ("Detail Focus" on the Training tab).
+# MiniMax H3 — how much of training happens at LOW NOISE ("Low-noise training" on the tab).
 #
-# H3's reference recipe draws a uniform u and maps it through sigma = shift*u/(1 + (shift-1)*u),
-# with shift = 12. That 12 is the VIDEO sigma-shift, calibrated for a ~5760-token 39-frame pack.
-# One training image is 256-1024 tokens, so image-only training inherits a shift roughly an
-# order of magnitude too large. Measured consequence: median sigma 0.923, and only 5% of steps
-# at or below 0.387 — the last non-zero sigma of Comfy's 20-step schedule, i.e. the single step
-# that renders all fine detail. Klein and Krea 2 scale their own shift by the sample's token
-# count and put 44% of steps below sigma 0.6, against 11% here.
+# The dial is the SHARE, not a shift number. Same underlying knob, stated as the thing that
+# actually matters. Training draws u uniform and maps it through
 #
-# The recommendations scale 12 down by the sqrt-token rule (the SD3/Flux resolution-transfer
-# result: equal coarse SNR between resolutions needs shift ratio sqrt(m/n)). With a /16 VAE and
-# a 2x2 patch, an image carries ~977*MP tokens, so
+#     sigma = shift * u / (1 + (shift - 1) * u)
 #
-#     shift = 12 * sqrt(977*MP / 5760)  ~=  5 * sqrt(MP)
+# so the fraction of steps landing below a threshold T is P = T / (shift*(1 - T) + T). At
+# T = 0.5 that inverts to exactly
 #
-# which is where 2.5 @ 0.25 MP and 5 @ 1.0 MP come from. NOTE the honest caveat, repeated in the
-# GUI help: the image ecosystem's own fitted rule (Flux's linear-in-tokens mu) is gentler than
-# pure sqrt and would put the same transfer nearer 6, so these numbers are the aggressive end of
-# a bracket, not a settled answer. Nobody has swept this properly — hence the "experiment" framing.
-MINIMAX_SHIFT_BY_MP = [
-    ("0.25", "2.5"), ("0.5", "3.5"), ("0.75", "4.3"), ("1.0", "5"),
-    ("1.5", "6"), ("2.0", "7"), ("2.4", "7.7"), ("3.0", "8.6"), ("4.2", "10"),
-]
-# Parsed with .split(" ")[0] — the same convention the Adaptive LR dropdowns use — so the
-# trailing note is free text and can be reworded without invalidating saved presets or queue
-# items. The trainer also accepts the literals 'sigmoid' and 'resolution' (logit-normal
-# densities) on the CLI; both overdrove the adapters at 1e-4 in real runs, so they are not
-# offered here, but an old preset carrying one still passes straight through.
-MINIMAX_SHIFT_OPTIONS = [f"{s} - for {mp} MP" for mp, s in MINIMAX_SHIFT_BY_MP] + [
-    "12 - MiniMax's own default (tuned for video, not stills)",
-]
+#     shift = (1 - P) / P
+#
+# — no solver, no table, no resolution term. Reference points: 50% -> shift 1 (unshifted
+# uniform), 22% -> 3.5, 7.7% -> 12 (H3's own video default).
+#
+# DELIBERATELY UNCAPPED and deliberately independent of megapixels. The previous MP-keyed
+# version derived its numbers from a sqrt-token transfer rule that has never been validated on
+# H3, and capping the list to that rule's answers ruled out settings worth trying.
+MINIMAX_LOWNOISE_SIGMA = 0.5     # "low noise" = the cleaner half of the sigma range
 
 
-def minimax_recommended_shift(megapixels):
-    """The Detail Focus value recommended for a Target Megapixels setting.
+def minimax_lownoise_to_shift(pct):
+    """Share of steps below sigma 0.5 (percent) -> the shift that produces it. None if unusable.
 
-    Exact match where the MP dropdown offers one, otherwise the closest listed MP (so a
-    hand-typed value still gets a sensible answer instead of nothing)."""
+    0 and 100 are the asymptotes, not values: 0% needs an infinite shift and 100% a shift of 0,
+    and neither is a schedule. Everything strictly between them is allowed."""
     try:
-        mp = float(str(megapixels).strip())
+        p = float(str(pct).strip().rstrip("%")) / 100.0
     except (TypeError, ValueError):
         return None
-    return min(MINIMAX_SHIFT_BY_MP, key=lambda kv: abs(float(kv[0]) - mp))[1]
+    if not (0.0 < p < 1.0):
+        return None
+    return (1.0 - p) / p
+
+
+def minimax_lownoise_to_lognorm_shift(pct):
+    """Share of steps below sigma 0.5 (percent) -> the shift for a LOGIT-NORMAL base.
+
+    The box means the same thing whichever shape is chosen; only the arithmetic behind it
+    changes. For a uniform base the inverse is closed-form. For a logit-normal base,
+    sigma < 0.5 happens when the base draw u < 1/(s+1), and u = sigmoid(z) with z ~ N(0,1), so
+
+        P = Phi(logit(1 / (s + 1)))
+
+    which is monotonically decreasing in s but has no tidy inverse — hence bisection. Bracketed
+    generously (1e-6 .. 1e6) so extreme box values still resolve rather than silently clamping.
+    """
+    import math as _m
+    p = None
+    try:
+        p = float(str(pct).strip().rstrip("%")) / 100.0
+    except (TypeError, ValueError):
+        return None
+    if not (0.0 < p < 1.0):
+        return None
+
+    def _share(s):
+        u = 1.0 / (s + 1.0)                                   # the base draw that gives sigma 0.5
+        z = _m.log(u / (1.0 - u))                             # logit
+        return 0.5 * (1.0 + _m.erf(z / _m.sqrt(2.0)))         # Phi(z)
+
+    lo, hi = 1e-6, 1e6
+    if p >= _share(lo):
+        return lo
+    if p <= _share(hi):
+        return hi
+    for _ in range(200):                                      # ~1e-60 on the bracket; cheap
+        mid = _m.sqrt(lo * hi)                                # geometric: s spans many decades
+        if _share(mid) > p:
+            lo = mid
+        else:
+            hi = mid
+    return _m.sqrt(lo * hi)
+
+
+def minimax_shift_to_lownoise(shift):
+    """The inverse — shows an existing shift (e.g. from an older preset) as a percentage."""
+    try:
+        s = float(shift)
+    except (TypeError, ValueError):
+        return None
+    return None if s <= 0 else 100.0 / (1.0 + s)
+
+
+# MiniMax H3 — which of the 50 DiT blocks to train ("Blocks to Train" on the Training tab).
+#
+# THIS IS A SEARCH, not a recommendation, and the labels say so. H3 is 50 identical blocks with
+# no published map. The ranges come from the proportions of Klein's empirically-built map
+# (composition in the first ~30% of depth, identity ~30-75%, fine detail ~60-100%) scaled to 50
+# blocks — an analogy between two architectures, not a measurement of this one.
+#
+# READ EVERY RESULT AS: "was this subset sufficient?" A range that trains a good likeness means
+# its COMPLEMENT was not needed — whichever end that turns out to be. There is no option here
+# that disproves the idea; a surprising winner just relocates the answer. (An earlier revision
+# labelled the front half a "control, expected worse". That was wrong: a good front-half result
+# would mean the back half is droppable, which is the outcome we are hunting, not a refutation.)
+#
+# Why dropping blocks may HELP rather than merely cost less: a block that carries no identity
+# still receives gradient, and what is left for it to learn is the dataset's background, framing
+# and lighting. Excluding it removes capacity that would otherwise go into memorising the set.
+#
+# What is measured: per-block ||dW|| on two finished H3 LoRAs is nearly FLAT (3x quietest to
+# loudest against a 2% flat expectation, thirds within 28/34/38), and the quietest blocks do not
+# agree between runs. Weight movement offers no map either way — which is why the only way to
+# learn anything here is to train a range and compare.
+# The box is EDITABLE: these are jumping-off points, and anything the trainer's parser accepts
+# can be typed instead — "3-12, 14-15, 22, 31-33". The label separator is "·" and not "-" or a
+# plain space, because both of those appear inside a block spec; splitting on them would turn
+# "3-12, 14" into "3-12," and train the wrong set without ever complaining.
+MINIMAX_BLOCK_OPTIONS = [
+    "all · every block (50 of 50)",
+    "10-49 · skip the first 10",
+    "14-37 · middle band",
+    "25-49 · back half",
+    "0-24 · front half",
+]
+
+
+MINIMAX_NUM_BLOCKS = 50          # H3's DiT block count (MiniMaxH3Config.num_layers)
+
+# Base Precision — the label the user sees, and the --base_quant value it sends. Auto plans the
+# quantisation and the block-swap count together (see plan_base_quant in minimax/trainer.py);
+# an explicit pick is never overridden, the swap plan is built around it instead.
+MINIMAX_BASE_QUANT_OPTIONS = [
+    "Auto (recommended)",
+    "int8 · most accurate, needs ~30 GB free",
+    "4-bit · fits smaller cards",
+]
+
+
+def minimax_base_quant(raw):
+    """Dropdown label -> the --base_quant value. Anything unrecognised falls back to auto."""
+    s = str(raw or "").split("·")[0].strip().lower()
+    if s.startswith("int8"):
+        return "int8"
+    if s.startswith("4-bit") or s.startswith("nf4"):
+        return "nf4"
+    return "auto"
+
+
+def minimax_block_spec(raw):
+    """The block selection out of a dropdown label OR a hand-typed spec. "" -> "all"."""
+    return str(raw or "").split("·")[0].strip() or "all"
+
 
 # Built-in presets — always available in the Load Preset dropdown, prefixed with ✨ to distinguish
 # from user-saved presets. Defined in code so they ship with the app and can't be deleted accidentally.
@@ -839,23 +939,80 @@ MINIMAX_BUILT_IN_PRESETS = {
     # Network Type is flipped back to LoRA — the H3 trainer ignores them under LoKR.
     #
     # Static 1e-4, adaptive OFF. The adaptive watcher probes the LR UP on steady descent, and a
-    # density sweep needs the LR held still or the runs aren't comparable. Turn it on once a
-    # Detail Focus value has been settled on.
+    # density sweep needs the LR held still or the runs aren't comparable.
     #
-    # Detail Focus 3.5 = the recommendation for the 0.5 MP this preset trains at. Change one and
-    # the Training tab flags the other (the readout beside the dial), so the pair stays coherent.
     # 0.5 MP rather than the 0.25 the other families default to: detail has to be present in the
     # training image before any schedule can teach it, and 0.5 still fits without block swap.
+    #
+    # 60% low-noise WITH mid-concentrated. The two controls answer different questions: the box
+    # is how much training sits below sigma 0.5, the checkbox is where that mass actually lands.
+    # At 60% the split is 58.8% of steps in sigma 0.3-0.7, 12.9% below 0.2, 5.0% above 0.8
+    # (measured, 2M draws through sample_sigmas). The same 60% on a UNIFORM base would dump far
+    # more into the near-clean end, where the latent is almost the finished image and the step
+    # teaches little. Peter ran 70% + mid-concentrated well; 60 keeps slightly more mid-band and
+    # gives back some sigma>0.8 mass, which is the only part of the schedule that lets the LoRA
+    # touch composition at all. Both beat the 22% this shipped with.
+    #
+    # Note the mid-band fraction peaks around 50% and is nearly flat from 45-60, so it does NOT
+    # discriminate on its own — it is a description of where the steps go, not a prediction of
+    # likeness. 60 is Peter's call from real runs, with the arithmetic agreeing rather than
+    # leading. 50% is worth trying: its shift is exactly 1.00, i.e. the plain logit-normal that
+    # earlier runs recorded as overdriving adapters — on adamw8bit, before the optimizer was
+    # understood.
     "✨ MiniMax H3 Defaults (LoKR 8, 0.5 MP)": {
-        "NETWORK_DIM": 32, "NETWORK_ALPHA": 32,
+        "NETWORK_DIM": 16, "NETWORK_ALPHA": 16,
         "NETWORK_TYPE": "LoKR (Kronecker)", "LOKR_FACTOR": 8,
         "LEARNING_RATE": 1e-4,
-        "MAX_TRAIN_EPOCHS": 50, "SAVE_EVERY_N_EPOCHS": 1, "SEED": 42,
+        "MAX_TRAIN_EPOCHS": 60, "SAVE_EVERY_N_EPOCHS": 1, "SEED": 42,
         "ADAPTIVE_LR": False, "ADAPTIVE_LR_MIN": "1e-5", "ADAPTIVE_LR_MAX": "4e-4",
-        "OPTIMIZER_TYPE": "adamw8bit",
+        # adamw, NOT adamw8bit — the single biggest likeness change measured on H3 (2026-08-06).
+        # Every other knob had been swept with likeness stuck around 40-50%; full-precision
+        # optimizer state moved it night-and-day on the same dataset. The 8-bit optimizer stores
+        # the second moment blockwise-quantized, and on this model that is evidently costing the
+        # fine detail. Costs ~1.2 GB of fp32 state against a 21 GB resident base.
+        "OPTIMIZER_TYPE": "adamw",
         "GRADIENT_ACCUMULATION": 1, "MAX_GRAD_NORM": 1.0,
         "DATASET_MEGAPIXELS": "0.5",
-        "MINIMAX_SHIFT": "3.5",
+        "MINIMAX_LOWNOISE_PCT": "60", "MINIMAX_LOGNORM": True,
+        # The experiment knobs all ship OFF, so the preset is the plain baseline every A/B is
+        # measured against. Each of these was built to be TRIED, not to be on by default:
+        #   blocks "all"      — no block-range restriction
+        #   AdaLN False       — Peter's call from real runs; the reference trains it, we do not
+        #   slow blocks ""    — one LR everywhere, no depth split
+        #   distill False     — ordinary photo training, no r2v teacher (which also needs the
+        #                       _teref cache built, so defaulting it on would break a fresh run)
+        "MINIMAX_BLOCKS": "all", "MINIMAX_BASE_QUANT": MINIMAX_BASE_QUANT_OPTIONS[0],
+        "MINIMAX_TRAIN_ADALN": False,
+        "MINIMAX_SLOW_BLOCKS": "", "MINIMAX_SLOW_LR_SCALE": "0.2",
+        "MINIMAX_DISTILL": False,
+    },
+    # Same run, fewer epochs, LR let off the leash. Adaptive LR IGNORES the Learning Rate box
+    # entirely — the run starts at the GEOMETRIC MIDPOINT of Min/Max, so 2e-4 and 4e-4 start it
+    # at 2.83e-4, nearly 3x the Defaults preset's static 1e-4, and the watcher owns it from
+    # there. That is where the time comes from: 30 epochs instead of 50, at a much higher LR.
+    # LEARNING_RATE is still carried so the box holds something sensible if adaptive is unticked.
+    #
+    # The 2e-4 floor is the same call the Klein Identity presets make, and it is a floor, not a
+    # target: the watcher halves the LR on plateau or instability but never below it, so the run
+    # cannot crawl to a stop the way a 1e-5 floor allows on a long run. Note the dropdown labels
+    # it "2e-4 - rank 4/8 only" — that warning is about LoRA RANK, and this preset trains LoKR,
+    # where dim/alpha do not apply at all. The caveat does not translate; treat this as the fast
+    # option to reach for when you want a result today, and the Defaults preset as the one to
+    # judge a dataset or an A/B on.
+    "✨ MiniMax H3 Fast (LoKR 8, adaptive LR)": {
+        "NETWORK_DIM": 16, "NETWORK_ALPHA": 16,
+        "NETWORK_TYPE": "LoKR (Kronecker)", "LOKR_FACTOR": 8,
+        "LEARNING_RATE": 1e-4,
+        "MAX_TRAIN_EPOCHS": 30, "SAVE_EVERY_N_EPOCHS": 1, "SEED": 42,
+        "ADAPTIVE_LR": True, "ADAPTIVE_LR_MIN": "2e-4", "ADAPTIVE_LR_MAX": "4e-4",
+        "OPTIMIZER_TYPE": "adamw",
+        "GRADIENT_ACCUMULATION": 1, "MAX_GRAD_NORM": 1.0,
+        "DATASET_MEGAPIXELS": "0.5",
+        "MINIMAX_LOWNOISE_PCT": "60", "MINIMAX_LOGNORM": True,
+        "MINIMAX_BLOCKS": "all", "MINIMAX_BASE_QUANT": MINIMAX_BASE_QUANT_OPTIONS[0],
+        "MINIMAX_TRAIN_ADALN": False,
+        "MINIMAX_SLOW_BLOCKS": "", "MINIMAX_SLOW_LR_SCALE": "0.2",
+        "MINIMAX_DISTILL": False,
     },
 }
 
@@ -1021,6 +1178,10 @@ DEFAULT_PREFS = {
     # MiniMax H3 model paths (experimental third family — barebones image-only LoRA training).
     # bf16 DiT is the training base (NF4-quantized at load); Qwen3-VL-32B TE + video VAE cache.
     "minimax_dit": "",
+    # ref2va is a DIFFERENT fine-tune from fl2va, not another quantization of it: it is what
+    # ComfyUI's r2v workflow loads, and the only H3 build that accepts reference images.
+    # Optional — required only for reference distillation.
+    "minimax_ref_dit": "",
     "minimax_text_encoder": "",
     "minimax_vae": "",
     # Output directories — relative to repo root, portable across clones/moves.
@@ -1501,9 +1662,26 @@ class LoRATrainerGUI:
             "SAVE_EVERY_N_EPOCHS": 1,
             "SEED": 42,
             "BLOCKS_SWAP": "auto",  # Klein valid range 0-16; "auto" detects from GPU
-            # MiniMax H3 only — training noise-level density (see MINIMAX_SHIFT_OPTIONS).
-            # Matches the shipped MiniMax preset (0.5 MP), not H3's video-tuned 12.
-            "MINIMAX_SHIFT": "3.5",
+            # MiniMax H3 only. Percent of steps trained below sigma 0.5 (H3's own default works out at ~7.7%).
+            # 60 + mid-concentrated matches the MiniMax preset, which is what a switch to that
+            # family applies anyway; these are the values the widgets are BUILT with, so they are
+            # what shows before any preset lands. Both keys are MiniMax-only — no other family
+            # reads them. (OPTIMIZER_TYPE below is deliberately NOT changed to match the preset:
+            # it is shared with Klein and Krea 2, and the MiniMax preset supplies adamw on switch.)
+            "MINIMAX_LOWNOISE_PCT": "60",
+            "MINIMAX_LOGNORM": True,       # False = flat spread; True = mid-concentrated
+            "MINIMAX_BLOCKS": "all",
+            "MINIMAX_BASE_QUANT": MINIMAX_BASE_QUANT_OPTIONS[0],
+            # OFF by default (Peter's call from real runs). The reference trains AdaLN on the
+            # pruned checkpoint, but AdaLN is a pure function of the timestep — adaln_proj(t_emb)
+            # and nothing else — so its adapters cannot tell one subject from another, and on the
+            # pruned build they were taking ~45% of all weight movement to do it.
+            "MINIMAX_TRAIN_ADALN": False,
+            "MINIMAX_DISTILL": False,      # off = ordinary training
+            "MINIMAX_DISTILL_WEIGHT": "0.8",
+            "MINIMAX_DISTILL_REFS": "2",
+            "MINIMAX_SLOW_BLOCKS": "",     # blank = one LR everywhere
+            "MINIMAX_SLOW_LR_SCALE": "0.2",
             "RESUME_TRAINING": "",
             "OPTIMIZER_TYPE": "adamw8bit",
             "OPTIMIZER_ARGS": "",
@@ -3817,43 +3995,211 @@ class LoRATrainerGUI:
                        "the scores with your dataset. Batch size 1.",
                   foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
         self._krea2_losswatch_hint.grid(row=24, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
-        # --- Detail Focus (MiniMax H3 only) — which noise levels the run actually trains on.
-        # Hidden for every other family by _apply_training_arch_visibility; see
-        # MINIMAX_SHIFT_OPTIONS for why the reference default starves the low-noise band.
-        self._minimax_shift_label = ttk.Label(training_content, text="Detail Focus:")
+        # --- Low-noise training share (MiniMax H3 only) -----------------------------------
+        # One number, uncapped: what fraction of steps train below sigma 0.5. Converted to the
+        # trainer's shift by minimax_lownoise_to_shift. Hidden for other families by
+        # _apply_training_arch_visibility.
+        self._minimax_shift_label = ttk.Label(training_content, text="Low-noise training:")
         self._minimax_shift_label.grid(row=26, column=0, sticky=tk.W, padx=5, pady=(8, 2))
         self._minimax_shift_frame = ttk.Frame(training_content)
         self._minimax_shift_frame.grid(row=26, column=1, columnspan=2, sticky=tk.W, padx=5, pady=(8, 2))
-        self.entries["MINIMAX_SHIFT"] = ttk.Combobox(
-            self._minimax_shift_frame, values=MINIMAX_SHIFT_OPTIONS, state="readonly", width=34)
-        self.entries["MINIMAX_SHIFT"].pack(side=tk.LEFT)
-        self._select_combo_by_token(self.entries["MINIMAX_SHIFT"],
-                                    self.settings.get("MINIMAX_SHIFT", "3.5"))
-        # Live "does this match your image size?" readout. The dial is deliberately NOT auto-set
-        # from the MP box: a queued A/B must keep the density the user chose for it, and silently
-        # rewriting a setting when an unrelated dropdown moves is exactly how a sweep gets muddled.
+        self.entries["MINIMAX_LOWNOISE_PCT"] = ttk.Entry(self._minimax_shift_frame, width=8)
+        self.entries["MINIMAX_LOWNOISE_PCT"].insert(
+            0, str(self.settings.get("MINIMAX_LOWNOISE_PCT", "22")))
+        self.entries["MINIMAX_LOWNOISE_PCT"].pack(side=tk.LEFT)
+        ttk.Label(self._minimax_shift_frame, text="% of steps").pack(side=tk.LEFT, padx=(4, 0))
+        # Live readout: the number you type is the thing you care about, but the schedule it
+        # produces is worth seeing — especially at the extremes, where a couple of percent of
+        # change swings the shift enormously.
         self._minimax_shift_match = tk.Label(self._minimax_shift_frame, text="",
                                              font=(FONT_FAMILY, 9), bg=COLORS["bg_surface"])
         self._minimax_shift_match.pack(side=tk.LEFT, padx=(10, 0))
+        self.minimax_lognorm_var = tk.BooleanVar(
+            value=bool(self.settings.get("MINIMAX_LOGNORM", False)))
+        ttk.Checkbutton(self._minimax_shift_frame, text="mid-concentrated",
+                        variable=self.minimax_lognorm_var,
+                        command=lambda: self._refresh_minimax_shift_match()).pack(side=tk.LEFT,
+                                                                                 padx=(10, 0))
+        self.entries["MINIMAX_LOWNOISE_PCT"].bind(
+            "<KeyRelease>", lambda _e: self._refresh_minimax_shift_match())
         self._minimax_shift_hint = ttk.Label(
             training_content,
-            text="Which noise levels this run actually trains on. MiniMax's own default is 12 — but "
-                 "that is tuned for VIDEO, where one sample carries ~20x the data of a single photo. "
-                 "On stills it leaves only ~5% of training in the low-noise range where fine detail "
-                 "is learned, so a LoRA gets good at pose, hairstyle and silhouette while skin, eyes "
-                 "and texture stay thin. The values above scale it to your image size (roughly "
-                 "5 x the square root of your Target Megapixels) — smaller images want a lower number.\n"
-                 "These are starting points, not rules, and nobody has swept this properly yet — "
-                 "experimenting here is genuinely worth doing. Lower = more detail training, but also "
-                 "a bigger effective step down there: if a lower setting overbakes, drop the Learning "
-                 "Rate or turn on Adaptive LR before you write it off. Every run stamps its setting "
-                 "into the saved LoRA (ss_timestep_density) and the training queue shows it, so "
-                 "back-to-back comparisons are easy to keep straight.",
+            text="How much of the run trains on nearly-clean images (noise below the halfway "
+                 "point) instead of heavily noised ones. Low noise is where fine detail and "
+                 "likeness are learned; high noise is where pose, framing and composition are. "
+                 "MiniMax's own default works out at about 8%, because it was tuned for video "
+                 "where one sample carries far more data than a single photo — on stills that "
+                 "leaves almost nothing for detail. For reference, Krea 2 spends about 30%. "
+                 "No cap and no right answer: type whatever you want to try. Higher means more "
+                 "detail training, but each of those steps also lands harder, so if a high value "
+                 "overbakes, drop the Learning Rate before you drop the number. Recorded in the "
+                 "LoRA's metadata and shown on the training queue, so runs stay comparable. "
+                 "'mid-concentrated' changes the SHAPE without changing that percentage: the "
+                 "same share of low-noise steps, but the rest bunched around the middle instead "
+                 "of spread evenly out to both extremes. Krea 2 and Klein both train that way. "
+                 "Worth an A/B — the number alone only controls how much, never where.",
             foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
         self._minimax_shift_hint.grid(row=27, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
-        self.dataset_megapixels_var.trace_add("write", lambda *_: self._refresh_minimax_shift_match())
-        self.entries["MINIMAX_SHIFT"].bind("<<ComboboxSelected>>",
-                                           lambda _e: self._refresh_minimax_shift_match())
+        # --- Blocks to Train (MiniMax only, experimental) ---------------------------------
+        self._minimax_blocks_label = ttk.Label(training_content, text="Blocks to Train:")
+        self._minimax_blocks_label.grid(row=28, column=0, sticky=tk.W, padx=5, pady=(8, 2))
+        self._minimax_blocks_frame = ttk.Frame(training_content)
+        self._minimax_blocks_frame.grid(row=28, column=1, columnspan=2, sticky=tk.W, padx=5, pady=(8, 2))
+        # Editable, not readonly — the presets are starting points and the real control is typing
+        # a spec. Anything the trainer's parser takes is legal here.
+        self.entries["MINIMAX_BLOCKS"] = ttk.Combobox(
+            self._minimax_blocks_frame, values=MINIMAX_BLOCK_OPTIONS, width=34)
+        self.entries["MINIMAX_BLOCKS"].pack(side=tk.LEFT)
+        self._select_combo_by_token(self.entries["MINIMAX_BLOCKS"],
+                                    self.settings.get("MINIMAX_BLOCKS", "all"))
+        # Live readout: a typed spec is easy to fat-finger, and "trained 3 blocks when you meant
+        # 30" is invisible in the output. Says how many blocks the box currently means.
+        self._minimax_blocks_count = tk.Label(self._minimax_blocks_frame, text="",
+                                              font=(FONT_FAMILY, 9), bg=COLORS["bg_surface"])
+        self._minimax_blocks_count.pack(side=tk.LEFT, padx=(10, 0))
+        self.entries["MINIMAX_BLOCKS"].bind(
+            "<KeyRelease>", lambda _e: self._refresh_minimax_blocks_count())
+        self.entries["MINIMAX_BLOCKS"].bind(
+            "<<ComboboxSelected>>", lambda _e: self._refresh_minimax_blocks_count())
+        self._minimax_blocks_hint = ttk.Label(
+            training_content,
+            text="EXPERIMENT — no recommended answer yet. H3 is 50 identical blocks and nobody has "
+                 "published what each one does. A block that doesn't carry identity still gets "
+                 "trained on something, and what's left for it to learn is your backgrounds, "
+                 "framing and lighting — so leaving blocks out may give a CLEANER likeness with "
+                 "less memorised set, not just a faster run. The ranges here are scaled from "
+                 "Klein's block map, a different architecture, so they're starting guesses. Train "
+                 "one against a full-model run on the same dataset and judge the pair: if a "
+                 "selection holds up, the blocks you left out weren't needed — whichever end they "
+                 "were. Type your own: ranges and single blocks, comma-separated, like "
+                 "3-12, 14-15, 22, 31-33. Blocks are numbered 0-49. "
+                 "Fewer blocks also means faster steps and a smaller file, and less capacity "
+                 "overall, so give a narrow range a few more epochs before calling it. The range "
+                 "is recorded in the LoRA's metadata as ss_train_blocks.",
+            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
+        self._minimax_blocks_hint.grid(row=29, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
+        self._refresh_minimax_blocks_count()
+
+        # --- Reference distillation (MiniMax only, experimental) ---------------------------
+        # No picker: the dataset IS the reference pool, so there is nothing to choose.
+        self.minimax_distill_var = tk.BooleanVar(
+            value=bool(self.settings.get("MINIMAX_DISTILL", False)))
+        self._minimax_distill_frame = ttk.Frame(training_content)
+        self._minimax_distill_frame.grid(row=35, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(8, 0))
+        self._minimax_distill_cb = ttk.Checkbutton(
+            self._minimax_distill_frame, text="Learn identity from my dataset (reference distillation)",
+            variable=self.minimax_distill_var)
+        self._minimax_distill_cb.pack(side=tk.LEFT)
+        ttk.Label(self._minimax_distill_frame, text="   teacher ").pack(side=tk.LEFT)
+        self.entries["MINIMAX_DISTILL_WEIGHT"] = ttk.Combobox(
+            self._minimax_distill_frame, values=["0.6", "0.7", "0.8", "0.9", "1.0"], width=5)
+        self.entries["MINIMAX_DISTILL_WEIGHT"].set(
+            str(self.settings.get("MINIMAX_DISTILL_WEIGHT", "0.8")))
+        self.entries["MINIMAX_DISTILL_WEIGHT"].pack(side=tk.LEFT)
+        ttk.Label(self._minimax_distill_frame, text="   references each ").pack(side=tk.LEFT)
+        self.entries["MINIMAX_DISTILL_REFS"] = ttk.Combobox(
+            self._minimax_distill_frame, values=["1", "2", "3", "4"], width=4)
+        self.entries["MINIMAX_DISTILL_REFS"].set(
+            str(self.settings.get("MINIMAX_DISTILL_REFS", "2")))
+        self.entries["MINIMAX_DISTILL_REFS"].pack(side=tk.LEFT)
+        self._minimax_distill_hint = ttk.Label(
+            training_content,
+            text="EXPERIMENT — off by default. H3 can already render a person well when it is "
+                 "SHOWN a photo of them; this teaches your LoRA to do the same from the trigger "
+                 "word alone, so you do not need a reference at generation time. Your dataset is "
+                 "used exactly as normal — same folder, same captions, every image still trained "
+                 "on. The difference is what each answer is marked against: normally it is the "
+                 "photograph itself, which is why a LoRA also learns your backgrounds and "
+                 "framing. With this on, most of the marking comes from what the model produces "
+                 "when shown OTHER photos of her from the same folder — identity without the "
+                 "scenery. Every image takes a turn as a reference, and no image is ever its own "
+                 "(the model would just copy the answer). Teacher 0.8 means 80% of that and 20% "
+                 "still the real photo, which keeps genuine skin and texture; 1.0 is pure and "
+                 "caps the LoRA at what reference mode can already do. Needs the ref2va model in "
+                 "Preferences. Caching takes longer and uses more disk.",
+            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
+        self._minimax_distill_hint.grid(row=36, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
+
+        # --- Base Precision (MiniMax only) -------------------------------------------------
+        # Auto picks the quantisation and the block-swap count TOGETHER. Deciding swap alone,
+        # with the precision already fixed by which file you loaded, gives mid-range cards the
+        # worst of both: the int8 base is ~21 GB, so a 24 GB card parks 38 of 50 blocks on CPU
+        # and crosses PCIe every step for ~4x the runtime, when the same file loaded 4-bit is
+        # ~11 GB and needs no swap at all.
+        self._minimax_quant_label = ttk.Label(training_content, text="Base Precision:")
+        self._minimax_quant_label.grid(row=37, column=0, sticky=tk.W, padx=5, pady=(8, 0))
+        self._minimax_quant_frame = ttk.Frame(training_content)
+        self._minimax_quant_frame.grid(row=37, column=1, sticky=tk.W, padx=5, pady=(8, 0))
+        self.entries["MINIMAX_BASE_QUANT"] = ttk.Combobox(
+            self._minimax_quant_frame, values=list(MINIMAX_BASE_QUANT_OPTIONS), width=30,
+            state="readonly")
+        self.entries["MINIMAX_BASE_QUANT"].set(
+            str(self.settings.get("MINIMAX_BASE_QUANT", MINIMAX_BASE_QUANT_OPTIONS[0])))
+        self.entries["MINIMAX_BASE_QUANT"].pack(side=tk.LEFT)
+        self._minimax_quant_hint = ttk.Label(
+            training_content,
+            text="Auto reads your FREE VRAM at launch and picks the base precision and block "
+                 "swap together. int8 is the checkpoint's own storage and the most accurate "
+                 "base (~0.17% error) — it needs about 30 GB free to run without block swap. "
+                 "4-bit loads the SAME file at ~11 GB instead of ~21, so it fits smaller cards "
+                 "with no swap, at ~9% error in the frozen base — the LoRA then spends some "
+                 "capacity correcting error that won't exist at inference. Auto only reaches "
+                 "for 4-bit when the alternative is most of the model crossing PCIe every step. "
+                 "Pin either one and the swap plan is built around your choice.",
+            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
+        self._minimax_quant_hint.grid(row=38, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
+
+        # --- Slow blocks (MiniMax only, experimental): depth-dependent LR -------------------
+        self._minimax_slow_label = ttk.Label(training_content, text="Slower LR for blocks:")
+        self._minimax_slow_label.grid(row=33, column=0, sticky=tk.W, padx=5, pady=(8, 2))
+        self._minimax_slow_frame = ttk.Frame(training_content)
+        self._minimax_slow_frame.grid(row=33, column=1, columnspan=2, sticky=tk.W, padx=5, pady=(8, 2))
+        self.entries["MINIMAX_SLOW_BLOCKS"] = ttk.Entry(self._minimax_slow_frame, width=22)
+        self.entries["MINIMAX_SLOW_BLOCKS"].insert(
+            0, str(self.settings.get("MINIMAX_SLOW_BLOCKS", "") or ""))
+        self.entries["MINIMAX_SLOW_BLOCKS"].pack(side=tk.LEFT)
+        ttk.Label(self._minimax_slow_frame, text="  at ×").pack(side=tk.LEFT)
+        self.entries["MINIMAX_SLOW_LR_SCALE"] = ttk.Combobox(
+            self._minimax_slow_frame, values=["0.1", "0.2", "0.3", "0.5", "0.7"],
+            state="normal", width=6)
+        self.entries["MINIMAX_SLOW_LR_SCALE"].set(
+            str(self.settings.get("MINIMAX_SLOW_LR_SCALE", "0.2")))
+        self.entries["MINIMAX_SLOW_LR_SCALE"].pack(side=tk.LEFT, padx=(2, 0))
+        self._minimax_slow_hint = ttk.Label(
+            training_content,
+            text="EXPERIMENT — leave blank for one learning rate everywhere (normal). A change in "
+                 "a late block goes almost straight to the output, while a change early on gets "
+                 "smoothed out by the 40-odd blocks after it — so the same learning rate is "
+                 "gentle at the front of the model and violent at the back. If the later blocks "
+                 "wreck your samples at a rate the early ones handle fine, put those blocks here "
+                 "with a multiplier instead of dropping them: 21-49 at ×0.2 trains them at a "
+                 "fifth the rate. Same syntax as Blocks to Train, and only blocks you're actually "
+                 "training count. Adaptive LR still works — it moves both rates together and "
+                 "keeps the ratio.",
+            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
+        self._minimax_slow_hint.grid(row=34, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
+
+        # --- Train AdaLN (MiniMax only, experimental) --------------------------------------
+        # A BooleanVar kept in self.entries so the preset/queue machinery picks it up for free.
+        self.entries["MINIMAX_TRAIN_ADALN"] = tk.BooleanVar(
+            value=bool(self.settings.get("MINIMAX_TRAIN_ADALN", False)))
+        self._minimax_adaln_cb = ttk.Checkbutton(
+            training_content, text="Train AdaLN (timestep modulation)",
+            variable=self.entries["MINIMAX_TRAIN_ADALN"])
+        self._minimax_adaln_cb.grid(row=31, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(8, 0))
+        self._minimax_adaln_hint = ttk.Label(
+            training_content,
+            text="EXPERIMENT — off by default (the reference trainer leaves it on). AdaLN is "
+                 "the part of the model that decides how strongly each block fires at each noise "
+                 "level. It only ever sees the noise level: not your image, not your prompt. So it "
+                 "CAN'T learn who someone is — but on this base it soaks up roughly 45% of "
+                 "everything your LoRA learns. Turning it off hands that capacity to the parts "
+                 "that do see the image. It may sharpen likeness, or it may cost you the timing "
+                 "control that makes the rest work — run it both ways on the same dataset. Only "
+                 "applies to the pruned int8 base; the bf16 one never trains AdaLN anyway.",
+            foreground="#95A5A6", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
+        self._minimax_adaln_hint.grid(row=32, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
+
         self._refresh_minimax_shift_match()
 
         # Answers "when do changes take effect?" (issue #40) right where people wonder it.
@@ -4611,6 +4957,11 @@ class LoRATrainerGUI:
             except (AttributeError, tk.TclError):
                 pass
 
+        if "MINIMAX_DISTILL" in preset and hasattr(self, "minimax_distill_var"):
+            self.minimax_distill_var.set(bool(preset["MINIMAX_DISTILL"]))
+        if "MINIMAX_LOGNORM" in preset and hasattr(self, "minimax_lognorm_var"):
+            self.minimax_lognorm_var.set(bool(preset["MINIMAX_LOGNORM"]))
+
         # Model Area to Train (training preset dropdown)
         if "TARGET_LAYERS" in preset and hasattr(self, 'training_preset_var'):
             legacy_map = {
@@ -5078,9 +5429,20 @@ class LoRATrainerGUI:
         # Detail Focus only means anything for MiniMax, and it's the whole point of queueing a
         # shift sweep — without it two rows of an A/B look identical in the manager.
         if ARCHITECTURES.get(item.get("architecture", ""), {}).get("is_minimax"):
-            _sh = str(p.get("MINIMAX_SHIFT") or "").split(" ")[0]
+            _sh = str(p.get("MINIMAX_LOWNOISE_PCT") or "").strip()
             if _sh:
-                bits.append(f"detail {_sh}")
+                bits.append(f"low-noise {_sh}%" + (" mid" if p.get("MINIMAX_LOGNORM") else ""))
+            _bl = minimax_block_spec(p.get("MINIMAX_BLOCKS"))
+            if _bl.lower() != "all":
+                bits.append(f"blocks {_bl}")
+            if p.get("MINIMAX_TRAIN_ADALN") is False:
+                bits.append("no adaln")
+            if p.get("MINIMAX_DISTILL"):
+                bits.append(f"distill x{p.get('MINIMAX_DISTILL_WEIGHT', '0.8')}"
+                            f" ({p.get('MINIMAX_DISTILL_REFS', '2')} refs)")
+            _sl = str(p.get("MINIMAX_SLOW_BLOCKS") or "").strip()
+            if _sl and str(p.get("MINIMAX_SLOW_LR_SCALE", "1")).strip() not in ("", "1", "1.0"):
+                bits.append(f"slow {_sl} ×{p.get('MINIMAX_SLOW_LR_SCALE')}")
         return name, "  ·  ".join(str(b) for b in bits) + f"\nqueued {item.get('queued_at', '?')}"
 
     def _render_queue_window(self):
@@ -5353,6 +5715,11 @@ class LoRATrainerGUI:
         _grab("krea2_per_image_lr_var", "KREA2_PER_IMAGE_LR")
         _grab("krea2_auto_recaption_var", "KREA2_AUTO_RECAPTION")
         _grab("krea2_warmup_look_var", "KREA2_WARMUP_LOOK")
+        # MiniMax reference distillation. A plain StringVar, so the generic self.entries sweep
+        # above does NOT see it — without this a queued distillation run loses its reference
+        # and silently becomes an ordinary run (tests/test_minimax_distill_gui.py).
+        _grab("minimax_distill_var", "MINIMAX_DISTILL")
+        _grab("minimax_lognorm_var", "MINIMAX_LOGNORM")
         _grab("grad_checkpoint_var", "GRADIENT_CHECKPOINTING")
         _grab("fp8_text_encoder_var", "FP8_TEXT_ENCODER")
         _grab("adaptive_lr_var", "ADAPTIVE_LR")
@@ -5649,27 +6016,51 @@ class LoRATrainerGUI:
         return False
 
     def _refresh_minimax_shift_match(self):
-        """Tell the user whether Detail Focus matches their Target Megapixels.
+        """Show the schedule the typed percentage produces, or why it can't be read.
 
-        Informational only — it never moves the dial. Someone sweeping densities has deliberately
-        picked a value the rule wouldn't, and the green/amber readout is there to confirm the
-        choice was deliberate, not to undo it."""
+        The relationship is very non-linear at the ends — 5% is shift 19, 2% is shift 49 — so the
+        resulting shift and median noise level are worth seeing next to the number you typed."""
         lbl = getattr(self, "_minimax_shift_match", None)
-        combo = self.entries.get("MINIMAX_SHIFT")
+        ent = self.entries.get("MINIMAX_LOWNOISE_PCT")
+        if lbl is None or ent is None or not lbl.winfo_exists():
+            return
+        lognorm = bool(getattr(self, "minimax_lognorm_var", None)
+                       and self.minimax_lognorm_var.get())
+        shift = (minimax_lownoise_to_lognorm_shift(ent.get()) if lognorm
+                 else minimax_lownoise_to_shift(ent.get()))
+        if shift is None:
+            lbl.config(text="✗ enter a number above 0 and below 100", fg="#E74C3C")
+            return
+        # The median is the shift map at the base's median draw — 0.5 for a uniform draw and for
+        # a logit-normal one alike — so it is shift/(shift+1) either way.
+        med = shift / (shift + 1.0)
+        lbl.config(text=f"→ {'logit-normal' if lognorm else 'uniform'} shift {shift:.3g}, "
+                        f"median noise {med:.2f}", fg="#27AE60")
+
+    def _refresh_minimax_blocks_count(self):
+        """Say how many blocks the Blocks to Train box currently means, or why it can't be read.
+
+        A typed spec fails silently in the worst way: "3-12, 4" trains 11 blocks and looks like a
+        run, and nothing downstream ever says otherwise. This turns that into a number you can
+        see before you launch."""
+        lbl = getattr(self, "_minimax_blocks_count", None)
+        combo = self.entries.get("MINIMAX_BLOCKS")
         if lbl is None or combo is None or not lbl.winfo_exists():
             return
-        want = minimax_recommended_shift(self.dataset_megapixels_var.get())
-        try:
-            have = str(combo.get()).split(" ")[0]
-        except tk.TclError:
+        spec = minimax_block_spec(combo.get())
+        if spec.lower() == "all":
+            lbl.config(text="all 50 blocks", fg=COLORS["text_explain"])
             return
-        if want is None:
+        try:
+            from fizgig.minimax.trainer import parse_block_spec
+            idx = parse_block_spec(spec, MINIMAX_NUM_BLOCKS)
+        except ValueError as e:
+            lbl.config(text=f"✗ {e}", fg="#E74C3C")
+            return
+        except ImportError:
             lbl.config(text="")
-        elif have == want:
-            lbl.config(text="✓ matches your image size", fg="#27AE60")
-        else:
-            lbl.config(text=f"recommended for {self.dataset_megapixels_var.get()} MP: {want}",
-                       fg="#E67E22")
+            return
+        lbl.config(text=f"✓ {len(idx)} of {MINIMAX_NUM_BLOCKS} blocks", fg="#27AE60")
 
     def _is_krea2_arch(self) -> bool:
         return ARCHITECTURES.get(self.architecture_var.get(), {}).get("is_krea2", False)
@@ -5848,7 +6239,13 @@ class LoRATrainerGUI:
 
         # Detail Focus is the inverse: MiniMax ONLY. Klein and Krea 2 already derive their shift
         # from the sample's token count, so there is nothing to dial there.
-        for w in (self._minimax_shift_label, self._minimax_shift_frame, self._minimax_shift_hint):
+        for w in (self._minimax_shift_label, self._minimax_shift_frame, self._minimax_shift_hint,
+                  self._minimax_blocks_label, self._minimax_blocks_frame, self._minimax_blocks_hint,
+                  self._minimax_adaln_cb, self._minimax_adaln_hint,
+                  self._minimax_slow_label, self._minimax_slow_frame, self._minimax_slow_hint,
+                  self._minimax_distill_frame, self._minimax_distill_hint,
+                  self._minimax_quant_label, self._minimax_quant_frame,
+                  self._minimax_quant_hint):
             self._set_widget_visible(w, is_minimax)
 
         # Context LoRA is wired for Klein and Krea 2 but NOT MiniMax — hide the whole row there
@@ -14800,6 +15197,20 @@ class LoRATrainerGUI:
             download_note="~21GB — Comfy-Org/MiniMax-H3 → diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors (fl2va is the trainable variant; the 66GB bf16 file works too)",
         )
         mr = self._add_pref_row(
+            mm_card, mr, "DiT (reference):", "minimax_ref_dit",
+            "OPTIONAL — only for reference distillation ('Learn identity from' on the Training "
+            "tab). This is the ref2va model, a DIFFERENT fine-tune from the fl2va one above and "
+            "not just another quantization of it: it is what ComfyUI's Reference-to-Video "
+            "workflow loads, and the only H3 build that accepts reference images. A LoRA "
+            "distilled this way is trained on it and runs on it. Leave blank for ordinary "
+            "training.",
+            download_url="https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+            download_note="~21GB — Comfy-Org/MiniMax-H3 -> diffusion_models/"
+                          "minimax_h3_ref2va_pruned_int8_convrot.safetensors (the pruned int8 "
+                          "build, same shape as the fl2va one above; you may already have it if "
+                          "you use the r2v workflow)",
+        )
+        mr = self._add_pref_row(
             mm_card, mr, "Qwen3-VL-32B TE:", "minimax_text_encoder",
             "Qwen3-VL-32B text encoder — nvfp4 (the compact ComfyUI file) or bf16 both work; the "
             "loader detects which you gave it. The nvfp4 file keeps its packed weights (~15.7 GB "
@@ -20827,6 +21238,32 @@ class LoRATrainerGUI:
         _check_num("Network Alpha", self.entries["NETWORK_ALPHA"].get(), float, 0)
         if self._network_type_is_lokr():
             _check_num("LoKR Factor", self.entries["LOKR_FACTOR"].get(), int, 2)
+        # Blocks to Train is free text, so a typo is caught HERE rather than after the 21 GB base
+        # has streamed in — and a queued run must never fail an hour later on a bad spec.
+        if self._is_minimax_arch():
+            _spec = minimax_block_spec(self.entries["MINIMAX_BLOCKS"].get())
+            if _spec.lower() != "all":
+                try:
+                    from fizgig.minimax.trainer import parse_block_spec
+                    parse_block_spec(_spec, MINIMAX_NUM_BLOCKS)
+                except ValueError as e:
+                    errors.append(f"Blocks to Train: {e}")
+                except ImportError:
+                    pass
+            if minimax_lownoise_to_shift(self.entries["MINIMAX_LOWNOISE_PCT"].get()) is None:
+                errors.append("Low-noise training must be a number above 0 and below 100 "
+                              f"(got {self.entries['MINIMAX_LOWNOISE_PCT'].get()!r})")
+            _slow_spec = str(self.entries["MINIMAX_SLOW_BLOCKS"].get() or "").strip()
+            if _slow_spec:
+                try:
+                    from fizgig.minimax.trainer import parse_block_spec
+                    parse_block_spec(_slow_spec, MINIMAX_NUM_BLOCKS)
+                except ValueError as e:
+                    errors.append(f"Slower LR for blocks: {e}")
+                except ImportError:
+                    pass
+                _check_num("Slower LR multiplier",
+                           self.entries["MINIMAX_SLOW_LR_SCALE"].get(), float, 0)
         _check_num("Max Train Epochs", self.entries["MAX_TRAIN_EPOCHS"].get(), int, 1)
         _check_num("Save Every N Epochs", self.entries["SAVE_EVERY_N_EPOCHS"].get(), int, 1)
         _check_num("Seed", self.entries["SEED"].get(), int)
@@ -20858,6 +21295,14 @@ class LoRATrainerGUI:
                     errors.append(f"{label} path is empty (set it on the Preferences tab)")
                 elif not os.path.exists(path):
                     errors.append(f"{label} file does not exist: {path}")
+            # Reference distillation needs the ref2va model and a real reference photo.
+            if getattr(self, "minimax_distill_var", None) and self.minimax_distill_var.get():
+                if not self._krea2_pref("minimax_ref_dit"):
+                    errors.append("Reference distillation needs the ref2va DiT — set "
+                                  "'DiT (reference)' on the Preferences tab. It is a different "
+                                  "model from the one above and the only H3 build that takes "
+                                  "reference images.")
+                _check_num("References each", self.entries["MINIMAX_DISTILL_REFS"].get(), int, 1)
         elif config.get("is_krea2"):
             # Krea 2 reads its own four model paths from Preferences (krea2_*). The
             # Turbo DiT is only required when in-training previews are enabled.
@@ -21272,7 +21717,19 @@ class LoRATrainerGUI:
             "BLOCKS_SWAP": blocks_swap,
             # MiniMax-only; the widget exists (hidden) under every family, so read it unconditionally
             # and let the MiniMax command builder be the one that acts on it.
-            "MINIMAX_SHIFT": str(self.entries["MINIMAX_SHIFT"].get() or "12").split(" ")[0],
+            # Stored as the percentage the user typed; the command builder converts it to the
+            # trainer's shift. Keeping the percentage is what makes a saved preset mean the same
+            # thing later, rather than a shift number nobody can interpret.
+            "MINIMAX_LOWNOISE_PCT": str(self.entries["MINIMAX_LOWNOISE_PCT"].get() or "").strip(),
+            "MINIMAX_LOGNORM": bool(self.minimax_lognorm_var.get()),
+            "MINIMAX_BLOCKS": minimax_block_spec(self.entries["MINIMAX_BLOCKS"].get()),
+            "MINIMAX_TRAIN_ADALN": bool(self.entries["MINIMAX_TRAIN_ADALN"].get()),
+            "MINIMAX_DISTILL": bool(self.minimax_distill_var.get()),
+            "MINIMAX_BASE_QUANT": self.entries["MINIMAX_BASE_QUANT"].get(),
+            "MINIMAX_DISTILL_WEIGHT": str(self.entries["MINIMAX_DISTILL_WEIGHT"].get() or "0.8").strip(),
+            "MINIMAX_DISTILL_REFS": str(self.entries["MINIMAX_DISTILL_REFS"].get() or "2").strip(),
+            "MINIMAX_SLOW_BLOCKS": str(self.entries["MINIMAX_SLOW_BLOCKS"].get() or "").strip(),
+            "MINIMAX_SLOW_LR_SCALE": str(self.entries["MINIMAX_SLOW_LR_SCALE"].get() or "1").strip(),
             "DATASET_CONFIG": self._get_path("DATASET_CONFIG"),
             "VAE_MODEL": self._get_path("VAE_MODEL"),
             "CLIP_MODEL": self._get_path("CLIP_MODEL"),
@@ -21812,8 +22269,15 @@ class LoRATrainerGUI:
             return self._build_krea2_cache_command("krea2_cache_text.py",
                                                    "--text_encoder", self._krea2_pref("krea2_text_encoder"))
         if config.get("is_minimax"):
-            return self._build_krea2_cache_command("minimax_cache_text.py",
-                                                   "--text_encoder", self._krea2_pref("minimax_text_encoder"))
+            cmd = self._build_krea2_cache_command("minimax_cache_text.py",
+                                                  "--text_encoder", self._krea2_pref("minimax_text_encoder"))
+            # Reference distillation: the TEACHER's conditioning has to be built HERE, because
+            # it needs the 15.7 GB vision-capable encoder and that can never be resident beside
+            # the DiT at training time. Each image is paired with N others from this same
+            # dataset — no picker, and no image is ever its own reference.
+            if self.settings.get("MINIMAX_DISTILL"):
+                cmd += ["--reference_count", str(self.settings.get("MINIMAX_DISTILL_REFS", "2"))]
+            return cmd
         arch = self.settings["ARCHITECTURE"]
         python_path = self._venv_python()
         cache_script_path = self._resolve_script(config, "cache_text_script")
@@ -21878,6 +22342,19 @@ class LoRATrainerGUI:
 
     def _krea2_script(self, name: str) -> str:
         return os.path.join(FIZGIG_DIR, "src", "fizgig", "scripts", name)
+
+    def _minimax_reference_canvas(self):
+        """The generation size the reference is scaled against — the square at Target Megapixels.
+
+        The trainer sizes the reference against the largest training bucket; matching that here
+        keeps the cached teacher conditioning and the training-time reference latent describing
+        the same picture."""
+        try:
+            mp = float(str(self.dataset_megapixels_var.get()).strip())
+        except (TypeError, ValueError, AttributeError):
+            mp = 0.5
+        side = int(round((mp * 1_000_000) ** 0.5 / 32) * 32) or 512
+        return side, side
 
     def _build_krea2_cache_command(self, script_name: str, model_flag: str, model_path: str):
         """Krea 2 caching: a plain venv-python call to krea2_cache_latents.py / krea2_cache_text.py."""
@@ -22204,7 +22681,11 @@ class LoRATrainerGUI:
         cmd = [
             self._venv_python(),
             self._krea2_script("minimax_train.py"),
-            "--dit", self._krea2_pref("minimax_dit"),
+            # Distillation trains against ref2va — the teacher only exists on that model.
+            "--dit", (self._krea2_pref("minimax_ref_dit")
+                      if (self.settings.get("MINIMAX_DISTILL")
+                          and self._krea2_pref("minimax_ref_dit"))
+                      else self._krea2_pref("minimax_dit")),
             "--dataset_config", self.settings["DATASET_CONFIG"],
             "--output_dir", self.settings["LORA_OUTPUT_DIR"],
             "--output_name", self.settings["LORA_NAME"],
@@ -22219,13 +22700,54 @@ class LoRATrainerGUI:
         # at run time — correct for queued runs too); an explicit number passes through.
         _bs = str(self.settings.get("BLOCKS_SWAP", "auto") or "auto").strip()
         cmd += ["--blocks_to_swap", "auto" if _bs.lower().startswith("auto") else _bs]
+        # Base Precision. Always sent, including "auto", so the launched command records which
+        # base a run used rather than leaving it implicit — these get A/B'd against each other.
+        cmd += ["--base_quant", minimax_base_quant(self.settings.get("MINIMAX_BASE_QUANT"))]
+        # Gradient Checkpointing. The flag used to not be sent at all here, so the checkbox was
+        # decorative on this family. Ticked (the default) means AUTO — the planner decides from
+        # free VRAM, exactly like Blocks Swap and Base Precision, and in practice that is "on"
+        # for anything short of a 36 GB+ card. Unticked is the explicit override that forces it
+        # off. Deliberately no "force ON": it only differs from auto where there is memory to
+        # spare, and there it just costs ~0.1 s/step for nothing.
+        cmd += ["--gradient_checkpointing",
+                "auto" if self.settings.get("GRADIENT_CHECKPOINTING", True) else "off"]
         # Detail Focus -> --shift. Sent ALWAYS, including the reference 12, so the launched
         # command (and the console line recording it) states which density a run used instead of
         # leaving it implicit — these are meant to be A/B'd against each other, often queued
         # back to back, and "which one was this?" has to be answerable from the record alone.
         # The trainer stamps the same thing into the LoRA as ss_timestep_density.
-        _shift = str(self.settings.get("MINIMAX_SHIFT", "12") or "12").split(" ")[0]
-        cmd += ["--shift", _shift]
+        # Low-noise share -> shift. Always sent, including the default, so the launched command
+        # records which density ran instead of leaving it implicit.
+        if self.settings.get("MINIMAX_LOGNORM"):
+            _shift = minimax_lownoise_to_lognorm_shift(self.settings.get("MINIMAX_LOWNOISE_PCT"))
+            if _shift is not None:
+                cmd += ["--shift", f"lognorm:{_shift:g}"]
+        else:
+            _shift = minimax_lownoise_to_shift(self.settings.get("MINIMAX_LOWNOISE_PCT"))
+            if _shift is not None:
+                cmd += ["--shift", f"{_shift:g}"]
+        # Blocks to Train — only sent when it's a real range; "all" is the trainer's own default,
+        # and not sending it keeps the flag's presence meaning "this run was a block experiment".
+        _blocks = minimax_block_spec(self.settings.get("MINIMAX_BLOCKS", "all"))
+        if _blocks.lower() != "all":
+            cmd += ["--train_blocks", _blocks]
+        # Reference distillation. Both flags travel together; the trainer also needs --vae to
+        # encode the reference, which the sample block may already have added.
+        if self.settings.get("MINIMAX_DISTILL"):
+            cmd += ["--distill",
+                    "--distill_weight", str(self.settings.get("MINIMAX_DISTILL_WEIGHT", "0.8"))]
+        # AdaLN is ON by default (the reference behaviour), so only the opt-out is ever sent.
+        if not self.settings.get("MINIMAX_TRAIN_ADALN", True):
+            cmd.append("--no_train_adaln")
+        # Depth-split LR: both halves must be present and the multiplier must actually do
+        # something, or the flag pair is noise on the command line.
+        _slow = str(self.settings.get("MINIMAX_SLOW_BLOCKS", "") or "").strip()
+        try:
+            _slow_x = float(self.settings.get("MINIMAX_SLOW_LR_SCALE", 1) or 1)
+        except ValueError:
+            _slow_x = 1.0
+        if _slow and abs(_slow_x - 1.0) > 1e-9:
+            cmd += ["--slow_blocks", _slow, "--slow_block_lr_scale", str(_slow_x)]
         # LoKR (Kronecker) — dim/alpha still ride along above but the trainer ignores them;
         # the factor is the dial. Same flags as the Krea 2 builder.
         if str(self.settings.get("NETWORK_TYPE", "")).startswith("LoKR"):

@@ -139,7 +139,12 @@ def _bundled_tokenizer_dir():
 
 
 def build_qwen3_te(config_overrides=None):
-    """A Qwen3Model text encoder with no final norm (returns the raw layer-50 output)."""
+    """A Qwen3Model text encoder with no final norm (returns the raw layer-50 output).
+
+    Text-only. For a caption with no reference image this is equivalent to the full Qwen3-VL
+    stack: VL applies mrope, but every text token gets the SAME index on all three axes, which
+    collapses mrope to ordinary 1-D rope. Reference images break that equality, which is why the
+    r2v path needs build_qwen3vl_te() below rather than this."""
     from transformers import Qwen3Config, Qwen3Model
     cfg = dict(_QWEN3_32B_TRUNC50)
     if config_overrides:
@@ -147,6 +152,110 @@ def build_qwen3_te(config_overrides=None):
     model = Qwen3Model(Qwen3Config(**cfg))
     model.norm = nn.Identity()          # comfy applies NO final norm to the layer-50 conditioning
     return model
+
+
+# Qwen3-VL-32B vision tower. Every value here is transformers' own default for
+# Qwen3VLVisionConfig EXCEPT out_hidden_size, and all of them were cross-checked against the
+# shipped checkpoint's tensor shapes rather than taken on trust:
+#   depth 27              <- 27 distinct visual.blocks.N
+#   hidden_size 1152      <- visual.blocks.N.attn.proj.weight [1152, 1152]
+#   intermediate_size 4304<- visual.blocks.N.mlp.linear_fc1.weight [4304, 1152]
+#   patch_size 16,        <- visual.patch_embed.proj.weight [1152, 3, 2, 16, 16]
+#   temporal_patch_size 2     (also gives in_channels 3 and the temporal patch)
+#   spatial_merge_size 2  <- visual.merger.linear_fc1.weight in-features 4608 = 1152 * 2 * 2
+#   out_hidden_size 5120  <- visual.merger.linear_fc2.weight [5120, 4608]; the DEFAULT IS 3584,
+#                            which is the one value that would have been wrong left alone
+#   num_position_embeddings 2304 <- visual.pos_embed.weight [2304, 1152]
+#   deepstack_visual_indexes [8, 16, 24] <- 3 visual.deepstack_merger_list.N entries
+# The config is hardcoded rather than fetched: ai-toolkit pulls it from the MiniMax HF repo,
+# which is gated and geo-restricted, and Fizgig already hardcodes the text half the same way.
+_QWEN3VL_VISION = dict(out_hidden_size=5120)
+
+# Qwen3-VL is an mrope model, so the text stack needs a rope_scaling section. mrope_section sums
+# to head_dim/2 (24+20+20 = 64 = 128/2).
+_QWEN3VL_ROPE_SCALING = {"rope_type": "default", "mrope_section": [24, 20, 20],
+                         "mrope_interleaved": True}
+
+
+def build_qwen3vl_te(config_overrides=None):
+    """The FULL Qwen3-VL stack — vision tower + language model — with no final norm.
+
+    Needed only for reference (r2v) conditioning, where the prompt carries `<Picture i>:` vision
+    blocks. Checked against the shipped nvfp4 checkpoint: all 902 of its base tensors map onto
+    this module tree with nothing left over (see tests/test_minimax_ref_encoder.py). The three
+    parameters with no checkpoint entry are `language_model.norm.weight` (replaced by Identity
+    here, as comfy applies no final norm) and the two computed rope inv_freq buffers."""
+    from transformers import Qwen3VLConfig, Qwen3VLModel
+    txt = dict(_QWEN3_32B_TRUNC50)
+    txt["rope_scaling"] = dict(_QWEN3VL_ROPE_SCALING)
+    vis = dict(_QWEN3VL_VISION)
+    if config_overrides:
+        txt.update(config_overrides.get("text", {}))
+        vis.update(config_overrides.get("vision", {}))
+    model = Qwen3VLModel(Qwen3VLConfig(text_config=txt, vision_config=vis))
+    model.language_model.norm = nn.Identity()
+    return model
+
+
+# AdaLN modality tags. The DiT selects its modulation by these, so a mis-tagged row is modulated
+# as the wrong modality — it renders, it just renders wrong.
+VIDEO_TAG, TEXT_TAG, AUDIO_TAG = 0, 1, 2
+
+
+def build_image_processor(tokenizer_dir=None):
+    """The Qwen3-VL image processor, from the config bundled in src/fizgig/assets.
+
+    Built directly from the bundled preprocessor_config.json rather than downloaded: MiniMax's
+    HF repo is gated and geo-restricted, and everything needed (patch 16, temporal patch 2,
+    merge 2, mean/std 0.5) already ships with the tokenizer assets."""
+    from transformers import AutoImageProcessor
+    return AutoImageProcessor.from_pretrained(tokenizer_dir or _bundled_tokenizer_dir())
+
+
+def build_reference_tokens(tokenizer, image_processor, caption, images, max_length: int = 512):
+    """The r2v prompt presentation: `<Picture i>: <vision block>` per image, then the caption.
+
+    Returns (input_ids [1, L], token_tags [L], pixel_values, image_grid_thw). Mirrors
+    ai-toolkit's encode_minimax_h3_prompt and comfy's MiniMaxH3Tokenizer.tokenize_with_weights:
+    raw tokens, no chat template, no special tokens.
+
+    The tags are the load-bearing part. `<Picture 1>: ` is TEXT, but the WHOLE vision run —
+    the <|vision_start|> and <|vision_end|> markers included, not just the image pads — is
+    VIDEO. Tagging the markers as text would modulate two rows per image as the wrong modality.
+    """
+    pixel_values, image_grid_thw = None, None
+    ids, tags = [], []
+    if images:
+        vision = image_processor(images=images, return_tensors="pt")
+        pixel_values, image_grid_thw = vision["pixel_values"], vision["image_grid_thw"]
+        merge = image_processor.merge_size ** 2
+        v_start = tokenizer.convert_tokens_to_ids("<|vision_start|>")
+        v_end = tokenizer.convert_tokens_to_ids("<|vision_end|>")
+        img_pad = tokenizer.convert_tokens_to_ids("<|image_pad|>")
+        for i in range(len(images)):
+            n_img = int(image_grid_thw[i].prod()) // merge
+            label = tokenizer(f"<Picture {i + 1}>: ", add_special_tokens=False)["input_ids"]
+            vision_ids = [v_start] + [img_pad] * n_img + [v_end]
+            ids += label + vision_ids
+            tags += [TEXT_TAG] * len(label) + [VIDEO_TAG] * len(vision_ids)
+
+    prompt_ids = tokenizer(caption, add_special_tokens=False,
+                           truncation=True, max_length=max_length)["input_ids"]
+    ids += prompt_ids
+    tags += [TEXT_TAG] * len(prompt_ids)
+    if not ids:                                     # empty prompt with no reference
+        pid = getattr(tokenizer, "pad_token_id", None)
+        ids, tags = [151643 if pid is None else int(pid)], [TEXT_TAG]
+    return (torch.tensor([ids], dtype=torch.long), torch.tensor(tags, dtype=torch.long),
+            pixel_values, image_grid_thw)
+
+
+def qwen3vl_key_map(key: str) -> str:
+    """Checkpoint key -> Qwen3VLModel parameter name.
+
+    The single-file checkpoint stores the language stack under `model.` and the vision tower
+    under `visual.`; Qwen3VLModel wants `language_model.` and `visual.`."""
+    return "language_model." + key[len("model."):] if key.startswith("model.") else key
 
 
 class MiniMaxH3TextEncoder:
@@ -158,6 +267,7 @@ class MiniMaxH3TextEncoder:
         self.device = device
         self.compute_dtype = compute_dtype
         self._cache = {}          # caption -> CPU embedding; see encode()
+        self._image_processor = None   # built on first r2v encode; see encode_with_reference()
 
     def _pad_id(self) -> int:
         """The tokenizer's pad id, or Qwen's default. NOT `pad_token_id or <default>` — a pad id
@@ -187,6 +297,50 @@ class MiniMaxH3TextEncoder:
         # keep it on CPU: a few hundred KB per caption, and GPU memory is the scarce thing here
         self._cache[caption] = emb.detach().to("cpu")
         return emb
+
+    @torch.no_grad()
+    def encode_with_reference(self, caption: str, images, max_length: int = 512):
+        """r2v conditioning: `<Picture i>:` vision blocks + caption -> ([1, L, 5120], tags [L]).
+
+        Requires the encoder to have been built with build_qwen3vl_te() — the text-only
+        Qwen3Model has no vision tower and would silently ignore the pixels. NOT memoized: the
+        cache is keyed by caption text alone, which would collide across different reference
+        images for the same caption.
+        """
+        if not hasattr(self.model, "visual"):
+            raise RuntimeError(
+                "encode_with_reference needs the vision-capable encoder — load with "
+                "with_vision=True (build_qwen3vl_te), not the text-only Qwen3Model.")
+        if self._image_processor is None:
+            self._image_processor = build_image_processor()
+        ids, tags, pixel_values, grid = build_reference_tokens(
+            self.tokenizer, self._image_processor, caption, images, max_length)
+        kw = {}
+        if pixel_values is not None:
+            # the vision tower is bf16 in the checkpoint; feed it its own dtype
+            kw["pixel_values"] = pixel_values.to(self.device, torch.bfloat16)
+            kw["image_grid_thw"] = grid.to(self.device)
+        out = self.model(input_ids=ids.to(self.device),
+                         attention_mask=torch.ones_like(ids).to(self.device), **kw)
+        # norm is Identity on this build, so last_hidden_state IS the raw layer-50 conditioning
+        emb = out.last_hidden_state.to(self.compute_dtype)
+        return emb, tags
+
+    # NO encode_with_reference_batch. Batching the reference encodes was implemented and
+    # MEASURED against the one-at-a-time path on the real encoder (tests/diag_ref_batch_encode.py)
+    # and it is NOT equivalent: max|diff| 1.3e2 to 1.7e3 on conditioning whose values top out
+    # around 2e4, i.e. up to ~8% — against a left-padding control of 1.8e4. A proper 0/1 attention
+    # mask (Qwen3-VL derives its mrope positions from it) improved matters but did not fix them.
+    #
+    # Right padding IS exact on the caption path, for the causal-attention reason documented on
+    # encode_batch. The vision path adds mrope positions computed from image_grid_thw and a
+    # scatter into the <|image_pad|> slots, and something there does not survive padding. Rather
+    # than ship conditioning that is subtly wrong in a way nothing downstream would reveal, the
+    # reference pass stays one encode at a time. The cost is ~1.5 s per encode — about 2.5 min
+    # for 46 images at 2 references, linear in (images x references), and cached afterwards.
+    #
+    # If this is ever worth revisiting, the diagnostic is the gate: it must reach the ~1e-7 the
+    # caption path achieves, not merely "look close".
 
     @torch.no_grad()
     def encode_batch(self, captions, max_length: int = 512, batch_size: int = 8):
@@ -289,8 +443,14 @@ class Nvfp4Linear(nn.Linear):
 
 def load_minimax_h3_te(path: str, device="cuda", compute_dtype=torch.bfloat16,
                        quantize=True, tokenizer_dir=None,
-                       te_quant="auto") -> MiniMaxH3TextEncoder:
-    """Build the Qwen3-VL-32B language TE (visual.* skipped).
+                       te_quant="auto", with_vision=False) -> MiniMaxH3TextEncoder:
+    """Build the Qwen3-VL-32B TE. Language-only by default (visual.* skipped).
+
+    with_vision=True builds the FULL stack instead — needed for r2v reference conditioning,
+    where the prompt carries `<Picture i>` vision blocks. The vision tower is left in bf16: it
+    is ~176 weights against the language stack's thousands, and none of its module names match
+    the quantization suffixes (checked — `attn.qkv` / `mlp.linear_fc1`, not `self_attn.q_proj`
+    / `mlp.gate_proj`), so it is excluded automatically rather than by a special case.
 
     te_quant:
       "nvfp4" — KEEP the checkpoint's packed nvfp4 weights (what the reference does). Same
@@ -312,8 +472,18 @@ def load_minimax_h3_te(path: str, device="cuda", compute_dtype=torch.bfloat16,
     if not quantize:
         mode = "none"
 
+    # Parameter name -> checkpoint key. The file stores the language stack under `model.` and
+    # the vision tower under `visual.`; the VL module tree calls those `language_model.` and
+    # `visual.`. Getting this wrong does not raise — the parameter simply keeps its random init.
+    def _ck(name: str) -> str:
+        if not with_vision:
+            return "model." + name
+        if name.startswith("language_model."):
+            return "model." + name[len("language_model."):]
+        return name
+
     with torch.device("meta"):
-        model = build_qwen3_te()
+        model = build_qwen3vl_te() if with_vision else build_qwen3_te()
 
         # Swap the NF4-target Linears for Linear4bit shells INSIDE the meta context. Outside it,
         # each Linear4bit eagerly allocates a full fp32 CPU weight (nn.Linear default) — across the
@@ -360,7 +530,7 @@ def load_minimax_h3_te(path: str, device="cuda", compute_dtype=torch.bfloat16,
             for mod_name, module in model.named_modules():
                 if not isinstance(module, Nvfp4Linear):
                     continue
-                fm = "model." + mod_name
+                fm = _ck(mod_name)
                 module.packed = f.get_tensor(fm + ".weight").to(torch.uint8).to(dev)
                 # byte views: fp8 block scales and the fp32 global scale must never be CAST
                 module.bscale = f.get_tensor(fm + ".weight_scale").contiguous().view(
@@ -372,7 +542,7 @@ def load_minimax_h3_te(path: str, device="cuda", compute_dtype=torch.bfloat16,
                                           if pqs in ckpt else None)
 
         for name in model_keys:
-            src = "model." + name                          # checkpoint prefixes the LM with model.
+            src = _ck(name)
             file_mod = src.rsplit(".", 1)[0]
             leaf = name.rsplit(".", 1)[1]
             if is_comfy_quant and leaf == "weight" and (file_mod + ".comfy_quant") in ckpt:
@@ -394,8 +564,18 @@ def load_minimax_h3_te(path: str, device="cuda", compute_dtype=torch.bfloat16,
     # Computed (non-checkpoint) buffers stayed on meta from the meta-build. The rotary
     # embedding's inv_freq is the load-bearing one — rebuild it on the real device. A general
     # sweep materializes any other stray meta buffers to be safe.
-    from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
-    model.rotary_emb = Qwen3RotaryEmbedding(model.config).to(dev)
+    # These carry inv_freq, which the generic sweep below would otherwise ZERO — a rope table of
+    # zeros is no positional information at all, and the model would still run.
+    if with_vision:
+        from transformers.models.qwen3_vl.modeling_qwen3_vl import (Qwen3VLTextRotaryEmbedding,
+                                                                    Qwen3VLVisionRotaryEmbedding)
+        model.language_model.rotary_emb = Qwen3VLTextRotaryEmbedding(model.config.text_config).to(dev)
+        _vcfg = model.config.vision_config
+        model.visual.rotary_pos_emb = Qwen3VLVisionRotaryEmbedding(
+            _vcfg.hidden_size // _vcfg.num_heads // 2).to(dev)
+    else:
+        from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
+        model.rotary_emb = Qwen3RotaryEmbedding(model.config).to(dev)
     for mod in model.modules():
         for bname, buf in list(mod.named_buffers(recurse=False)):
             if buf is not None and buf.is_meta:

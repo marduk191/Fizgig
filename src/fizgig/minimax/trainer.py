@@ -14,11 +14,13 @@ So the training target for the model's output is `x0 - noise`.
 """
 
 import argparse
+import contextlib
 import gc
 import logging
 import math
 import os
 import random
+import re
 import sys
 import time
 from multiprocessing import Value
@@ -55,6 +57,83 @@ DEFAULT_INCLUDE_PATTERNS = [r"blocks\.\d+\.attn\..*", r"blocks\.\d+\.mlp\..*",
 PRUNED_INCLUDE_PATTERNS = DEFAULT_INCLUDE_PATTERNS + [r"blocks\.\d+\.adaln_proj\..*"]
 
 
+def parse_block_spec(spec, num_blocks: int = None):
+    """"3-12, 14-15, 22,27,31-33" -> [3,4,...,12,14,15,22,27,31,32,33].
+
+    Ranges and singles, comma-separated, whitespace anywhere. Returns sorted unique indices.
+    Raises ValueError on anything it cannot read — a typo here must stop the run, not silently
+    train a different set of blocks than the one being tested.
+
+    num_blocks, when given, bounds-checks: an out-of-range index would otherwise just match
+    nothing and quietly shrink the experiment.
+    """
+    text = str(spec if spec is not None else "").strip()
+    if not text:
+        raise ValueError("no blocks given")
+    out = set()
+    for part in text.split(","):
+        chunk = part.strip()
+        if not chunk:
+            continue                       # tolerate a trailing or doubled comma
+        m = re.fullmatch(r"(\d+)\s*-\s*(\d+)", chunk)
+        if m:
+            lo, hi = int(m.group(1)), int(m.group(2))
+            if lo > hi:
+                raise ValueError(f"range runs backwards: {chunk!r}")
+            out.update(range(lo, hi + 1))
+        elif re.fullmatch(r"\d+", chunk):
+            out.add(int(chunk))
+        else:
+            raise ValueError(f"cannot read {chunk!r} — use numbers and ranges, "
+                             f"e.g. '3-12, 14-15, 22, 31-33'")
+    if not out:
+        raise ValueError("no blocks given")
+    if num_blocks is not None:
+        bad = sorted(i for i in out if i >= num_blocks)
+        if bad:
+            raise ValueError(f"block(s) {bad} do not exist — this model has {num_blocks} "
+                             f"(0-{num_blocks - 1})")
+    return sorted(out)
+
+
+def format_block_spec(indices):
+    """[3,4,5,7] -> "3-5,7" — the canonical form recorded in metadata and logged."""
+    if not indices:
+        return ""
+    runs, start, prev = [], indices[0], indices[0]
+    for i in indices[1:]:
+        if i == prev + 1:
+            prev = i
+            continue
+        runs.append((start, prev))
+        start = prev = i
+    runs.append((start, prev))
+    return ",".join(str(a) if a == b else f"{a}-{b}" for a, b in runs)
+
+
+def restrict_patterns_to_blocks(patterns, block_spec, num_blocks: int = None):
+    """Narrow `blocks.N.*` patterns to a block selection. Non-block patterns pass through.
+
+    H3 is 50 IDENTICAL blocks with no published map of what each one does, so training a subset is
+    an experiment, not a recipe — this exists to make that experiment cheap to run. The token
+    refiner is deliberately never narrowed: it is text-side (where a trigger token gets shaped),
+    it is 8 of 258 modules, and holding it constant keeps two selections comparable to each other
+    rather than confounding the block question with a conditioning change.
+
+    Applied ON TOP of the per-checkpoint pattern list rather than replacing it, so the pruned vs
+    bf16 AdaLN decision stays in exactly one place.
+    """
+    idx = parse_block_spec(block_spec, num_blocks)
+    alt = "|".join(str(i) for i in idx)
+    out = []
+    for p in patterns:
+        if p.startswith(r"blocks\.\d+"):
+            out.append(p.replace(r"blocks\.\d+", rf"blocks\.(?:{alt})", 1))
+        else:
+            out.append(p)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # VRAM planner — resolves "auto" block swap + gradient checkpointing from the card's actual
 # free VRAM and the run's real token load (bucket megapixels x batch). Simpler than Krea 2's:
@@ -66,12 +145,28 @@ PRUNED_INCLUDE_PATTERNS = DEFAULT_INCLUDE_PATTERNS + [r"blocks\.\d+\.adaln_proj\
 #   swap 16 + ckpt   : resident 11.9 (0.34 GB/block), steady 12.8, step peak 19.3 — the swap
 #                      path carries a ~7.4 GB backward transient (checkpoint recompute segments
 #                      held by the engine), which the planner must budget on top of residency.
+#
+# Re-measured 6 Aug on the SHIPPED default (int8 base, LoKR factor 8 + adamw, AdaLN off), because
+# those anchors were taken with a rank-16 LoRA on adamw8bit — an adapter of ~0.4 GB against the
+# ~3.1 GB the defaults now carry, so the planner was budgeting for a run nobody does:
+#   resident         : base 21.07 + LoKR weights 0.63 + fp32 Adam state 2.50 = 24.20 GB
+#   0.23 MP  no ckpt : 29.18      |  ckpt: 24.39
+#   0.50 MP  no ckpt : OOM (>31)  |  ckpt: 24.47
+#   0.98 MP  no ckpt : OOM        |  ckpt: 24.56
+# Two things fall out. Un-checkpointed really does scale hard (0.5 MP OOMs a 32 GB card, so
+# forcing ckpt on there is correct), and CHECKPOINTED IS ALMOST FLAT — 1 MP costs 0.17 GB more
+# than 0.23 MP, not four times as much. Hence _ACT_GB_CKPT below.
 _RESIDENT_GB = 17.5          # full bf16 model, NF4 resident (measured 17.3-17.6)
 # The PRUNED checkpoint drops the full-width AdaLN (~40% of the model's weight mass) for a curve
 # table, so the same NF4 pass lands far smaller: ~20.1 B params quantized -> ~10.1 GB, plus the
 # unquantized remainder. Estimated from the file's own tensor census, not yet GPU-measured, so
 # it carries margin.
-_RESIDENT_PRUNED_GB = 11.0
+# MEASURED 6 Aug (was 11.0, estimated from the file's tensor census): the pruned checkpoint
+# decoded and re-quantized to NF4 sits at 10.46 GB resident, and a checkpointed step peaks at
+# 13.46 / 13.56 / 13.63 GB at 0.23 / 0.50 / 0.98 MP — flat in megapixels, exactly like int8.
+# Un-checkpointed it is 18.27 / 23.52 / OOM. Now that Auto can CHOOSE this mode, the number it
+# chooses against had to stop being a guess.
+_RESIDENT_PRUNED_GB = 10.5
 # int8 base (base_quant=int8, the reference's own storage): the 200 block linears stay 1 byte
 # per param instead of NF4's 0.5, and the refiner/AdaLN load dense — ~19.3 + ~1.5 GB.
 _RESIDENT_INT8_GB = 21.0
@@ -83,14 +178,146 @@ _RESIDENT_INT8_GB = 21.0
 # 0.12 GB now, and the real DiT has 200.)
 _INT8_TRANSIENT_GB = 1.0
 _PER_BLOCK_GB = 0.34         # one parked block's GPU share (measured: (17.5-11.9)/16)
-_ACT_GB_NOCKPT = 5.5         # step overhead at 0.25 MP batch 1, no checkpointing (measured 5.1)
-_ACT_GB_CKPT = 2.0           # step overhead at 0.25 MP batch 1, checkpointed (measured 0.9; margin)
+_ACT_GB_NOCKPT = 5.5         # step overhead at 0.25 MP batch 1, no checkpointing (measured 4.98)
+# Checkpointed memory is very nearly FLAT in megapixels — that is the whole point of recompute,
+# and the old 2.0 (which then got multiplied by the MP scale) modelled it as growing four times
+# faster than it does. Measured on the shipped default (int8 base, LoKR 8 + adamw, 6 Aug 2026),
+# peak above the resident 24.20 GB:
+#     0.23 MP  0.19 GB        0.50 MP  0.27 GB        0.98 MP  0.36 GB
+# i.e. ~0.15 + 0.2 x scale. 0.5 keeps a wide margin at every size and still leaves the planner
+# free to say "no swap" where the card genuinely fits — the old value invented 25 blocks of swap
+# for a 1 MP run that actually peaks at 24.6 GB, costing ~4x the step time for nothing.
+_ACT_GB_CKPT = 0.5           # step overhead at 0.25 MP batch 1, checkpointed (measured 0.19)
 _SWAP_TRANSIENT_GB = 7.5     # extra backward-time peak whenever swap is active (measured 7.4 @ n=16)
 _RESERVE_GB = 1.5            # display / allocator / fragmentation headroom
+# Skipping checkpointing has to EARN it. Measured on H3, recompute costs ~0.1 s/step and saves
+# ~5 GB — so choosing "no checkpointing" on a thin margin trades five gigabytes of headroom for
+# a tenth of a second. Peter's 6 Aug run picked it with 0.37 GB of predicted margin (needed
+# 32.13 of 32.5 GB free) and then ran at 4-6 s/step instead of ~1: on Windows the driver spills
+# to system RAM rather than OOMing, so an over-tight plan does not fail, it just crawls, with
+# nothing in the log to say why. The un-checkpointed peak is also the one that scales with
+# megapixels, so a plan that barely fits at one bucket size will not fit at the next.
+_NOCKPT_MARGIN_GB = 3.0      # extra headroom demanded before skipping recompute
+
+
+def adapter_param_count(dit_path: str, include_patterns, network_type: str = "lora",
+                        network_dim: int = 16, lokr_factor: int = 8,
+                        train_blocks: str = None) -> int:
+    """Trainable parameter count, read from the checkpoint HEADER — no model, no GPU.
+
+    The VRAM plan runs before the DiT is built, so the shapes come from the safetensors header
+    (which is just JSON at the front of the file). That keeps this exact rather than an
+    architecture guess: it sees the real targeted Linears for whichever checkpoint is loaded,
+    respects include_patterns and the Blocks to Train restriction, and works the same on the
+    pruned and full builds.
+    """
+    import json
+    import re as _re
+    import struct
+    try:
+        with open(dit_path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            hdr = json.loads(f.read(n))
+    except Exception:
+        return 0
+
+    pats = list(include_patterns or [])
+    if train_blocks:
+        n_blocks = len({int(m.group(1)) for k in hdr
+                        for m in [_re.match(r"blocks\.(\d+)\.", k)] if m} or {0})
+        pats = restrict_patterns_to_blocks(pats, train_blocks, n_blocks)
+    if not pats:
+        return 0
+    rx = [_re.compile(p) for p in pats]
+
+    total = 0
+    for key, ent in hdr.items():
+        if key == "__metadata__" or not key.endswith(".weight"):
+            continue
+        shape = ent.get("shape") or []
+        if len(shape) != 2:                     # Linears only, as create_modules wraps
+            continue
+        name = key[:-len(".weight")]
+        if not any(r.search(name) for r in rx):
+            continue
+        out_dim, in_dim = int(shape[0]), int(shape[1])
+        if str(network_type).lower() == "lokr":
+            from fizgig.networks.lora import factorization   # local: avoids a circular import
+            a, _c = factorization(out_dim, int(lokr_factor))
+            b, _d = factorization(in_dim, int(lokr_factor))
+            total += a * b + _c * _d            # w1 (a,b) + w2 (c,d)
+        else:
+            total += int(network_dim) * (in_dim + out_dim)
+    return total
+
+
+def adapter_vram_gb(params: int, optimizer_type: str = "adamw8bit") -> float:
+    """GB the adapter holds for the WHOLE run: bf16 weights + optimizer state.
+
+    Not a rounding error at these sizes. LoKR factor 8 on H3 trains ~313 M parameters against a
+    rank-16 LoRA's ~77 M, and the state dtype widens the gap again: fp32 Adam keeps two 4-byte
+    moments per parameter where the 8-bit optimizers keep two 1-byte ones. LoKR + adamw is
+    ~3.1 GB against ~0.4 GB for the rank-16 + adamw8bit configuration the original anchors were
+    measured on — which is why planning without this term was planning for a run nobody does.
+
+    Gradients are deliberately NOT counted here. They are transient, and fused AdamW frees them
+    per parameter as it steps, so they never all coexist: measured, a checkpointed step peaks
+    only 0.19 GB above this figure even though the gradients would be 0.63 GB if they were all
+    live at once. They belong in the activation term's margin, not in the resident one.
+
+    Verified against a real step (6 Aug 2026): base 21.07 + weights 0.63 + fp32 state 2.50 =
+    24.20 GB resident, exactly what this returns for 313.1 M parameters on adamw.
+    """
+    key = (optimizer_type or "adamw8bit").lower()
+    n_states = 1 if "lion" in key else 2        # Lion keeps momentum only
+    state_bytes = (1 if "8bit" in key else 4) * n_states
+    return params * (2 + state_bytes) / 1e9     # bf16 weight + optimizer state
+
+
+def plan_base_quant(free_gb: float, pruned: bool, mp: float = 0.25, adapter_gb: float = 0.0):
+    """Pick the base quantisation AND the swap plan together -> (mode, blocks_to_swap, ckpt, why).
+
+    Choosing a swap count from VRAM alone, with the quantisation already fixed, produces the
+    worst available outcome on mid-range cards: the int8 base is ~21 GB, so a 24 GB card cannot
+    hold it and the planner parks 38 of 50 blocks on CPU — every one of them crossing PCIe every
+    step, for roughly 4x the step time. The same file loaded 4-bit is ~11 GB and needs no swap at
+    all. Krea 2 hit this exact failure and fixed it the same way (see _auto_krea2_strategy):
+    quantisation and swap are one decision.
+
+    Order of preference:
+      1. int8, no swap  — the most accurate base (~0.17% error against the reference's own
+                          storage) with no PCIe cost. Always preferred when it fits.
+      2. 4-bit, no swap — trades base accuracy (~9.5% error) for keeping every block resident.
+      3. 4-bit + swap   — 11 GB resident always parks fewer blocks than 21 GB would.
+
+    The trade in step 2 is real and worth stating: a LoRA fitted on a 9.5%-perturbed base spends
+    capacity correcting error that will not exist at inference, and it compounds with depth. It
+    is chosen only when the alternative is most of the model crossing PCIe on every step.
+
+    Only applies to a pruned int8 checkpoint — the bf16 file has no int8 weights to keep, so
+    there is nothing to choose between.
+    """
+    if not pruned:
+        n, c = plan_vram(free_gb, mp=mp, resident_gb=_RESIDENT_GB, adapter_gb=adapter_gb)
+        return "nf4", n, c, "bf16 checkpoint — NF4 is the only option"
+
+    i_swap, i_ckpt = plan_vram(free_gb, mp=mp, resident_gb=_RESIDENT_INT8_GB,
+                               transient_gb=_INT8_TRANSIENT_GB, adapter_gb=adapter_gb)
+    if i_swap == 0:
+        return "int8", i_swap, i_ckpt, "int8 fits with no block swap — the most accurate base"
+
+    n_swap, n_ckpt = plan_vram(free_gb, mp=mp, resident_gb=_RESIDENT_PRUNED_GB,
+                               adapter_gb=adapter_gb)
+    if n_swap == 0:
+        return ("nf4", n_swap, n_ckpt,
+                f"int8 would need {i_swap} of 50 blocks on CPU (~4x slower); 4-bit fits entirely "
+                f"in VRAM, at ~9% more error in the frozen base")
+    return ("nf4", n_swap, n_ckpt,
+            f"neither fits outright — 4-bit parks {n_swap} blocks against int8's {i_swap}")
 
 
 def plan_vram(free_gb: float, mp: float = 0.25, batch: int = 1, resident_gb: float = None,
-              transient_gb: float = 0.0):
+              transient_gb: float = 0.0, adapter_gb: float = 0.0):
     """Pure planner: (blocks_to_swap, gradient_checkpointing) from free VRAM + token load.
 
     Token load scales the activation term linearly (tokens ∝ mp x batch). Checkpointing is
@@ -99,9 +326,13 @@ def plan_vram(free_gb: float, mp: float = 0.25, batch: int = 1, resident_gb: flo
     Swap additionally budgets _SWAP_TRANSIENT_GB: the backward pass transiently holds
     recompute segments beyond the parked residency (measured, see anchors above)."""
     resident = _RESIDENT_GB if resident_gb is None else float(resident_gb)
-    base = resident + float(transient_gb)
+    # adapter_gb is resident for the whole run (weights + grads + optimizer state), so it belongs
+    # in the base, not the activation term — gradient checkpointing does not reduce it.
+    base = resident + float(transient_gb) + float(adapter_gb)
     scale = max(0.25, float(mp)) / 0.25 * max(1, int(batch))
-    need_nockpt = base + _ACT_GB_NOCKPT * scale + _RESERVE_GB
+    # _NOCKPT_MARGIN_GB, not just _RESERVE_GB: see the note on the constant. Recompute is ~0.1 s
+    # a step and worth ~5 GB, so skipping it on a thin margin is a bad trade in both directions.
+    need_nockpt = base + _ACT_GB_NOCKPT * scale + _RESERVE_GB + _NOCKPT_MARGIN_GB
     if free_gb >= need_nockpt:
         return 0, False
     need_ckpt = base + _ACT_GB_CKPT * scale + _RESERVE_GB
@@ -184,6 +415,14 @@ def sample_sigmas(batch: int, device, shift=None, generator=None,
         mu = 0.5 + (tokens - 256.0) * (1.15 - 0.5) / (6400.0 - 256.0)
         s = math.exp(mu)
         base = torch.sigmoid(torch.randn(batch, device=device, generator=generator))
+    elif isinstance(shift, str) and shift.startswith("lognorm:"):
+        # SHAPE, not amount. Same shift map, but a logit-normal base instead of a uniform one:
+        # the mass piles up in the middle and thins at BOTH ends, where a uniform base has fat
+        # tails. Krea 2 and Klein both draw logit-normal, so this is the one axis the numeric
+        # ladder cannot reach — it only ever varies how much low-noise training there is, never
+        # where the rest of the mass sits.
+        s = float(shift.split(":", 1)[1])
+        base = torch.sigmoid(torch.randn(batch, device=device, generator=generator))
     else:
         s = float(shift)
         base = torch.rand(batch, device=device, generator=generator)
@@ -229,6 +468,85 @@ def compute_loss(model, latent: torch.Tensor, text_embeds: torch.Tensor, *,
     pred = model(noised.to(latent.dtype), t, text_embeds)
     target = (x0 - noise).to(pred.dtype)
     return F.mse_loss(pred.float(), target.float()), float(sigma.reshape(-1)[0])
+
+
+@contextlib.contextmanager
+def lora_disabled(network):
+    """Run the frozen BASE inside this block — every adapter's multiplier is temporarily 0.
+
+    Every module type (LoRA, LoKR, LoHa) reads self.multiplier live in its forward and
+    short-circuits on 0.0, so this needs no re-apply and no weight surgery. Restores whatever
+    each module had, not a blanket 1.0 — a context LoRA rides at its own strength."""
+    mods = list(getattr(network, "unet_loras", []))
+    saved = [m.multiplier for m in mods]
+    try:
+        for m in mods:
+            m.multiplier = 0.0
+        yield
+    finally:
+        for m, v in zip(mods, saved):
+            m.multiplier = v
+
+
+def compute_distill_loss(model, network, latent, text_plain, *, text_ref, ref_latents,
+                         text_token_tags=None, distill_weight=0.8, shift=None, generator=None,
+                         noise=None, seed=0):
+    """Reference distillation: teach the LoRA to behave, from text alone, as if it had been
+    shown the reference photo.
+
+    Two predictions of the SAME noised latent at the SAME timestep:
+      teacher — frozen base, LoRA off, conditioning WITH the reference (vision blocks + ref rows)
+      student — LoRA on, conditioning WITHOUT it
+    loss = w * MSE(student, teacher) + (1 - w) * MSE(student, x0 - noise)
+
+    The photo term is what keeps real photographic detail available: pure distillation caps the
+    LoRA at exactly the teacher's habits and can never exceed them. The teacher term is what
+    stops the run spending capacity on backgrounds and framing, because the target is no longer
+    a particular photograph.
+
+    Everything the two passes share is drawn ONCE — noise, timestep, and the audio silence rows.
+    The audio rows especially: model.forward redraws them per call when not given, so letting
+    each pass draw its own would put a different soundtrack under teacher and student and add
+    pure noise to the very signal being distilled.
+    """
+    if latent.shape[0] != 1:
+        raise ValueError("MiniMax H3 image training is batch size 1")
+    device = latent.device
+    x0 = latent.float()
+    _pt, _ph, _pw = getattr(model, "patch_size", (1, 2, 2))
+    _H, _W = x0.shape[-2], x0.shape[-1]
+    _Hc, _Wc = (_H // _ph) * _ph, (_W // _pw) * _pw
+    if (_Hc, _Wc) != (_H, _W):
+        x0 = x0[..., :_Hc, :_Wc].contiguous()
+    if noise is None:
+        noise = torch.randn(x0.shape, device=device, generator=generator, dtype=torch.float32)
+    else:
+        noise = noise.to(device=device, dtype=torch.float32)[..., :x0.shape[-2], :x0.shape[-1]]
+
+    _tokens = (x0.shape[-2] // _ph) * (x0.shape[-1] // _pw)
+    sigma = sample_sigmas(1, device, shift=shift, generator=generator, image_tokens=_tokens)
+    s = sigma.reshape(1, 1, 1, 1, 1).to(torch.float32)
+    noised = ((1.0 - s) * x0 + s * noise).to(latent.dtype)
+    t = (1.0 - sigma).to(device)
+
+    # one soundtrack for both passes (see the docstring)
+    audio_noise = None
+    if getattr(model, "pack_audio_rows", False):
+        from fizgig.minimax.model import AUDIO_CHANNELS, audio_latents_for_frames
+        n_a = audio_latents_for_frames(1) * AUDIO_CHANNELS
+        audio_noise = torch.randn(n_a, model.config.audio_latents_dim, device=device,
+                                  generator=generator, dtype=torch.float32)
+
+    with torch.no_grad(), lora_disabled(network):
+        teacher = model(noised, t, text_ref, audio_noise, ref_latents=ref_latents,
+                        text_token_tags=text_token_tags, seed=seed).float()
+    student = model(noised, t, text_plain, audio_noise).float()
+
+    w = float(distill_weight)
+    loss = w * F.mse_loss(student, teacher.detach())
+    if w < 1.0:
+        loss = loss + (1.0 - w) * F.mse_loss(student, (x0 - noise).float())
+    return loss, float(sigma.reshape(-1)[0])
 
 
 # ---------------------------------------------------------------------------
@@ -392,8 +710,11 @@ class AdaptiveLR:
                 reason = f"loss plateau, streak {self.bad_streak}/{patience_down}"
 
         if new_lr != cur_lr:
+            # Respect a depth-split LR: each group carries its own lr_scale, so the watcher moves
+            # the whole schedule up or down while KEEPING the ratio between groups. Writing new_lr
+            # flat would silently undo the split on the first adaptive move.
             for pg in optimizer.param_groups:
-                pg["lr"] = new_lr
+                pg["lr"] = new_lr * pg.get("lr_scale", 1.0)
         lr_str = f"{cur_lr:.2e}" if new_lr == cur_lr else f"{cur_lr:.2e}->{new_lr:.2e}"
         wn_str = f"{weight_growth*100:+.0f}%" if weight_growth is not None else "—"
         logger.info(f"[adaptive_lr] epoch {epoch + 1}: loss={current_loss:.4f} lr={lr_str} "
@@ -550,6 +871,12 @@ def train_minimax(
     caption_dropout: float = 0.05,
     base_quant: str = "auto",
     include_patterns: list = None,
+    train_blocks: str = None,        # "14-37" = train only that block range (experiment)
+    train_adaln: bool = True,        # False = drop adaln_proj from the targets (pruned only)
+    distill: bool = False,           # reference distillation (references come from the dataset)
+    distill_weight: float = 0.8,     # teacher share of the loss; the rest is the real photo
+    slow_blocks: str = None,         # block spec trained at a reduced LR ("21-49")
+    slow_block_lr_scale: float = 1.0,  # the multiplier applied to those blocks' LR
     quantize: bool = True,           # NF4 the base (QLoRA); False = bf16 base (needs ~66 GB VRAM)
     shift: float = None,             # None = auto resolution schedule (logit-normal); float = legacy
     blocks_to_swap="auto",           # "auto" | int — park the last N blocks on CPU between uses
@@ -600,6 +927,11 @@ def train_minimax(
 
     torch.manual_seed(seed)
     user_include_patterns = include_patterns   # None -> resolved per checkpoint below
+    # Parse the block selection NOW, before the 21 GB base streams in: a typo surfacing after
+    # the load costs minutes and reads like a crash rather than a correction. Bounds-checking
+    # waits until the model is up (that is when the real block count is known).
+    if train_blocks:
+        parse_block_spec(train_blocks)
 
     # ---- dataset (built from the caches the two cache scripts wrote) ----
     shared_epoch = Value("i", 0)
@@ -621,6 +953,9 @@ def train_minimax(
     elif shift == "resolution":
         logger.warning("[timesteps] logit-normal + resolution shift (median ~0.62) — A/B mode; "
                        "same overdrive caveat as sigmoid.")
+    elif isinstance(shift, str) and str(shift).startswith("lognorm:"):
+        logger.info(f"[timesteps] logit-normal base at shift {str(shift).split(':', 1)[1]} — "
+                    f"mid-concentrated spread at the requested low-noise share.")
     else:
         logger.info(f"[timesteps] explicit shift={shift} — uniform-u map.")
 
@@ -639,23 +974,59 @@ def train_minimax(
         if torch.cuda.is_available() and quantize:
             _free_gb = torch.cuda.mem_get_info()[0] / 1e9
             _pruned = is_pruned_checkpoint(dit_path)
-            _mode = base_quant if base_quant != "auto" else ("int8" if _pruned else "nf4")
+            # The adapter is NOT a rounding error and it is not fixed: LoKR 8 trains ~313 M
+            # parameters against a rank-16 LoRA's ~75 M, and fp32 Adam state is 4x the 8-bit
+            # one. Planning without it was planning for a configuration nobody runs — the
+            # anchors were measured on rank-16 + adamw8bit (~0.45 GB) while the shipped default
+            # is LoKR 8 + adamw (~3.8 GB). Shapes come from the checkpoint header, so this is
+            # the real targeted module set for whichever file is loaded.
+            _pat = PRUNED_INCLUDE_PATTERNS if _pruned else DEFAULT_INCLUDE_PATTERNS
+            if not train_adaln:
+                _pat = [p for p in _pat if "adaln" not in p]
+            _ad_params = adapter_param_count(dit_path, _pat, network_type=network_type,
+                                             network_dim=network_dim, lokr_factor=lokr_factor,
+                                             train_blocks=train_blocks)
+            _adapter = adapter_vram_gb(_ad_params, optimizer_type)
+
+            if base_quant == "auto":
+                _mode, n_swap, _ckpt_auto, _why = plan_base_quant(
+                    _free_gb, _pruned, mp=_mp, adapter_gb=_adapter)
+            else:
+                # An explicit choice is never overridden — the plan is built AROUND it, or the
+                # swap count would be sized for a quantisation that will not run.
+                _mode = base_quant
+                _res = (_RESIDENT_INT8_GB if _mode == "int8"
+                        else _RESIDENT_PRUNED_GB if _pruned else _RESIDENT_GB)
+                n_swap, _ckpt_auto = plan_vram(
+                    _free_gb, mp=_mp, resident_gb=_res,
+                    transient_gb=_INT8_TRANSIENT_GB if _mode == "int8" else 0.0,
+                    adapter_gb=_adapter)
+                _why = f"base precision pinned to {_mode} by the user"
             _base_mode = _mode
             _resident = (_RESIDENT_INT8_GB if _mode == "int8"
                          else _RESIDENT_PRUNED_GB if _pruned else _RESIDENT_GB)
-            _trans = _INT8_TRANSIENT_GB if _mode == "int8" else 0.0
-            n_swap, _ckpt_auto = plan_vram(_free_gb, mp=_mp, resident_gb=_resident,
-                                           transient_gb=_trans)
+
             logger.info(f"[vram] auto plan: free {_free_gb:.1f} GB, largest bucket {_mp:.2f} MP, "
-                        f"base ~{_resident:.0f} GB ({_mode}, {'pruned' if _pruned else 'bf16'}) "
-                        f"-> blocks_to_swap={n_swap}, checkpointing={'on' if _ckpt_auto else 'off'}")
-            if n_swap > 0 and _mode == "int8":
+                        f"base ~{_resident:.0f} GB ({_mode}, {'pruned' if _pruned else 'bf16'}), "
+                        f"adapter ~{_adapter:.1f} GB ({_ad_params/1e6:.0f} M params, "
+                        f"{optimizer_type}) -> blocks_to_swap={n_swap}, "
+                        f"checkpointing={'on' if _ckpt_auto else 'off'}")
+            logger.info(f"[vram] base precision: {_mode} — {_why}")
+            if _mode == "nf4" and _pruned and base_quant == "auto":
+                # Say it plainly rather than quietly downgrading the base: this costs likeness,
+                # and the user has a real alternative (train slower on int8, or free some VRAM).
                 logger.warning(
-                    f"[vram] {n_swap} blocks will live on CPU and cross PCIe every step, which is "
-                    f"several times slower. The int8 base is ~{_resident:.0f} GB against NF4's "
-                    f"~{_RESIDENT_PRUNED_GB:.0f}, so it only fits this bucket size with swap. "
-                    f"Faster options: lower Target Megapixels (~0.7 MP fits with no swap), or "
-                    f"--base_quant nf4 (fits, at ~9% more error in the frozen base).")
+                    "[vram] this run trains on a 4-bit base (~9% error) instead of the "
+                    "checkpoint's own int8 (~0.17%). It is much faster here, but the LoRA spends "
+                    "some capacity correcting quantization error that will NOT exist at "
+                    "inference. To force the accurate base, set Base Precision to int8 — expect "
+                    "block swap and a several-times-slower run — or close other GPU apps and "
+                    "re-launch.")
+            if n_swap > 0:
+                logger.warning(
+                    f"[vram] {n_swap} of 50 blocks will live on CPU and cross PCIe every step, "
+                    f"which is several times slower. Lower Target Megapixels, or free VRAM, to "
+                    f"avoid it.")
         else:
             n_swap, _ckpt_auto = 0, False
     else:
@@ -714,6 +1085,33 @@ def train_minimax(
     # AdaLN targeting is per-checkpoint — see the pattern note at the top of this file.
     include_patterns = user_include_patterns or (
         PRUNED_INCLUDE_PATTERNS if dit.pruned_adaln else DEFAULT_INCLUDE_PATTERNS)
+    # AdaLN is a pure function of the TIMESTEP — DiTBlock.forward calls adaln_proj(t_emb) and
+    # nothing else, so its adapters cannot tell one subject from another. They can only reshape
+    # how strongly each block fires at each noise level. On the pruned checkpoint they carry
+    # ~45% of all weight movement in a matched epoch, which is a lot of a LoRA's capacity spent
+    # somewhere structurally incapable of holding a face — hence the toggle. See
+    # docs/MINIMAX_BLOCKS.md. No-op on the bf16 checkpoint, which never targets AdaLN.
+    _adaln_on = bool(train_adaln) and dit.pruned_adaln
+    if not train_adaln:
+        _before = len(include_patterns)
+        include_patterns = [p for p in include_patterns if "adaln" not in p]
+        if len(include_patterns) < _before:
+            logger.info("[base] EXPERIMENT: AdaLN adapters OFF. AdaLN sees only the timestep, so "
+                        "it cannot encode identity — this frees the capacity it was taking. "
+                        "Compare against the same run with it on.")
+        else:
+            logger.info("[base] AdaLN was not a target on this checkpoint; the toggle changes "
+                        "nothing here.")
+    _blocks_used = "all"
+    if train_blocks:
+        _n_blocks = len(dit.blocks)
+        include_patterns = restrict_patterns_to_blocks(include_patterns, train_blocks, _n_blocks)
+        _sel = parse_block_spec(train_blocks, _n_blocks)
+        _blocks_used = format_block_spec(_sel)
+        logger.info("[base] EXPERIMENT: training blocks %s only (%d of %d), text refiner "
+                    "included. Nobody has mapped what H3's blocks do — judge this against a "
+                    "full-model run on the same dataset, not on its own.",
+                    _blocks_used, len(_sel), _n_blocks)
     logger.info("[base] %s checkpoint; LoRA targets: attention + MLP + token refiner%s",
                 "pruned (curve-table AdaLN)" if dit.pruned_adaln else "full bf16",
                 " + AdaLN (deploy-consistent on this build; rank caps at 8)"
@@ -782,7 +1180,51 @@ def train_minimax(
     # when the user hasn't set their own via Optimizer Args.
     if "weight_decay" not in (optimizer_args or "") and "adam" in optimizer_type.lower():
         optimizer_args = (optimizer_args + " weight_decay=1e-4").strip()
-    optimizer, optimizer_label = create_optimizer(optimizer_type, params, learning_rate, optimizer_args)
+
+    # Depth-dependent LR. A perturbation injected at block 5 passes through 45 more blocks that
+    # absorb and renormalize it; one injected at block 45 lands almost directly on the output. So
+    # the same |dW| is far more disruptive the later it sits, and ONE learning rate is wrong by
+    # construction — it is either too low for the early blocks or too high for the late ones.
+    # Observed here: at 1e-4, blocks 0-20 train cleanly but slowly while anything past 20 wrecks
+    # the samples (block swap ruled out — those runs recorded blocks_swapped=0).
+    # Built AFTER the adaptive block above, so `learning_rate` is already the resolved start LR.
+    _slow_used, _slow_n = "", 0
+    opt_params = params          # the optimizer may get groups; `params` stays flat for clipping
+    if slow_blocks and abs(float(slow_block_lr_scale) - 1.0) > 1e-9:
+        _slow_idx = set(parse_block_spec(slow_blocks, len(dit.blocks)))
+        _slow_ids = set()
+        for _lora in network.unet_loras:
+            _nm = _lora.lora_name
+            if "token_refiner" in _nm:      # text-side, never part of the depth argument
+                continue
+            _m = re.search(r"blocks_(\d+)_", _nm)
+            if _m and int(_m.group(1)) in _slow_idx:
+                _slow_ids.update(id(p) for p in _lora.parameters())
+        if _slow_ids:
+            _slow = [p for p in params if id(p) in _slow_ids]
+            _fast = [p for p in params if id(p) not in _slow_ids]
+            _scaled = learning_rate * float(slow_block_lr_scale)
+            # lr_scale rides along on the group so the adaptive watcher can move both groups
+            # together without flattening them back to one rate.
+            # NOTE: assign to opt_params, NOT params. `params` stays the flat tensor list because
+            # clip_grad_norm_ iterates it every step and cannot take param-group dicts.
+            opt_params = [{"params": _fast, "lr": learning_rate, "lr_scale": 1.0},
+                          {"params": _slow, "lr": _scaled, "lr_scale": float(slow_block_lr_scale)}]
+            _slow_used = format_block_spec(sorted(_slow_idx))
+            _slow_n = len(_slow)
+            logger.info("[lr] depth-split: blocks %s train at %.3e (x%g), the rest at %.3e "
+                        "(%d of %d tensors slowed)", _slow_used, _scaled, slow_block_lr_scale,
+                        learning_rate, _slow_n, len(_slow) + len(_fast))
+        else:
+            logger.warning("[lr] slow_blocks %r matched no trained modules — is it outside "
+                           "Blocks to Train? Depth-split LR is not active.", slow_blocks)
+
+    # eps_floor_8bit: H3-only. The 8-bit second moment underflows on this model's most structured
+    # tensors and the update degrades to lr*m/eps — measured at ~100x the configured LR, which
+    # presented as melted anatomy at epoch 1. The floor caps that. It is passed here and nowhere
+    # else: Krea 2 has never shown the failure and keeps the library default.
+    optimizer, optimizer_label = create_optimizer(optimizer_type, opt_params, learning_rate,
+                                                  optimizer_args, eps_floor_8bit=True)
     logger.info(f"optimizer: {optimizer_label} @ lr={learning_rate:.3e}")
 
     # Caption dropout (reference default 0.05): swap in the cached empty-prompt embed for a
@@ -801,6 +1243,14 @@ def train_minimax(
                            "caching to enable it) — dropout disabled for this run")
         else:
             logger.info(f"[caption_dropout] {caption_dropout:.2f} — empty-prompt embed loaded")
+
+    # Reference distillation needs nothing at run start: each item's reference conditioning AND
+    # that reference's latent both ride in from the cache, one slot picked at random per step.
+    if distill:
+        logger.info("[distill] reference distillation ON — teacher weight %.2f, photo %.2f. "
+                    "References come from the dataset itself (each image paired with others by "
+                    "the caching pass); no image is ever its own reference.",
+                    distill_weight, 1.0 - distill_weight)
 
     collator = _Collator(shared_epoch, group)
     loader = DataLoader(group, batch_size=1, shuffle=True, collate_fn=collator, num_workers=0)
@@ -854,6 +1304,12 @@ def train_minimax(
             "ss_learning_rate": f"{learning_rate:g}",
             "ss_optimizer": optimizer_label,
             "ss_timestep_density": _dens,
+            "ss_train_blocks": _blocks_used,
+            "ss_train_adaln": "1" if _adaln_on else "0",
+            "ss_distill": "dataset" if distill else "off",
+            "ss_distill_weight": (f"{distill_weight:g}" if distill else "0"),
+            "ss_slow_blocks": _slow_used or "none",
+            "ss_slow_block_lr_scale": (f"{slow_block_lr_scale:g}" if _slow_used else "1"),
             "ss_caption_dropout": f"{caption_dropout:g}" if uncond_text is not None else "0",
             "ss_max_grad_norm": f"{max_grad_norm:g}",
             "ss_bucket_resolutions": ",".join(_res),
@@ -1002,7 +1458,18 @@ def train_minimax(
             text = batch["hidden_states"].to(device, dtype)        # (1, L, 5120)
             if uncond_text is not None and random.random() < caption_dropout:
                 text = uncond_text.to(device, dtype)               # caption dropout step
-            loss, _ = compute_loss(dit, latents, text, shift=shift)
+            if distill and "ref_hidden_states" in batch:
+                _rz = batch["ref_latent"].to(device, dtype)      # (1, 24, h, w) from the cache
+                if _rz.dim() == 4:
+                    _rz = _rz.unsqueeze(2)                       # -> (1, 24, 1, h, w)
+                loss, _ = compute_distill_loss(
+                    dit, network, latents, text,
+                    text_ref=batch["ref_hidden_states"].to(device, dtype),
+                    ref_latents=[_rz],
+                    text_token_tags=batch["ref_token_tags"][0],
+                    distill_weight=distill_weight, shift=shift, seed=seed)
+            else:
+                loss, _ = compute_loss(dit, latents, text, shift=shift)
             loss.backward()
             if max_grad_norm and max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(params, max_grad_norm)

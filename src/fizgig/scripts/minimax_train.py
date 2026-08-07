@@ -26,8 +26,17 @@ logging.basicConfig(level=logging.INFO)
 
 
 def _shift_arg(v):
-    """--shift takes the literals 'sigmoid'/'resolution' or a float (see the flag's help)."""
-    return v if v in ("sigmoid", "resolution") else float(v)
+    """--shift takes 'sigmoid' / 'resolution', 'lognorm:<float>', or a plain float.
+
+    'lognorm:<s>' is the same shift map as a plain float but drawn from a logit-normal base
+    instead of a uniform one — the SHAPE axis: mid-concentrated rather than flat with fat tails.
+    """
+    if v in ("sigmoid", "resolution"):
+        return v
+    if isinstance(v, str) and v.startswith("lognorm:"):
+        float(v.split(":", 1)[1])          # validate now, not 20 minutes into a run
+        return v
+    return float(v)
 
 
 def setup_parser() -> argparse.ArgumentParser:
@@ -65,6 +74,37 @@ def setup_parser() -> argparse.ArgumentParser:
                         "needs the uncond embed cached by minimax_cache_text). 0 disables.")
     p.add_argument("--include_patterns", nargs="*", default=None,
                    help="Regex module filters (Model Area to Train). Default: all transformer blocks.")
+    p.add_argument("--distill", action="store_true",
+                   help="EXPERIMENT: reference distillation. Instead of only reconstructing each "
+                        "photo, the LoRA is taught to behave — from text alone — as the model "
+                        "does when SHOWN a reference. The references are OTHER images from this "
+                        "same dataset, paired by minimax_cache_text --reference_count. Train and "
+                        "deploy on the ref2va checkpoint.")
+    p.add_argument("--distill_weight", type=float, default=0.8, metavar="W",
+                   help="Teacher share of the loss (default 0.8); the remaining 1-W is the "
+                        "ordinary flow loss against the real photo. 1.0 is pure distillation, "
+                        "which caps the LoRA at exactly the teacher's habits; a little photo "
+                        "keeps real photographic detail reachable.")
+    p.add_argument("--slow_blocks", default=None, metavar="SPEC",
+                   help="EXPERIMENT: train these blocks at a reduced learning rate (same syntax "
+                        "as --train_blocks). A perturbation in a late block reaches the output "
+                        "almost undamped while an early one is absorbed by everything after it, "
+                        "so one LR is too high for the late blocks or too low for the early ones. "
+                        "Pair with --slow_block_lr_scale.")
+    p.add_argument("--slow_block_lr_scale", type=float, default=1.0, metavar="X",
+                   help="LR multiplier for --slow_blocks (e.g. 0.2 = one fifth). 1.0 disables.")
+    p.add_argument("--no_train_adaln", dest="train_adaln", action="store_false",
+                   help="EXPERIMENT: drop the per-block AdaLN adapters. AdaLN is a function of "
+                        "the TIMESTEP only, so it cannot encode identity — yet on the pruned "
+                        "checkpoint it carries ~45%% of all weight movement. Turning it off frees "
+                        "that capacity for the attention and MLP paths, which do see the image. "
+                        "No effect on the bf16 checkpoint (it never targets AdaLN).")
+    p.add_argument("--train_blocks", default=None, metavar="SPEC",
+                   help="EXPERIMENT: train only these DiT blocks (of 50) instead of all of them. "
+                        "Ranges and singles, comma-separated: '14-37' or '3-12, 14-15, 22, 31-33'. "
+                        "The text refiner is always included. H3's blocks are identical and nobody "
+                        "has mapped what each one does, so any selection is a hypothesis — compare "
+                        "against a full-model run on the same dataset.")
     p.add_argument("--base_quant", default="auto", choices=["auto", "int8", "nf4"],
                    help="Frozen-base precision. 'int8' keeps the checkpoint's own ConvRot "
                         "weights (~0.17%% base error, ~21 GB) — what the reference trainer "
@@ -152,6 +192,12 @@ def main():
         caption_dropout=args.caption_dropout,
         base_quant=args.base_quant,
         include_patterns=args.include_patterns,
+        train_blocks=args.train_blocks,
+        distill=args.distill,
+        distill_weight=args.distill_weight,
+        train_adaln=args.train_adaln,
+        slow_blocks=args.slow_blocks,
+        slow_block_lr_scale=args.slow_block_lr_scale,
         quantize=not args.no_quantize,
         shift=args.shift,
         blocks_to_swap=args.blocks_to_swap,

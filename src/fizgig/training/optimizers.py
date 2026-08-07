@@ -99,12 +99,16 @@ def _warn_lr(name: str, lr: float) -> None:
         logger.warning("[optimizer] LR %.2e is very high for %s.", lr, name)
 
 
-def create_optimizer(name: str, params, lr: float, args_str: str = "") -> tuple:
+def create_optimizer(name: str, params, lr: float, args_str: str = "",
+                     eps_floor_8bit: bool = False) -> tuple:
     """Build an optimizer. Returns `(optimizer, label)`; the label goes into LoRA metadata.
 
     Falls back to plain AdamW if the requested one cannot be constructed — a training run should
     not die at minute one over a dropdown, but the substitution is logged as a warning, never
     silently.
+
+    `eps_floor_8bit` raises the 8-bit Adam family's eps to 1e-6. OFF by default: it is a
+    MiniMax H3 workaround and every other family keeps the library default. See the note below.
     """
     name = (name or DEFAULT_OPTIMIZER).strip()
     kwargs = parse_optimizer_args(args_str)
@@ -120,7 +124,17 @@ def create_optimizer(name: str, params, lr: float, args_str: str = "") -> tuple:
     # the most structured tensors (adaln worst, fc1 next), which presented as melted anatomy
     # at epoch 1. eps=1e-6 caps that amplification two orders of magnitude lower. Explicit
     # "eps=..." in Optimizer Args still wins.
-    if "8bit" in key and "lion" not in key or key in ("adamw", "adam"):
+    # NOTE the two conditions. 8-BIT Adam family only, NOT full-precision adam/adamw: full
+    # precision has no quantized state, so v is whatever it really is, and a 1e-6 floor there
+    # would DAMP the tensors with genuinely small second moments — the ones converging on fine
+    # detail — while looking like a stability measure.
+    #
+    # And OPT-IN per caller, never global. This began as a MiniMax fix (bafb4e6) applied to the
+    # whole Adam family, which silently moved Krea 2's DEFAULT optimizer off the library eps and
+    # shipped that way in v3.3.0. Krea 2 never had the failure this works around and never asked
+    # for the change. A workaround for one model family does not get to alter another's defaults;
+    # the caller that needs it asks for it. Explicit "eps=..." in Optimizer Args still wins.
+    if eps_floor_8bit and "8bit" in key and "lion" not in key:
         kwargs.setdefault("eps", 1e-6)
 
     try:

@@ -449,6 +449,23 @@ class BucketBatchManager:
             sd_latent = load_file(item_info.latent_cache_path)
             sd_te = load_file(item_info.text_encoder_output_cache_path)
             sd = {**sd_latent, **sd_te}
+            # MiniMax H3 reference distillation only: sibling `..._teref{N}.safetensors` files
+            # hold the TEACHER's conditioning (caption + a `<Picture 1>` vision block), its
+            # per-row modality tags, and that reference's own latent. Each item has one slot per
+            # paired reference; a slot is picked at RANDOM per step so the LoRA sees every
+            # pairing across an epoch while the teacher's sequence stays short.
+            #
+            # Gated on the files EXISTING, which they only do when a MiniMax cache pass ran with
+            # --reference_count — so Klein, Krea 2 and non-distillation H3 batches are unchanged.
+            _ref_te = item_info.text_encoder_output_cache_path
+            if _ref_te:
+                _stem, _ext = os.path.splitext(_ref_te)
+                _slots = [i for i in range(8) if os.path.exists(f"{_stem}ref{i}{_ext}")]
+                if _slots:
+                    _sd_ref = load_file(f"{_stem}ref{random.choice(_slots)}{_ext}")
+                    sd["ref_hidden_states"] = _sd_ref["hidden_states"]
+                    sd["ref_token_tags"] = _sd_ref["token_tags"]
+                    sd["ref_latent"] = _sd_ref["ref_latent"]
 
             for key, tensor in sd.items():
                 # Map Fizgig-native keys to training batch keys
@@ -461,6 +478,8 @@ class BucketBatchManager:
                     content_key = "latents"
                 elif key == "text_embed":
                     content_key = "ctx_vec"
+                elif key in ("ref_hidden_states", "ref_token_tags", "ref_latent"):
+                    content_key = key          # H3 distillation, passed through verbatim
                 elif key in ("hidden_states", "attention_mask"):
                     # Krea 2 text cache: multi-layer Qwen3-VL stack + validity mask
                     content_key = key
