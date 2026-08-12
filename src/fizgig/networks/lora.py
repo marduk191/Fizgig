@@ -1376,6 +1376,73 @@ _DIFFUSERS_SINGLE_QKV = [
 ]
 
 
+# Diffusers-name -> Fizgig-native renames for Krea 2, applied to FLATTENED kohya module names.
+# Straight from OneTrainer's own diffusers_to_original table (modules/model/Krea2Model.py) —
+# q/k/v are split in BOTH namespaces, so unlike Flux there is no QKV fusion stage, only renames.
+# Order matters: longest/most-specific first, so _attn_to_out_0 wins before _attn_to_o could.
+_KREA2_DIFFUSERS_RENAMES = (
+    ("_attn_to_out_0", "_attn_wo"),
+    ("_attn_to_gate", "_attn_gate"),
+    ("_attn_to_q", "_attn_wq"),
+    ("_attn_to_k", "_attn_wk"),
+    ("_attn_to_v", "_attn_wv"),
+    ("_ff_up", "_mlp_up"),
+    ("_ff_gate", "_mlp_gate"),
+    ("_ff_down", "_mlp_down"),
+)
+
+
+def _is_diffusers_krea2_lora(weights_sd: Dict[str, torch.Tensor]) -> bool:
+    """Krea 2 in diffusers naming (OneTrainer, AI-Toolkit, diffusers exports).
+
+    Must be checked BEFORE the Flux converter: both architectures use `transformer_blocks.` in
+    diffusers form, and the Flux converter would silently map a Krea 2 file onto
+    double_blocks/single_blocks names that do not exist there. The discriminators are modules
+    only Krea 2 has: the gated-MLP `ff.up/gate/down` (Flux's MLP is `ff.net.*`), the attention
+    output gate `attn.to_gate`, and the `text_fusion.` tower.
+    """
+    for k in weights_sd:
+        kk = k.replace("_", ".")        # catch the pre-flattened legacy form too
+        if (".ff.up." in kk or ".ff.gate." in kk or ".ff.down." in kk
+                or ".attn.to.gate." in kk or "text.fusion." in kk):
+            return True
+    return False
+
+
+def _krea2_diffusers_to_native(weights_sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Rename flattened diffusers-Krea 2 module names to the native ones our KreaDiT exposes.
+
+    Runs AFTER prefix stripping + dot flattening, so every key looks like
+    `lora_unet_transformer_blocks_0_attn_to_q.lora_down.weight`. Without this pass none of
+    those names exist in the model and create_network_from_weights builds zero modules —
+    "No LoRA modules found" (issue #50, OneTrainer Krea 2 LoRAs).
+    """
+    out: Dict[str, torch.Tensor] = {}
+    n = 0
+    for k, v in weights_sd.items():
+        mod, dot, rest = k.partition(".")
+        new_mod = mod
+        new_mod = re.sub(r"^lora_unet_transformer_blocks_(\d+)_", lambda m_: "lora_unet_blocks_" + m_.group(1) + "_", new_mod)
+        new_mod = new_mod.replace("lora_unet_text_fusion_", "lora_unet_txtfusion_")
+        for a, b in _KREA2_DIFFUSERS_RENAMES:
+            if a in new_mod:
+                new_mod = new_mod.replace(a, b)
+        # IO layers, for completeness (rarely trained, cheap to map): img_in -> first,
+        # final_layer.linear -> last.linear, txt_in linears -> the txtmlp Sequential slots.
+        new_mod = (new_mod
+                   .replace("lora_unet_img_in", "lora_unet_first")
+                   .replace("lora_unet_final_layer_linear", "lora_unet_last_linear")
+                   .replace("lora_unet_txt_in_linear_1", "lora_unet_txtmlp_1")
+                   .replace("lora_unet_txt_in_linear_2", "lora_unet_txtmlp_3")
+                   .replace("lora_unet_time_embed_linear_1", "lora_unet_tmlp_0")
+                   .replace("lora_unet_time_embed_linear_2", "lora_unet_tmlp_2"))
+        if new_mod != mod:
+            n += 1
+        out[new_mod + dot + rest] = v
+    logger.info("Krea 2 diffusers naming detected — renamed %d key(s) to native module names.", n)
+    return out
+
+
 def _is_diffusers_flux_lora(weights_sd: Dict[str, torch.Tensor]) -> bool:
     """Check if the state dict uses diffusers-style Flux key names."""
     for k in weights_sd:
@@ -1577,7 +1644,12 @@ def peft_to_kohya(weights_sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor
     """
     # Check for diffusers-style Flux keys (transformer_blocks / single_transformer_blocks)
     # These need full key remapping + QKV fusion, not just prefix stripping.
-    if _is_diffusers_flux_lora(weights_sd):
+    # Checked FIRST: Krea 2 and Flux both say `transformer_blocks.` in diffusers form, and the
+    # Flux converter would map a Krea 2 file onto block names that do not exist there. Krea 2
+    # needs no QKV fusion (q/k/v are split in both namespaces), so the ordinary strip+flatten
+    # below does the heavy lifting and the rename pass runs on the result at the end.
+    _krea2 = _is_diffusers_krea2_lora(weights_sd)
+    if not _krea2 and _is_diffusers_flux_lora(weights_sd):
         logger.info("Diffusers-format Flux LoRA detected (transformer_blocks) — converting with QKV fusion.")
         return _convert_diffusers_flux_lora(weights_sd)
 
@@ -1665,6 +1737,8 @@ def peft_to_kohya(weights_sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor
         f"[peft→kohya] converted {len(weights_sd)} keys → {len(converted)} "
         f"({len(ranks)} LoRA modules, alphas synthesized where absent)"
     )
+    if _krea2:
+        converted = _krea2_diffusers_to_native(converted)
     return converted
 
 
@@ -1692,6 +1766,11 @@ def ensure_kohya_lora_state_dict(weights_sd: Dict[str, torch.Tensor]) -> Dict[st
         n_renamed = sum(1 for k in weights_sd if k.startswith("lora_transformer_"))
         logger.info("OneTrainer legacy format detected — renamed %d lora_transformer_ keys to lora_unet_", n_renamed)
         weights_sd = renamed
+        # The module paths are still diffusers-shaped after the prefix swap. A Krea 2 file
+        # (ff_up / attn_to_gate / text_fusion markers) needs the same rename pass the dotted
+        # form gets in peft_to_kohya, or none of its names exist in the model (issue #50).
+        if _is_diffusers_krea2_lora(weights_sd):
+            weights_sd = _krea2_diffusers_to_native(weights_sd)
 
     if fmt == "peft":
         logger.info("PEFT/diffusers-format LoRA detected — converting key names to kohya convention.")

@@ -403,26 +403,102 @@ class MiniMaxH3VideoVAEDecoder(nn.Module):
         decoder ever saw (measured: 16 dB and visibly dark). See `single_frame_mode` above for
         which replication scheme runs."""
         if z.shape[2] != 1:
-            raise NotImplementedError(
-                "MiniMax H3 decode here is single-frame (latent_t == 1); multi-frame needs the "
-                "reference's temporal chunking, which is not ported.")
-        n_rep, _ = self._pad_and_index()
+            return self.decode_clip(z)
+        n_rep, keep = self._pad_and_index()
         lm = self.latents_mean.view(1, -1, 1, 1, 1).to(z)
         ls = self.latents_std.view(1, -1, 1, 1, 1).to(z)
         # Follow the module's own dtype rather than forcing fp32: this decoder is 2.4 B params,
-        # so fp32 residency is 9.7 GB against bf16's 4.8 GB — a difference that matters when it
-        # is loaded on top of the resident base for a preview.
+        # so fp32 residency is 9.7 GB against 4.8 GB for a 16-bit dtype — a difference that
+        # matters when it is loaded on top of the resident base for a preview. Callers should
+        # load it FP16 (the weights' native format, and the only 16-bit dtype ComfyUI permits
+        # for this VAE), not bf16.
         w_dtype = self.post_quant_conv.weight.dtype
         # post_quant_conv is a real learned 1x1x1 channel mix, NOT an identity — skipping it
         # leaves the image structurally recognisable but badly wrong (measured: 7 dB PSNR).
         zz = self.post_quant_conv((z * ls + lm).to(w_dtype)).repeat(1, 1, n_rep, 1, 1)
-        dec = self._tiled_decode(zz)                    # -> [B, 3, H*16, W*16]
+        dec = self._tiled_decode(zz)[:, :, keep]        # -> [B, 3, H*16, W*16]
         dec = dec.float() * self.pixel_std.to(dec)[:, :, 0] + self.pixel_mean.to(dec)[:, :, 0]
         return dec.clamp_(0.0, 1.0)
 
+    # --- multi-frame decode: the reference's temporal chunking, ported ------------------------
+    # comfy/ldm/minimax/vae.py::decode_temporal with its constants resolved for this VAE:
+    # vae_ratio_t=4, clip_length=17 -> tokens_chunk_size=5, token_overlap=(-3)%5=2,
+    # frame_pre_padding=(-17)%4=3, frame_overlap=max(2*4-3,0)=5. Each chunk decodes 5+2
+    # latent tokens spatially tiled, drops the 3-frame causal lead-in, keeps the first 17
+    # frames, and cross-fades a 5-frame overlap into the next chunk — so 5n+2 latents come
+    # back as exactly 17n+5 pixel frames.
+    _RATIO_T = 4
+    _CHUNK_TOK = 5
+    _TOK_OVERLAP = 2
+    _PRE_PAD = 3
+    _FRAME_OVERLAP = 5
+
+    @torch.no_grad()
+    def decode_clip(self, z):
+        """z: normalized latent [B, 24, T_lat, H, W] (T_lat on the 5n+2 grid) ->
+        pixels [B, 3, 17n+5, H*16, W*16] in [0, 1]."""
+        from fizgig.minimax.model import pixel_frames_for_latent
+        out_frames = pixel_frames_for_latent(int(z.shape[2]))    # validates the grid too
+        lm = self.latents_mean.view(1, -1, 1, 1, 1).to(z)
+        ls = self.latents_std.view(1, -1, 1, 1, 1).to(z)
+        w_dtype = self.post_quant_conv.weight.dtype
+        zz = self.post_quant_conv((z * ls + lm).to(w_dtype))
+
+        # token padding: pseudo length includes the 3 dropped-by-encode tokens
+        pseudo = zz.shape[2] + self._PRE_PAD
+        pad_tokens = (-pseudo) % self._CHUNK_TOK
+        num_chunks = (pseudo + pad_tokens) // self._CHUNK_TOK - 1
+        if num_chunks < 1:
+            pad_tokens += self._CHUNK_TOK
+            num_chunks += 1
+        if pad_tokens:
+            zz = torch.cat([zz, zz[:, :, -1:].repeat(1, 1, pad_tokens, 1, 1)], dim=2)
+
+        chunk_dec = self._CHUNK_TOK * self._RATIO_T
+        dec, dec_overlap, write_pos = None, None, 0
+
+        def write_part(part):
+            nonlocal dec, write_pos
+            if part.shape[2] <= 0:
+                return
+            if dec is None:
+                shape = list(part.shape)
+                shape[2] = out_frames
+                dec = torch.empty(shape, dtype=part.dtype, device=part.device)
+            n = min(part.shape[2], max(0, dec.shape[2] - write_pos))
+            if n > 0:
+                dec[:, :, write_pos:write_pos + n].copy_(part[:, :, :n])
+                write_pos += n
+
+        for i in range(num_chunks):
+            t0 = i * self._CHUNK_TOK
+            clip = zz[:, :, t0:t0 + self._CHUNK_TOK + self._TOK_OVERLAP]
+            clip_dec = self._tiled_decode(clip)                  # [B,3,4*tok,h,w], spatially tiled
+            for j in range(2):                                   # split_count with token_drop > 0
+                f0 = j * chunk_dec
+                f1 = min(f0 + chunk_dec, clip_dec.shape[2])
+                # the reference drops the 3-frame causal lead-in from EVERY split chunk:
+                # j=0 -> frames [3:20] (17 kept), j=1 -> [23:28] (the 5-frame overlap)
+                if j == 0:
+                    part = clip_dec[:, :, self._PRE_PAD:f1]
+                    if dec_overlap is not None:
+                        part = self._blend(dec_overlap, part, self._FRAME_OVERLAP, dim=-3)
+                        dec_overlap = None
+                    write_part(part)
+                else:
+                    dec_overlap = clip_dec[:, :, f0 + self._PRE_PAD:f1].contiguous()
+            if i == num_chunks - 1 and dec_overlap is not None:
+                write_part(dec_overlap)
+                dec_overlap = None
+            del clip_dec, clip
+
+        dec = dec.float() * self.pixel_std.to(dec) + self.pixel_mean.to(dec)
+        return dec.clamp_(0.0, 1.0)
+
     def _decode_tile(self, zz):
-        """One tile: the replicated clip in, the single kept frame out."""
-        return self.decoder(zz)[:, :, self._pad_and_index()[1]]
+        """One spatial tile: the full decoded clip [B, 3, 4*T, h*16, w*16] — temporal selection
+        is the caller's job (single-frame keeps one frame; decode_clip slices per chunk)."""
+        return self.decoder(zz)
 
     def _split_tiles(self, input_len):
         """Tile starts/lengths/overlaps in PIXELS, matching the reference's layout."""

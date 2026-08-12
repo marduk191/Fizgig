@@ -42,8 +42,16 @@ def cache_with_latent(name, h, w):
 
 check = ImageDataset.latent_cache_matches_reso
 
-ck("factors: klein 16, krea2 8",
-   LATENT_SPATIAL_FACTOR == {"klein9b": 16, "krea2": 8}, LATENT_SPATIAL_FACTOR)
+# Subset, not equality: the point is that the two factors this file exercises are right, and an
+# exact dict pins the table shut against new architectures. MiniMax H3 was added later (16x video
+# VAE) precisely because its ABSENCE made latent_cache_matches_reso return None for H3, so
+# --skip_existing re-encoded every image on each launch. An equality check would have called that
+# fix a regression. The guard that matters is that a known factor is never silently changed.
+for _arch, _factor in (("klein9b", 16), ("krea2", 8)):
+    ck(f"factor: {_arch} is {_factor}", LATENT_SPATIAL_FACTOR.get(_arch) == _factor,
+       LATENT_SPATIAL_FACTOR)
+ck("every registered factor is a positive int",
+   all(isinstance(v, int) and v > 0 for v in LATENT_SPATIAL_FACTOR.values()), LATENT_SPATIAL_FACTOR)
 
 # The issue-27 case: a fresh Klein cache at the run's own bucket must PASS.
 f = cache_with_latent("k1.safetensors", 31, 31)               # 496x496 bucket, packed /16

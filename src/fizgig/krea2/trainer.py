@@ -512,6 +512,34 @@ def _save_training_state(output_dir, output_name, network, optimizer, *, epoch, 
     _detect_latest_state_dir finds the highest-numbered one and passes it to --resume."""
     state_dir = os.path.join(output_dir, f"{output_name}-{epoch:06d}-state")
     os.makedirs(state_dir, exist_ok=True)
+    try:
+        return _write_state_files(state_dir, network, optimizer, epoch=epoch,
+                                  global_step=global_step, network_dim=network_dim,
+                                  network_alpha=network_alpha, dtype=dtype, extra=extra)
+    except Exception as _first:
+        # Clean the partial dir (no training_state.json = no commit marker, but it would shadow
+        # the previous good state in the GUI's latest-state scan), then retry ONCE after a short
+        # pause. Network filesystems (RunPod volumes) throw transient stream errors that clear
+        # in seconds — a real run lost its epoch-8 state to exactly one of those. If the retry
+        # also fails it is not transient; re-raise and let the caller decide fatality.
+        import shutil
+        import time
+        shutil.rmtree(state_dir, ignore_errors=True)
+        logger.warning("[state] save failed (%s: %s) — retrying once in 5s",
+                       type(_first).__name__, _first)
+        time.sleep(5)
+        try:
+            os.makedirs(state_dir, exist_ok=True)
+            return _write_state_files(state_dir, network, optimizer, epoch=epoch,
+                                      global_step=global_step, network_dim=network_dim,
+                                      network_alpha=network_alpha, dtype=dtype, extra=extra)
+        except Exception:
+            shutil.rmtree(state_dir, ignore_errors=True)
+            raise
+
+
+def _write_state_files(state_dir, network, optimizer, *, epoch, global_step,
+                       network_dim, network_alpha, dtype, extra=None):
     _save_lora(network, os.path.join(state_dir, "lora.safetensors"), network_dim, network_alpha, dtype)
     torch.save(optimizer.state_dict(), os.path.join(state_dir, "optimizer.pt"))
     rng = {"torch": torch.get_rng_state()}
@@ -523,12 +551,66 @@ def _save_training_state(output_dir, output_name, network, optimizer, *, epoch, 
         meta.update(extra)
     with open(os.path.join(state_dir, "training_state.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f)
+    # training_state.json is written LAST on purpose: it is the commit marker. A save that
+    # dies partway leaves no json, and both the resume validator and the GUI's latest-state
+    # detection treat a json-less dir as not-a-state rather than resuming garbage.
     logger.info(f"[state] saved -> {state_dir}")
     return state_dir
 
 
+def _validate_state_dir(state_dir):
+    """Refuse anything that is not a saved training state, and say what to pick instead.
+
+    Issue #48: choosing the OUTPUT directory rather than a state folder failed with a bare
+    "lora.safetensors not found", and the obvious workaround — putting a LoRA there under that
+    name — then appeared to work. It cannot: without training_state.json there is no epoch or
+    step, and without optimizer.pt there is no Adam state, so the run silently starts over from
+    epoch 0 while looking like a resume, and overwrites the finished LoRA on the way. Refusing
+    is the only safe answer, and the message has to name the folder they actually wanted.
+    """
+    if os.path.isfile(state_dir):
+        sib = ""
+        base = os.path.dirname(state_dir)
+        try:
+            states = sorted(d for d in os.listdir(base) if d.endswith("-state")
+                            and os.path.isfile(os.path.join(base, d, "training_state.json")))
+            if states:
+                sib = " Next to it: " + ", ".join(states[-3:])
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"[resume] {os.path.basename(state_dir)} is a file — resume takes the saved-state "
+            f"FOLDER (named like '<lora name>-000012-state'), not a .safetensors.{sib}")
+    if not os.path.isdir(state_dir):
+        raise RuntimeError(f"[resume] {state_dir} does not exist — was the state folder moved "
+                           f"or renamed?")
+    missing = [f for f in ("lora.safetensors", "training_state.json")
+               if not os.path.isfile(os.path.join(state_dir, f))]
+    if not missing:
+        return
+    lines = [
+        f"[resume] {state_dir} is not a saved training state — missing {', '.join(missing)}.",
+        "[resume] Pick the folder named like '<lora name>-000012-state'. Renaming a LoRA to "
+        "lora.safetensors does not make one: there would be no optimizer state and no epoch "
+        "to resume from, so the run would quietly start again from scratch.",
+    ]
+    try:
+        # The usual mistake is picking the parent output directory, one level above the state
+        # folders — so if they are sitting right there, name them.
+        here = sorted(d for d in os.listdir(state_dir)
+                      if d.endswith("-state")
+                      and os.path.isfile(os.path.join(state_dir, d, "training_state.json")))
+        if here:
+            lines.append("[resume] That looks like your output directory. The saved states in "
+                         "it are: " + ", ".join(here[-5:]))
+    except OSError:
+        pass
+    raise RuntimeError(os.linesep.join(lines))
+
+
 def _load_training_state(state_dir, network, optimizer, *, device):
     """Restore network + optimizer + RNG from a state dir. Returns (start_epoch, global_step, meta)."""
+    _validate_state_dir(state_dir)
     from safetensors.torch import load_file
     # strict=False tolerates benign key drift, but if NOTHING matched the LoRA silently stays at
     # its zero init and the run "succeeds" while training from scratch — then overwrites the
@@ -1491,7 +1573,10 @@ def train_krea2(
     global_step = 0
     start_epoch = 0
     # Resume: restore LoRA + optimizer + RNG + (start_epoch, global_step) from a saved state dir.
-    if resume_state_dir and os.path.isdir(resume_state_dir):
+    # `if resume_state_dir` — NOT `and os.path.isdir(...)`: a requested resume whose path is bad
+    # (the .safetensors picked instead of its folder, a moved/typo'd dir) used to skip this block
+    # silently and train from scratch. If a resume was asked for, it happens or the run refuses.
+    if resume_state_dir:
         start_epoch, global_step, _resume_meta = _load_training_state(resume_state_dir, network, optimizer, device=device)
         if adaptive:
             adaptive.load_state_dict(_resume_meta.get("adaptive_lr_state"))
@@ -1904,11 +1989,24 @@ def train_krea2(
             # was flushed above, the adaptive-LR watcher has already made its call for this epoch,
             # and any queued caption updates are applied — so the optimizer is settled.
             if save_state:
-                _save_training_state(output_dir, output_name, network, optimizer,
-                                     epoch=epoch + 1, global_step=global_step,
-                                     network_dim=network_dim, network_alpha=network_alpha, dtype=dtype,
-                                     extra={"adaptive_lr_state": adaptive.state_dict()} if adaptive else None)
-                state_saved_this_epoch = True
+                # NON-FATAL by design. A real run (7 Aug, RunPod) died at 27% of 55 hours
+                # because rng.pt hit a full network volume — for a file whose only job is to
+                # make resume nicer. The checkpoint itself had already saved. State saving must
+                # never cost a run; if the disk is truly full, the next EPOCH CHECKPOINT will
+                # fail and that one is rightly fatal.
+                try:
+                    _save_training_state(output_dir, output_name, network, optimizer,
+                                         epoch=epoch + 1, global_step=global_step,
+                                         network_dim=network_dim, network_alpha=network_alpha, dtype=dtype,
+                                         extra={"adaptive_lr_state": adaptive.state_dict()} if adaptive else None)
+                    state_saved_this_epoch = True
+                except Exception as _se:
+                    logger.error("[state] saving the resume state FAILED (%s: %s). This is "
+                                 "almost always the disk — on RunPod the volume quota is "
+                                 "invisible from inside the pod (the dashboard is the only true "
+                                 "reading), so writes fail with no warning. Training continues; "
+                                 "this epoch has no resume point. The epoch checkpoint itself "
+                                 "already saved.", type(_se).__name__, _se)
                 prune_state_dirs(output_dir, output_name, keep_last_n_states)
 
         if (do_previews and sample_every_n_epochs and (epoch + 1) % sample_every_n_epochs == 0
@@ -2043,10 +2141,16 @@ def train_krea2(
                 logger.info(f"[pause] requested — state for epoch {epoch + 1} already saved; exiting cleanly")
             else:
                 logger.info(f"[pause] requested — saving state at epoch {epoch + 1} and exiting cleanly")
-                _save_training_state(output_dir, output_name, network, optimizer,
-                                     epoch=epoch + 1, global_step=global_step,
-                                     network_dim=network_dim, network_alpha=network_alpha, dtype=dtype,
-                                     extra={"adaptive_lr_state": adaptive.state_dict()} if adaptive else None)
+                try:
+                    _save_training_state(output_dir, output_name, network, optimizer,
+                                         epoch=epoch + 1, global_step=global_step,
+                                         network_dim=network_dim, network_alpha=network_alpha, dtype=dtype,
+                                         extra={"adaptive_lr_state": adaptive.state_dict()} if adaptive else None)
+                except Exception as _se:
+                    logger.error("[pause] state save FAILED (%s: %s) — there is NO new resume "
+                                 "point for this pause. Free disk space (on RunPod: check the "
+                                 "volume quota in the dashboard) and resume from the previous "
+                                 "saved state.", type(_se).__name__, _se)
             try:
                 os.remove(pause_flag)
             except Exception:
@@ -2063,11 +2167,18 @@ def train_krea2(
     # Skipped when the run trained nothing (resumed from a state already at the final epoch) —
     # the only dir we'd write is the one we resumed FROM, and the save overwrites in place.
     if save_state_on_train_end and max_train_epochs > start_epoch:
-        _save_training_state(output_dir, output_name, network, optimizer,
-                             epoch=max_train_epochs, global_step=global_step,
-                             network_dim=network_dim, network_alpha=network_alpha, dtype=dtype,
-                             extra={"adaptive_lr_state": adaptive.state_dict()} if adaptive else None)
-        prune_state_dirs(output_dir, output_name, keep_last_n_states)
+        # Non-fatal: the final LoRA is already on disk; dying here would turn a finished run red.
+        try:
+            _save_training_state(output_dir, output_name, network, optimizer,
+                                 epoch=max_train_epochs, global_step=global_step,
+                                 network_dim=network_dim, network_alpha=network_alpha, dtype=dtype,
+                                 extra={"adaptive_lr_state": adaptive.state_dict()} if adaptive else None)
+            prune_state_dirs(output_dir, output_name, keep_last_n_states)
+        except Exception as _se:
+            logger.error("[state] end-of-run state save FAILED (%s: %s) — the finished LoRA is "
+                         "saved and fine; only train-further-by-resume is affected. Free disk "
+                         "space (RunPod: dashboard quota) and re-run the last epoch if you need "
+                         "the state.", type(_se).__name__, _se)
 
     out = os.path.join(output_dir, f"{output_name}.safetensors")
     # Record the context LoRA in metadata so users know to pair it at the same strength at

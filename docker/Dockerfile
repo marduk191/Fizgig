@@ -51,7 +51,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-venv \
       python3-tk \
       git curl ca-certificates \
-      gcc libc6-dev \
+      gcc libc6-dev python3-dev \
       xvfb openbox x11-utils wmctrl \
       libxfont2 libgbm1 libgl1-mesa-dri libegl1 \
       libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
@@ -70,6 +70,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # cleanly when no cc exists, but shipping one is what makes compile actually WORK on pods —
 # it's a real speed win on the INT8/NF4 paths. Not build-essential: g++/make/dpkg-dev would
 # triple the size for nothing.
+# python3-dev rides with them for the same reason: triton's stubs #include <Python.h>, so a
+# compiler without the headers gets further and then dies with "Python.h: No such file or
+# directory" (reported by a RunPod user on Krea 2, 7 Aug 2026). The builder stage always had
+# it — the runtime is where compile actually runs.
 # pcmanfm is what makes the "Open folder" buttons work: _open_in_file_manager shells out to
 # xdg-open, which needs something to hand the folder to.
 #

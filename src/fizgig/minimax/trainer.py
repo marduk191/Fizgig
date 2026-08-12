@@ -34,6 +34,11 @@ logger = logging.getLogger(__name__)
 
 VIDEO_SIGMA_SHIFT_TRAIN = 12.0     # H3's video shift — also the reference TRAINING density
 
+# Identity-first phase 1 trains at this fraction of the Learning Rate box (Peter, 11 Aug). Phase
+# 1 places the identity on a near-zero adapter, where a full-size Adam stride does the most
+# damage and the least good; phase 2 then gets the full rate from a sensible starting point.
+_P1_LR_SCALE = 1.0 / 3.0
+
 # LoRA targets the transformer blocks' ATTENTION + MLP Linears (+ the 2-block text refiner).
 # The fp32 patch/head IO layers are left alone (wrapping them clashes fp32-base vs bf16-adapter).
 #
@@ -55,6 +60,24 @@ DEFAULT_INCLUDE_PATTERNS = [r"blocks\.\d+\.attn\..*", r"blocks\.\d+\.mlp\..*",
 # them. It also happened to carry our single highest per-element drift after a matched epoch
 # (0.0133 vs their 0.0068 max), so it was contributing noise rather than capability.
 PRUNED_INCLUDE_PATTERNS = DEFAULT_INCLUDE_PATTERNS + [r"blocks\.\d+\.adaln_proj\..*"]
+
+
+def clip_fallback_frames(frames: int) -> int:
+    """Next shorter clip length to retry with after a clip preview fails (in practice, OOM).
+
+    Halves the request and snaps down onto the model's 17n+5 grid, so a 141-frame OOM retries
+    at 56, then 22, and only then gives up on clips: 141 -> 56 -> 22 -> 1.
+
+    Stepping down rather than collapsing straight to a still matters because a still is the
+    MOST out-of-distribution render H3 has — ComfyUI cannot even construct one (its video
+    latent floor is 2 frames) and the trained band is ~124-362. Dropping a clip run to stills
+    on one OOM quietly replaces the previews being judged with the least trustworthy kind,
+    for the rest of the run. A shorter clip is still a clip.
+    """
+    half = int(frames) // 2
+    if half < 22:                      # below the first real grid point above a keyframe pair
+        return 1
+    return half - (half - 5) % 17      # largest 17n+5 value <= half
 
 
 def parse_block_spec(spec, num_blocks: int = None):
@@ -490,7 +513,7 @@ def lora_disabled(network):
 
 def compute_distill_loss(model, network, latent, text_plain, *, text_ref, ref_latents,
                          text_token_tags=None, distill_weight=0.8, shift=None, generator=None,
-                         noise=None, seed=0):
+                         noise=None, seed=0, parts_out=None):
     """Reference distillation: teach the LoRA to behave, from text alone, as if it had been
     shown the reference photo.
 
@@ -543,9 +566,19 @@ def compute_distill_loss(model, network, latent, text_plain, *, text_ref, ref_la
     student = model(noised, t, text_plain, audio_noise).float()
 
     w = float(distill_weight)
-    loss = w * F.mse_loss(student, teacher.detach())
+    teacher_mse = F.mse_loss(student, teacher.detach())
+    loss = w * teacher_mse
+    photo_mse = None
     if w < 1.0:
-        loss = loss + (1.0 - w) * F.mse_loss(student, (x0 - noise).float())
+        photo_mse = F.mse_loss(student, (x0 - noise).float())
+        loss = loss + (1.0 - w) * photo_mse
+    if parts_out is not None:
+        # The RAW errors, before the 0.8/0.2 weights. The weights are already known; what is not
+        # is how BIG each error is — and "how much of the learning comes from real pixels" is a
+        # question about the errors, not the weights. Matching a real photograph is harder than
+        # matching the model's own output, so the photo term can punch well above its weight.
+        parts_out["teacher"] = float(teacher_mse.detach())
+        parts_out["photo"] = float(photo_mse.detach()) if photo_mse is not None else 0.0
     return loss, float(sigma.reshape(-1)[0])
 
 
@@ -724,6 +757,450 @@ class AdaptiveLR:
 
 
 # ---------------------------------------------------------------------------
+# Per-block movement limiter — a compressor on the block bus.
+#
+# Empirical finding (8 Aug, three runs + a block-range A/B): whichever block sits LAST in the
+# trained range absorbs wildly disproportionate movement — 2-4x the median block from epoch 1,
+# and still diverging 40 epochs later. Cut blocks 46-49 and blocks 43-45 inherit the exact
+# same signature: the pathology is POSITIONAL, not a property of particular layers. The
+# deepest trained block gets the most coherent, least-attenuated gradient (everything after
+# it is frozen and decorrelates nothing), and Adam turns coherence into relentless movement.
+# The visible symptom is output-adjacent over-editing: distorted eyes and other
+# high-frequency damage.
+#
+# LR penalties and block cuts are positional patches for a positional problem — they just
+# relocate the hot spot. This limiter is self-targeting: after each optimizer step, any
+# block whose TOTAL RELATIVE movement (sum over its adapters of ||dW||/||W_base||, the same
+# metric the offline analysis used) exceeds `cap_factor x median block` is projected back to
+# the cap by scaling its up-factors. Blocks move freely until one hogs; then only that one
+# is pulled back, wherever the trained range ends.
+# ---------------------------------------------------------------------------
+class StepClipper:
+    """Cap how far any block may move in a SINGLE optimizer step.
+
+    Replaces the cumulative BlockLimiter that shipped in 3.5.0. That one clamped a block's
+    TOTAL accumulated movement back to cap x median, which necessarily scaled down everything
+    the block had legitimately learned in earlier epochs along with the overshoot — measured on
+    real runs as a genuine likeness ceiling: limiter ON was visibly worse than OFF, while OFF
+    corrupted. Clipping the STEP prevents the overshoot instead of undoing the history, so
+    there is no quality to trade for the safety.
+
+    Being per-step also removes the calibration problem that sank the movement governor: a
+    per-epoch budget has to be scaled by dataset size, and got it wrong by 7x on a 272-step
+    epoch, starving a run for 84 epochs. A step is a step on any dataset.
+
+    Measured in MODEL space — the change this step in each block's effective delta, summed in
+    quadrature across the block's modules — and cheap, because every term is a rank-sized
+    product via <kron(a,b), kron(c,d)> = <a,c><b,d> and <UV, XY> = tr(U^T X Y V^T). A full
+    weight matrix is never materialised. Over-cap blocks are lerped back toward their pre-step
+    weights, which is exact to first order in the step size (the delta is bilinear in the
+    factors, so the second-order term is negligible at real step sizes).
+
+    Self-calibrating: the cap is a multiple of the MEDIAN block's step, so it needs no absolute
+    threshold and targets whichever block is actually running hot — the caboose, wherever the
+    trained range happens to end.
+    """
+
+    def __init__(self, network, cap_factor: float = 1.25):
+        import re as _re
+        self.cap = float(cap_factor)
+        self.clamped_total = 0
+        self.clamp_counts = {}
+        self.groups = {}              # block id -> [module]
+        for m in getattr(network, "unet_loras", []):
+            blk = _re.search(r"blocks_(\d+)_", m.lora_name)
+            if blk is None or "token_refiner" in m.lora_name:
+                continue              # text-side refiner is not part of the depth argument
+            self.groups.setdefault(int(blk.group(1)), []).append(m)
+        # Pre-step parameter snapshot, allocated ONCE and copied into each step.
+        self._params = {blk: [p for m in mods for p in m.parameters() if p.requires_grad]
+                        for blk, mods in self.groups.items()}
+        self._prev = {blk: [p.detach().clone() for p in ps] for blk, ps in self._params.items()}
+        self._prev_f = {}             # per-module factor snapshot for the delta measurement
+        # Clip on each block's SMOOTHED step rate, not its instantaneous step. The caboose is a
+        # PERSISTENTLY hot block; a single step landing above the median is just noise, and
+        # per-step movement is far noisier than the cumulative quantity the retired limiter
+        # measured. Reusing 1.25x on the raw per-step value therefore braked whichever blocks
+        # were learning fastest on any given step — measured as a real quality loss that no LR
+        # change touched (halving the LR moved the dose by 8%).
+        self._rate = {}               # block id -> EMA of its per-step movement
+        self._clipped_steps = 0
+        self._total_steps = 0
+        self._tail = 0.0              # last measured peak/median ACCUMULATED movement
+
+    @staticmethod
+    def _factors(m):
+        """(a, b, scale) such that the module's delta is scale * a (x) b, for whichever form."""
+        if hasattr(m, "lokr_w1"):
+            return m.lokr_w1, m.lokr_w2, 1.0        # Fizgig LoKR: alpha 1.0, scale 1.0
+        return m.lora_up.weight, m.lora_down.weight, float(m.scale)
+
+    @classmethod
+    def _cum_sq(cls, m) -> float:
+        """||D||_F^2 for one module — its ACCUMULATED delta, not this step's."""
+        a, b, sc = cls._factors(m)
+        a, b = a.float(), b.float()
+        if hasattr(m, "lokr_w1"):
+            n = (a.norm() * b.norm()) ** 2
+        else:
+            n = torch.trace((a.T @ a) @ (b @ b.T)).clamp(min=0)
+        return float(n) * sc * sc
+
+    @classmethod
+    def _step_delta_sq(cls, m, prev) -> float:
+        """||D_post - D_pre||_F^2 for one module, without materialising D."""
+        a1, b1, sc = cls._factors(m)
+        a0, b0 = prev
+        a1, b1, a0, b0 = a1.float(), b1.float(), a0.float(), b0.float()
+        if hasattr(m, "lokr_w1"):
+            # <kron(a,b), kron(c,d)> = <a,c><b,d>
+            n1 = (a1.norm() * b1.norm()) ** 2
+            n0 = (a0.norm() * b0.norm()) ** 2
+            cross = (a1 * a0).sum() * (b1 * b0).sum()
+        else:
+            # <U1 V1, U0 V0> = tr(U1^T U0 V0 V1^T); ||UV||^2 = tr((U^T U)(V V^T))
+            n1 = torch.trace((a1.T @ a1) @ (b1 @ b1.T))
+            n0 = torch.trace((a0.T @ a0) @ (b0 @ b0.T))
+            cross = torch.trace((a1.T @ a0) @ (b0 @ b1.T))
+        return float((n1 + n0 - 2 * cross).clamp(min=0)) * sc * sc
+
+    @torch.no_grad()
+    def pre_step(self):
+        """Snapshot the weights the optimizer is about to move. Call BEFORE optimizer.step()."""
+        for blk, ps in self._params.items():
+            for dst, p in zip(self._prev[blk], ps):
+                dst.copy_(p.detach())
+        self._prev_f = {id(m): tuple(t.detach().clone() for t in self._factors(m)[:2])
+                        for mods in self.groups.values() for m in mods}
+
+    @torch.no_grad()
+    def step(self):
+        """Clip blocks whose SMOOTHED movement rate is running above cap x the pack's."""
+        import statistics as _st
+        if len(self.groups) < 3 or not self._prev_f:
+            return
+        moved = {blk: sum(self._step_delta_sq(m, self._prev_f[id(m)]) for m in mods) ** 0.5
+                 for blk, mods in self.groups.items()}
+        for blk, d in moved.items():
+            r = self._rate.get(blk)
+            self._rate[blk] = d if r is None else 0.9 * r + 0.1 * d
+        med = _st.median(self._rate.values())
+        self._total_steps += 1
+        if med <= 0:
+            return                                  # nothing has moved yet
+        cap = self.cap * med
+        # ACCUMULATION AWARENESS. Capping strides bounds how fast a block moves but not how far
+        # it has GOT — and a coherent run (which is what gradient accumulation produces) lets
+        # the caboose accumulate imbalance even while every stride is legal: measured at 2.02x
+        # the median block by epoch 2 with strides capped at 1.25x. The old limiter fixed that
+        # by scaling the block's accumulated delta down, which also destroyed what it had
+        # legitimately learned. Instead, a block that is ALREADY ahead simply gets a tighter
+        # step allowance until the pack catches up: no history is ever touched, the block just
+        # stops pulling further away. Squeeze is proportional and floored so it never freezes.
+        cums = {blk: sum(self._cum_sq(m) for m in mods) ** 0.5
+                for blk, mods in self.groups.items()}
+        med_cum = _st.median(cums.values())
+        self._tail = (max(cums.values()) / med_cum) if med_cum > 0 else 0.0
+        _fired = False
+        for blk, d in moved.items():
+            blk_cap = cap
+            if med_cum > 0 and cums[blk] > self.cap * med_cum:
+                # SQRT, not the raw ratio, and floored at 0.5. An already-ahead block is
+                # otherwise penalised twice over — once by the per-step cap for being above the
+                # median, again by this squeeze for being ahead — and those are the same late
+                # blocks every time, so the stacked penalty reads as a treble cut. At a 2.41x
+                # tail under a 2.0 cap the raw ratio pulled the effective cap down to 1.66;
+                # softened it is 1.82, so raising the cap actually raises it. Genuine runaways
+                # still get squeezed, just proportionally less hard.
+                blk_cap = cap * max(0.5, ((self.cap * med_cum) / cums[blk]) ** 0.5)
+            # TREND decides whether to act — that is what makes a persistently hot block (the
+            # caboose) the target and lets a one-off noisy step from a healthy block through.
+            # The TRIM is then applied to this actual step, not to the lagging average: scaling
+            # by cap/rate under-corrects badly (a 10x hog only came back to ~5.9x).
+            if self._rate[blk] <= blk_cap or d <= blk_cap:
+                continue
+            cap_ = blk_cap
+            s = cap_ / d
+            for p, prev in zip(self._params[blk], self._prev[blk]):
+                p.data.lerp_(prev, 1.0 - s)
+            # The trend must reflect what actually happened, not the pre-trim step, or it stays
+            # inflated and keeps re-triggering on a block that is now behaving.
+            self._rate[blk] -= 0.1 * (d - cap_)
+            self.clamped_total += 1
+            self.clamp_counts[blk] = self.clamp_counts.get(blk, 0) + 1
+            _fired = True
+        if _fired:
+            self._clipped_steps += 1
+
+    def epoch_report(self):
+        # The clip-rate is the number that matters as much as WHICH blocks: a cap that fires on
+        # most steps is braking the whole pack, not trimming a caboose, and that reads from the
+        # outside as "quality is worse" with no distortion to point at. A healthy run trims a
+        # few persistent blocks; if this says most steps, the cap is too tight for the dataset.
+        pct = (100.0 * self._clipped_steps / self._total_steps) if self._total_steps else 0.0
+        self._clipped_steps = self._total_steps = 0
+        tail = f" · tail {self._tail:.2f}x median" if self._tail else ""
+        if not self.clamp_counts:
+            return f"[clip] no block ran above the cap this epoch{tail}"
+        top = sorted(self.clamp_counts.items(), key=lambda kv: -kv[1])[:6]
+        n_blocks = len(self.clamp_counts)
+        self.clamp_counts = {}
+        return (f"[clip] fired on {pct:.0f}% of steps across {n_blocks} block(s){tail} — "
+                + ", ".join(f"block {b} x{n}" for b, n in top))
+
+
+class BlockLimiter:
+    """RETIRED (10 Aug) — kept only because the offline analysis scripts import _movement.
+
+    Superseded by StepClipper: clamping CUMULATIVE movement also scaled down legitimately
+    learned history, which measurably capped likeness. Do not wire this into the loop."""
+
+    def __init__(self, network, dit, cap_factor: float = 1.5):
+        import re as _re
+        self.cap = float(cap_factor)
+        self.clamped_total = 0
+        self.clamp_counts = {}
+        # Own the module map, by ISINSTANCE — the shared _build_dit_linear_map filters on the
+        # exact class NAME "Linear", which made the int8 base's ConvRotInt8Linear (and bnb's
+        # Linear4bit) invisible: on a real base the limiter watched ZERO blocks and reported
+        # "no block exceeded the cap" while the caboose ran hot. Both are nn.Linear subclasses.
+        linear_map = {"lora_unet_" + n.replace(".", "_"): m
+                      for n, m in dit.named_modules() if isinstance(m, torch.nn.Linear)}
+        self.groups = {}          # block id -> [(module, base_norm)]
+        for m in getattr(network, "unet_loras", []):
+            blk = _re.search(r"blocks_(\d+)_", m.lora_name)
+            if blk is None or "token_refiner" in m.lora_name:
+                continue          # text-side refiner is not part of the depth argument
+            target = linear_map.get(m.lora_name)
+            bn = self._base_norm(target) if target is not None else None
+            if bn:
+                self.groups.setdefault(int(blk.group(1)), []).append((m, bn))
+
+    @staticmethod
+    def _base_norm(mod) -> float:
+        """||W_base||_F for whichever storage the base uses. The ConvRot rotation is
+        orthogonal, so the norm of the int8 codes x scales IS the true weight norm."""
+        import torch as _t
+        with _t.no_grad():
+            if hasattr(mod, "qdata"):                        # ConvRotInt8Linear
+                return float((mod.qdata.float() * mod.wscale.float()).norm())
+            w = getattr(mod, "weight", None)
+            if w is None:
+                return 0.0
+            if w.__class__.__name__ == "Params4bit":         # bnb NF4 shell
+                try:
+                    import bitsandbytes.functional as _bf
+                    return float(_bf.dequantize_4bit(w.data, w.quant_state).float().norm())
+                except Exception:
+                    return 0.0
+            return float(w.float().norm())
+
+    @staticmethod
+    def _movement(m) -> float:
+        """||dW||_F for one adapter, exactly as the offline analysis computes it."""
+        import torch as _t
+        with _t.no_grad():
+            if hasattr(m, "lokr_w1"):
+                return float(m.lokr_w1.float().norm() * m.lokr_w2.float().norm()) * float(m.scale)
+            up, dn = m.lora_up.weight.float(), m.lora_down.weight.float()
+            g = _t.trace((up.T @ up) @ (dn @ dn.T)).clamp(min=0)
+            return float(g.sqrt()) * float(m.scale)
+
+    @torch.no_grad()
+    def step(self):
+        """Project any over-cap block back to cap_factor x median. Cheap: rank-sized matmuls.
+
+        The metric is RAW ||dW|| per block — NOT movement relative to the block's base norm.
+        It used to be relative, and a real run showed why that leaks: damage correlates with
+        raw delta (the whole dose-response table is in raw units), late blocks have LARGER
+        base weights, so the relative metric granted the tail extra raw allowance — while
+        the limiter held every block to 1.25x in ITS units, the tail crept to 2.34x median
+        in raw units, over the damage threshold the governor was holding the pack under.
+        All H3 blocks are identical shapes, so raw norms are directly comparable."""
+        import statistics as _st
+        rel = {}
+        for blk, mods in self.groups.items():
+            rel[blk] = sum(self._movement(m) for m, _bn in mods)
+        if len(rel) < 3:
+            return
+        med = _st.median(rel.values())
+        if med <= 0:
+            return                                            # nothing has moved yet
+        cap = self.cap * med
+        for blk, r in rel.items():
+            if r <= cap:
+                continue
+            s = cap / r
+            for m, _bn in self.groups[blk]:
+                if hasattr(m, "lokr_w2"):
+                    m.lokr_w2.mul_(s)                         # delta scales linearly in w2
+                else:
+                    m.lora_up.weight.mul_(s)
+            self.clamped_total += 1
+            self.clamp_counts[blk] = self.clamp_counts.get(blk, 0) + 1
+
+    def epoch_report(self):
+        if not self.clamp_counts:
+            return "[limiter] no block exceeded the cap this epoch"
+        top = sorted(self.clamp_counts.items(), key=lambda kv: -kv[1])[:6]
+        msg = "[limiter] clamped " + ", ".join(f"block {b} x{n}" for b, n in top)
+        self.clamp_counts = {}
+        return msg
+
+
+class AdapterRamp:
+    """Hold each step at a constant FRACTION of the adapter's current size, ramping the LR up
+    toward the configured ceiling as the adapter grows.
+
+    The observation this comes from: an adapter at ||dW|| ~53, trained slowly for 92 epochs,
+    took a full 2e-4 for ten epochs with no distortion at all and produced the best likeness of
+    the project. A fresh adapter at ||dW|| ~3 is visibly damaged by half that. The rate was
+    never the problem — the SAME step is a 9% perturbation of a mature adapter and a 150%
+    perturbation of a new one. A LoRA starts at exactly zero, so the ratio of step size to
+    adapter size is at its worst on step one and improves monotonically from there.
+
+    Which means the conventional schedule is backwards for adapters. Warmup-then-decay is built
+    for models that start from a sensible initialisation; here it is too hot when the adapter is
+    tiny and too cold once the adapter could take it. This ramps the other way.
+
+    Why it needs no calibration, unlike the retired movement governor: the governor servoed on
+    an ABSOLUTE movement rate, which depends on dataset size, network type and model width — it
+    was wrong by 7x on a 272-step epoch. `step / ||dW||` is dimensionless, so one target
+    transfers across datasets, LoRA vs LoKR, and any model size.
+
+    At equilibrium the adapter grows exponentially (d||dW||/dt = rho*||dW||) until the LR hits
+    the ceiling, after which growth returns to linear. rho is therefore best read as a growth
+    rate: 0.005/step doubles the adapter roughly every 140 steps."""
+
+    def __init__(self, network, target_rel: float = 0.005, start_mult: float = 0.1):
+        self.target = float(target_rel)
+        self.mult = float(start_mult)
+        self._smooth = None
+        self._prev = None
+        self.params = [p for p in network.parameters() if p.requires_grad]
+        self._mods = [m for m in getattr(network, "unet_loras", [])]
+
+    @torch.no_grad()
+    def _size(self) -> float:
+        """||dW|| across the whole adapter — model-space, not parameter-space."""
+        return sum(StepClipper._cum_sq(m) for m in self._mods) ** 0.5
+
+    @torch.no_grad()
+    def step(self) -> float:
+        cur = self._size()
+        if self._prev is None or cur <= 1e-9:
+            self._prev = cur
+            return self.mult
+        rel = max(0.0, cur - self._prev) / cur      # this step as a fraction of what exists
+        self._prev = cur
+        self._smooth = rel if self._smooth is None else 0.9 * self._smooth + 0.1 * rel
+        if self._smooth > 1e-12:
+            err = self._smooth / self.target
+            # Per-step gain caps, both damped after a real run hunted and then DAMAGED the
+            # model on the way back up: 22 -> 77 -> 73 -> 68 -> 63 -> 29 -> 100 across
+            # consecutive epochs, and the jump to 100% hit an adapter that was not ready for
+            # it. The RELEASE rate is therefore a safety parameter in its own right, not a
+            # tuning nicety — the old 1.03 compounds to 3.9x over a 46-step epoch, enough to
+            # go from a third of the ceiling to all of it in one epoch. 1.01 caps that at
+            # ~1.6x per epoch, so the ceiling is approached over several epochs and the
+            # adapter has time to grow into it.
+            #
+            # The old 0.70 down cap compounds to 4e-8 over the same epoch — a 12:1 asymmetry
+            # against the up-gain that caused the slam-to-floor half of the oscillation, whose
+            # rebound was what overshot. 0.95 keeps a safety bias (still ~5x faster down than
+            # up) without flooring the LR from a single noisy reading.
+            self.mult = min(1.0, max(0.02, self.mult * min(1.01, max(0.95, err ** -0.3))))
+        return self.mult
+
+    def epoch_report(self) -> str:
+        rel = (self._smooth or 0.0)
+        return (f"[ramp] adapter ||dW||={self._prev or 0:.2f}, growing {100 * rel:.3f}%/step "
+                f"(target {100 * self.target:.3f}%) — LR at {100 * self.mult:.0f}% of the "
+                f"configured ceiling")
+
+
+def should_reassert_lr(*, resuming, adaptive, ramp, warmup_steps, global_step) -> bool:
+    """Does anything write param_group['lr'] from here on? If not, a resume must reassert the
+    CONFIGURED rate.
+
+    torch's optimizer.load_state_dict restores the saved param_groups INCLUDING lr, and the
+    step loop only writes lr while warmup is still ramping. A state written while something
+    WAS modulating the LR (the retired movement governor throttled it) therefore handed its
+    last throttled rate to a run that no longer modulates anything, and kept it for the whole
+    run — measured on a real run as 3.28e-5 against a configured 2e-4.
+
+    The subtle case, and the one the first version of this fix got wrong: warmup CONFIGURED but
+    already FINISHED. warmup_steps > 0 is not the question — `global_step < warmup_steps` is."""
+    if not resuming:
+        return False
+    if adaptive is not None:
+        return False        # adaptive owns the LR; its restored mid-flight value is correct
+    if ramp is not None:
+        return False        # the adapter ramp rewrites lr every step
+    if warmup_steps and global_step < warmup_steps:
+        return False        # the warmup ramp rewrites lr every step until it ends
+    return True
+
+
+class EMAWeights:
+    """Exponential moving average of the trainable adapter — the smooth center of a rough
+    trajectory.
+
+    High static LRs take big Adam strides that zigzag around the good solution; the raw
+    weights at any single step are one corner of the zigzag, and that roughness reads as
+    distortion in samples. The EMA is the running average of the path, so what gets SAVED
+    (and previewed) is the center the strides orbit — the standard diffusion-training cure
+    for exactly this. Training itself always runs on the raw weights: swap_in/swap_out
+    bracket saves and previews only.
+
+    Decay ramps in as min(decay, (1+n)/(10+n)) so the first steps track the weights closely
+    instead of anchoring to the zero init. Shadow is fp32 (the adapter is small)."""
+
+    def __init__(self, network, decay: float):
+        self.decay = float(decay)
+        self.n = 0
+        self.params = [p for p in network.parameters() if p.requires_grad]
+        self.shadow = [p.detach().clone().float() for p in self.params]
+        self._backup = None
+
+    @torch.no_grad()
+    def update(self):
+        self.n += 1
+        d = min(self.decay, (1 + self.n) / (10 + self.n))
+        for s, p in zip(self.shadow, self.params):
+            s.mul_(d).add_(p.detach().float(), alpha=1.0 - d)
+
+    @torch.no_grad()
+    def swap_in(self):
+        """Put the averaged weights into the live network (for a save or a preview).
+
+        The raw-weight backup lives on CPU: swap_in brackets previews, and a clip preview
+        is exactly when GPU headroom is scarcest — a GPU-resident backup (~0.6 GB at LoKR
+        factor 8) was part of what tipped 32 GB cards back into the Windows VRAM spill."""
+        self._backup = [p.detach().to("cpu", copy=True) for p in self.params]
+        for s, p in zip(self.shadow, self.params):
+            p.data.copy_(s.to(p.device, p.dtype))
+
+    @torch.no_grad()
+    def swap_out(self):
+        """Restore the raw training weights. Must always pair with swap_in."""
+        for b, p in zip(self._backup, self.params):
+            p.data.copy_(b.to(p.device, p.dtype))
+        self._backup = None
+
+    def state_dict(self):
+        return {"n": self.n, "decay": self.decay,
+                "shadow": [s.detach().cpu() for s in self.shadow]}
+
+    def load_state_dict(self, sd):
+        self.n = int(sd["n"])
+        if len(sd["shadow"]) != len(self.shadow):
+            raise ValueError(f"EMA state has {len(sd['shadow'])} tensors, network has "
+                             f"{len(self.shadow)} — different run configuration?")
+        self.shadow = [t.to(s.device, torch.float32) for t, s in zip(sd["shadow"], self.shadow)]
+
+
+# ---------------------------------------------------------------------------
 # Full image-only training loop (NF4 base + LoRA) over the H3 caches.
 # ---------------------------------------------------------------------------
 class _Collator:
@@ -741,7 +1218,7 @@ class _Collator:
 
 
 def _save_training_state(output_dir, output_name, network, optimizer, *, epoch, global_step,
-                         dtype, extra=None):
+                         dtype, extra=None, ema=None):
     """Save a resumable training-state dir matching Klein/Krea 2 naming: <name>-<NNNNNN>-state/.
 
     NNNNNN is the number of COMPLETED epochs (= the next 0-indexed epoch to run). Holds the
@@ -751,10 +1228,41 @@ def _save_training_state(output_dir, output_name, network, optimizer, *, epoch, 
     import json
     state_dir = os.path.join(output_dir, f"{output_name}-{epoch:06d}-state")
     os.makedirs(state_dir, exist_ok=True)
+    try:
+        return _write_state_files(state_dir, network, optimizer, epoch=epoch,
+                                  global_step=global_step, dtype=dtype, extra=extra, ema=ema)
+    except Exception as _first:
+        # Clean the partial dir (no training_state.json = no commit marker, but it would shadow
+        # the previous good state in the GUI's latest-state scan), then retry ONCE after a short
+        # pause. Network filesystems (RunPod volumes) throw transient stream errors that clear
+        # in seconds — a real run lost its epoch-8 state to exactly one of those. If the retry
+        # also fails it is not transient; re-raise and let the caller decide fatality.
+        import shutil
+        import time
+        shutil.rmtree(state_dir, ignore_errors=True)
+        logger.warning("[state] save failed (%s: %s) — retrying once in 5s",
+                       type(_first).__name__, _first)
+        time.sleep(5)
+        try:
+            os.makedirs(state_dir, exist_ok=True)
+            return _write_state_files(state_dir, network, optimizer, epoch=epoch,
+                                      global_step=global_step, dtype=dtype, extra=extra, ema=ema)
+        except Exception:
+            shutil.rmtree(state_dir, ignore_errors=True)
+            raise
+
+
+def _write_state_files(state_dir, network, optimizer, *, epoch, global_step,
+                       dtype, extra=None, ema=None):
+    import json
     network.save_weights(os.path.join(state_dir, "lora.safetensors"), dtype,
                          {"ss_architecture": ARCHITECTURE_MINIMAX,
                           "ss_network_module": "fizgig.minimax (state dir, native keys)"})
     torch.save(optimizer.state_dict(), os.path.join(state_dir, "optimizer.pt"))
+    if ema is not None:
+        # The RAW weights are what lora.safetensors holds (training resumes from them); the
+        # EMA shadow rides alongside so the average survives pause/resume too.
+        torch.save(ema.state_dict(), os.path.join(state_dir, "ema.pt"))
     rng = {"torch": torch.get_rng_state()}
     if torch.cuda.is_available():
         rng["cuda"] = torch.cuda.get_rng_state_all()
@@ -764,12 +1272,66 @@ def _save_training_state(output_dir, output_name, network, optimizer, *, epoch, 
         meta.update(extra)
     with open(os.path.join(state_dir, "training_state.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f)
+    # training_state.json is written LAST on purpose: it is the commit marker. A save that
+    # dies partway leaves no json, and both the resume validator and the GUI's latest-state
+    # detection treat a json-less dir as not-a-state rather than resuming garbage.
     logger.info(f"[state] saved -> {state_dir}")
     return state_dir
 
 
+def _validate_state_dir(state_dir):
+    """Refuse anything that is not a saved training state, and say what to pick instead.
+
+    Issue #48: choosing the OUTPUT directory rather than a state folder failed with a bare
+    "lora.safetensors not found", and the obvious workaround — putting a LoRA there under that
+    name — then appeared to work. It cannot: without training_state.json there is no epoch or
+    step, and without optimizer.pt there is no Adam state, so the run silently starts over from
+    epoch 0 while looking like a resume, and overwrites the finished LoRA on the way. Refusing
+    is the only safe answer, and the message has to name the folder they actually wanted.
+    """
+    if os.path.isfile(state_dir):
+        sib = ""
+        base = os.path.dirname(state_dir)
+        try:
+            states = sorted(d for d in os.listdir(base) if d.endswith("-state")
+                            and os.path.isfile(os.path.join(base, d, "training_state.json")))
+            if states:
+                sib = " Next to it: " + ", ".join(states[-3:])
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"[resume] {os.path.basename(state_dir)} is a file — resume takes the saved-state "
+            f"FOLDER (named like '<lora name>-000012-state'), not a .safetensors.{sib}")
+    if not os.path.isdir(state_dir):
+        raise RuntimeError(f"[resume] {state_dir} does not exist — was the state folder moved "
+                           f"or renamed?")
+    missing = [f for f in ("lora.safetensors", "training_state.json")
+               if not os.path.isfile(os.path.join(state_dir, f))]
+    if not missing:
+        return
+    lines = [
+        f"[resume] {state_dir} is not a saved training state — missing {', '.join(missing)}.",
+        "[resume] Pick the folder named like '<lora name>-000012-state'. Renaming a LoRA to "
+        "lora.safetensors does not make one: there would be no optimizer state and no epoch "
+        "to resume from, so the run would quietly start again from scratch.",
+    ]
+    try:
+        # The usual mistake is picking the parent output directory, one level above the state
+        # folders — so if they are sitting right there, name them.
+        here = sorted(d for d in os.listdir(state_dir)
+                      if d.endswith("-state")
+                      and os.path.isfile(os.path.join(state_dir, d, "training_state.json")))
+        if here:
+            lines.append("[resume] That looks like your output directory. The saved states in "
+                         "it are: " + ", ".join(here[-5:]))
+    except OSError:
+        pass
+    raise RuntimeError(os.linesep.join(lines))
+
+
 def _load_training_state(state_dir, network, optimizer, *, device):
     """Restore network + optimizer + RNG from a state dir. Returns (start_epoch, global_step, meta)."""
+    _validate_state_dir(state_dir)
     import json
     from safetensors.torch import load_file
     # strict=False tolerates benign key drift, but if NOTHING matched the network silently stays
@@ -875,7 +1437,14 @@ def train_minimax(
     train_adaln: bool = True,        # False = drop adaln_proj from the targets (pruned only)
     distill: bool = False,           # reference distillation (references come from the dataset)
     distill_weight: float = 0.8,     # teacher share of the loss; the rest is the real photo
+    distill_phase1_epochs: int = -1,  # identity-first: teacher-ONLY epochs, then photos-only
+                                      # (-1 = auto from dataset size, 0 = off/blended)
     slow_blocks: str = None,         # block spec trained at a reduced LR ("21-49")
+    block_limit: float = 0.0,   # >0 = per-block movement cap at N x the median block (the limiter)
+    adapter_ramp: float = 0.0,  # >0 = hold each step at this FRACTION of the adapter's size
+    gradient_accumulation_steps: int = 1,  # batches summed per optimizer step (effective batch)
+    lr_warmup_epochs: float = 0.0,  # >0 = linear LR ramp over the first N epochs (static LR only)
+    ema_decay: float = 0.0,     # >0 = save/preview the EMA of the adapter instead of raw weights
     slow_block_lr_scale: float = 1.0,  # the multiplier applied to those blocks' LR
     quantize: bool = True,           # NF4 the base (QLoRA); False = bf16 base (needs ~66 GB VRAM)
     shift: float = None,             # None = auto resolution schedule (logit-normal); float = legacy
@@ -899,6 +1468,7 @@ def train_minimax(
     # (measured seam energy 4.0 on an off-manifold latent vs 1.05 on a real one).
     sample_steps: int = 28,
     sample_cfg_scale: float = 1.0,
+    sample_frames: int = 1,      # pixel frames on the 17n+5 grid; 1 = classic still
     sample_negative: str = None,
     sample_seed: int = 42,
     # Output metadata (recorded in the saved LoRA).
@@ -1072,8 +1642,11 @@ def train_minimax(
             do_previews = False
 
     # ---- base (NF4-frozen) + trainable LoRA over the transformer blocks ----
+    # adaln_fp32 matches ComfyUI's curve-checkpoint dtype, but only when AdaLN is NOT a LoRA
+    # target — a bf16 adapter cannot take an fp32 activation from the Linear it wraps.
     dit = load_minimax_h3_dit(dit_path, device=device, compute_dtype=dtype, quantize=quantize,
-                              blocks_to_swap=n_swap, base_quant=base_quant)
+                              blocks_to_swap=n_swap, base_quant=base_quant,
+                              adaln_fp32=not train_adaln)
     dit.requires_grad_(False)                                   # frozen base (QLoRA-style)
     if n_swap > 0:
         n_swap = dit.enable_block_swap(n_swap)                  # sets the JIT-move boundary
@@ -1112,10 +1685,14 @@ def train_minimax(
                     "included. Nobody has mapped what H3's blocks do — judge this against a "
                     "full-model run on the same dataset, not on its own.",
                     _blocks_used, len(_sel), _n_blocks)
+    # Report what is ACTUALLY targeted: this used to key off the checkpoint alone, so a run with
+    # --no_train_adaln announced "+ AdaLN" one line after saying AdaLN adapters were off.
+    _adaln_on = bool(dit.pruned_adaln and train_adaln)
     logger.info("[base] %s checkpoint; LoRA targets: attention + MLP + token refiner%s",
                 "pruned (curve-table AdaLN)" if dit.pruned_adaln else "full bf16",
-                " + AdaLN (deploy-consistent on this build; rank caps at 8)"
-                if dit.pruned_adaln else " (AdaLN excluded - dropped by pruned inference builds)")
+                " + AdaLN (deploy-consistent on this build; rank caps at 8)" if _adaln_on
+                else (" (AdaLN excluded - turned off for this run)" if dit.pruned_adaln
+                      else " (AdaLN excluded - dropped by pruned inference builds)"))
     if network_type == "lokr":
         # LoKR (Kronecker) — same mechanism as Krea 2's: module_class swaps the parametrization
         # inside the identical scan/wrap machinery, so include_patterns (adaln exclusion) and the
@@ -1227,6 +1804,43 @@ def train_minimax(
                                                   optimizer_args, eps_floor_8bit=True)
     logger.info(f"optimizer: {optimizer_label} @ lr={learning_rate:.3e}")
 
+    limiter = None
+    if block_limit and float(block_limit) > 0:
+        limiter = StepClipper(network, float(block_limit))
+        logger.info(f"[clip] per-step movement cap ON at {float(block_limit):g}x the median "
+                    f"block ({len(limiter.groups)} blocks watched) — whichever block overshoots "
+                    f"in a single step gets pulled back to the pack, wherever the trained range "
+                    f"ends. Only the offending STEP is shortened; nothing already learned is "
+                    f"scaled down.")
+
+    ramp = None
+    if adapter_ramp and float(adapter_ramp) > 0:
+        if adaptive is not None:
+            logger.info("[ramp] ignored — Adaptive LR owns the schedule.")
+        else:
+            ramp = AdapterRamp(network, float(adapter_ramp))
+            logger.info(f"[ramp] adapter-relative LR ON — each step held at "
+                        f"{100 * float(adapter_ramp):.3f}% of the adapter's current size, so the "
+                        f"LR starts low and climbs toward your configured ceiling as the adapter "
+                        f"grows. A step is a huge perturbation of a new adapter and a small one "
+                        f"of a mature adapter; this keeps the RATIO steady instead of the rate.")
+
+    ema = None
+    if ema_decay and float(ema_decay) > 0:
+        ema = EMAWeights(network, float(ema_decay))
+        logger.info(f"[ema] ON at decay {float(ema_decay):g} — checkpoints and previews use the "
+                    f"smoothed average of the training path; training itself runs on the raw "
+                    f"weights. Big-LR strides zigzag; the EMA is the center of the zigzag.")
+
+    # LR warmup: the epoch-1 damage from a high static LR comes from oversized strides landing
+    # on zero-init adapters at the steepest part of the loss surface. A linear ramp over the
+    # first N epochs eases in, then runs at full speed — the cost is a fraction of one epoch's
+    # worth of movement. Adaptive LR owns its own schedule, so warmup only applies without it.
+    if adaptive is not None and lr_warmup_epochs and lr_warmup_epochs > 0:
+        logger.info("[warmup] ignored — Adaptive LR owns the schedule (it already starts at "
+                    "the midpoint and probes from there).")
+        lr_warmup_epochs = 0.0
+
     # Caption dropout (reference default 0.05): swap in the cached empty-prompt embed for a
     # random ~5% of steps. The uncond file is written by minimax_cache_text next to the caches.
     uncond_text = None
@@ -1259,6 +1873,52 @@ def train_minimax(
     except TypeError:
         steps_per_epoch = group.num_train_items
 
+    # --- identity-first (two-phase distillation) --------------------------------------------
+    # Phase 1 trains ONLY against the teacher, so the adapter learns who the trigger means
+    # before it is asked to reproduce any particular photograph. Phase 2 then drops the teacher
+    # entirely and trains on the photos alone, starting from an adapter that already has the
+    # identity in the right places. A hard switch, not a decay: this is an INITIALISATION
+    # strategy, so what phase 2 forgets about the teacher does not matter.
+    #
+    # AUTO length comes from a real run (11 Aug, 82 images): the teacher error fell 0.069 ->
+    # 0.051 -> 0.050 over epochs 7-9 — converged by epoch 8, i.e. ~650 gradient STEPS. Steps,
+    # not epochs, is the invariant: a 24-image set needs the same number of steps, which is
+    # many more epochs. Held at one epoch minimum.
+    _p1_epochs = 0
+    if distill:
+        _p1_epochs = (max(1, math.ceil(650 / max(1, steps_per_epoch)))
+                      if distill_phase1_epochs is None or distill_phase1_epochs < 0
+                      else int(distill_phase1_epochs))
+        _p1_epochs = min(_p1_epochs, max_train_epochs)
+        if _p1_epochs > 0:
+            logger.info(
+                f"[distill] IDENTITY-FIRST: epochs 1-{_p1_epochs} train against the teacher "
+                f"ONLY (~{_p1_epochs * steps_per_epoch} steps) at "
+                f"{learning_rate * _P1_LR_SCALE:.2e} — a third of the box — then the teacher is "
+                f"dropped and epochs {_p1_epochs + 1}-{max_train_epochs} train on the "
+                f"photographs alone at the full {learning_rate:.2e}. "
+                f"The teacher weight box does not apply in this mode."
+                + ("" if distill_phase1_epochs is not None and distill_phase1_epochs >= 0 else
+                   "  (length chosen from the dataset size — the teacher objective converges in "
+                   "roughly 650 steps whatever the image count.)"))
+
+    # Gradient accumulation. Batch size 1 means every step is aimed by ONE image, so a large
+    # stride follows an equally large random walk — the roughness that reads as "quality loss
+    # without distortion" when a run covers ground fast. Averaging the gradient over N images
+    # before stepping makes a big step PRECISE instead of rough, at the same wall-clock per
+    # epoch (same forwards, N times fewer optimizer steps).
+    _accum_n = max(1, int(gradient_accumulation_steps or 1))
+    if _accum_n > 1:
+        logger.info(f"[accum] gradient accumulation {_accum_n} — effective batch {_accum_n}, "
+                    f"{steps_per_epoch // _accum_n} optimizer steps per epoch instead of "
+                    f"{steps_per_epoch}. Each step is aimed by {_accum_n} images, so the same "
+                    f"stride carries far less sampling noise.")
+
+    warmup_steps = int(round(float(lr_warmup_epochs or 0.0) * steps_per_epoch))
+    if warmup_steps > 0:
+        logger.info(f"[warmup] LR ramps linearly over the first {lr_warmup_epochs:g} epoch(s) "
+                    f"= {warmup_steps} steps, then holds at the configured LR.")
+
     os.makedirs(output_dir, exist_ok=True)
     pause_flag = os.path.join(output_dir, ".pause_requested")
 
@@ -1266,11 +1926,31 @@ def train_minimax(
     from fizgig.training.train_utils import prune_state_dirs
     global_step = 0
     start_epoch = 0
-    if resume_state_dir and os.path.isdir(resume_state_dir):
+    # `if resume_state_dir` — NOT `and os.path.isdir(...)`: a requested resume whose path is bad
+    # used to skip this block silently and train from scratch. Resume, or refuse — never ignore.
+    if resume_state_dir:
         start_epoch, global_step, _resume_meta = _load_training_state(
             resume_state_dir, network, optimizer, device=device)
         if adaptive:
             adaptive.load_state_dict(_resume_meta.get("adaptive_lr_state"))
+        if ema is not None:
+            _ema_path = os.path.join(resume_state_dir, "ema.pt")
+            if os.path.isfile(_ema_path):
+                ema.load_state_dict(torch.load(_ema_path, map_location="cpu"))
+                logger.info(f"[ema] restored the running average ({ema.n} updates)")
+            else:
+                # The state predates EMA (or it was off then). Restart the average from the
+                # RESTORED weights — the shadow currently holds the zero init from construction.
+                ema.shadow = [p.detach().clone().float() for p in ema.params]
+                logger.info("[ema] no EMA state in the resume dir — restarting the average "
+                            "from the restored weights.")
+        _rs = _resume_meta.get("adapter_ramp")
+        if ramp is not None and _rs:
+            ramp.mult = float(_rs.get("mult", ramp.mult))
+            ramp._smooth = (float(_rs["smooth"]) if _rs.get("smooth") is not None else None)
+            ramp._prev = (float(_rs["prev"]) if _rs.get("prev") is not None else None)
+            logger.info(f"[ramp] restored — LR resumes at {100 * ramp.mult:.0f}% of the "
+                        f"configured ceiling rather than re-climbing from the floor")
         logger.info(f"[resume] from {resume_state_dir}: continuing at epoch "
                     f"{start_epoch + 1}/{max_train_epochs} (global_step {global_step})")
         if start_epoch >= max_train_epochs:
@@ -1279,6 +1959,26 @@ def train_minimax(
             logger.warning(f"[resume] state is at epoch {start_epoch} of {max_train_epochs} — "
                            f"nothing left to train. Writing the final LoRA from the restored "
                            f"state. To train further, raise Max Train Epochs and resume again.")
+
+    if warmup_steps > 0 or ramp is not None or _p1_epochs:
+        # Stashed AFTER the resume block: optimizer.load_state_dict replaces the param-group
+        # dicts, so a stash made earlier would not survive a resume. Derived from the CONFIGURED
+        # rate (x the group's depth-split scale), not the group's current lr, which a resumed
+        # mid-ramp state would have left partway up.
+        for _g in optimizer.param_groups:
+            _g["_warmup_base_lr"] = learning_rate * float(_g.get("lr_scale", 1.0))
+    # WHOEVER OWNS THE LR SETS IT — and when nobody does, the configured value must win.
+    # NOT an elif on the block above: warmup CONFIGURED but already FINISHED lands here too,
+    # and that was exactly the case the first version of this fix missed.
+    if should_reassert_lr(resuming=bool(resume_state_dir), adaptive=adaptive, ramp=ramp,
+                          warmup_steps=warmup_steps, global_step=global_step):
+        _stale = float(optimizer.param_groups[0].get("lr", learning_rate))
+        for _g in optimizer.param_groups:
+            _g["lr"] = learning_rate * float(_g.get("lr_scale", 1.0))
+        if abs(_stale - learning_rate) > 1e-12:
+            logger.info("[resume] the saved state carried lr=%.3e (a throttled value from when "
+                        "it was written); nothing is modulating the LR this run, so the "
+                        "configured %.3e is reasserted.", _stale, learning_rate)
 
     def _run_provenance():
         """What actually produced this LoRA — the facts you need to compare two of them.
@@ -1309,8 +2009,20 @@ def train_minimax(
             "ss_distill": "dataset" if distill else "off",
             "ss_distill_weight": (f"{distill_weight:g}" if distill else "0"),
             "ss_slow_blocks": _slow_used or "none",
+            "ss_block_limit": str(block_limit or 0),
+            "ss_gradient_accumulation": str(_accum_n),
+            "ss_adapter_ramp": f"{adapter_ramp:g}" if ramp is not None else "0",
+            "ss_lr_warmup_epochs": f"{lr_warmup_epochs:g}",
+            "ss_ema_decay": f"{ema_decay:g}" if ema is not None else "0",
             "ss_slow_block_lr_scale": (f"{slow_block_lr_scale:g}" if _slow_used else "1"),
             "ss_caption_dropout": f"{caption_dropout:g}" if uncond_text is not None else "0",
+            # One [[datasets]] block per subject is how Multi Concept keeps two people apart, so
+            # a deployed LoRA should say how many it carries and where they came from — six
+            # months later the trigger words are the only other clue.
+            "ss_multi_concept": str(len(group.datasets)),
+            "ss_concept_dirs": ",".join(
+                os.path.basename(str(getattr(d, "image_directory", "") or "").rstrip("/\\"))
+                for d in group.datasets),
             "ss_max_grad_norm": f"{max_grad_norm:g}",
             "ss_bucket_resolutions": ",".join(_res),
             "ss_gradient_checkpointing": "1" if use_ckpt else "0",
@@ -1328,7 +2040,16 @@ def train_minimax(
         return md
 
     def _state_extra():
-        return {"adaptive_lr_state": adaptive.state_dict()} if adaptive else None
+        extra = {}
+        if adaptive:
+            extra["adaptive_lr_state"] = adaptive.state_dict()
+        if ramp is not None:
+            # Three JSON-safe scalars. Without them a resume restarts the climb at the floor
+            # and spends ~78 steps re-earning a multiplier it had already established — the
+            # same defect the retired governor shipped with, so it does not ship again.
+            extra["adapter_ramp"] = {"mult": ramp.mult, "smooth": ramp._smooth,
+                                     "prev": ramp._prev}
+        return extra or None
 
     # Encoded override prompt, kept between epochs: re-encoding costs a TE load, so only redo it
     # when the prompt text actually changes.
@@ -1361,6 +2082,33 @@ def train_minimax(
                 gc.collect()
                 torch.cuda.empty_cache()
 
+    # Clip previews carry real failure risk a still never had (a 124-frame clip is ~30x the
+    # sampling tokens plus a chunked multi-frame decode), and the epoch loop LATCHES previews
+    # off on any preview exception. A clip-specific failure must degrade to a SHORTER clip that
+    # fits, not take every future preview down with it — so the frame count lives in mutable
+    # state the failure handlers can lower.
+    _clip_state = {"frames": max(1, int(sample_frames or 1)), "notice_done": False,
+                   "slow_done": False}
+
+    def _slow_step_notice(seconds, step, total):
+        """Told once when a preview step runs absurdly long.
+
+        A preview that does not fit in VRAM does NOT raise on Windows — the driver pages to
+        system RAM and the render succeeds at roughly a hundred times the cost, so the
+        clip->stills fallback (which is exception-driven) never fires and the run looks hung.
+        Wall time is the only symptom that survives, so it is what we watch."""
+        if _clip_state["slow_done"]:
+            return
+        _clip_state["slow_done"] = True
+        logger.warning(
+            f"[preview] step {step}/{total} took {seconds:.0f}s — far slower than this should "
+            f"be, which almost always means the preview does not fit in VRAM and is spilling "
+            f"into system RAM. It will finish, just slowly. For future previews, lower "
+            f"Width/Height on the Samples tab (and Sample length if you are rendering clips). "
+            f"Previews are a heartbeat between checkpoints, not the verdict: every epoch saves "
+            f"a .safetensors, and you can Pause the run to free the GPU, judge an epoch in "
+            f"ComfyUI, then close ComfyUI and Resume.")
+
     def _render_previews(epoch):
         """Render one still per prompt on the RESIDENT training DiT and write them where the
         samples gallery looks. The filename format is the gallery/likeness/Visualiser contract
@@ -1374,6 +2122,9 @@ def train_minimax(
         from fizgig.minimax import sampling
         was_training = dit.training
         decoder = None
+        _base_parked = False        # set in phase 2; the finally MUST restore a parked base
+        _opt_parked = []            # set in phase 1; ditto for the parked optimizer state
+        _ema_parked = False         # set in phase 1; ditto for the parked fp32 EMA shadow
         try:
             dit.eval()
             if vae_path:
@@ -1384,9 +2135,21 @@ def train_minimax(
                 decoder = MiniMaxH3VideoVAEDecoder()
                 with _safe_open(vae_path, framework="pt", device="cpu") as _f:
                     decoder.load_state_dict({k: _f.get_tensor(k) for k in _f.keys()}, strict=False)
-                # bf16, NOT fp32: 2.4 B params is 4.8 GB vs 9.7 GB, and this sits on top of the
-                # already-resident base. decode() follows the module dtype.
-                decoder = decoder.to(device, dtype).eval()
+                # FP16, not the training dtype and not fp32. ComfyUI allows this VAE exactly
+                # [float16, float32] (sd.py:951) where its class default and every neighbouring
+                # video VAE also list bfloat16 — bf16 was singled out and removed for this
+                # decoder. The weights ship fp16 (minimax_h3_video_vae_fp16.safetensors), so
+                # casting to bf16 threw away 3 mantissa bits at load, and 36 pre-norm residual
+                # blocks feed a proj_out that emits 3072 pixel values per token: the error lands
+                # straight on pixels as softness and gradient banding, with nothing downstream to
+                # smooth it. fp16 costs the same 4.8 GB as bf16 (fp32 would be 9.7), so this is
+                # free. Overflow is covered by the same nan_to_num guard ComfyUI relies on
+                # (vae.py, attention output) — fp16 is the regime that guard was written for.
+                # It also stays on CPU until the DECODE phase: previews used to put it on the GPU
+                # before sampling even started, which cost the sampling forward 4.85 GB of
+                # headroom it never used — harmless for a 256-token still, an OOM for a 124-frame
+                # clip whose forward is ~30x the tokens (real 32 GB-card failure, 8 Aug).
+                decoder = decoder.to(torch.float16).eval()
             # Live override from the GUI, re-read every epoch so it can be turned on, changed or
             # switched off mid-run without touching the paused/resume path.
             _prompts, _w, _h = encoded_prompts, sample_width, sample_height
@@ -1398,40 +2161,169 @@ def train_minimax(
                 _ov = None
             if _ov:
                 if _ov["prompt"] != _ov_state["prompt"]:
-                    _ov_state["enc"] = _encode_override(_ov["prompt"])
-                    _ov_state["prompt"] = _ov["prompt"]
+                    # A failed encode must not take previews down with it. This loads the
+                    # 14.5 GB TE mid-run (parking the 21 GB base to fit), and on a tight card
+                    # that can OOM — and an exception from here used to propagate into the
+                    # epoch loop's preview catch, which LATCHES previews off for the rest of
+                    # the run. One bad encode silently ended every preview and read from the
+                    # outside as "the override just stopped working". Fall back to the Samples
+                    # tab prompts for this epoch instead; the state is left untouched, so the
+                    # next boundary retries.
+                    try:
+                        _ov_state["enc"] = _encode_override(_ov["prompt"])
+                        _ov_state["prompt"] = _ov["prompt"]
+                    except Exception as _oe:
+                        logger.warning(
+                            f"[sample override] could not encode the new prompt "
+                            f"({type(_oe).__name__}) — using the Samples tab prompts this "
+                            f"epoch; will retry at the next preview.")
+                        _ov = None
+            if _ov:
                 _prompts, _w, _h, _seed = _ov_state["enc"], _ov["width"], _ov["height"], _ov["seed"]
                 logger.info(f"[sample override] active — '{_ov['prompt'][:60]}' "
                             f"seed={_seed} {_w}x{_h}")
 
             _seed = _seed if _seed != 0 else random.randint(1, 2 ** 31 - 1)
             ts = _time.strftime("%Y%m%d%H%M%S")
+            _frames = max(1, int(_clip_state["frames"]))
+            if _frames > 1 and decoder is None:
+                logger.warning("[preview] clip samples need the video VAE for decode — no VAE "
+                               "path is configured, so this epoch renders stills instead.")
+                _frames = 1
+            if _frames > 1 and not _clip_state["notice_done"]:
+                _clip_state["notice_done"] = True
+                logger.info(f"[preview] clip mode: {_frames} frames per sample at {_w}x{_h} — "
+                            f"clips take longer than stills, and longer clips take longer "
+                            f"still. Cadence is 'Sample every N epochs' and size is "
+                            f"Width/Height, both on the Samples tab.")
+            # PHASE 1 — sample every prompt with the decoder still on CPU. The latents are a
+            # few MB each, so parking them on CPU between phases costs nothing; the clip
+            # forward gets the whole non-base headroom instead of sharing it with a decoder
+            # it is not using yet.
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()          # drop the training step's allocator slack
+            # Clip forwards are big enough that VRAM pressure does not OOM on Windows - the
+            # driver spills to system RAM and every step silently runs 3-6x slower (the
+            # same failure signature as the checkpointing-margin bug). The fp32 Adam state
+            # is ~2.5 GB of dead weight during a no-grad preview: park it on CPU for the
+            # sampling phase. Costs about a second each way, once per preview epoch.
+            if _frames > 1 and torch.cuda.is_available():
+                for _st in optimizer.state.values():
+                    for _k, _v in list(_st.items()):
+                        if torch.is_tensor(_v) and _v.is_cuda:
+                            _st[_k] = _v.to('cpu')
+                            _opt_parked.append((_st, _k))
+                if ema is not None:
+                    # The fp32 shadow (~1.25 GB at LoKR factor 8) is dead weight during a
+                    # no-grad preview — the EMA weights are already swapped INTO the live
+                    # network. Park it with the optimizer state; next ema.update() is a
+                    # training step away, after the finally restores it.
+                    ema.shadow = [s.to('cpu') for s in ema.shadow]
+                    _ema_parked = True
+                if _opt_parked or _ema_parked:
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                _free0 = torch.cuda.mem_get_info()[0] / 1e9
+                logger.info(f'[preview] clip sampling with {_free0:.1f} GB free '
+                            f'({len(_opt_parked)} optimizer tensors parked'
+                            f'{", EMA shadow parked" if _ema_parked else ""})')
+            _rendered = []
             for i, txt in enumerate(_prompts):
                 print(f"[preview] epoch {epoch}: prompt {i + 1}/{len(_prompts)} "
-                      f"({_w}x{_h}, seed {_seed + i})", flush=True)
+                      f"({_w}x{_h}, {_frames} frame(s), seed {_seed + i})", flush=True)
                 lat = sampling.sample_image(
                     dit, txt.to(device, dtype),
                     width=_w, height=_h, steps=sample_steps,
                     cfg_scale=sample_cfg_scale,
                     uncond_embeds=(encoded_negative.to(device, dtype)
                                    if encoded_negative is not None else None),
-                    seed=_seed + i, device=device, dtype=dtype, log_steps=True)
-                if decoder is not None:
+                    seed=_seed + i, device=device, dtype=dtype, log_steps=True,
+                    num_frames=_frames, on_slow_step=_slow_step_notice)
+                _rendered.append((f"{output_name}_e{epoch:06d}_{i:02d}_{ts}_{_seed + i}",
+                                  lat.to("cpu")))
+                del lat
+
+            # optimizer state back before anything else - the next training step needs it
+            for _st, _k in _opt_parked:
+                _st[_k] = _st[_k].to(device)
+            _opt_parked = []
+
+            # PHASE 2 — decode. Clip decode wants ~6 GB (decoder weights + chunk transients);
+            # if the card cannot offer that next to the resident base, park the base on CPU
+            # for the duration, exactly as the override-encode path does. A ~21 GB round trip
+            # costs seconds once per preview epoch; an OOM used to cost the previews entirely.
+            if decoder is not None:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    _free = torch.cuda.mem_get_info()[0] / 1e9
+                    if _frames > 1 and _free < 7.5:
+                        logger.info(f"[preview] {_free:.1f} GB free is too tight for clip "
+                                    f"decode — parking the base on CPU for this decode pass.")
+                        dit.to("cpu")
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        _base_parked = True
+                decoder = decoder.to(device)
+            for stem, lat in _rendered:
+                lat = lat.to(device)
+                if lat.shape[2] > 1 and decoder is not None:
+                    # Clip: decode every frame, store EVERY 2ND frame as JPEG in a sibling
+                    # .clip dir, and save the MIDDLE frame as the contract PNG — written LAST,
+                    # so the gallery/likeness settle guard sees one finished unit. The PNG name
+                    # is the gallery/likeness/Visualiser contract; the .clip dir is additive.
+                    px = decoder.decode_clip(lat.float())[0]     # [3, F, H, W] in [0, 1]
+                    n_f = px.shape[1]
+                    clip_dir = os.path.join(sample_dir, stem + ".clip")
+                    os.makedirs(clip_dir, exist_ok=True)
+                    _keep = list(range(0, n_f, 2))
+                    if _keep[-1] != n_f - 1:
+                        _keep.append(n_f - 1)          # always include the final frame
+                    for k in _keep:
+                        fr = (px[:, k].permute(1, 2, 0).clamp(0, 1) * 255).byte().cpu().numpy()
+                        Image.fromarray(fr).save(os.path.join(clip_dir, f"f{k:03d}.jpg"),
+                                                 quality=87)
+                    mid = (px[:, n_f // 2].permute(1, 2, 0).clamp(0, 1) * 255).byte().cpu().numpy()
+                    img = Image.fromarray(mid)
+                    print(f"[preview] decoded {n_f}-frame clip at {_w}x{_h} "
+                          f"({(n_f + 1) // 2} scrub frames)", flush=True)
+                    del px
+                elif decoder is not None:
                     px = decoder.decode(lat.float())[0]          # [3, H, W] in [0, 1]
                     arr = (px.permute(1, 2, 0).clamp(0, 1) * 255).byte().cpu().numpy()
                     img = Image.fromarray(arr)
+                    print(f"[preview] decoded {_w}x{_h}", flush=True)
                 else:
                     # No VAE path configured — fall back to the 24ch->RGB linear approximation
                     # (a 1/16-scale rough look) rather than dropping previews entirely.
                     arr = sampling.latent_to_rgb(lat)
                     img = Image.fromarray(arr).resize((_w, _h), Image.NEAREST)
-                print(f"[preview] decoded {_w}x{_h}", flush=True)
-                img.save(os.path.join(
-                    sample_dir, f"{output_name}_e{epoch:06d}_{i:02d}_{ts}_{_seed + i}.png"))
+                    print(f"[preview] decoded {_w}x{_h}", flush=True)
+                img.save(os.path.join(sample_dir, stem + ".png"))
+                del lat
+            if _base_parked:
+                dit.to(device)
+                if n_swap > 0:
+                    dit.enable_block_swap(n_swap)     # restore the parked-block split
+                gc.collect()
+                torch.cuda.empty_cache()
+                _base_parked = False
             logger.info(f"[preview] epoch {epoch}: wrote {len(_prompts)} sample(s) "
                         f"({sample_steps} steps, seed {_seed}) to {sample_dir}")
         finally:
             del decoder                                  # free the ~4.85 GB decoder immediately
+            for _st, _k in _opt_parked:      # exception during phase 1: state must return
+                _st[_k] = _st[_k].to(device)
+            if _ema_parked:                  # next ema.update() needs the shadow on-device
+                ema.shadow = [s.to(device) for s in ema.shadow]
+            if _base_parked:
+                # An exception mid-decode left the 21 GB base on CPU — the next training step
+                # would die with "mat2 is on cpu". Restore residency (and the swap split)
+                # before anything else runs.
+                dit.to(device)
+                if n_swap > 0:
+                    dit.enable_block_swap(n_swap)
             if was_training:
                 dit.train()
             gc.collect()
@@ -1444,13 +2336,41 @@ def train_minimax(
         try:
             _render_previews(0)
         except Exception as _e0:
-            logger.warning(f"[preview] Sample at Start failed ({type(_e0).__name__}) — training "
-                           f"continues; per-epoch previews will still be attempted.")
+            if _clip_state["frames"] > 1:
+                _was = _clip_state["frames"]
+                _clip_state["frames"] = clip_fallback_frames(_was)
+                logger.warning(
+                    f"[preview] Sample at Start failed in CLIP mode ({type(_e0).__name__}) at "
+                    f"{_was} frames — later previews retry at "
+                    f"{_clip_state['frames']} frame(s). Training continues.")
+            else:
+                logger.warning(f"[preview] Sample at Start failed ({type(_e0).__name__}) — training "
+                               f"continues; per-epoch previews will still be attempted.")
     progress_bar = tqdm(total=steps_per_epoch * max_train_epochs, initial=global_step,
                         desc="minimax-h3")
+    # Distillation only: the two loss terms, summed over the epoch. The 0.8/0.2 weights are known
+    # up front; what is not is how BIG each error is, and that is what actually decides how much
+    # of the learning comes from real pixels versus from the teacher's rendering of them.
+    _distill_parts = {}
+    _distill_acc = [0.0, 0.0, 0]        # teacher sum, photo sum, count
     for epoch in range(start_epoch, max_train_epochs):
         shared_epoch.value = epoch + 1
         network.train()
+        _distill_acc[:] = [0.0, 0.0, 0]
+        # Identity-first: teacher-only while inside phase 1, photos-only after. Phase 2 takes the
+        # ORDINARY loss path, so it never runs the teacher forward at all — half the compute of a
+        # blended step, and no reference cache is touched.
+        _teacher_phase = bool(distill and _p1_epochs and epoch < _p1_epochs)
+        # Phase 1 runs at a THIRD of the Learning Rate box. It is placing the identity, not
+        # reproducing detail, and it does that on a near-zero adapter where a full-size stride is
+        # at its most destructive. Phase 2 gets the rate you actually asked for, starting from an
+        # adapter that is already in the right place.
+        _phase_lr = _P1_LR_SCALE if _teacher_phase else 1.0
+        if _p1_epochs and epoch == _p1_epochs and epoch > start_epoch:
+            logger.info(f"[distill] identity-first phase 1 complete after {_p1_epochs} epoch(s) "
+                        f"— dropping the teacher; from here it trains on the photographs alone, "
+                        f"at the full {learning_rate:.2e} (phase 1 ran at "
+                        f"{learning_rate * _P1_LR_SCALE:.2e}).")
         for i, batch in enumerate(loader):
             latents = batch["latents"].to(device, dtype)           # (1, 24, H, W)
             if latents.dim() == 4:
@@ -1458,7 +2378,7 @@ def train_minimax(
             text = batch["hidden_states"].to(device, dtype)        # (1, L, 5120)
             if uncond_text is not None and random.random() < caption_dropout:
                 text = uncond_text.to(device, dtype)               # caption dropout step
-            if distill and "ref_hidden_states" in batch:
+            if distill and (_teacher_phase or not _p1_epochs) and "ref_hidden_states" in batch:
                 _rz = batch["ref_latent"].to(device, dtype)      # (1, 24, h, w) from the cache
                 if _rz.dim() == 4:
                     _rz = _rz.unsqueeze(2)                       # -> (1, 24, 1, h, w)
@@ -1467,14 +2387,41 @@ def train_minimax(
                     text_ref=batch["ref_hidden_states"].to(device, dtype),
                     ref_latents=[_rz],
                     text_token_tags=batch["ref_token_tags"][0],
-                    distill_weight=distill_weight, shift=shift, seed=seed)
+                    # Phase 1 is teacher-ONLY (weight 1.0); the blended mode keeps the box value.
+                    distill_weight=(1.0 if _teacher_phase else distill_weight),
+                    shift=shift, seed=seed, parts_out=_distill_parts)
+                _distill_acc[0] += _distill_parts["teacher"]
+                _distill_acc[1] += _distill_parts["photo"]
+                _distill_acc[2] += 1
             else:
                 loss, _ = compute_loss(dit, latents, text, shift=shift)
-            loss.backward()
-            if max_grad_norm and max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+            # Divide so the accumulated gradient is the MEAN over the window, not the sum —
+            # otherwise the effective LR scales with the accumulation count.
+            (loss / _accum_n if _accum_n > 1 else loss).backward()
+            # Step on the window boundary, and always on the last batch of the epoch so a
+            # partial tail window is never silently discarded.
+            if (i + 1) % _accum_n == 0 or (i + 1) >= steps_per_epoch:
+                if max_grad_norm and max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
+                if warmup_steps or ramp is not None or _p1_epochs:
+                    # Warmup, the ramp and the identity-first phase scale all COMPOSE: warmup
+                    # covers the first steps (where the adapter is near zero and the ramp's ratio
+                    # is undefined), the ramp takes over from there, and phase 1 runs the whole
+                    # thing at a third of the box. The product is the LR.
+                    _wf = (min(1.0, (global_step + 1) / warmup_steps) if warmup_steps else 1.0)
+                    _rm = ramp.mult if ramp is not None else 1.0
+                    for _g in optimizer.param_groups:
+                        _g["lr"] = _g["_warmup_base_lr"] * _wf * _rm * _phase_lr
+                if limiter is not None:
+                    limiter.pre_step()   # snapshot BEFORE the optimizer moves anything
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                if limiter is not None:
+                    limiter.step()
+                if ramp is not None:
+                    ramp.step()          # post-clip weights; sets the multiplier for NEXT step
+                if ema is not None:
+                    ema.update()         # after the clip, so the shadow tracks clipped weights
             global_step += 1
             loss_recorder.add(epoch=epoch, step=i, loss=loss.item())
             progress_bar.set_postfix(avr_loss=f"{loss_recorder.moving_average:.4f}", refresh=False)
@@ -1499,37 +2446,99 @@ def train_minimax(
                 logger.info(f"[drift] max|lora_up|={_drift:.4f} (bound ~{_bound:.4f} — healthy)")
         except Exception:
             pass
+        if _p1_epochs and not _teacher_phase and distill:
+            logger.info(f"[distill] photos only (identity-first phase 2) — the teacher was "
+                        f"dropped after epoch {_p1_epochs}.")
+        if _distill_acc[2]:
+            _t = _distill_acc[0] / _distill_acc[2]
+            _p = _distill_acc[1] / _distill_acc[2]
+            _w = 1.0 if _teacher_phase else float(distill_weight)
+            # Weighted contributions are what the optimizer actually sees. The raw errors are
+            # printed too, because the interesting question is whether the photo term is HARDER
+            # (bigger error) than the teacher term, which is what lets 20% punch above its weight.
+            _wt, _wp = _w * _t, (1.0 - _w) * _p
+            _tot = _wt + _wp
+            logger.info(
+                f"[distill] teacher err {_t:.4f} x{_w:.2f} = {_wt:.4f} | "
+                f"photo err {_p:.4f} x{1 - _w:.2f} = {_wp:.4f} | "
+                f"real pixels are {100 * _wp / _tot if _tot else 0:.0f}% of this epoch's loss "
+                f"(the weight alone says {100 * (1 - _w):.0f}%)")
+        if limiter is not None:
+            logger.info(limiter.epoch_report())
+        if ramp is not None:
+            logger.info(ramp.epoch_report())
         if adaptive is not None:
             adaptive.epoch_boundary(epoch, loss_recorder.moving_average, network, optimizer)
         if save_every_n_epochs and (epoch + 1) % save_every_n_epochs == 0 and (epoch + 1) < max_train_epochs:
             ckpt = os.path.join(output_dir, f"{output_name}-{epoch + 1:06d}.safetensors")
-            _save_lora(network, ckpt, network_dim, network_alpha, dtype, _meta())
+            if ema is not None:
+                ema.swap_in()
+            try:
+                _save_lora(network, ckpt, network_dim, network_alpha, dtype, _meta())
+            finally:
+                if ema is not None:
+                    ema.swap_out()
             logger.info(f"saved {ckpt}")
             if save_state:
-                _save_training_state(output_dir, output_name, network, optimizer,
-                                     epoch=epoch + 1, global_step=global_step,
-                                     dtype=dtype, extra=_state_extra())
-                prune_state_dirs(output_dir, output_name, keep_last_n_states)
+                # Non-fatal (see the krea2 twin): a failed convenience save must never kill a
+                # run whose checkpoint already wrote. Truly-full disks fail the next epoch
+                # CHECKPOINT, and that one is rightly fatal.
+                try:
+                    _save_training_state(output_dir, output_name, network, optimizer,
+                                         epoch=epoch + 1, global_step=global_step,
+                                         dtype=dtype, extra=_state_extra(), ema=ema)
+                    prune_state_dirs(output_dir, output_name, keep_last_n_states)
+                except Exception as _se:
+                    logger.error("[state] saving the resume state FAILED (%s: %s) — likely the "
+                                 "disk (on RunPod the volume quota is only visible in the "
+                                 "dashboard). Training continues; this epoch has no resume "
+                                 "point. The epoch checkpoint itself already saved.",
+                                 type(_se).__name__, _se)
         if do_previews and sample_every_n_epochs and (epoch + 1) % sample_every_n_epochs == 0:
             try:
-                _render_previews(epoch + 1)
+                # Previews render on the EMA weights when EMA is on — a preview must show what
+                # the saved checkpoint will look like, not the raw zigzag the EMA exists to hide.
+                if ema is not None:
+                    ema.swap_in()
+                try:
+                    _render_previews(epoch + 1)
+                finally:
+                    if ema is not None:
+                        ema.swap_out()
             except Exception as _pe:
                 # Latch previews OFF for the rest of the run rather than re-failing (and
                 # re-OOMing) every epoch. Training and checkpoints are never at risk.
                 _oom = "out of memory" in str(_pe).lower()
-                logger.warning(
-                    f"[preview] epoch {epoch + 1} preview failed "
-                    f"({'CUDA OOM' if _oom else type(_pe).__name__}); disabling previews for the "
-                    f"rest of the run. Training continues and LoRAs still save normally.")
-                do_previews = False
+                if _clip_state["frames"] > 1:
+                    # The failure arrived in CLIP mode — the mode a still preview never
+                    # exercised. Step DOWN the frame grid and keep clips rather than ending
+                    # every preview for the run; only a failure at stills latches off.
+                    _was = _clip_state["frames"]
+                    _clip_state["frames"] = clip_fallback_frames(_was)
+                    logger.warning(
+                        f"[preview] epoch {epoch + 1} CLIP preview failed at {_was} frames "
+                        f"({'CUDA OOM' if _oom else type(_pe).__name__}) — retrying at "
+                        f"{_clip_state['frames']} frame(s) from the next preview on. Training "
+                        f"continues and LoRAs still save normally.")
+                else:
+                    logger.warning(
+                        f"[preview] epoch {epoch + 1} preview failed "
+                        f"({'CUDA OOM' if _oom else type(_pe).__name__}); disabling previews for "
+                        f"the rest of the run. Training continues and LoRAs still save normally.")
+                    do_previews = False
             network.train()
         if os.path.exists(pause_flag):
             # Pause = graceful epoch-end exit with FULL state (regardless of the save-state
             # toggles), so Resume continues exactly here — matching Klein/Krea 2. The final
             # LoRA is deliberately NOT written; Resume (or the natural run end) writes it.
-            _save_training_state(output_dir, output_name, network, optimizer,
-                                 epoch=epoch + 1, global_step=global_step,
-                                 dtype=dtype, extra=_state_extra())
+            try:
+                _save_training_state(output_dir, output_name, network, optimizer,
+                                     epoch=epoch + 1, global_step=global_step,
+                                     dtype=dtype, extra=_state_extra(), ema=ema)
+            except Exception as _se:
+                logger.error("[pause] state save FAILED (%s: %s) — there is NO new resume point "
+                             "for this pause. Free disk space (RunPod: dashboard quota) and "
+                             "resume from the previous saved state.", type(_se).__name__, _se)
             try:
                 os.remove(pause_flag)
             except OSError:
@@ -1540,13 +2549,25 @@ def train_minimax(
 
     progress_bar.close()
     final = os.path.join(output_dir, f"{output_name}.safetensors")
-    _save_lora(network, final, network_dim, network_alpha, dtype, _meta())
+    if ema is not None:
+        ema.swap_in()
+    try:
+        _save_lora(network, final, network_dim, network_alpha, dtype, _meta())
+    finally:
+        if ema is not None:
+            ema.swap_out()
     logger.info(f"saved final LoRA: {final}")
     if save_state_on_train_end and max_train_epochs > start_epoch:
-        _save_training_state(output_dir, output_name, network, optimizer,
-                             epoch=max_train_epochs, global_step=global_step,
-                             dtype=dtype, extra=_state_extra())
-        prune_state_dirs(output_dir, output_name, keep_last_n_states)
+        # Non-fatal: the final LoRA is already on disk; dying here would turn a finished run red.
+        try:
+            _save_training_state(output_dir, output_name, network, optimizer,
+                                 epoch=max_train_epochs, global_step=global_step,
+                                 dtype=dtype, extra=_state_extra(), ema=ema)
+            prune_state_dirs(output_dir, output_name, keep_last_n_states)
+        except Exception as _se:
+            logger.error("[state] end-of-run state save FAILED (%s: %s) — the finished LoRA is "
+                         "saved and fine; only train-further-by-resume is affected.",
+                         type(_se).__name__, _se)
     try:
         os.remove(pause_flag)
     except OSError:

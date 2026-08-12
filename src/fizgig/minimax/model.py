@@ -131,8 +131,33 @@ MODALITY_NUM = 3
 
 
 def audio_latents_for_frames(num_frames: int = 1) -> int:
-    """Audio latents covering `num_frames` video frames (24 fps video, 40 Hz audio)."""
+    """Audio latents covering `num_frames` PIXEL frames (24 fps video, 40 Hz audio)."""
     return int(round(num_frames / FPS * AUDIO_LATENTS_PER_SECOND))
+
+
+def pixel_frames_for_latent(latent_t: int) -> int:
+    """Latent frames -> the pixel frames they encode: 5n+2 latents <-> 17n+5 pixels.
+
+    The lone-latent still (latent_t == 1) is its own case — one keyframe, one pixel frame.
+    Anything else must sit on the 5n+2 grid; a count off the grid means the caller built a
+    latent the VAE could never have produced, and silently rounding it would misalign the
+    audio clock against the video rows, so it raises instead."""
+    if latent_t == 1:
+        return 1
+    if latent_t < 2 or (latent_t - 2) % 5:
+        raise ValueError(f"latent_t={latent_t} is not on the 5n+2 grid (2, 7, 12, ...)")
+    return 17 * (latent_t - 2) // 5 + 5
+
+
+def latent_frames_for_pixels(num_frames: int) -> int:
+    """Pixel frames -> latent frames, snapping DOWN onto the 17n+5 grid like the reference
+    trainer does (align_num_frames_down): 5..21 -> 2 latents, 22..38 -> 7, 124 -> 37.
+    num_frames == 1 is the still case -> 1 latent."""
+    if num_frames <= 1:
+        return 1
+    n = max(5, int(num_frames))
+    n -= (n - 5) % 17                       # snap down onto 17n+5
+    return 5 * (n - 5) // 17 + 2
 
 
 def shift_sigma(sigma, shift: float):
@@ -148,14 +173,28 @@ def remap_sigma(sigma, from_shift: float = VIDEO_SIGMA_SHIFT, to_shift: float = 
     return shift_sigma(sigma / (from_shift + sigma * (1.0 - from_shift)), to_shift)
 
 
+def sigma_remap_slope(sigma, from_shift: float = VIDEO_SIGMA_SHIFT,
+                      to_shift: float = AUDIO_SIGMA_SHIFT):
+    """d(sigma_to)/d(sigma_from) at the same base-grid point — comfy's `time_shift_slope`.
+
+    Scaling the audio head's velocity by this puts the audio stream onto the VIDEO sigma grid,
+    which is how the reference lets one sampler drive both streams: comfy packs audio and video
+    into a single latent (NestedTensor) and returns `(-slope)*audio_out`, so res_multistep's
+    second-order update applies to the audio rows too. Integrating the audio separately on its
+    own grid is a first-order scheme for a stream the video attends to at every step."""
+    base = sigma / (from_shift + sigma * (1.0 - from_shift))
+    return ((to_shift * (1.0 + (from_shift - 1.0) * base) ** 2)
+            / (from_shift * (1.0 + (to_shift - 1.0) * base) ** 2))
+
+
 def ref_row_count(refs) -> int:
     """Total packed rows contributed by a list of (latent_h, latent_w) reference images."""
     return sum((rh // 2) * (rw // 2) for rh, rw in (refs or ()))
 
 
 def image_position_ids(text_len, latent_h, latent_w, num_audio_latents: int = 0,
-                       refs=None) -> torch.Tensor:
-    """3-axis (t, h, w) position ids for a [text | refs | audio | single-video-frame] sequence.
+                       refs=None, latent_t: int = 1) -> torch.Tensor:
+    """3-axis (t, h, w) position ids for a [text | refs | audio | video] sequence.
 
     Text rows: t = 0..text_len-1, h=w=0 — so prompt length shifts the whole media clock.
     Reference rows (r2v): each reference image contributes its OWN area-normalized frame grid at
@@ -164,7 +203,11 @@ def image_position_ids(text_len, latent_h, latent_w, num_audio_latents: int = 0,
     (comfy/ldm/minimax/model.py::PackedLayout).
     Audio rows: t = cursor + 0..A-1 repeated per channel, h = 0, w pinned to the frame grid's
     first column for channel 0 and its last for channel 1 (the reference's stereo convention).
-    Video rows: t pinned at the cursor (single frame), (h, w) from the area-normalized frame grid.
+    Video rows: latent_t frames, t-major (matching patchify_video's row order), each frame's
+    rows at t = _video_t_grid(latent_t, cursor)[k] — the (1,4,4,4,4)x5/3 spans that keep the
+    video clock aligned with the 40 Hz audio clock (17 pixel frames = 5 latents = 28.33 rotary
+    units ~ 28 audio latents). latent_t=1 is the still case and reproduces the old layout
+    exactly.
 
     NOTE the cursor: with no references it is text_len and this is exactly the old layout, but
     every reference image SHIFTS THE TARGET'S TEMPORAL ORIGIN by +1.0. Pinning the target at
@@ -196,10 +239,10 @@ def image_position_ids(text_len, latent_h, latent_w, num_audio_latents: int = 0,
                                torch.full((num_audio_latents,), float(w_axis[-1]), dtype=torch.float64)])
         rows.append(aud)
 
-    t_grid = _video_t_grid(1, cursor)                       # [1], = [cursor]
-    vid = torch.empty(frame_rows, 3, dtype=torch.float64)
-    vid[:, 0] = t_grid[0]
-    vid[:, 1:] = frame
+    t_grid = _video_t_grid(latent_t, cursor)                # [latent_t], t_grid[0] = cursor
+    vid = torch.empty(latent_t * frame_rows, 3, dtype=torch.float64)
+    vid[:, 0] = t_grid.repeat_interleave(frame_rows)        # t-major, like patchify_video
+    vid[:, 1:] = frame.repeat(latent_t, 1)
     rows.append(vid)
     return torch.cat(rows, dim=0)
 
@@ -427,6 +470,9 @@ class MiniMaxH3DiT(nn.Module):
         self.condition_proj = nn.Linear(c.text_dim, c.hidden_size, bias=True)
         # Full model: a timestep MLP. Pruned: a sampled curve table (see the config field).
         self.pruned_adaln = c.adaln_t_table_size is not None
+        # Set by the loader when it keeps the AdaLN projections fp32 (pruned checkpoints, as
+        # ComfyUI does). The forward then hands them an fp32 t_emb instead of demoting it.
+        self.adaln_fp32 = False
         _silu = not self.pruned_adaln              # the table already absorbs the nonlinearity
         if self.pruned_adaln:
             self.time_embedder = None
@@ -493,7 +539,8 @@ class MiniMaxH3DiT(nn.Module):
                 ref_latents=None, text_token_tags: torch.Tensor = None, seed: int = 0,
                 visual_cond_noise_aug: float = VISUAL_COND_TIMESTEP):
         """
-        video_latent : [1, C=latents_dim, T=1, H, W]  — one image as a single video frame.
+        video_latent : [1, C=latents_dim, T, H, W] — a still (T=1, the keyframe layout) or a
+                       clip (T on the 5n+2 latent grid; position ids and audio rows follow).
         t            : scalar or [1] flow time in [0, 1] (the value fed to the time embedder;
                        the trainer owns noising and the flow target).
         text_embeds  : [1, L, text_dim] Qwen3-VL hidden states (or already [1, L, hidden]).
@@ -555,7 +602,10 @@ class MiniMaxH3DiT(nn.Module):
         # the video rows. Present because the base model has never seen a pack without it.
         t_val = t.reshape(-1)[:1].to(torch.float32) if torch.is_tensor(t) else torch.tensor([float(t)], device=device)
         t_val = t_val.to(device)
-        n_audio_latents = audio_latents_for_frames(latent_t) if self.pack_audio_rows else 0
+        # PIXEL frames, not latent frames: a 37-latent clip is 124 pixel frames and needs
+        # round(124/24*40)=207 audio latents, not round(37/24*40). Identical at T=1.
+        n_audio_latents = (audio_latents_for_frames(pixel_frames_for_latent(latent_t))
+                          if self.pack_audio_rows else 0)
         audio_embed = None
         if n_audio_latents:
             sigma_v = (1.0 - t_val).clamp(0.0, 1.0)
@@ -595,7 +645,12 @@ class MiniMaxH3DiT(nn.Module):
                                                              device=device, dtype=torch.float32)))
         t_all = torch.cat(t_parts) if len(t_parts) > 1 else t_val
         uniq, inverse = torch.unique(t_all, sorted=True, return_inverse=True)
-        t_emb = self._time_embedding(uniq).to(dtype)                              # [M, t_dim]
+        # Kept fp32 when the loader kept the AdaLN projections fp32 (ComfyUI's curve-checkpoint
+        # dtype). _mod_scale_shift / _mod_gate cast back to the activation dtype at the point of
+        # use, exactly as the reference does, so only the modulation gains the precision.
+        t_emb = self._time_embedding(uniq)                                        # [M, t_dim]
+        if not self.adaln_fp32:
+            t_emb = t_emb.to(dtype)
         tags = torch.full((seq_len,), VIDEO_TAG, dtype=torch.long, device=device)
         tags[:text_len] = TEXT_TAG
         if text_token_tags is not None:
@@ -614,7 +669,7 @@ class MiniMaxH3DiT(nn.Module):
 
         # rope
         pos = image_position_ids(text_len, lat_h, lat_w, n_audio_latents,
-                                 refs=ref_shapes or None).to(device)
+                                 refs=ref_shapes or None, latent_t=latent_t).to(device)
         cos, sin = rope_cos_sin(pos, self.rope.inv_freq.to(device))
         cos, sin = cos.to(dtype), sin.to(dtype)
 

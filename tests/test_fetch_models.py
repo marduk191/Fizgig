@@ -21,8 +21,10 @@ import tempfile
 # absolute path, which made the whole suite unrunnable anywhere else.
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "src"))
+sys.path.insert(0, REPO)  # for lora_trainer_gui, to cross-check manifest keys against the prefs
 
 from fizgig.scripts import fetch_models as F
+import lora_trainer_gui as G
 
 fails = []
 
@@ -58,10 +60,22 @@ ck("every weight has a pref key, repo and path",
    all(w.pref_key and w.repo and w.path_in_repo
        for fam in F.FAMILIES.values() for w in fam))
 ck("pref keys match what the GUI reads",
-   {w.pref_key for w in F.FAMILIES["klein"]} == {"base_dit", "distilled_dit", "vae", "text_encoder"}
+   {w.pref_key for w in F.FAMILIES["klein"]} >= {"base_dit", "distilled_dit", "vae", "text_encoder"}
    and {w.pref_key for w in F.FAMILIES["krea2"]} >= {"krea2_raw_dit", "krea2_turbo_dit",
                                                      "krea2_vae", "krea2_text_encoder",
                                                      "krea2_turbo_lora"})
+# Klein's set is a superset, not an exact match: the Captions tab captions ANY dataset with the
+# Krea 2 Qwen3-VL encoder, so every family's button now fetches it too. That shared entry is the
+# invariant worth asserting -- it is the thing that silently goes missing if a family list is
+# rebuilt from its own models alone, and a Klein-only user then has no captioner.
+ck("every family fetches the shared captioning TE",
+   all("krea2_text_encoder" in {w.pref_key for w in fam} for fam in F.FAMILIES.values()),
+   {k: sorted(w.pref_key for w in v) for k, v in F.FAMILIES.items()})
+# Every pref key the manifest can write must be one the GUI actually reads back, or a download
+# lands somewhere Preferences never looks.
+ck("no manifest key is unknown to the GUI",
+   {w.pref_key for fam in F.FAMILIES.values() for w in fam} <= set(G.DEFAULT_PREFS),
+   sorted({w.pref_key for fam in F.FAMILIES.values() for w in fam} - set(G.DEFAULT_PREFS)))
 ck("Klein is flagged gated, Krea 2 is not",
    any(w.gated for w in F.FAMILIES["klein"]) and not any(w.gated for w in F.FAMILIES["krea2"]))
 # Nothing in a family is optional any more. "Download models for me" that silently omits a model
