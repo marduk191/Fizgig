@@ -6,6 +6,7 @@
 </p>
 
 <p align="center">
+  <a href="#install"><img src="https://img.shields.io/badge/⬇%20Install%20Fizgig-2EA043?style=for-the-badge&logoColor=white" alt="Jump to the install instructions"></a>
   <a href="https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=faoq8ed6um&ref=vkb387ep"><img src="https://img.shields.io/badge/⚡%20Deploy%20on%20RunPod-673AB7?style=for-the-badge&logoColor=white" alt="Deploy Fizgig on RunPod"></a>
   <a href="https://buymeacoffee.com/lorasandlenses"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee"></a>
 </p>
@@ -28,6 +29,7 @@
 </p>
 
 > ### 📰 Latest news
+> - **The workbench checks your LoRA before it loads 9 GB** (3.6.4) — pick a Krea 2 LoRA with the selector on Klein 9B in **Royale**, **Explorer** or **Repair Studio** and it now switches to match in milliseconds, instead of loading the wrong pipeline and failing 25 seconds later. Installs got faster and lighter on disk in the same release. All of it contributed by **[@FNGarvin](https://github.com/FNGarvin)**. [Release notes](docs/RELEASE_NOTES_v3.6.4.md)
 > - **Pick which graphics card Fizgig uses** (3.6.2) — more than one GPU in the machine? **Preferences** now lists them by name and size, and everything follows your choice: training, caching, samples, the workbench tabs and the VRAM gauge. In the same release, MiniMax text caching needs **1.5 GB less VRAM**, which brings it inside what a 16 GB card can give it — existing caches stay valid. [Release notes](docs/RELEASE_NOTES_v3.6.2.md)
 > - **MiniMax H3 stops asking you to choose between quality and speed** (3.6.0) — the new **✨ MiniMax H3 Fast** preset reaches full likeness in a few hundred steps at dim/alpha 8, and the lower rank tends to come out *more* flexible rather than less. Load it, caption a folder of 35–45 images, press Start — you shouldn't need to touch anything else. **Multi Concept** is new too: two subjects in one LoRA, each with its own folder and its own trigger word. One thing worth knowing — judge quality by **pausing** and loading an epoch in ComfyUI; the image previews are for watching likeness arrive, and can show distortion that simply isn't there in a real render. [Details ↓](#minimax-h3--third-model-family) · [Release notes](docs/RELEASE_NOTES_v3.6.0.md)
 > - **MiniMax H3 now hits real likeness.** H3 LoRAs used to nail pose and framing while staying soft on the face; they don't any more. The change that did it was the **optimizer** — MiniMax trains with `adamw` instead of `adamw8bit`, and it's the new default. Alongside it: a single **% of training in low noise** box replacing Detail Focus, a **mid-concentrated** shape toggle, and new defaults (LoKR 8, dim/alpha 16, 60 epochs, 0.5 MP, 60% low noise). [Details ↓](#minimax-h3--third-model-family)
@@ -40,6 +42,17 @@
 > - **Caption with the model that trains your LoRA** (v2.10) — the Captions tab can use **Qwen3-VL**, the same vision-language model that conditions Krea 2 training. Every task is an **editable preset** — including a style-LoRA preset validated on real training runs. The slot takes fp8_scaled builds and community fine-tunes; since that model writes your captions, swapping it changes how your dataset gets described.
 
 > **Two model families, one workbench.** Everything here works with both **Flux 2 Klein 9B** and **Krea 2 (12.9B)** — Repair Studio, Explorer, Royale, Profiler, Extract, plus Context LoRA, Adaptive LR and Pause/Resume. [Krea 2 details ↓](#krea-2--second-model-family)
+
+> ### ⚠ Using a MiniMax H3 LoRA **without** the Turbo LoRA?
+> Fizgig by default trains H3 with most of the run at **low noise** — that's what gives these LoRAs
+> their likeness, and it's why they look so good in a 4-step Turbo workflow. Take Turbo out and run
+> the stock 20-step workflow at the same strength and they can go soft, drift, or distort, and it's
+> worth turning it down in that case. I'll be adding more presets around training structure and so
+> on, but wanted to flag this advice for anyone sticking to non-Turbo workflows.
+>
+> You might need to reduce down to `0.4` or `0.5`, or you might not need to reduce at all — it's
+> partly relative to the size of your dataset etc. A LoRA that seemed broken without Turbo usually
+> isn't.
 
 > **Two things worth reading about before you start.** The Krea 2 trainer **curates your dataset while it trains** — detecting problem images from their loss alone, throttling them, having the text encoder *look at* the stuck ones and rewrite their captions, and telling you the best epoch when the run plateaus. [Details ↓](#the-trainer-curates-your-dataset-while-it-trains-krea-2-experimental) And the **sample gallery is an instrument**, not a contact sheet: it scores every sample's likeness against your own photos live during training, with a Royale-style **Training Run Visualiser** to scrub and export the run. [Details ↓](#the-sample-gallery-is-an-instrument-both-families)
 
@@ -130,6 +143,18 @@ You can also edit any caption yourself mid-run from the Problem Images window �
 ## MiniMax H3 — third model family
 
 Fizgig now trains LoRAs for **MiniMax H3**, MiniMax's open-weight ~33B video model — the biggest model Fizgig supports — from **ordinary still-image datasets**, on a single consumer GPU. It's a native port, and the output is a standard `.safetensors` that loads straight into ComfyUI's H3 workflows, including the pruned inference builds.
+
+### ⚠ Using a MiniMax H3 LoRA **without** the Turbo LoRA?
+
+Fizgig by default trains H3 with most of the run at **low noise** — that's what gives these LoRAs
+their likeness, and it's why they look so good in a 4-step Turbo workflow. Take Turbo out and run
+the stock 20-step workflow at the same strength and they can go soft, drift, or distort, and it's
+worth turning it down in that case. I'll be adding more presets around training structure and so
+on, but wanted to flag this advice for anyone sticking to non-Turbo workflows.
+
+You might need to reduce down to `0.4` or `0.5`, or you might not need to reduce at all — it's
+partly relative to the size of your dataset etc. A LoRA that seemed broken without Turbo usually
+isn't.
 
 **Training only, for now.** MiniMax H3 trains, previews and pauses/resumes like the other two
 families, but the workbench tabs — Repair Studio, LoRA the Explorer, LoRA Royale, Profiler and
@@ -302,12 +327,37 @@ session picks up where you left off.
 
 ## Install
 
-Clone the repo (or download the ZIP via the green **Code** button and extract):
+Clone the repo:
 
 ```bash
 git clone https://github.com/shootthesound/Fizgig.git
 cd Fizgig
 ```
+
+**Clone it rather than downloading the ZIP.** `update_fizgig.bat` updates you by pulling the
+latest changes with git, and a ZIP arrives without the information git needs, so updating fails
+with `fatal: not a git repository`.
+
+<details>
+<summary><b>Already installed from a ZIP? Fix it without starting over</b></summary>
+
+Open a terminal in your Fizgig folder and run these six commands:
+
+```bash
+git init
+git remote add origin https://github.com/shootthesound/Fizgig.git
+git fetch --depth 1 origin master
+git reset --hard FETCH_HEAD
+git branch -M master
+git branch --set-upstream-to=origin/master master
+```
+
+That turns the folder you already have into a proper checkout and brings it up to the current
+release. Your model paths, output LoRAs, caches, dataset configs, presets and the venv are all left
+alone — git ignores every one of those, so it only replaces Fizgig's own program files.
+`update_fizgig.bat` will work normally from then on.
+
+</details>
 
 **Windows (one-click)** — double-click `install_fizgig.bat`. It creates a venv, installs CUDA 12.8 PyTorch and all dependencies, pre-downloads the InsightFace models, and verifies CUDA is visible to PyTorch. Launch with `run_fizgig.bat`; update later with `update_fizgig.bat`.
 

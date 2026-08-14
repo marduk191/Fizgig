@@ -298,6 +298,10 @@ def _find_host_compiler() -> bool:
         if not os.path.isfile(vcvars):
             continue
         try:
+            # shell=True is intentional here: vcvars is a path just discovered via vswhere/
+            # well-known VS install roots (not external input), and we need the shell's &&
+            # to source the .bat file's env vars into `set`. cmd.exe /c would hit the same
+            # interpreter anyway, so it'd be cosmetic, not safer.
             out = subprocess.run(f'"{vcvars}" >nul && set', shell=True, capture_output=True,
                                  text=True, timeout=120)
             if out.returncode != 0:
