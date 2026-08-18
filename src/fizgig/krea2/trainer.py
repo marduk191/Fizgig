@@ -36,7 +36,7 @@ from fizgig.networks.lora import create_network
 from fizgig.training.metadata import (
     ARCHITECTURE_KREA2, build_metadata, latest_sample_image, thumbnail_data_uri, resolve_title,
 )
-from fizgig.training.train_utils import LossRecorder, prune_state_dirs
+from fizgig.training.train_utils import LossRecorder, prune_state_dirs, validate_output_name
 
 logger = logging.getLogger(__name__)
 
@@ -1396,6 +1396,7 @@ def train_krea2(
     """Native Krea 2 LoRA training: bucketed multi-resolution dataloader over the krea2 caches ->
     flow-matching loss -> AdamW -> save a ComfyUI-compatible LoRA. In-training Turbo previews +
     GUI wiring are layered on elsewhere."""
+    validate_output_name(output_name)     # before the model loads, not an epoch later (#70)
     torch.manual_seed(seed)
 
     # Updated at every sample render (see the sample_previews*/prompts= call sites below) so

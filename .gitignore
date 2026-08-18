@@ -41,6 +41,10 @@ profiles/*
 
 # Model files (user-provided)
 *.safetensors
+# ...except the bundled silu(t_emb) grid (5.5 MB, Apache-2.0, from larryvrh's
+# ComfyUI-MiniMax-H3-Turbo node): the pruned base cannot compute silu(t_emb), and the
+# Turbo LoRA's AdaLN injection for previews needs the full model's answer.
+!src/fizgig/assets/h3_silu_temb_grid.safetensors
 *.ckpt
 *.bin
 
@@ -82,3 +86,4 @@ launch_error.log
 # (upstream also ignores tests/ here — this fork keeps them tracked on purpose, as the
 # only assertion coverage for verifying upstream merges, so that entry is omitted)
 docs/RUNPOD_TEMPLATE.md
+gizmo_settings.json
