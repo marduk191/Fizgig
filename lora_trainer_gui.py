@@ -684,6 +684,22 @@ def minimax_block_spec(raw):
     return str(raw or "").split("·")[0].strip() or "all"
 
 
+# Training Base — which H3 fine-tune the LoRA trains against. fl2va (first/last-frame) is the
+# ordinary model; ref2va is the Reference-to-Video fine-tune ComfyUI's r2v workflow runs. Same
+# architecture and shapes, so the trainer takes either — a LoRA is most faithful on the base it
+# trained against, which is the point of the choice. Deliberately NOT preset-affected: the var
+# lives outside self.entries and is never collected, so presets/last-train can't flip it.
+MINIMAX_TRAIN_BASE_OPTIONS = [
+    "First/last frame (fl2va) — standard",
+    "Reference (ref2va)",
+]
+
+
+def minimax_train_base(raw):
+    """Dropdown label -> canonical base key. Anything unrecognised is the fl2va default."""
+    return "ref2va" if "ref2va" in str(raw or "").lower() else "fl2va"
+
+
 # Built-in presets — always available in the Load Preset dropdown, prefixed with ✨ to distinguish
 # from user-saved presets. Defined in code so they ship with the app and can't be deleted accidentally.
 # Tune these as empirical findings accumulate.
@@ -1712,6 +1728,9 @@ class LoRATrainerGUI:
             # pruned build they were taking ~45% of all weight movement to do it.
             "MINIMAX_TRAIN_ADALN": False,
             "MINIMAX_DISTILL": False,      # off = ordinary training
+            # Which H3 base ordinary training runs on ("fl2va"/"ref2va"). NOT in any preset —
+            # the Training Base dropdown's var lives outside self.entries by design.
+            "MINIMAX_TRAIN_BASE": "fl2va",
             "MINIMAX_DISTILL_WEIGHT": "0.8",
             "MINIMAX_DISTILL_REFS": "2",
             "MINIMAX_SLOW_BLOCKS": "",     # blank = one LR everywhere
@@ -3920,6 +3939,38 @@ class LoRATrainerGUI:
             arch_combo.bind("<<ComboboxSelected>>", self._on_architecture_selected)
             ToolTip(arch_combo, "Model family to train (Klein 9B, Krea 2 or MiniMax H3)")
 
+            # Training Base (MiniMax only) — which H3 fine-tune the run trains against, right
+            # where the family was just chosen. A dedicated var kept OUT of self.entries and
+            # never collected, so presets can't flip it; last-train and the queue carry it
+            # explicitly. Shown/hidden by _apply_training_arch_visibility alongside the note.
+            self.minimax_train_base_var = tk.StringVar(
+                value=MINIMAX_TRAIN_BASE_OPTIONS[
+                    1 if minimax_train_base(self.settings.get("MINIMAX_TRAIN_BASE")) == "ref2va"
+                    else 0])
+            self._minimax_base_frame = tk.Frame(model_card, bg=COLORS["bg_surface"])
+            tk.Label(
+                self._minimax_base_frame, text="Training Base:",
+                font=(FONT_FAMILY, 10), fg=COLORS["text_secondary"], bg=COLORS["bg_surface"],
+            ).pack(side=tk.LEFT, padx=(0, 8))
+            self._minimax_base_combo = ttk.Combobox(
+                self._minimax_base_frame, textvariable=self.minimax_train_base_var,
+                values=list(MINIMAX_TRAIN_BASE_OPTIONS), state="readonly", width=36)
+            self._minimax_base_combo.pack(side=tk.LEFT)
+            self._minimax_base_hint = tk.Label(
+                model_card,
+                text="Pick the H3 model you deploy on. First/last frame (fl2va) is the standard "
+                     "model most workflows run. Reference (ref2va) is the Reference-to-Video "
+                     "fine-tune — choose it if your LoRA's home is the r2v workflow (needs 'DiT "
+                     "(reference)' set in Preferences). Presets never change this; reference "
+                     "distillation always trains on ref2va regardless.",
+                font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"],
+                bg=COLORS["bg_surface"], wraplength=760, justify=tk.LEFT)
+            self._minimax_base_frame.pack(anchor=tk.W, pady=(10, 0))
+            self._minimax_base_hint.pack(anchor=tk.W, pady=(2, 0))
+            if not self._is_minimax_arch():
+                self._minimax_base_frame.pack_forget()
+                self._minimax_base_hint.pack_forget()
+
             # Previews track likeness honestly but are not the place to compare quality — say
             # so where the family is chosen, along with the Pause/Resume route that makes
             # judging in ComfyUI practical on one GPU.
@@ -5463,6 +5514,12 @@ class LoRATrainerGUI:
             # the same reasoning the training queue uses when it stores the architecture beside
             # its snapshot. Namespaced so _apply_preset_values ignores it as an unknown key.
             snapshot["__architecture__"] = self.architecture_var.get()
+            # Training Base is preset-immune (outside self.entries, never collected) but
+            # "restore my last launch" plainly includes which base it ran on — same reasoning
+            # as the architecture above. Namespaced so _apply_preset_values ignores it.
+            if hasattr(self, "minimax_train_base_var"):
+                snapshot["__minimax_train_base__"] = minimax_train_base(
+                    self.minimax_train_base_var.get())
             with open(LAST_TRAIN_FILE, "w", encoding="utf-8") as f:
                 json.dump(snapshot, f, indent=2, default=str)
         except Exception as e:
@@ -5490,7 +5547,13 @@ class LoRATrainerGUI:
                 self.architecture_var.set(_arch)
                 self.on_architecture_changed()
                 _switched = f"\n\nSwitched the Base Model back to {_arch}."
+            # Training Base rides beside the preset, not in it (preset-immune by design) —
+            # pop before applying so _apply_preset_values never sees it even by accident.
+            _base = snapshot.pop("__minimax_train_base__", None)
             self._apply_preset_values(snapshot)
+            if _base and hasattr(self, "minimax_train_base_var"):
+                self.minimax_train_base_var.set(MINIMAX_TRAIN_BASE_OPTIONS[
+                    1 if minimax_train_base(_base) == "ref2va" else 0])
             messagebox.showinfo("Loaded",
                                 f"Restored settings from your last training launch.{_switched}")
         except Exception as e:
@@ -5592,6 +5655,11 @@ class LoRATrainerGUI:
                                 getattr(self, "_concept_folder_vars", [])],
             "preset": self._collect_preset_values(),
             "samples": samples,
+            # Training Base rides beside the preset, not in it (preset-immune by design) — a
+            # queued ref2va run would otherwise silently launch on fl2va.
+            "minimax_train_base": minimax_train_base(
+                getattr(self, "minimax_train_base_var", None)
+                and self.minimax_train_base_var.get()),
         }
 
     def _apply_queue_item(self, item):
@@ -5604,6 +5672,12 @@ class LoRATrainerGUI:
             except Exception as e:
                 self.update_console(f"[queue] arch switch to {arch!r} failed: {e}\n")
         self._apply_preset_values(item.get("preset", {}))
+        # Items queued before the Training Base dropdown existed carry no key — leave the
+        # dropdown as it stands rather than forcing a default onto an old queue file.
+        _base = item.get("minimax_train_base")
+        if _base and hasattr(self, "minimax_train_base_var"):
+            self.minimax_train_base_var.set(MINIMAX_TRAIN_BASE_OPTIONS[
+                1 if minimax_train_base(_base) == "ref2va" else 0])
         folder = str(item.get("image_folder") or "").strip()
         if folder:
             self.image_folder_var.set(folder)   # traces regenerate Fizgig_train.toml
@@ -5633,7 +5707,8 @@ class LoRATrainerGUI:
         """What makes two queue entries THE SAME RUN: everything except id/queued_at."""
         try:
             return json.dumps({k: item.get(k) for k in
-                               ("architecture", "image_folder", "preset", "samples")},
+                               ("architecture", "image_folder", "preset", "samples",
+                                "minimax_train_base")},
                               sort_keys=True, default=str)
         except Exception:
             return repr(item)
@@ -6505,18 +6580,18 @@ class LoRATrainerGUI:
     def _build_minimax_structure_row(self, parent):
         """Training Structure — the MiniMax timestep density, named.
 
-        Rows 20-23 of Training Parameters, under Network Type. The dropdown is a VIEW of
+        Rows 22-26 of Training Parameters, under Network Type. The structure dropdown is a VIEW of
         MINIMAX_LOWNOISE_PCT rather than a setting of its own, so every existing preset and saved
         run keeps working with no migration: 60 shows Face likeness, anything unrecognised shows
         Custom and reveals the box it came from.
         """
         self._minimax_structure_label = ttk.Label(parent, text="Training Structure:")
-        self._minimax_structure_label.grid(row=20, column=0, sticky=tk.W, padx=5, pady=(8, 2))
+        self._minimax_structure_label.grid(row=22, column=0, sticky=tk.W, padx=5, pady=(8, 2))
         self.minimax_structure_var = tk.StringVar(value=MINIMAX_STRUCTURE_DEFAULT)
         self._minimax_structure_combo = ttk.Combobox(
             parent, textvariable=self.minimax_structure_var,
             values=list(MINIMAX_STRUCTURE_OPTIONS), state="readonly", width=36)
-        self._minimax_structure_combo.grid(row=20, column=1, columnspan=2, sticky=tk.W,
+        self._minimax_structure_combo.grid(row=22, column=1, columnspan=2, sticky=tk.W,
                                            padx=5, pady=(8, 2))
         self._minimax_structure_combo.bind("<<ComboboxSelected>>",
                                            lambda _e: self._on_minimax_structure_changed())
@@ -6524,7 +6599,7 @@ class LoRATrainerGUI:
         self._minimax_structure_desc = tk.Label(
             parent, text="", font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"],
             bg=COLORS["bg_surface"], justify=tk.LEFT, wraplength=700)
-        self._minimax_structure_desc.grid(row=21, column=0, columnspan=3, sticky=tk.W,
+        self._minimax_structure_desc.grid(row=23, column=0, columnspan=3, sticky=tk.W,
                                           padx=(12, 5), pady=(0, 4))
 
         # Shown when the dataset carries voice recordings and the structure ISN'T Likeness —
@@ -6577,9 +6652,9 @@ class LoRATrainerGUI:
 
         # The raw share, revealed only under Custom — the named options are the point.
         self._minimax_shift_label = ttk.Label(parent, text="Clean-end share:")
-        self._minimax_shift_label.grid(row=22, column=0, sticky=tk.W, padx=5, pady=2)
+        self._minimax_shift_label.grid(row=24, column=0, sticky=tk.W, padx=5, pady=2)
         self._minimax_shift_frame = ttk.Frame(parent)
-        self._minimax_shift_frame.grid(row=22, column=1, columnspan=2, sticky=tk.W, padx=5, pady=2)
+        self._minimax_shift_frame.grid(row=24, column=1, columnspan=2, sticky=tk.W, padx=5, pady=2)
         self.entries["MINIMAX_LOWNOISE_PCT"] = ttk.Entry(self._minimax_shift_frame, width=8)
         self.entries["MINIMAX_LOWNOISE_PCT"].insert(
             0, str(self.settings.get("MINIMAX_LOWNOISE_PCT", "60")))
@@ -6596,9 +6671,9 @@ class LoRATrainerGUI:
         # Always visible: a preset recommends a value, the user can override it without that
         # counting as a different structure.
         self._minimax_hnlr_label = ttk.Label(parent, text="Medium to High LR:")
-        self._minimax_hnlr_label.grid(row=23, column=0, sticky=tk.W, padx=5, pady=(2, 8))
+        self._minimax_hnlr_label.grid(row=25, column=0, sticky=tk.W, padx=5, pady=(2, 8))
         self._minimax_hnlr_frame = ttk.Frame(parent)
-        self._minimax_hnlr_frame.grid(row=23, column=1, columnspan=2, sticky=tk.W,
+        self._minimax_hnlr_frame.grid(row=25, column=1, columnspan=2, sticky=tk.W,
                                       padx=5, pady=(2, 8))
         self.entries["MINIMAX_HIGHNOISE_LR_PCT"] = ttk.Entry(self._minimax_hnlr_frame, width=8)
         self.entries["MINIMAX_HIGHNOISE_LR_PCT"].insert(
@@ -6619,7 +6694,7 @@ class LoRATrainerGUI:
                  "datasets 100 held face shape better, and nothing distorted at any setting.",
             font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
             justify=tk.LEFT, wraplength=700)
-        self._minimax_hnlr_hint.grid(row=24, column=0, columnspan=3, sticky=tk.W,
+        self._minimax_hnlr_hint.grid(row=26, column=0, columnspan=3, sticky=tk.W,
                                      padx=(12, 5), pady=(0, 8))
 
         self._sync_minimax_structure_from_pct()
@@ -6809,6 +6884,20 @@ class LoRATrainerGUI:
                     _note.pack(anchor=tk.W, pady=(10, 0))
             elif _note.winfo_manager():
                 _note.pack_forget()
+        # Training Base rides in the same card, above the note (before= keeps the order when
+        # the note is already on screen).
+        _brow = getattr(self, "_minimax_base_frame", None)
+        if _brow is not None:
+            _bhint = self._minimax_base_hint
+            if is_minimax:
+                if not _brow.winfo_manager():
+                    _kw = {"before": _note} if (_note is not None
+                                                and _note.winfo_manager()) else {}
+                    _brow.pack(anchor=tk.W, pady=(10, 0), **_kw)
+                    _bhint.pack(anchor=tk.W, pady=(2, 0), **_kw)
+            elif _brow.winfo_manager():
+                _brow.pack_forget()
+                _bhint.pack_forget()
 
         # The live-override REFERENCE image is a Klein edit-model feature. Neither native family
         # is an edit model, and their trainers ignore the field — so hide the picker rather than
@@ -8540,7 +8629,7 @@ class LoRATrainerGUI:
                                    "Likeness"))
                 if _wants_note:
                     self._minimax_structure_voice_note.grid(
-                        row=25, column=0, columnspan=3, sticky=tk.W, padx=(12, 5), pady=(0, 4))
+                        row=27, column=0, columnspan=3, sticky=tk.W, padx=(12, 5), pady=(0, 4))
                 else:
                     self._minimax_structure_voice_note.grid_remove()
             # Per-category retirement rows: only when the dataset is genuinely MIXED — with
@@ -8548,11 +8637,11 @@ class LoRATrainerGUI:
             if hasattr(self, "_mixed_stop_label"):
                 _mixed = _has_audio and not audio_only
                 if _mixed:
-                    self._mixed_stop_label.grid(row=26, column=0, sticky=tk.W, padx=5,
+                    self._mixed_stop_label.grid(row=28, column=0, sticky=tk.W, padx=5,
                                                 pady=(8, 2))
-                    self._mixed_stop_frame.grid(row=26, column=1, columnspan=2, sticky=tk.W,
+                    self._mixed_stop_frame.grid(row=28, column=1, columnspan=2, sticky=tk.W,
                                                 padx=5, pady=(8, 2))
-                    self._mixed_stop_hint.grid(row=27, column=0, columnspan=3, sticky=tk.W,
+                    self._mixed_stop_hint.grid(row=29, column=0, columnspan=3, sticky=tk.W,
                                                padx=(12, 5), pady=(0, 4))
                 else:
                     self._mixed_stop_label.grid_remove()
@@ -10092,6 +10181,7 @@ class LoRATrainerGUI:
             prompt_card, textvariable=self.sample_frames_var, state="readonly", width=34,
             values=["Still (1 frame)", "22 frames (~1s)", "56 frames (~2.3s)",
                     "124 frames (~5s — trained minimum)", "141 frames (~6s)",
+                    "22 frames with sound (~1s)",
                     "56 frames with sound (~2.3s)",
                     "124 frames with sound (~5s)"])
         self.sample_frames_combo.grid(row=8, column=1, columnspan=2, sticky=tk.W, pady=4)
@@ -10099,7 +10189,9 @@ class LoRATrainerGUI:
         self._sample_frames_hint = tk.Label(prompt_card,
                  text="Samples render as short clips you can scrub in the gallery — the regime "
                       "H3 was trained in. Longer clips cost minutes each, so set the cadence "
-                      "with 'Generate every N epochs'. Full write-up in the README.",
+                      "with 'Generate every N epochs'. On 16 GB cards previews cap at 768×640 "
+                      "and 22 frames (sound kept) — longer or larger picks clamp automatically. "
+                      "Full write-up in the README.",
                  font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"],
                  bg=COLORS["bg_surface"], wraplength=560, justify=tk.LEFT)
         self._sample_frames_hint.grid(row=9, column=1, columnspan=2, sticky=tk.W, pady=(0, 4))
@@ -16490,12 +16582,12 @@ class LoRATrainerGUI:
         )
         mr = self._add_pref_row(
             mm_card, mr, "DiT (reference):", "minimax_ref_dit",
-            "OPTIONAL — only for reference distillation ('Learn identity from' on the Training "
-            "tab). This is the ref2va model, a DIFFERENT fine-tune from the fl2va one above and "
-            "not just another quantization of it: it is what ComfyUI's Reference-to-Video "
-            "workflow loads, and the only H3 build that accepts reference images. A LoRA "
-            "distilled this way is trained on it and runs on it. Leave blank for ordinary "
-            "training.",
+            "OPTIONAL — used when the Training tab's Training Base is set to Reference "
+            "(ref2va), and for reference distillation ('Learn identity from'). This is the "
+            "ref2va model, a DIFFERENT fine-tune from the fl2va one above and not just another "
+            "quantization of it: it is what ComfyUI's Reference-to-Video workflow loads, and "
+            "the only H3 build that accepts reference images. A LoRA trained on it is most "
+            "faithful deployed on it. Leave blank if you only train on the standard base.",
             download_url="https://huggingface.co/Comfy-Org/MiniMax-H3/blob/main/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors",
             download_note="~21GB — Comfy-Org/MiniMax-H3 -> diffusion_models/"
                           "minimax_h3_ref2va_pruned_int8_convrot.safetensors (the pruned int8 "
@@ -22968,6 +23060,18 @@ class LoRATrainerGUI:
                     errors.append(f"{label} path is empty (set it on the Preferences tab)")
                 elif not os.path.exists(path):
                     errors.append(f"{label} file does not exist: {path}")
+            # Training Base = ref2va needs the ref2va model actually set — without this check
+            # the command builder would silently fall back to fl2va, the one thing the user
+            # explicitly asked it not to train on.
+            if (getattr(self, "minimax_train_base_var", None)
+                    and minimax_train_base(self.minimax_train_base_var.get()) == "ref2va"
+                    and not self._krea2_pref("minimax_ref_dit")):
+                errors.append("Training Base is set to Reference (ref2va) but 'DiT (reference)' "
+                              "is empty on the Preferences tab. Easiest fix: on the Preferences "
+                              "tab tick 'Include the reference DiT (+21 GB)' and hit "
+                              "'⬇ Download models for me' — it fetches the model and fills the "
+                              "path in for you. Or switch Training Base back to First/last "
+                              "frame.")
             # Reference distillation needs the ref2va model and a real reference photo.
             if getattr(self, "minimax_distill_var", None) and self.minimax_distill_var.get():
                 if not self._krea2_pref("minimax_ref_dit"):
@@ -23442,6 +23546,11 @@ class LoRATrainerGUI:
             "MINIMAX_BLOCKS": minimax_block_spec(self.entries["MINIMAX_BLOCKS"].get()),
             "MINIMAX_TRAIN_ADALN": bool(self.entries["MINIMAX_TRAIN_ADALN"].get()),
             "MINIMAX_DISTILL": bool(self.minimax_distill_var.get()),
+            # Canonical key ("fl2va"/"ref2va"), never the display label. Preset-immune by
+            # design — the var is outside self.entries and _collect_preset_values skips it.
+            "MINIMAX_TRAIN_BASE": minimax_train_base(
+                getattr(self, "minimax_train_base_var", None)
+                and self.minimax_train_base_var.get()),
             "MINIMAX_MULTICONCEPT": bool(self.minimax_multiconcept_var.get()),
             "MINIMAX_CONCEPT_DIRS": [v.get().strip() for v in
                                      getattr(self, "_concept_folder_vars", [])],
@@ -24420,8 +24529,11 @@ class LoRATrainerGUI:
             self._venv_python(),
             self._krea2_script("minimax_train.py"),
             # Distillation trains against ref2va — the teacher only exists on that model.
+            # Otherwise the Training Base dropdown decides: ref2va when the user deploys on
+            # the r2v workflow, the ordinary fl2va base by default.
             "--dit", (self._krea2_pref("minimax_ref_dit")
-                      if (self.settings.get("MINIMAX_DISTILL")
+                      if ((self.settings.get("MINIMAX_DISTILL")
+                           or self.settings.get("MINIMAX_TRAIN_BASE") == "ref2va")
                           and self._krea2_pref("minimax_ref_dit"))
                       else self._krea2_pref("minimax_dit")),
             "--dataset_config", self.settings["DATASET_CONFIG"],
