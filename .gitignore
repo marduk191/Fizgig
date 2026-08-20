@@ -87,3 +87,4 @@ launch_error.log
 # only assertion coverage for verifying upstream merges, so that entry is omitted)
 docs/RUNPOD_TEMPLATE.md
 gizmo_settings.json
+docs/RESEARCH_*
