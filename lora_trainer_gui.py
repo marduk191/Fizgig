@@ -972,13 +972,12 @@ MINIMAX_BUILT_IN_PRESETS["✨ MiniMax H3 Fast (LoRA 8, 40 epochs)"] = {
 # The 19 Aug style ablation (Repair Studio, same instrument that found the likeness set): a
 # style LoRA's deltas matter across nearly the WHOLE model — droppable only at 4-5 (the dead
 # band / audio-embedder pipe) and 48-49 (subject-specific last-mile work: load-bearing for
-# likeness and voice, silent for style). Hence 0-3, 6-47. Style rides on the gradient-fragile
-# early blocks that likeness training deliberately freezes, so the LR is halved from Fast's
-# 2e-4: style is a broad low-magnitude tilt accumulated over epochs, and gentle everywhere is
-# both the deformation mitigation and good style practice in its own right.
-MINIMAX_BUILT_IN_PRESETS["✨ MiniMax H3 Style (LoRA 8, gentle LR)"] = {
+# likeness and voice, silent for style). Hence 0-3, 6-47. LR matches Fast's 2e-4 — Peter's
+# real style runs (20 Aug) found the halved 1e-4 unnecessary; drop it manually for an extra-
+# gentle run if a style ever fries.
+MINIMAX_BUILT_IN_PRESETS["✨ MiniMax H3 Style (LoRA 8)"] = {
     **MINIMAX_BUILT_IN_PRESETS["✨ MiniMax H3 Fast (LoRA 8, 40 epochs)"],
-    "LEARNING_RATE": 1e-4,
+    "LEARNING_RATE": 2e-4,
     "MINIMAX_BLOCKS": "0-3, 6-47",
     # MUST be off here: style measurably needs the early blocks the likeness mask freezes, and
     # with it on the blocks spec above would be ignored outright.
