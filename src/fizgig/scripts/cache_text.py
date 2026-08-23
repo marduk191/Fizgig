@@ -48,14 +48,18 @@ def prepare_cache_files_and_paths(datasets):
     return all_files, all_paths
 
 
-def process_batches(args, datasets, all_files, all_paths, encode_fn):
-    """Process text encoder batches with skip-existing and batching support."""
+def process_batches(args, datasets, all_files, all_paths, encode_fn, index_offset=0):
+    """Process text encoder batches with skip-existing and batching support.
+
+    index_offset only affects the log line: the reference pass calls this once per dataset with
+    a ONE-element list, so without it every dataset reports itself as "[0]"."""
     num_workers = args.num_workers if args.num_workers is not None else max(1, os.cpu_count() - 1)
     for i, dataset in enumerate(datasets):
-        logger.info(f"Encoding dataset [{i}]")
+        logger.info(f"Encoding dataset [{i + index_offset}]")
         batches = dataset.retrieve_text_encoder_output_cache_batches(num_workers)
 
-        for batch in tqdm(batches):
+        bs_want = args.batch_size if args.batch_size is not None else 16
+        for batch in tqdm(_regroup(batches, bs_want)):
             all_paths[i].update(os.path.normpath(item.text_encoder_output_cache_path) for item in batch)
 
             if args.skip_existing:
@@ -66,6 +70,22 @@ def process_batches(args, datasets, all_files, all_paths, encode_fn):
             bs = args.batch_size if args.batch_size is not None else len(batch)
             for j in range(0, len(batch), bs):
                 encode_fn(batch[j : j + bs])
+
+
+def _regroup(batches, size):
+    """Re-chunk the dataset's batches to `size`.
+
+    The dataset yields groups of its TRAINING batch_size — 1 for MiniMax — which has nothing to
+    do with how many captions a text-encoder forward should take. Without this the encoder is
+    called once per caption no matter what --batch_size says."""
+    buf = []
+    for b in batches:
+        buf.extend(b)
+        while len(buf) >= size:
+            yield buf[:size]
+            buf = buf[size:]
+    if buf:
+        yield buf
 
 
 def post_process(datasets, all_files, all_paths, keep_cache):
@@ -128,4 +148,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if sys.platform == "linux" and os.environ.get("FIZGIG_GPU_BACKEND", "").lower() == "rocm":
+        from fizgig.rocm.cache_exit import run_cache_main
+
+        run_cache_main(main)
+    else:
+        main()

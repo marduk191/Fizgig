@@ -31,13 +31,13 @@ RUN python3 -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 COPY requirements.txt /tmp/requirements.txt
+COPY uv_install_deps.py /tmp/uv_install_deps.py
 # The cache purge has to happen in THIS layer: a later RUN would delete the files but the layer
 # holding them stays in the image. uv keeps its own wheel cache and ignores PIP_NO_CACHE_DIR,
 # which is how a first build shipped 7.8 GB of wheels alongside the 7.8 GB venv they installed.
 RUN pip install --upgrade pip uv \
-    && uv pip install --link-mode=copy --index-strategy unsafe-best-match \
-         -r /tmp/requirements.txt \
-    && rm -rf /root/.cache /tmp/requirements.txt
+    && python3 /tmp/uv_install_deps.py /tmp/requirements.txt "$VIRTUAL_ENV" \
+    && rm -rf /root/.cache /tmp/requirements.txt /tmp/uv_install_deps.py
 
 # ---------------------------------------------------------------------------- runtime
 FROM ubuntu:22.04
@@ -51,19 +51,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3 python3-venv \
       python3-tk \
       git curl ca-certificates \
-      gcc libc6-dev \
+      gcc libc6-dev python3-dev \
       xvfb openbox x11-utils wmctrl \
       libxfont2 libgbm1 libgl1-mesa-dri libegl1 \
       libgl1 libglib2.0-0 libsm6 libxext6 libxrender1 \
       fonts-dejavu-core fonts-liberation fontconfig unzip \
       xdg-utils pcmanfm dbus-x11 \
+      openssh-server \
     && rm -rf /var/lib/apt/lists/*
+# openssh-server sits here unused unless PUBLIC_KEY is set at boot (see entrypoint.sh) — the
+# file manager + runpodctl remain the default, keyless transfer path. This is for anyone who
+# wants a real shell for debugging: RunPod's own "SSH Terminal Access" toggle sets PUBLIC_KEY
+# for you, so opting in there wires this up with no template changes; anywhere else, set
+# PUBLIC_KEY to your own public key. Off by default: no open port 22 for someone who never asked.
 # gcc + libc6-dev are RUNTIME dependencies, not builder leftovers: torch.compile has
 # inductor/triton build small host-side C stubs while training runs, and without a compiler
 # every compiled run died with "Failed to find C compiler". The app now declines compile
 # cleanly when no cc exists, but shipping one is what makes compile actually WORK on pods —
 # it's a real speed win on the INT8/NF4 paths. Not build-essential: g++/make/dpkg-dev would
 # triple the size for nothing.
+# python3-dev rides with them for the same reason: triton's stubs #include <Python.h>, so a
+# compiler without the headers gets further and then dies with "Python.h: No such file or
+# directory" (reported by a RunPod user on Krea 2, 7 Aug 2026). The builder stage always had
+# it — the runtime is where compile actually runs.
 # pcmanfm is what makes the "Open folder" buttons work: _open_in_file_manager shells out to
 # xdg-open, which needs something to hand the folder to.
 #
@@ -212,9 +222,10 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # noVNC over HTTP — the only port that needs exposing. 5900 stays internal on purpose: raw VNC
 # is unencrypted, and the host's HTTPS proxy is what makes this safe to reach over the internet.
-# 8081 is reserved for the app to serve on (a phone-facing run monitor). Declaring it here
-# is documentation — RunPod exposes what the TEMPLATE lists — but it keeps the ports in
-# one place and works for a plain `docker run -p`.
-EXPOSE 6080 8080 8081
+# 8081 is reserved for the app to serve on (a phone-facing run monitor). 22 only ever listens
+# if PUBLIC_KEY is set (see entrypoint.sh) — declaring it here is documentation, same as 8081.
+# Declaring these is documentation — RunPod exposes what the TEMPLATE lists — but it keeps the
+# ports in one place and works for a plain `docker run -p`.
+EXPOSE 6080 8080 8081 22
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

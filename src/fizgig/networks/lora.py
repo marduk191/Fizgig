@@ -52,6 +52,15 @@ class LoRAModule(torch.nn.Module):
             in_dim = org_module.in_features
             out_dim = org_module.out_features
 
+        # NOTE: rank is NOT capped at min(in, out), even though B@A can never exceed that rank.
+        # A cap was added and then removed (4 Aug) after measuring what it costs: on MiniMax H3's
+        # pruned AdaLN ([96768, 8]) capping rank 32 -> 8 cut that layer's learning to 27% of the
+        # reference trainer's after one matched epoch, and AdaLN carries ~45% of all weight
+        # movement there. The expressible SET is identical either way; the optimisation dynamics
+        # are not — an over-complete factorisation trains markedly faster under Adam (implicit
+        # acceleration of overparameterised linear networks). The extra columns are not dead
+        # weight, they are the gradient path. Keep whatever rank the caller asked for.
+
         self.lora_dim = lora_dim
         self.split_dims = split_dims
 
@@ -837,7 +846,20 @@ class LoRANetwork(torch.nn.Module):
                         module = root_module  # search all modules
 
                     for child_name, child_module in module.named_modules():
-                        is_linear = child_module.__class__.__name__ == "Linear"
+                        # bitsandbytes 4-bit/8-bit linears are Linears for LoRA purposes: they
+                        # expose in_features/out_features and LoRAModule only wraps their
+                        # forward. Needed to LoRA-train on an NF4-quantized frozen base
+                        # (MiniMax H3's 33B DiT), which Fizgig loads as Linear4bit.
+                        # Match by CLASS NAME, so every quantized Linear stand-in must be listed
+                        # here or its modules are silently skipped — a LoRA that trains a
+                        # fraction of what was asked for, with no error. ConvRotInt8Linear /
+                        # Nvfp4Linear (MiniMax H3's int8-ConvRot and nvfp4 bases) were exactly
+                        # that: 58 of 258 modules wrapped. An isinstance(nn.Linear) test would
+                        # be more robust; the name list is kept for Conv2d symmetry, so ADD TO
+                        # IT when introducing a Linear subclass.
+                        is_linear = child_module.__class__.__name__ in (
+                            "Linear", "Linear4bit", "Linear8bitLt",
+                            "ConvRotInt8Linear", "Nvfp4Linear")
                         is_conv2d = child_module.__class__.__name__ == "Conv2d"
                         is_conv2d_1x1 = is_conv2d and child_module.kernel_size == (1, 1)
 
@@ -1294,6 +1316,9 @@ def detect_lora_format(weights_sd: Dict[str, torch.Tensor]) -> str:
             has_peft = True
         if k.startswith("transformer.") and (".lora_A." in k or ".lora_B." in k or ".lora_down" in k or ".lora_up" in k):
             has_peft = True  # AI-Toolkit / OneTrainer OMI format
+        if "." in k and not k.startswith(("lora_unet_", "lora_transformer_")) \
+                and (".lora_A." in k or ".lora_B." in k):
+            has_peft = True  # bare dotted paths, no prefix — MiniMax H3 ecosystem exports
     if has_kohya and not has_peft:
         return "kohya"
     if has_peft and not has_kohya:
@@ -1352,6 +1377,73 @@ _DIFFUSERS_SINGLE_QKV = [
     ("attn.to_v", "linear1", 2),
     ("proj_mlp", "linear1", 3),  # MLP projection fused into linear1 slot 3
 ]
+
+
+# Diffusers-name -> Fizgig-native renames for Krea 2, applied to FLATTENED kohya module names.
+# Straight from OneTrainer's own diffusers_to_original table (modules/model/Krea2Model.py) —
+# q/k/v are split in BOTH namespaces, so unlike Flux there is no QKV fusion stage, only renames.
+# Order matters: longest/most-specific first, so _attn_to_out_0 wins before _attn_to_o could.
+_KREA2_DIFFUSERS_RENAMES = (
+    ("_attn_to_out_0", "_attn_wo"),
+    ("_attn_to_gate", "_attn_gate"),
+    ("_attn_to_q", "_attn_wq"),
+    ("_attn_to_k", "_attn_wk"),
+    ("_attn_to_v", "_attn_wv"),
+    ("_ff_up", "_mlp_up"),
+    ("_ff_gate", "_mlp_gate"),
+    ("_ff_down", "_mlp_down"),
+)
+
+
+def _is_diffusers_krea2_lora(weights_sd: Dict[str, torch.Tensor]) -> bool:
+    """Krea 2 in diffusers naming (OneTrainer, AI-Toolkit, diffusers exports).
+
+    Must be checked BEFORE the Flux converter: both architectures use `transformer_blocks.` in
+    diffusers form, and the Flux converter would silently map a Krea 2 file onto
+    double_blocks/single_blocks names that do not exist there. The discriminators are modules
+    only Krea 2 has: the gated-MLP `ff.up/gate/down` (Flux's MLP is `ff.net.*`), the attention
+    output gate `attn.to_gate`, and the `text_fusion.` tower.
+    """
+    for k in weights_sd:
+        kk = k.replace("_", ".")        # catch the pre-flattened legacy form too
+        if (".ff.up." in kk or ".ff.gate." in kk or ".ff.down." in kk
+                or ".attn.to.gate." in kk or "text.fusion." in kk):
+            return True
+    return False
+
+
+def _krea2_diffusers_to_native(weights_sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Rename flattened diffusers-Krea 2 module names to the native ones our KreaDiT exposes.
+
+    Runs AFTER prefix stripping + dot flattening, so every key looks like
+    `lora_unet_transformer_blocks_0_attn_to_q.lora_down.weight`. Without this pass none of
+    those names exist in the model and create_network_from_weights builds zero modules —
+    "No LoRA modules found" (issue #50, OneTrainer Krea 2 LoRAs).
+    """
+    out: Dict[str, torch.Tensor] = {}
+    n = 0
+    for k, v in weights_sd.items():
+        mod, dot, rest = k.partition(".")
+        new_mod = mod
+        new_mod = re.sub(r"^lora_unet_transformer_blocks_(\d+)_", lambda m_: "lora_unet_blocks_" + m_.group(1) + "_", new_mod)
+        new_mod = new_mod.replace("lora_unet_text_fusion_", "lora_unet_txtfusion_")
+        for a, b in _KREA2_DIFFUSERS_RENAMES:
+            if a in new_mod:
+                new_mod = new_mod.replace(a, b)
+        # IO layers, for completeness (rarely trained, cheap to map): img_in -> first,
+        # final_layer.linear -> last.linear, txt_in linears -> the txtmlp Sequential slots.
+        new_mod = (new_mod
+                   .replace("lora_unet_img_in", "lora_unet_first")
+                   .replace("lora_unet_final_layer_linear", "lora_unet_last_linear")
+                   .replace("lora_unet_txt_in_linear_1", "lora_unet_txtmlp_1")
+                   .replace("lora_unet_txt_in_linear_2", "lora_unet_txtmlp_3")
+                   .replace("lora_unet_time_embed_linear_1", "lora_unet_tmlp_0")
+                   .replace("lora_unet_time_embed_linear_2", "lora_unet_tmlp_2"))
+        if new_mod != mod:
+            n += 1
+        out[new_mod + dot + rest] = v
+    logger.info("Krea 2 diffusers naming detected — renamed %d key(s) to native module names.", n)
+    return out
 
 
 def _is_diffusers_flux_lora(weights_sd: Dict[str, torch.Tensor]) -> bool:
@@ -1555,7 +1647,12 @@ def peft_to_kohya(weights_sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor
     """
     # Check for diffusers-style Flux keys (transformer_blocks / single_transformer_blocks)
     # These need full key remapping + QKV fusion, not just prefix stripping.
-    if _is_diffusers_flux_lora(weights_sd):
+    # Checked FIRST: Krea 2 and Flux both say `transformer_blocks.` in diffusers form, and the
+    # Flux converter would map a Krea 2 file onto block names that do not exist there. Krea 2
+    # needs no QKV fusion (q/k/v are split in both namespaces), so the ordinary strip+flatten
+    # below does the heavy lifting and the rename pass runs on the result at the end.
+    _krea2 = _is_diffusers_krea2_lora(weights_sd)
+    if not _krea2 and _is_diffusers_flux_lora(weights_sd):
         logger.info("Diffusers-format Flux LoRA detected (transformer_blocks) — converting with QKV fusion.")
         return _convert_diffusers_flux_lora(weights_sd)
 
@@ -1579,9 +1676,17 @@ def peft_to_kohya(weights_sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor
                 stripped = key[len(pfx):]
                 break
         if stripped is None:
-            # Not a LoRA weight in a format we convert — preserve as-is (rare)
-            converted[key] = tensor
-            continue
+            # No prefix at all, but a dotted module path with a LoRA suffix — the MiniMax H3
+            # ecosystem exports like this (blocks.0.attn.qkv_proj.lora_A.weight, e.g. the
+            # Turbo LoRA). Treat the whole key as the stripped path.
+            _bare_suffixes = (".lora_A.weight", ".lora_B.weight", ".lora_down.weight",
+                              ".lora_up.weight", ".alpha") + LYCORIS_SUFFIXES
+            if "." in key and key.endswith(_bare_suffixes):
+                stripped = key
+            else:
+                # Not a LoRA weight in a format we convert — preserve as-is (rare)
+                converted[key] = tensor
+                continue
 
         # LyCORIS suffix? Preserve it verbatim.
         lycoris_match = None
@@ -1643,6 +1748,8 @@ def peft_to_kohya(weights_sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor
         f"[peft→kohya] converted {len(weights_sd)} keys → {len(converted)} "
         f"({len(ranks)} LoRA modules, alphas synthesized where absent)"
     )
+    if _krea2:
+        converted = _krea2_diffusers_to_native(converted)
     return converted
 
 
@@ -1651,6 +1758,109 @@ class UnsupportedLoRAFormat(RuntimeError):
     (LoKR / LoHa / GLoRA). Fizgig's LoRAInfModule only implements standard LoRA
     (`up @ down`); these variants use Kronecker / Hadamard / four-matrix
     decompositions that would need separate module classes."""
+
+
+class LoRAFamilyMismatch(RuntimeError):
+    """Raised when a LoRA's trained-for family doesn't match the family a caller
+    (Royale / Explorer / Repair Studio) is about to load it against. Callers should
+    catch this the same way they catch UnsupportedLoRAFormat — a clean single-line
+    message, no traceback — since it's an expected user-facing outcome, not a bug."""
+
+
+# Family display names, keyed by the same "klein" / "krea2" / "minimax" strings the
+# GUI's *_family_var StringVars already use — lets callers compare lora_family_from_file's
+# result against a family_var.get() directly with no translation step.
+FAMILY_DISPLAY_NAMES = {
+    "klein": "Klein 9B",
+    "krea2": "Krea 2",
+    "minimax": "MiniMax H3",
+}
+
+# Families that actually have an inference-side selector (Royale, Explorer, Repair Studio).
+# A caller auto-following lora_family_from_file's result must only .set() values a radio
+# button carries (issue #62 follow-up: a value with no radio leaves both blank and the family
+# that loads is whichever "else" branch the caller's ternary falls back to).
+INFERENCE_FAMILIES = ("klein", "krea2", "minimax")
+
+# Klein 9B's block depth (Klein9BParams in klein/model.py: depth=8, depth_single_blocks=24).
+# double_blocks/single_blocks (native/kohya) and transformer_blocks/single_transformer_blocks
+# (diffusers) are BFL naming shared with other Flux variants at different depths — Flux.1
+# dev/schnell is 19+38, full Flux.2 is 8+48 — so the family can't be read off the block-name
+# substring alone; the deepest block index actually present has to fall inside Klein's own
+# shape. A negative lookbehind keeps "single_transformer_blocks.N" from also matching the
+# double/transformer_blocks pattern (it contains "transformer_blocks.N" as a substring).
+_KLEIN_MAX_DOUBLE_BLOCKS = 8
+_KLEIN_MAX_SINGLE_BLOCKS = 24
+_KLEIN_DOUBLE_BLOCK_RE = re.compile(r"(?<!single_)(?:double_blocks|transformer_blocks)[._](\d+)")
+_KLEIN_SINGLE_BLOCK_RE = re.compile(r"single_(?:transformer_)?blocks[._](\d+)")
+
+
+def lora_family_from_file(path: str) -> Optional[str]:
+    """Identify which model family a LoRA/LyCORIS file was trained for, from its
+    safetensors header alone — no tensor data read, no pipeline load, microseconds.
+
+    Returns "klein", "krea2", "minimax", or None if the file doesn't match any
+    known signature (callers should not block on None — fail open and let the
+    real loader be the judge, the same as an unreadable/corrupt file). None also
+    covers a file that uses Klein's own block-name segments at a depth Klein 9B
+    doesn't have (a Flux.1 or full-Flux.2 LoRA) — see _KLEIN_MAX_DOUBLE_BLOCKS.
+
+    Krea 2 and MiniMax H3 are each identified by a substring nothing else uses, so a
+    plain membership check is enough for them regardless of whether the file uses
+    Fizgig's own native prefixes (`diffusion_model.`, `transformer.`), the kohya/
+    sd-scripts flattened form (`lora_unet_*`), or another tool's dotted diffusers
+    export. Klein 9B shares its block-name segments with other Flux depths, so it's
+    identified by block count instead (checked last, after Krea 2 and MiniMax H3 are
+    ruled out — diffusers-form Krea 2 also says `transformer_blocks.`).
+    """
+    from fizgig.utils.safetensors import MemoryEfficientSafeOpen
+    try:
+        with MemoryEfficientSafeOpen(path) as f:
+            keys = f.keys()
+    except Exception:
+        return None
+    for k in keys:
+        if "text_fusion" in k or "txtfusion" in k:
+            return "krea2"
+    if _is_diffusers_krea2_lora(keys):
+        return "krea2"
+    for k in keys:
+        if "token_refiner" in k or "adaln_proj" in k:
+            return "minimax"
+    max_double = -1
+    max_single = -1
+    for k in keys:
+        m = _KLEIN_DOUBLE_BLOCK_RE.search(k)
+        if m:
+            max_double = max(max_double, int(m.group(1)))
+            continue
+        m = _KLEIN_SINGLE_BLOCK_RE.search(k)
+        if m:
+            max_single = max(max_single, int(m.group(1)))
+    if max_double < 0 and max_single < 0:
+        return None
+    if max_double < _KLEIN_MAX_DOUBLE_BLOCKS and max_single < _KLEIN_MAX_SINGLE_BLOCKS:
+        return "klein"
+    return None
+
+
+def assert_lora_family_matches(path: str, selected_family: str, tab_label: str) -> None:
+    """Guard for the family/LoRA mismatch in issue #62: check the file's family against
+    what the tab's selector is set to BEFORE a caller commits to a full pipeline load.
+    No-op when the file's family can't be determined (fail open) or already matches.
+
+    Raises LoRAFamilyMismatch with a plain-English message on a real mismatch — callers
+    should catch it alongside UnsupportedLoRAFormat and show it without a traceback.
+    """
+    detected = lora_family_from_file(path)
+    if detected is None or detected == selected_family:
+        return
+    detected_name = FAMILY_DISPLAY_NAMES.get(detected, detected)
+    selected_name = FAMILY_DISPLAY_NAMES.get(selected_family, selected_family)
+    raise LoRAFamilyMismatch(
+        f"This LoRA was trained for {detected_name}, but the {tab_label} family selector "
+        f"is on {selected_name}. Switch it to {detected_name} to use this file."
+    )
 
 
 def ensure_kohya_lora_state_dict(weights_sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
@@ -1670,6 +1880,11 @@ def ensure_kohya_lora_state_dict(weights_sd: Dict[str, torch.Tensor]) -> Dict[st
         n_renamed = sum(1 for k in weights_sd if k.startswith("lora_transformer_"))
         logger.info("OneTrainer legacy format detected — renamed %d lora_transformer_ keys to lora_unet_", n_renamed)
         weights_sd = renamed
+        # The module paths are still diffusers-shaped after the prefix swap. A Krea 2 file
+        # (ff_up / attn_to_gate / text_fusion markers) needs the same rename pass the dotted
+        # form gets in peft_to_kohya, or none of its names exist in the model (issue #50).
+        if _is_diffusers_krea2_lora(weights_sd):
+            weights_sd = _krea2_diffusers_to_native(weights_sd)
 
     if fmt == "peft":
         logger.info("PEFT/diffusers-format LoRA detected — converting key names to kohya convention.")
@@ -1709,7 +1924,12 @@ def _build_dit_linear_map(
     for name, module in unet.named_modules():
         if target_replace_modules is None or module.__class__.__name__ in target_replace_modules:
             for child_name, child_module in module.named_modules():
-                if child_module.__class__.__name__ in ("Linear", "Conv2d"):
+                # Must match create_modules' whitelist (lora.py ~:860) — quantized bases hold
+                # Linear SUBCLASSES, and a plain-Linear test silently drops every LyCORIS
+                # module on them (H3's LoKR default loaded 0 modules before this).
+                if child_module.__class__.__name__ in (
+                        "Linear", "Linear4bit", "Linear8bitLt",
+                        "ConvRotInt8Linear", "Nvfp4Linear", "Conv2d"):
                     original_name = (name + "." if name else "") + child_name
                     lora_name = f"{prefix}.{original_name}".replace(".", "_")
                     result[lora_name] = child_module

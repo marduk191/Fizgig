@@ -41,6 +41,10 @@ profiles/*
 
 # Model files (user-provided)
 *.safetensors
+# ...except the bundled silu(t_emb) grid (5.5 MB, Apache-2.0, from larryvrh's
+# ComfyUI-MiniMax-H3-Turbo node): the pruned base cannot compute silu(t_emb), and the
+# Turbo LoRA's AdaLN injection for previews needs the full model's answer.
+!src/fizgig/assets/h3_silu_temb_grid.safetensors
 *.ckpt
 *.bin
 
@@ -72,10 +76,26 @@ docs/bench_krea2_baseline.json
 
 # Internal design notes (not for publication)
 docs/PHONE_MONITOR_PLAN.md
+docs/MINIMAX_REFERENCE_NOTES.md
+docs/MINIMAX_BLOCKS.md
 
 # Written by launch.pyw when the app fails to start
 launch_error.log
 
+# Written by install_fizgig_rocm.bat / install_fizgig_rocm.sh (BNB_ROCM_VERSION / ROCM_PATH)
+rocm_env.bat
+rocm_env.sh
+gpu_detect_debug.log
+
+# Leftover portable-Python cache from older ROCm installer attempts
+python312/
+
+
 # Internal-only: debugging test harnesses + template setup notes (local, never public)
 tests/
 docs/RUNPOD_TEMPLATE.md
+
+# Local-only deploy/sync helpers (never commit)
+sync-to-remote.sh
+gizmo_settings.json
+docs/RESEARCH_*

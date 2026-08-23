@@ -61,17 +61,18 @@ You're in business when the log reaches:
 | | Port | Username | Password |
 |---|---|---|---|
 | **Fizgig** | 6080 | `fizgig` | your `VNC_PASSWORD` |
-| **File manager** | 8080 | `admin` | the same one |
+| **File manager** | 8080 | `admin` | the same one* |
+
+\* One wrinkle: the file manager requires 12+ characters, so a shorter password gets zeros added
+to the end **for port 8080 only** (`mypass` becomes `mypass000000`). Pick a password of 12+
+characters and both logins are literally identical — no wrinkle.
 
 **Set your own password when you deploy.** On the deploy screen expand **Edit Template →
 Environment Variables**, add `VNC_PASSWORD`, and pick something 12+ characters. Then you already
 know it, and you never have to go looking.
 
-Anything shorter gets zero-padded for the file manager, which needs 12 — so choose 12+ and both
-logins stay identical.
-
-**Didn't set one?** Fizgig generates one per pod and prints it at the **end of the log**, in the
-"Ready" banner:
+**Didn't set one?** Fizgig generates one per pod (already 12 characters, so it works everywhere
+as-is) and prints it at the **end of the log**, in the "Ready" banner:
 
 ```
 [fizgig]  Your browser will ask for a username and password:
@@ -81,6 +82,24 @@ logins stay identical.
 
 If the log looks like it stops short of that, switch to another tab and back — RunPod's log view
 sometimes needs a nudge before it shows the newest lines.
+
+### How the pod is secured
+
+Worth knowing, and worth writing down so it doesn't get "fixed" into something worse later.
+
+**The desktop always needs a password.** There is no unauthenticated mode — if you don't set
+`VNC_PASSWORD`, one is generated for that pod and printed in the log. An open VNC on a public URL
+is a shell on someone else's GPU, so this one isn't optional.
+
+**SSH is off unless you ask for it.** Port 22 is listed on the image as documentation, but nothing
+listens on it until `PUBLIC_KEY` is set, and then only your own key gets in. RunPod's "SSH Terminal
+Access" toggle sets that variable for you; on any other host you set it yourself.
+
+**Everything in the pod runs as root, deliberately.** A rented GPU has exactly one tenant — you —
+and logging in gives you a full desktop on it by design. Running the container as an unprivileged
+user would not change what you can do, would not help anyone who already had the password, and
+would break `/workspace` permissions on pods that already exist. The protection that matters here
+is the password on the door, not the user behind it.
 
 ## First run
 

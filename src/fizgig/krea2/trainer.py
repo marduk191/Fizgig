@@ -33,8 +33,10 @@ from fizgig.krea2.utils import load_krea2_dit
 from fizgig.krea2.sampling import gather_valid_text, prepare
 from fizgig.modules.sdpa import consider_training_backend as _consider_training_backend
 from fizgig.networks.lora import create_network
-from fizgig.training.metadata import ARCHITECTURE_KREA2
-from fizgig.training.train_utils import LossRecorder, prune_state_dirs
+from fizgig.training.metadata import (
+    ARCHITECTURE_KREA2, build_metadata, latest_sample_image, thumbnail_data_uri, resolve_title,
+)
+from fizgig.training.train_utils import LossRecorder, prune_state_dirs, validate_output_name
 
 logger = logging.getLogger(__name__)
 
@@ -310,6 +312,10 @@ def _find_host_compiler() -> bool:
         if not os.path.isfile(vcvars):
             continue
         try:
+            # shell=True is intentional here: vcvars is a path just discovered via vswhere/
+            # well-known VS install roots (not external input), and we need the shell's &&
+            # to source the .bat file's env vars into `set`. cmd.exe /c would hit the same
+            # interpreter anyway, so it'd be cosmetic, not safer.
             out = subprocess.run(f'"{vcvars}" >nul && set', shell=True, capture_output=True,
                                  text=True, timeout=120)
             if out.returncode != 0:
@@ -575,6 +581,34 @@ def _save_training_state(output_dir, output_name, network, optimizer, *, epoch, 
     _detect_latest_state_dir finds the highest-numbered one and passes it to --resume."""
     state_dir = os.path.join(output_dir, f"{output_name}-{epoch:06d}-state")
     os.makedirs(state_dir, exist_ok=True)
+    try:
+        return _write_state_files(state_dir, network, optimizer, epoch=epoch,
+                                  global_step=global_step, network_dim=network_dim,
+                                  network_alpha=network_alpha, dtype=dtype, extra=extra)
+    except Exception as _first:
+        # Clean the partial dir (no training_state.json = no commit marker, but it would shadow
+        # the previous good state in the GUI's latest-state scan), then retry ONCE after a short
+        # pause. Network filesystems (RunPod volumes) throw transient stream errors that clear
+        # in seconds — a real run lost its epoch-8 state to exactly one of those. If the retry
+        # also fails it is not transient; re-raise and let the caller decide fatality.
+        import shutil
+        import time
+        shutil.rmtree(state_dir, ignore_errors=True)
+        logger.warning("[state] save failed (%s: %s) — retrying once in 5s",
+                       type(_first).__name__, _first)
+        time.sleep(5)
+        try:
+            os.makedirs(state_dir, exist_ok=True)
+            return _write_state_files(state_dir, network, optimizer, epoch=epoch,
+                                      global_step=global_step, network_dim=network_dim,
+                                      network_alpha=network_alpha, dtype=dtype, extra=extra)
+        except Exception:
+            shutil.rmtree(state_dir, ignore_errors=True)
+            raise
+
+
+def _write_state_files(state_dir, network, optimizer, *, epoch, global_step,
+                       network_dim, network_alpha, dtype, extra=None):
     _save_lora(network, os.path.join(state_dir, "lora.safetensors"), network_dim, network_alpha, dtype)
     if optimizer is not None:   # None under fused backward (per-parameter optimizers)
         torch.save(optimizer.state_dict(), os.path.join(state_dir, "optimizer.pt"))
@@ -587,12 +621,66 @@ def _save_training_state(output_dir, output_name, network, optimizer, *, epoch, 
         meta.update(extra)
     with open(os.path.join(state_dir, "training_state.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f)
+    # training_state.json is written LAST on purpose: it is the commit marker. A save that
+    # dies partway leaves no json, and both the resume validator and the GUI's latest-state
+    # detection treat a json-less dir as not-a-state rather than resuming garbage.
     logger.info(f"[state] saved -> {state_dir}")
     return state_dir
 
 
+def _validate_state_dir(state_dir):
+    """Refuse anything that is not a saved training state, and say what to pick instead.
+
+    Issue #48: choosing the OUTPUT directory rather than a state folder failed with a bare
+    "lora.safetensors not found", and the obvious workaround — putting a LoRA there under that
+    name — then appeared to work. It cannot: without training_state.json there is no epoch or
+    step, and without optimizer.pt there is no Adam state, so the run silently starts over from
+    epoch 0 while looking like a resume, and overwrites the finished LoRA on the way. Refusing
+    is the only safe answer, and the message has to name the folder they actually wanted.
+    """
+    if os.path.isfile(state_dir):
+        sib = ""
+        base = os.path.dirname(state_dir)
+        try:
+            states = sorted(d for d in os.listdir(base) if d.endswith("-state")
+                            and os.path.isfile(os.path.join(base, d, "training_state.json")))
+            if states:
+                sib = " Next to it: " + ", ".join(states[-3:])
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"[resume] {os.path.basename(state_dir)} is a file — resume takes the saved-state "
+            f"FOLDER (named like '<lora name>-000012-state'), not a .safetensors.{sib}")
+    if not os.path.isdir(state_dir):
+        raise RuntimeError(f"[resume] {state_dir} does not exist — was the state folder moved "
+                           f"or renamed?")
+    missing = [f for f in ("lora.safetensors", "training_state.json")
+               if not os.path.isfile(os.path.join(state_dir, f))]
+    if not missing:
+        return
+    lines = [
+        f"[resume] {state_dir} is not a saved training state — missing {', '.join(missing)}.",
+        "[resume] Pick the folder named like '<lora name>-000012-state'. Renaming a LoRA to "
+        "lora.safetensors does not make one: there would be no optimizer state and no epoch "
+        "to resume from, so the run would quietly start again from scratch.",
+    ]
+    try:
+        # The usual mistake is picking the parent output directory, one level above the state
+        # folders — so if they are sitting right there, name them.
+        here = sorted(d for d in os.listdir(state_dir)
+                      if d.endswith("-state")
+                      and os.path.isfile(os.path.join(state_dir, d, "training_state.json")))
+        if here:
+            lines.append("[resume] That looks like your output directory. The saved states in "
+                         "it are: " + ", ".join(here[-5:]))
+    except OSError:
+        pass
+    raise RuntimeError(os.linesep.join(lines))
+
+
 def _load_training_state(state_dir, network, optimizer, *, device):
     """Restore network + optimizer + RNG from a state dir. Returns (start_epoch, global_step, meta)."""
+    _validate_state_dir(state_dir)
     from safetensors.torch import load_file
     # strict=False tolerates benign key drift, but if NOTHING matched the LoRA silently stays at
     # its zero init and the run "succeeds" while training from scratch — then overwrites the
@@ -1245,7 +1333,7 @@ def sample_previews(turbo_path, ae, encoded_prompts, lora_sd, out_dir, epoch, *,
                     output_name="krea2", steps=8, cfg_scale=1.0, neg=None,
                     width=512, height=512,
                     seed=42, context_lora_path=None, context_lora_strength=1.0,
-                    blocks_to_swap=0, int8=False, device="cuda"):
+                    blocks_to_swap=0, int8=False, device="cuda", prompts=None):
     """Load the (clean) pre-quant fp8 Turbo, apply the current LoRA LIVE (no merge -> no grid),
     and render each pre-encoded prompt. Turbo is freed afterwards.
 
@@ -1293,23 +1381,31 @@ def sample_previews(turbo_path, ae, encoded_prompts, lora_sd, out_dir, epoch, *,
         turbo.move_to_device_except_swap_blocks(torch.device(device))
         turbo.switch_block_swap_for_inference()
     turbo.eval()
-    paths = _render_prompt_set(turbo, ae, encoded_prompts, out_dir, epoch,
-                               output_name=output_name, steps=steps, cfg_scale=cfg_scale,
-                               neg=neg, width=width, height=height, seed=seed, device=device)
+    result = _render_prompt_set(turbo, ae, encoded_prompts, out_dir, epoch,
+                                output_name=output_name, steps=steps, cfg_scale=cfg_scale,
+                                neg=neg, width=width, height=height, seed=seed, device=device,
+                                prompts=prompts)
     del turbo, net, ctx_net
     torch.cuda.empty_cache()
-    return paths
+    return result
 
 
 def _render_prompt_set(model, ae, encoded_prompts, out_dir, epoch, *, output_name, steps,
-                       cfg_scale, neg, width, height, seed, device):
+                       cfg_scale, neg, width, height, seed, device, prompts=None):
     """Shared preview render loop — identical settings (mu=1.15 pinned) and the exact gallery
-    filename pattern for both the Turbo-model path and the turbo-LoRA-on-training-DiT path."""
+    filename pattern for both the Turbo-model path and the turbo-LoRA-on-training-DiT path.
+
+    `prompts` is the raw text parallel to `encoded_prompts` (same order, same length) — optional
+    because a couple of call sites don't have it handy, but when it's there we hand back which
+    prompt made the LAST image, so a checkpoint saved right after can default its description to
+    it instead of shipping blank (same idea as the auto-thumbnail, which is already whatever
+    sample happens to be newest on disk)."""
     import datetime
     from fizgig.krea2 import sampling
     os.makedirs(out_dir, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")  # 14-digit timestamp
     paths = []
+    last_prompt = None
     # Negative prompt rides through the CFG path (untxt) — only when CFG is actually on.
     _untxt = _untxtmask = None
     if neg is not None and cfg_scale and cfg_scale > 1.0:
@@ -1322,12 +1418,15 @@ def _render_prompt_set(model, ae, encoded_prompts, out_dir, epoch, *, output_nam
         p = os.path.join(out_dir, f"{output_name}_e{epoch:06d}_{i:02d}_{ts}_{seed + i}.png")
         imgs[0].save(p)
         paths.append(p)
-    return paths
+        if prompts and i < len(prompts):
+            last_prompt = prompts[i]
+    return paths, last_prompt
 
 
 def sample_previews_on_dit(dit, turbo_net, turbo_diffb, ae, encoded_prompts, out_dir, epoch, *,
                            output_name="krea2", steps=8, cfg_scale=1.0, neg=None,
-                           width=512, height=512, seed=42, blocks_to_swap=0, device="cuda"):
+                           width=512, height=512, seed=42, blocks_to_swap=0, device="cuda",
+                           prompts=None):
     """Render previews on the RESIDENT training DiT with the Turbo LoRA enabled at 1.0 —
     no Turbo checkpoint load, no parking the trainer to CPU.
 
@@ -1356,7 +1455,8 @@ def sample_previews_on_dit(dit, turbo_net, turbo_diffb, ae, encoded_prompts, out
             bias.data.add_(delta.to(device=bias.device, dtype=bias.dtype))
         return _render_prompt_set(dit, ae, encoded_prompts, out_dir, epoch,
                                   output_name=output_name, steps=steps, cfg_scale=cfg_scale,
-                                  neg=neg, width=width, height=height, seed=seed, device=device)
+                                  neg=neg, width=width, height=height, seed=seed, device=device,
+                                  prompts=prompts)
     finally:
         for bias, snap in saved_biases:
             bias.data.copy_(snap)
@@ -1473,13 +1573,43 @@ def train_krea2(
     metadata_description: str = None,
     metadata_license: str = None,
     metadata_tags: str = None,
+    metadata_trigger_phrase: str = None,
+    metadata_thumbnail: str = None,
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
 ):
     """Native Krea 2 LoRA training: bucketed multi-resolution dataloader over the krea2 caches ->
     flow-matching loss -> AdamW -> save a ComfyUI-compatible LoRA. In-training Turbo previews +
     GUI wiring are layered on elsewhere."""
+    validate_output_name(output_name)     # before the model loads, not an epoch later (#70)
     torch.manual_seed(seed)
+
+    # Updated at every sample render (see the sample_previews*/prompts= call sites below) so
+    # _sai_metadata can default the description to whatever prompt made the newest thumbnail,
+    # instead of shipping blank.
+    _last_sample_prompt = None
+
+    def _sai_metadata():
+        """SAI ModelSpec block shared by every checkpoint (per-epoch and final), so an epoch
+        picked over the last one is just as identifiable in ComfyUI. Thumbnail defaults to
+        whatever preview training has produced so far — cosmetic, so a missing one is fine."""
+        if metadata_thumbnail and metadata_thumbnail.lower() in ("off", "none"):
+            thumb_source = None
+        elif metadata_thumbnail:
+            thumb_source = metadata_thumbnail
+        else:
+            thumb_source = latest_sample_image(output_dir)
+        return build_metadata(
+            None, ARCHITECTURE_KREA2, time.time(),
+            title=(metadata_title if metadata_title is not None
+                   else resolve_title(output_name, metadata_trigger_phrase)),
+            author=metadata_author,
+            description=(metadata_description if metadata_description is not None
+                         else _last_sample_prompt),
+            license=metadata_license, tags=metadata_tags,
+            trigger_phrase=metadata_trigger_phrase,
+            thumbnail=thumbnail_data_uri(thumb_source),
+        )
 
     shared_epoch = Value("i", 0)
     user_config = load_user_config(dataset_config)
@@ -1889,7 +2019,10 @@ def train_krea2(
     global_step = 0
     start_epoch = 0
     # Resume: restore LoRA + optimizer + RNG + (start_epoch, global_step) from a saved state dir.
-    if resume_state_dir and os.path.isdir(resume_state_dir):
+    # `if resume_state_dir` — NOT `and os.path.isdir(...)`: a requested resume whose path is bad
+    # (the .safetensors picked instead of its folder, a moved/typo'd dir) used to skip this block
+    # silently and train from scratch. If a resume was asked for, it happens or the run refuses.
+    if resume_state_dir:
         start_epoch, global_step, _resume_meta = _load_training_state(resume_state_dir, network, optimizer, device=device)
         if adaptive:
             adaptive.load_state_dict(_resume_meta.get("adaptive_lr_state"))
@@ -2132,11 +2265,13 @@ def train_krea2(
         logger.info("rendering epoch-0 preview (Sample at Start, on training DiT)...")
         try:
             _seed0 = sample_seed if sample_seed != 0 else random.randint(1, 2**31 - 1)
-            sample_previews_on_dit(dit, turbo_net, turbo_diffb, sample_ae, encoded_prompts,
+            _, _last_p = sample_previews_on_dit(dit, turbo_net, turbo_diffb, sample_ae, encoded_prompts,
                                    sample_dir, 0, output_name=output_name, steps=sample_steps,
                                    cfg_scale=sample_cfg_scale, neg=encoded_negative,
                                    width=sample_width, height=sample_height, seed=_seed0,
-                                   blocks_to_swap=blocks_to_swap, device=device)
+                                   blocks_to_swap=blocks_to_swap, device=device, prompts=sample_prompts)
+            if _last_p:
+                _last_sample_prompt = _last_p
         except Exception as _e0:
             logger.warning(f"[preview] Sample at Start failed ({type(_e0).__name__}) — training "
                            f"continues; per-epoch previews will still be attempted.")
@@ -2153,13 +2288,16 @@ def train_krea2(
         torch.cuda.empty_cache()
         try:
             _seed0 = sample_seed if sample_seed != 0 else random.randint(1, 2**31 - 1)
-            sample_previews(turbo_path, sample_ae, encoded_prompts, _lf0(_tmp0), sample_dir, 0,
+            _, _last_p = sample_previews(turbo_path, sample_ae, encoded_prompts, _lf0(_tmp0), sample_dir, 0,
                             output_name=output_name, steps=sample_steps,
                             cfg_scale=sample_cfg_scale, neg=encoded_negative,
                             width=sample_width, height=sample_height, seed=_seed0,
                             context_lora_path=context_lora_path,
                             context_lora_strength=context_lora_strength,
-                            blocks_to_swap=preview_blocks_to_swap, int8=preview_int8, device=device)
+                            blocks_to_swap=preview_blocks_to_swap, int8=preview_int8, device=device,
+                            prompts=sample_prompts)
+            if _last_p:
+                _last_sample_prompt = _last_p
         except Exception as _e0:
             logger.warning(f"[preview] Sample at Start failed ({type(_e0).__name__}) — training "
                            f"continues; per-epoch previews will still be attempted.")
@@ -2398,16 +2536,30 @@ def train_krea2(
                 # comfy_format so a user's picked-best epoch is byte-format-identical to the final
                 # artifact (LoKR: LyCORIS-standard keys). No-op for standard LoRA.
                 _save_lora(network, os.path.join(output_dir, f"{output_name}-{epoch + 1:06d}.safetensors"),
-                           network_dim, network_alpha, dtype, comfy_format=True)
+                           network_dim, network_alpha, dtype, extra_metadata=_sai_metadata(),
+                           comfy_format=True)
                 # Resumable state rides the checkpoint cadence. Safe to snapshot here: pending_accum
                 # was flushed above, the adaptive-LR watcher has already made its call for this epoch,
                 # and any queued caption updates are applied — so the optimizer is settled.
                 if save_state:
-                    _save_training_state(output_dir, output_name, network, optimizer,
-                                         epoch=epoch + 1, global_step=global_step,
-                                         network_dim=network_dim, network_alpha=network_alpha, dtype=dtype,
-                                         extra={"adaptive_lr_state": adaptive.state_dict()} if adaptive else None)
-                    state_saved_this_epoch = True
+                    # NON-FATAL by design. A real run (7 Aug, RunPod) died at 27% of 55 hours
+                    # because rng.pt hit a full network volume — for a file whose only job is to
+                    # make resume nicer. The checkpoint itself had already saved. State saving must
+                    # never cost a run; if the disk is truly full, the next EPOCH CHECKPOINT will
+                    # fail and that one is rightly fatal.
+                    try:
+                        _save_training_state(output_dir, output_name, network, optimizer,
+                                             epoch=epoch + 1, global_step=global_step,
+                                             network_dim=network_dim, network_alpha=network_alpha, dtype=dtype,
+                                             extra={"adaptive_lr_state": adaptive.state_dict()} if adaptive else None)
+                        state_saved_this_epoch = True
+                    except Exception as _se:
+                        logger.error("[state] saving the resume state FAILED (%s: %s). This is "
+                                     "almost always the disk — on RunPod the volume quota is "
+                                     "invisible from inside the pod (the dashboard is the only true "
+                                     "reading), so writes fail with no warning. Training continues; "
+                                     "this epoch has no resume point. The epoch checkpoint itself "
+                                     "already saved.", type(_se).__name__, _se)
                     prune_state_dirs(output_dir, output_name, keep_last_n_states)
 
         if (do_previews and sample_every_n_epochs and (epoch + 1) % sample_every_n_epochs == 0
@@ -2426,16 +2578,21 @@ def train_krea2(
                     prev_enc = encode_sample_prompts(te_path, [ov["prompt"]],
                                                      ref_image=ov.get("ref_image") or None, device=device)
                     prev_w, prev_h, prev_seed = ov["width"], ov["height"], ov["seed"]
+                    prev_prompts = [ov["prompt"]]
                 else:
                     prev_enc, prev_w, prev_h, prev_seed = encoded_prompts, sample_width, sample_height, sample_seed
+                    prev_prompts = sample_prompts
                 if prev_seed == 0:
                     prev_seed = random.randint(1, 2**31 - 1)
                     logger.info(f"[sample] seed 0 -> random {prev_seed}")
-                sample_previews_on_dit(dit, turbo_net, turbo_diffb, sample_ae, prev_enc,
+                _, _last_p = sample_previews_on_dit(dit, turbo_net, turbo_diffb, sample_ae, prev_enc,
                                        sample_dir, epoch + 1, output_name=output_name,
                                        steps=sample_steps, cfg_scale=sample_cfg_scale,
                                        neg=encoded_negative, width=prev_w, height=prev_h,
-                                       seed=prev_seed, blocks_to_swap=blocks_to_swap, device=device)
+                                       seed=prev_seed, blocks_to_swap=blocks_to_swap, device=device,
+                                       prompts=prev_prompts)
+                if _last_p:
+                    _last_sample_prompt = _last_p
             except Exception as _prev_err:
                 _oom = "out of memory" in str(_prev_err).lower()
                 logger.warning(
@@ -2475,19 +2632,24 @@ def train_krea2(
                     prev_enc = encode_sample_prompts(te_path, [ov["prompt"]],
                                                      ref_image=ov.get("ref_image") or None, device=device)
                     prev_w, prev_h, prev_seed = ov["width"], ov["height"], ov["seed"]
+                    prev_prompts = [ov["prompt"]]
                 else:
                     prev_enc, prev_w, prev_h, prev_seed = encoded_prompts, sample_width, sample_height, sample_seed
+                    prev_prompts = sample_prompts
                 # Seed 0 means "random": pick a fresh seed for this preview so 0 isn't a fixed seed
                 # (each epoch's sample differs). Covers the Samples-tab field and a 0 in the override.
                 if prev_seed == 0:
                     prev_seed = random.randint(1, 2**31 - 1)
                     logger.info(f"[sample] seed 0 -> random {prev_seed}")
-                sample_previews(turbo_path, sample_ae, prev_enc, load_file(tmp), sample_dir, epoch + 1,
+                _, _last_p = sample_previews(turbo_path, sample_ae, prev_enc, load_file(tmp), sample_dir, epoch + 1,
                                 output_name=output_name, steps=sample_steps,
                                 cfg_scale=sample_cfg_scale, neg=encoded_negative, width=prev_w,
                                 height=prev_h, seed=prev_seed,
                                 context_lora_path=context_lora_path, context_lora_strength=context_lora_strength,
-                                blocks_to_swap=preview_blocks_to_swap, int8=preview_int8, device=device)
+                                blocks_to_swap=preview_blocks_to_swap, int8=preview_int8, device=device,
+                                prompts=prev_prompts)
+                if _last_p:
+                    _last_sample_prompt = _last_p
             except Exception as _prev_err:
                 # A preview failure — almost always CUDA OOM (the ~13 GB Turbo + the Qwen3-VL
                 # encoder won't fit alongside the parked training DiT on a small card) — must NEVER
@@ -2532,10 +2694,16 @@ def train_krea2(
                 logger.info(f"[pause] requested — state for epoch {epoch + 1} already saved; exiting cleanly")
             else:
                 logger.info(f"[pause] requested — saving state at epoch {epoch + 1} and exiting cleanly")
-                _save_training_state(output_dir, output_name, network, optimizer,
-                                     epoch=epoch + 1, global_step=global_step,
-                                     network_dim=network_dim, network_alpha=network_alpha, dtype=dtype,
-                                     extra={"adaptive_lr_state": adaptive.state_dict()} if adaptive else None)
+                try:
+                    _save_training_state(output_dir, output_name, network, optimizer,
+                                         epoch=epoch + 1, global_step=global_step,
+                                         network_dim=network_dim, network_alpha=network_alpha, dtype=dtype,
+                                         extra={"adaptive_lr_state": adaptive.state_dict()} if adaptive else None)
+                except Exception as _se:
+                    logger.error("[pause] state save FAILED (%s: %s) — there is NO new resume "
+                                 "point for this pause. Free disk space (on RunPod: check the "
+                                 "volume quota in the dashboard) and resume from the previous "
+                                 "saved state.", type(_se).__name__, _se)
             try:
                 os.remove(pause_flag)
             except Exception:
@@ -2554,11 +2722,18 @@ def train_krea2(
     # No state dir under fine-tuning: the LoRA is inert, the optimizer may be None (fused
     # backward), and the full checkpoint below IS the continuation point.
     if save_state_on_train_end and max_train_epochs > start_epoch and rotator is None:
-        _save_training_state(output_dir, output_name, network, optimizer,
-                             epoch=max_train_epochs, global_step=global_step,
-                             network_dim=network_dim, network_alpha=network_alpha, dtype=dtype,
-                             extra={"adaptive_lr_state": adaptive.state_dict()} if adaptive else None)
-        prune_state_dirs(output_dir, output_name, keep_last_n_states)
+        # Non-fatal: the final LoRA is already on disk; dying here would turn a finished run red.
+        try:
+            _save_training_state(output_dir, output_name, network, optimizer,
+                                 epoch=max_train_epochs, global_step=global_step,
+                                 network_dim=network_dim, network_alpha=network_alpha, dtype=dtype,
+                                 extra={"adaptive_lr_state": adaptive.state_dict()} if adaptive else None)
+            prune_state_dirs(output_dir, output_name, keep_last_n_states)
+        except Exception as _se:
+            logger.error("[state] end-of-run state save FAILED (%s: %s) — the finished LoRA is "
+                         "saved and fine; only train-further-by-resume is affected. Free disk "
+                         "space (RunPod: dashboard quota) and re-run the last epoch if you need "
+                         "the state.", type(_se).__name__, _se)
 
     out = os.path.join(output_dir, f"{output_name}.safetensors")
     # Record the context LoRA in metadata so users know to pair it at the same strength at
@@ -2567,12 +2742,9 @@ def train_krea2(
     if context_lora_path:
         extra.update({"ss_context_lora": os.path.basename(context_lora_path),
                       "ss_context_lora_strength": str(context_lora_strength)})
-    # User metadata (GUI: Other Options → Metadata) — same keys ComfyUI/model managers read.
-    for _mk, _mv in (("modelspec.title", metadata_title), ("modelspec.author", metadata_author),
-                     ("modelspec.description", metadata_description),
-                     ("modelspec.license", metadata_license), ("modelspec.tags", metadata_tags)):
-        if _mv:
-            extra[_mk] = str(_mv)
+    # Full SAI ModelSpec block — same keys ComfyUI/model managers read (GUI: Other Options →
+    # Metadata), plus trigger phrase and an auto-picked sample thumbnail.
+    extra.update(_sai_metadata())
     if rotator is not None:
         # Fine-tune mode: the training lives in the base weights, not the (inert) LoRA.
         _save_full_checkpoint(rotator, raw_path, out, extra_metadata=extra)

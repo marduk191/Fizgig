@@ -48,11 +48,68 @@ echo -e "${VNC_PASSWORD}
 ${VNC_PASSWORD}
 " | kasmvncpasswd -u fizgig -w -o /root/.kasmpasswd >/dev/null 2>&1
 
+# ---------------------------------------------------------------- optional SSH
+# Off by default — the file manager + runpodctl are the transfer path this image is built
+# around, and an image that opens port 22 for everyone regardless of whether they asked is a
+# worse default than a debugging feature nobody but us used. PUBLIC_KEY is RunPod's OWN
+# convention (their "SSH Terminal Access" toggle sets it for you), so opting in there wires
+# this up for free; on any other host, set PUBLIC_KEY to your public key yourself.
+if [ -n "${PUBLIC_KEY:-}" ]; then
+  # Self-installing so this also works against an already-published image that predates
+  # openssh-server being baked in (see Dockerfile) — a no-op once a newer image has it.
+  if ! command -v sshd >/dev/null 2>&1; then
+    log "PUBLIC_KEY set — installing openssh-server"
+    apt-get update -qq && apt-get install -y --no-install-recommends openssh-server -qq
+  fi
+  mkdir -p /root/.ssh
+  echo "$PUBLIC_KEY" >> /root/.ssh/authorized_keys
+  chmod 700 /root/.ssh
+  chmod 600 /root/.ssh/authorized_keys
+  # PasswordAuthentication stays default (no) — a key was just handed to us, a password wasn't,
+  # and this is root on a box reachable from the whole internet.
+  mkdir -p /run/sshd
+  /usr/sbin/sshd
+  log "SSH enabled on :22 (PUBLIC_KEY was set)"
+fi
+
 # ---------------------------------------------------------------- Fizgig source
 # Pulled rather than baked, so a new release needs no image rebuild. A pod restart is an update.
 if [ -d "$APP_DIR/.git" ]; then
   log "Updating Fizgig in $APP_DIR"
-  git -C "$APP_DIR" fetch --depth 1 origin "$REPO_REF" && git -C "$APP_DIR" reset --hard FETCH_HEAD
+  # A persistent volume can carry a checkout from a DIFFERENT FIZGIG_REPO than the one
+  # configured now (switched forks, fixed a typo) — origin is whatever the ORIGINAL clone
+  # set it to, so point it at the current URL before fetching, or the ref lookup silently
+  # targets the wrong repo.
+  git -C "$APP_DIR" remote set-url origin "$REPO_URL"
+  # NOT `fetch && reset` as one statement: under `set -e`, a failing command is only fatal
+  # as the LAST command in an && chain — bash's own documented errexit exemption for
+  # everything before it. A bad FIZGIG_REF used to fail the fetch, skip the reset, and
+  # carry on running whatever was already checked out, with nothing but a bare `fatal:`
+  # line (no [fizgig] prefix, nothing that reads as an error) to show for it.
+  if ! git -C "$APP_DIR" fetch --depth 1 origin "$REPO_REF" \
+      || ! git -C "$APP_DIR" reset --hard FETCH_HEAD; then
+    # A checkout on a persistent volume can wedge permanently — a hard pod stop corrupts
+    # git's object store, and from then on EVERY pod that mounts this volume fails this
+    # update and silently runs old code, whatever image it booted from (observed in the
+    # field: three different images, one stale volume). Limping on was the wrong policy:
+    # quarantine the broken clone (rescuing a models dir if one ever landed inside) and
+    # re-clone fresh. One slow boot instead of weeks of mystery-old pods.
+    log "ERROR: could not update to '$REPO_REF' from $REPO_URL."
+    if git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" "$APP_DIR.fresh"; then
+      log "Re-cloning: the old checkout is quarantined at $APP_DIR.broken (delete it when convenient)."
+      if [ -d "$APP_DIR/models" ]; then
+        log "Rescuing $APP_DIR/models into the fresh checkout."
+        mv "$APP_DIR/models" "$APP_DIR.fresh/models"
+      fi
+      rm -rf "$APP_DIR.broken" 2>/dev/null || true
+      mv "$APP_DIR" "$APP_DIR.broken"
+      mv "$APP_DIR.fresh" "$APP_DIR"
+    else
+      log "ERROR: re-clone failed too — check FIZGIG_REPO/FIZGIG_REF for a typo, or network access."
+      log "       Continuing on whatever was already checked out ($(git -C "$APP_DIR" rev-parse --short HEAD 2>/dev/null))."
+      rm -rf "$APP_DIR.fresh" 2>/dev/null || true
+    fi
+  fi
 else
   log "Cloning Fizgig ($REPO_REF)"
   git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" "$APP_DIR"
@@ -60,9 +117,11 @@ fi
 
 # Top up dependencies in case the checkout is newer than the image. Almost always a no-op, and
 # a few seconds when it isn't — far cheaper than making users re-pull 10 GB for a new pin.
+# uv_install_deps.py comes from the fresh checkout above, not the image, so a pin/index-strategy
+# fix to it reaches running pods on their next restart same as any other source change.
 log "Checking dependencies"
-uv pip install --link-mode=copy --index-strategy unsafe-best-match \
-   -r "$APP_DIR/requirements.txt" 2>&1 | tail -2 || log "dependency top-up skipped"
+python3 "$APP_DIR/uv_install_deps.py" "$APP_DIR/requirements.txt" "$VIRTUAL_ENV" \
+   2>&1 | tail -5 || log "dependency top-up skipped"
 
 # ---------------------------------------------------------------- persistent paths
 # Point the portable output dirs at the volume. Model paths are left alone: fetch_models writes
