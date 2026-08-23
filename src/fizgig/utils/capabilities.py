@@ -278,15 +278,23 @@ def recommend_ft_rotation(free_gb: Optional[float] = None):
     """
     if free_gb is None:
         try:
-            import torch
-            if torch.cuda.is_available():
-                free_b, _ = torch.cuda.mem_get_info(0)
-                free_gb = free_b / (1024 ** 3)
+            # plannable_free_vram honours FIZGIG_SIM_VRAM_GB, so FT sizing is testable on
+            # the small-card simulator like every other planner (post-merge follow-up).
+            from fizgig.utils.device import plannable_free_vram
+            free_gb = plannable_free_vram()
         except Exception:
             free_gb = None
     if free_gb is None:
         return ("component", 14, False,
                 ["could not read free VRAM — falling back to component mode"])
+    try:
+        if is_rocm():
+            # Tiers were measured on a 5090; ROCm allocator behaviour differs enough that
+            # the numbers are advisory there. Don't refuse — warn.
+            logger.warning("[ft-rotation] tier table was measured on NVIDIA (5090); on ROCm "
+                           "treat the picked window as a starting point and watch VRAM.")
+    except Exception:
+        pass
 
     for min_free, mode, blocks, stream, peak in FT_ROTATION_TIERS:
         if free_gb >= min_free:
@@ -309,6 +317,51 @@ def recommend_ft_rotation(free_gb: Optional[float] = None):
              f"smallest window — trying {lo[1]} mode with {lo[2]} blocks anyway "
              f"(measured peak {lo[4]:.1f} GB). Expect an out-of-memory error.",
              "Rotating fine-tune cannot reach 16 GB cards in any configuration."])
+
+
+# MiniMax H3 rotation FT. H3 is structurally different from Krea 2 here: whole-model
+# component windows DO NOT FIT 32 GB (fc1 across 50 blocks is 15.4 GB of bf16 on its own),
+# so H3 runs block mode only, no frozen-block streaming in v1. ESTIMATED tiers — replace
+# with measured peaks from the first real runs (the estimate: ~21 GB int8 residency
+# + N x (0.771 bf16 - 0.386 freed int8) + fused-backward grad transient + activations
+# + ~2 GB context/workspace).
+MINIMAX_FT_TIERS = [
+    # (min_free_gb, mode, blocks, stream, estimated_peak_gb)
+    (30.0, "block", 8, False, 28.9),
+    (28.0, "block", 4, False, 27.4),
+]
+
+
+def recommend_minimax_ft_rotation(free_gb: Optional[float] = None):
+    """H3 analogue of recommend_ft_rotation. Returns (mode, blocks, stream, reasons).
+
+    Uses plannable_free_vram (honours the FIZGIG_SIM_VRAM_GB small-card simulator) rather
+    than raw mem_get_info, so the tier decision is testable like every other planner."""
+    if free_gb is None:
+        try:
+            from fizgig.utils.device import plannable_free_vram
+            free_gb = plannable_free_vram()
+        except Exception:
+            free_gb = None
+    if free_gb is None:
+        return ("block", 4, False,
+                ["could not read free VRAM — falling back to block mode, 4 blocks/window"])
+
+    for min_free, mode, blocks, stream, peak in MINIMAX_FT_TIERS:
+        if free_gb >= min_free:
+            return (mode, blocks, stream,
+                    [f"{free_gb:.1f} GB free -> block mode, {blocks} blocks per window "
+                     f"(estimated peak {peak:.1f} GB; measured tiers land with the first "
+                     "real runs)",
+                     "Component mode does not fit H3 at 32 GB — a single component across "
+                     "all 50 blocks is up to 15.4 GB of bf16 before gradients."])
+
+    lo = MINIMAX_FT_TIERS[-1]
+    return (None, 0, False,
+            [f"{free_gb:.1f} GB free is below the ~{lo[0]:.0f} GB H3 rotation FT needs at "
+             "its smallest window — the int8 base alone is ~21 GB resident. Refusing "
+             "rather than OOMing mid-run; a streamed-frozen-blocks mode for 24 GB cards "
+             "is a possible v2."])
 
 def recommend_krea2_strategy(vram_gb: Optional[float] = None,
                              caps: Optional[Capabilities] = None,
