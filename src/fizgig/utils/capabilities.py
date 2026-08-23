@@ -326,8 +326,11 @@ def recommend_ft_rotation(free_gb: Optional[float] = None):
 # + N x (0.771 bf16 - 0.386 freed int8) + fused-backward grad transient + activations
 # + ~2 GB context/workspace).
 MINIMAX_FT_TIERS = [
-    # (min_free_gb, mode, blocks, stream, estimated_peak_gb)
-    (30.0, "block", 8, False, 28.9),
+    # (min_free_gb, mode, blocks, stream, peak_gb)
+    # N=8 MEASURED OOM on a real 32 GB card (30.4 GB allocated at the first backward with
+    # ~32.5 free at plan time — the +3.1 GB net window cost lands on top of the int8
+    # baseline's ~27 GB working peak). 8-block windows need a bigger card.
+    (33.0, "block", 8, False, 30.5),
     (28.0, "block", 4, False, 27.4),
 ]
 

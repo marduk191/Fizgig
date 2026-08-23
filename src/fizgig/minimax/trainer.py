@@ -3409,11 +3409,14 @@ def train_minimax(
             # is ~2.5 GB of dead weight during a no-grad preview: park it on CPU for the
             # sampling phase. Costs about a second each way, once per preview epoch.
             if _frames > 1 and torch.cuda.is_available():
-                for _st in optimizer.state.values():
-                    for _k, _v in list(_st.items()):
-                        if torch.is_tensor(_v) and _v.is_cuda:
-                            _st[_k] = _v.to('cpu')
-                            _opt_parked.append((_st, _k))
+                # optimizer is None under FT's fused backward (per-tensor Adafactor whose
+                # factored state is a rounding error) — nothing to park there.
+                if optimizer is not None:
+                    for _st in optimizer.state.values():
+                        for _k, _v in list(_st.items()):
+                            if torch.is_tensor(_v) and _v.is_cuda:
+                                _st[_k] = _v.to('cpu')
+                                _opt_parked.append((_st, _k))
                 if ema is not None:
                     # The fp32 shadow (~1.25 GB at LoKR factor 8) is dead weight during a
                     # no-grad preview — the EMA weights are already swapped INTO the live
