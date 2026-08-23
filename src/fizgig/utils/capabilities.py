@@ -424,6 +424,70 @@ def wait_for_gpu_handoff(threshold_gb: float = 6.0, timeout_s: float = 180.0,
         used, timeout_s)
 
 
+def _available_ram_gb():
+    """(available_gb, total_gb) physical RAM, or (None, None) when unreadable."""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class _MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            ms = _MS(dwLength=ctypes.sizeof(_MS))
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+            return ms.ullAvailPhys / 2**30, ms.ullTotalPhys / 2**30
+        with open("/proc/meminfo") as f:
+            info = {l.split(":")[0]: int(l.split()[1]) for l in f if ":" in l}
+        return info["MemAvailable"] / 2**20, info["MemTotal"] / 2**20
+    except Exception:
+        return None, None
+
+
+def wait_for_ram_recovery(timeout_s: float = 180.0, poll_s: float = 5.0) -> None:
+    """The RAM leg of the fine-tune handoff guard — call right after wait_for_gpu_handoff.
+
+    A single H3 fine-tune commits ~120 GB (bf16 master + CUDA's system-RAM backing under
+    WDDM + park arenas), and a just-finished one takes a while to hand that back. A second
+    fine-tune started into that teardown gets its master evicted to the pagefile AS IT IS
+    BUILT, and the evictions bite when each window first rotates in — measured in the field
+    as a crawl through cycle 1, worst at its last windows (epochs 6-7). Physical
+    availability climbs back within a minute or two of the old process dying, so waiting is
+    both observable and sufficient. Threshold: 40%% of total RAM (a 128 GB box waits for
+    ~51 GB — master + working margin; scales down for smaller boxes, where the run was
+    always going to lean on the pagefile anyway)."""
+    avail, total = _available_ram_gb()
+    if avail is None or total is None:
+        return
+    need = 0.40 * total
+    if avail >= need:
+        return
+    import time
+    logger.info(
+        "[ft-guard] only %.0f GB of %.0f GB RAM is available — a fine-tune wants ~%.0f GB "
+        "before its master builds, so waiting up to %.0f s for Windows to hand memory back "
+        "(a just-finished fine-tune releases ~120 GB and that takes a minute; restarting "
+        "Fizgig between fine-tunes always guarantees a clean handoff).",
+        avail, total, need, timeout_s)
+    start = time.monotonic()
+    while time.monotonic() - start < timeout_s:
+        time.sleep(poll_s)
+        avail, _ = _available_ram_gb()
+        if avail is None or avail >= need:
+            logger.info("[ft-guard] RAM recovered (%.0f GB available) after %.0f s — "
+                        "proceeding.", avail or 0.0, time.monotonic() - start)
+            return
+    logger.warning(
+        "[ft-guard] still only %.0f GB of RAM available after %.0f s — starting anyway. If "
+        "this run crawls in its first cycle, restart Fizgig between fine-tunes.",
+        avail or 0.0, timeout_s)
+
+
 def recommend_krea2_strategy(vram_gb: Optional[float] = None,
                              caps: Optional[Capabilities] = None,
                              mp: float = 0.25, batch: int = 1,

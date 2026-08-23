@@ -1650,11 +1650,13 @@ def train_krea2(
     ft_rotation = max(0, int(finetune_rotation or 0))
 
     if ft_rotation:
-        # Driver-level handoff guard, before our first CUDA call: a back-to-back fine-tune
-        # can start while the previous trainer process is still tearing down, and WDDM's
-        # demotion to shared memory is sticky — see wait_for_gpu_handoff's docstring.
-        from fizgig.utils.capabilities import wait_for_gpu_handoff
+        # Handoff guards, before our first CUDA call: a back-to-back fine-tune can start
+        # while the previous trainer process is still tearing down — VRAM (WDDM demotion is
+        # sticky) and RAM (the old process hands back a huge commit) both need to settle.
+        # See the guards' docstrings in capabilities.py.
+        from fizgig.utils.capabilities import wait_for_gpu_handoff, wait_for_ram_recovery
         wait_for_gpu_handoff()
+        wait_for_ram_recovery()
 
     if slider_pairs:
         # Slider mode's structural coercions. FT and sliders are mutually exclusive (a slider

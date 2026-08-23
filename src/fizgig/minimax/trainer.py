@@ -2177,11 +2177,13 @@ def train_minimax(
     ft_subset = None
     if ft_rotation:
         from fizgig.utils.capabilities import (recommend_minimax_ft_rotation,
-                                               wait_for_gpu_handoff)
+                                               wait_for_gpu_handoff, wait_for_ram_recovery)
         # Before OUR first CUDA call (the recommender's free-VRAM read inits the context):
         # a back-to-back fine-tune can start while the previous trainer process is still
-        # tearing down, and the resulting WDDM demotion is sticky — see the guard's docstring.
+        # tearing down, and the resulting WDDM demotion is sticky — see the guards' docstrings.
+        # Two legs: VRAM (driver view) and RAM (a finished FT hands back ~120 GB of commit).
         wait_for_gpu_handoff()
+        wait_for_ram_recovery()
         if resume_state_dir:
             raise RuntimeError(
                 "[h3-ft] --resume with a state dir is not supported under rotation fine-tune: "
