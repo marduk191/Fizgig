@@ -2,6 +2,19 @@
 
 Fizgig is written by [Peter Neill (shootthesound)](https://github.com/shootthesound).
 
+## scryptio
+
+[scryptio](https://github.com/scryptio) built the **AMD ROCm support** that headlines v4.3.0
+([#53](https://github.com/shootthesound/Fizgig/pull/53)): the Windows and Linux ROCm install
+paths and launchers, GPU architecture detection, cross-platform VRAM monitoring for the status
+bar, and the RDNA4 batched-GEMM workaround — a lot of building and testing on real hardware.
+Along the way the same investigation pinned down the torch.compile recompile cost on
+ROCm, now handled automatically. The PR thread was a group effort:
+[tsubasasora](https://github.com/tsubasasora) ran repeated from-scratch Linux installs on an
+R9700 that shook out real install bugs, [FNGarvin](https://github.com/FNGarvin) pushed for the
+wheel pinning that made the install materially safer, and
+[taisunyoung](https://github.com/taisunyoung) contributed expert ROCm performance diagnostics.
+
 ## rintic-13
 
 [rintic-13](https://github.com/rintic-13) designed and prototyped the **async H2D-only int8
@@ -10,8 +23,19 @@ block streaming** that headlines v4.0.0
 stream host-to-GPU through a pinned ring buffer on a copy stream and never travel back —
 measured **6.4× faster** than round-trip swap at the same depth, which is what lets 16 GB and
 24 GB cards train MiniMax H3 on the accurate int8 base instead of 4-bit. Landed with
-`Co-authored-by` credit (ab90dda), and ongoing work extends the idea to the text encoder
+`Co-authored-by` credit (ab90dda). They then extended the idea to the **text encoder**
+([#79](https://github.com/shootthesound/Fizgig/pull/79), merged in v4.3.0): layer-streamed
+reference-mode encoding drops the peak from ~26 GB to ~12.7 GB with bit-for-bit identical
+output, bringing identity distillation to 16 GB cards
 ([#74](https://github.com/shootthesound/Fizgig/issues/74)).
+
+## dewwwey
+
+[dewwwey](https://github.com/dewwwey) diagnosed and fixed a subtle crash on 24 GB cards
+([#84](https://github.com/shootthesound/Fizgig/pull/84), shipped in v4.2.1): parking the DiT
+for a preview corrupted the H2D ring buffer's shared slot storage, killing training at step 0
+with a misleading CUDA error far from the cause. The instrumented diagnosis was exact and the
+fix minimal — verified and merged the same day.
 
 ## FNGarvin
 

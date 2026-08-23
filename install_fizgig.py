@@ -327,9 +327,52 @@ def check_msvc_build_tools():
     print("  detects it automatically.")
 
 
+def _windows_has_amd_radeon() -> bool:
+    """Best-effort AMD detect for the hand-off message (PowerShell CIM)."""
+    ps = (
+        "Get-CimInstance Win32_VideoController | "
+        "Select-Object -ExpandProperty Name"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0:
+            text = result.stdout or ""
+            return "AMD" in text and "Radeon" in text
+    except Exception:
+        pass
+    return False
+
+
+def redirect_amd_to_rocm_installer():
+    """AMD support is additive: leave the CUDA path untouched and hand off early."""
+    if platform.system() == "Linux":
+        has_nvidia = os.path.exists("/dev/nvidia0") or bool(shutil.which("nvidia-smi"))
+        if os.path.exists("/dev/kfd") and not has_nvidia:
+            print("AMD ROCm detected. This installer is NVIDIA CUDA only.")
+            print("Use the separate AMD installer (Linux AMD is highly experimental):")
+            print(f"  chmod +x {SCRIPT_DIR / 'install_fizgig_rocm.sh'}")
+            print(f"  {SCRIPT_DIR / 'install_fizgig_rocm.sh'}")
+            sys.exit(1)
+        return
+
+    if platform.system() == "Windows":
+        if shutil.which("nvidia-smi"):
+            return
+        if _windows_has_amd_radeon():
+            print("AMD GPU detected. This installer is NVIDIA CUDA only.")
+            print("Use the separate AMD installer:")
+            print(f"  {SCRIPT_DIR / 'install_fizgig_rocm.bat'}")
+            sys.exit(1)
+
+
 def main():
     print_header("Fizgig Installer — Klein 9B & Krea 2 LoRA Workbench")
     print(f"Installation directory: {SCRIPT_DIR}")
+
+    redirect_amd_to_rocm_installer()
 
     # Step 1: Check Python version
     print_step(1, "Checking Python version")

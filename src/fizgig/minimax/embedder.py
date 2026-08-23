@@ -674,3 +674,32 @@ def load_minimax_h3_te(path: str, device="cuda", compute_dtype=torch.bfloat16,
     _add_h3_special_tokens(tok)
     return MiniMaxH3TextEncoder(model, tok, device=device, compute_dtype=compute_dtype,
                                 cpu_embed=cpu_embed)
+
+
+def load_minimax_h3_te_planned(path: str, device="cuda", **kw):
+    """Resident or H2D layer-streamed TE, planned from free VRAM.
+
+    Measured on the real 32B nvfp4-awq checkpoint: the resident build peaks at 25.8 GB for
+    a reference (vision) encode; the streamed build (#79, rintic-13) peaks at 12.7 GB with
+    bit-for-bit identical output on both encode paths, at ~2% speed cost. Reference-mode
+    ONLY: the H2D file scopes streaming to the vision stack (streaming_enabled requires
+    with_vision), and a text-only load through it comes back broken — silently unstreamed,
+    then 'Nvfp4Linear GPU weights are not loaded' at encode. Text-only always takes the
+    resident build (13.7 GB peak — fits 16 GB, the shipped behaviour)."""
+    if not kw.get("with_vision"):
+        return load_minimax_h3_te(path, device=device, **kw)
+    need_gb = 27.0                                        # measured 25.8 peak + margin
+    free_gb = None
+    if torch.cuda.is_available() and str(device) != "cpu":
+        try:
+            from fizgig.utils.device import plannable_free_vram
+            free_gb = plannable_free_vram(device)
+        except Exception:
+            free_gb = None
+    if free_gb is not None and free_gb < need_gb:
+        from fizgig.minimax.embedderH2D import load_minimax_h3_te as _load_h2d
+        print(f"[minimax-te] {free_gb:.1f} GB free < {need_gb:.0f} GB the resident "
+              "encoder peaks at — streaming layers host-to-device instead "
+              "(identical output, ~2% slower; #79)")
+        return _load_h2d(path, device=device, layer_streaming=True, **kw)
+    return load_minimax_h3_te(path, device=device, **kw)

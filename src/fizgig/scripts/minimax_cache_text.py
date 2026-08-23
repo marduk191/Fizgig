@@ -244,8 +244,10 @@ def main():
     _refs = max(0, int(args.reference_count or 0))
     logger.info(f"Loading Qwen3-VL-32B text encoder from {args.text_encoder}"
                 + (f" (with the vision tower — {_refs} reference(s) per image)" if _refs else ""))
-    encoder = load_minimax_h3_te(args.text_encoder, device=device, compute_dtype=torch.bfloat16,
-                                 quantize=not args.no_quantize, with_vision=bool(_refs))
+    from fizgig.minimax.embedder import load_minimax_h3_te_planned
+    encoder = load_minimax_h3_te_planned(args.text_encoder, device=device,
+                                         compute_dtype=torch.bfloat16,
+                                         quantize=not args.no_quantize, with_vision=bool(_refs))
 
     args.batch_size = _report_headroom(device, args.batch_size or 16, with_vision=bool(_refs))
 
@@ -293,4 +295,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if sys.platform == "linux" and os.environ.get("FIZGIG_GPU_BACKEND", "").lower() == "rocm":
+        from fizgig.rocm.cache_exit import run_cache_main
+
+        run_cache_main(main)
+    else:
+        main()

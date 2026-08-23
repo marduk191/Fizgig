@@ -364,8 +364,9 @@ def encode_sample_prompts(te_path, prompts, *, device="cuda", quantize=True):
 
     Always call this BEFORE the DiT loads: the Qwen3-VL-32B text encoder is ~14 GB NF4 and must
     never be resident alongside the ~17 GB DiT. Returns CPU tensors."""
-    from fizgig.minimax.embedder import load_minimax_h3_te
-    te = load_minimax_h3_te(te_path, device=device, compute_dtype=torch.bfloat16, quantize=quantize)
+    from fizgig.minimax.embedder import load_minimax_h3_te_planned
+    te = load_minimax_h3_te_planned(te_path, device=device, compute_dtype=torch.bfloat16,
+                                    quantize=quantize)
     out = [te.encode(p).cpu() for p in prompts]
     del te
     gc.collect()

@@ -883,7 +883,7 @@ MINIMAX_BUILT_IN_PRESETS = {
     # were standard LoRA at dim/alpha 16, and LoKR moves ~7-10x further per unit LR — which made
     # the same Learning Rate box mean two very different things depending on the Network Type
     # sitting above it. LoKR stays one dropdown away for anyone who wants it.
-    "✨ MiniMax H3 Defaults (LoRA 16, 0.25 MP)": {
+    "✨ MiniMax H3 (Lower LR - slower)": {
         "NETWORK_DIM": 16, "NETWORK_ALPHA": 16,
         "NETWORK_TYPE": "LoRA (standard)", "LOKR_FACTOR": 8,
         # Flat 1e-4 (Peter, 17 Aug). With the ramp off this IS the rate — and rank 16 wants
@@ -956,10 +956,10 @@ MINIMAX_BUILT_IN_PRESETS = {
 # retirement. Keyed off the first entry rather than the title, because the title has been
 # renamed twice already.
 _MM_DEFAULTS_KEY = next(iter(MINIMAX_BUILT_IN_PRESETS))
-MINIMAX_BUILT_IN_PRESETS["✨ MiniMax H3 Fast (LoRA 8, 40 epochs)"] = {
+MINIMAX_BUILT_IN_PRESETS["✨ MiniMax H3 Fast (LoRA 8, 50 epochs)"] = {
     **MINIMAX_BUILT_IN_PRESETS[_MM_DEFAULTS_KEY],
     "NETWORK_DIM": 8, "NETWORK_ALPHA": 8,
-    "MAX_TRAIN_EPOCHS": 40,
+    "MAX_TRAIN_EPOCHS": 50,
     "LEARNING_RATE": 2e-4,
     # Flat, not ramped. The ramp exists to stop a full-size stride landing on a near-zero
     # adapter; at rank 8 there are half as many directions to move, and the measured run that
@@ -976,12 +976,22 @@ MINIMAX_BUILT_IN_PRESETS["✨ MiniMax H3 Fast (LoRA 8, 40 epochs)"] = {
 # real style runs (20 Aug) found the halved 1e-4 unnecessary; drop it manually for an extra-
 # gentle run if a style ever fries.
 MINIMAX_BUILT_IN_PRESETS["✨ MiniMax H3 Style (LoRA 8)"] = {
-    **MINIMAX_BUILT_IN_PRESETS["✨ MiniMax H3 Fast (LoRA 8, 40 epochs)"],
+    **MINIMAX_BUILT_IN_PRESETS["✨ MiniMax H3 Fast (LoRA 8, 50 epochs)"],
     "LEARNING_RATE": 2e-4,
     "MINIMAX_BLOCKS": "0-3, 6-47",
     # MUST be off here: style measurably needs the early blocks the likeness mask freezes, and
     # with it on the blocks spec above would be ignored outright.
     "MINIMAX_LIKENESS_OPT": False,
+}
+
+# Fast is the shipped default (Peter, 22 Aug): the FIRST entry is what a family switch and a
+# fresh start apply, and the rank-8 Fast recipe is where most datasets should begin. The
+# rank-16 recipe stays one dropdown away, flagged in the GUI as the larger-dataset choice.
+# (Re-inserting an existing key keeps its first position, so Fast leads and nothing else moves.)
+_MM_FAST_KEY = "✨ MiniMax H3 Fast (LoRA 8, 50 epochs)"
+MINIMAX_BUILT_IN_PRESETS = {
+    _MM_FAST_KEY: MINIMAX_BUILT_IN_PRESETS[_MM_FAST_KEY],
+    **MINIMAX_BUILT_IN_PRESETS,
 }
 
 # Directory for dataset configurations
@@ -2325,6 +2335,7 @@ class LoRATrainerGUI:
         ("repair_ref_path_var", "repair_ref_path"),
         ("repair_ref_mp_var", "repair_ref_mp"),
         ("repair_ref_strength_var", "repair_ref_strength"),
+        ("repair_metrics_ref_var", "repair_metrics_ref"),
         ("explorer_lora_var", "explorer_lora"),
         ("explorer_prompt_var", "explorer_prompt"),
         ("explorer_ref_path_var", "explorer_ref_path"),
@@ -2692,10 +2703,11 @@ class LoRATrainerGUI:
 
     def _read_vram(self):
         """Return (used_bytes, total_bytes) for the GPU training uses, or None. Prefers pynvml
-        (fast); falls back to a one-shot nvidia-smi query.
+        (fast); falls back to a one-shot nvidia-smi query. AMD ROCm paths are
+        tried only when NVIDIA readers return nothing.
 
-        The index is read once per call rather than twice: when nothing is pinned it is not
-        known until torch has built its context (see _visible_gpu_index), so it can firm up
+        [fork] The index is read once per call rather than twice: when nothing is pinned it is
+        not known until torch has built its context (see _visible_gpu_index), so it can firm up
         mid-session — and the cached NVML handle has to be rebuilt when it does."""
         physical = self._visible_gpu_index()
         try:
@@ -2720,6 +2732,11 @@ class LoRATrainerGUI:
             )
             used, total = out.stdout.strip().splitlines()[0].split(",")
             return int(used) * 1024 * 1024, int(total) * 1024 * 1024
+        except Exception:
+            pass
+        try:
+            from fizgig.utils.vram_monitor import read_amd_gpu_vram
+            return read_amd_gpu_vram()
         except Exception:
             return None
 
@@ -4063,6 +4080,13 @@ class LoRATrainerGUI:
         self.custom_preset_combo.pack(side=tk.LEFT)
         self.custom_preset_combo.bind("<<ComboboxSelected>>", self.load_custom_preset)
         ToolTip(self.custom_preset_combo, "Your saved training presets")
+        # Bracketed nudge for the rank-16 recipe, shown only while the MiniMax Defaults preset
+        # is selected: Fast is the default now, and this says when the bigger one earns its keep.
+        self._preset_hint_label = tk.Label(
+            preset_row1, text="(more suitable for larger datasets with longer trains)",
+            font=(FONT_FAMILY, 9), fg=COLORS["text_secondary"], bg=COLORS["bg_surface"],
+        )
+        self.custom_preset_var.trace_add("write", lambda *_: self._update_preset_hint())
 
         # Row 2: Load Settings From Last Train
         load_last_btn = ttk.Button(preset_card, text="Load Settings From Last Train",
@@ -5332,6 +5356,21 @@ class LoRATrainerGUI:
         if cfg.get("is_minimax"):
             return MINIMAX_BUILT_IN_PRESETS
         return KREA2_BUILT_IN_PRESETS if cfg.get("is_krea2") else BUILT_IN_PRESETS
+
+    def _update_preset_hint(self):
+        """The bracketed note beside Load Preset: visible only while the MiniMax rank-16
+        Defaults preset is the selection — with Fast as the shipped default, this label is
+        what tells the user when the bigger recipe is the right reach."""
+        lbl = getattr(self, "_preset_hint_label", None)
+        if lbl is None:
+            return
+        try:
+            if self._is_minimax_arch() and self.custom_preset_var.get() == _MM_DEFAULTS_KEY:
+                lbl.pack(side=tk.LEFT, padx=(8, 0))
+            else:
+                lbl.pack_forget()
+        except Exception:
+            pass
 
     def refresh_preset_combobox(self):
         """Refresh the preset combobox: built-in presets first, then user-saved presets."""
@@ -13331,6 +13370,39 @@ class LoRATrainerGUI:
                         self._ff_embed_cache[key] = None
         return self._ff_embed_cache[key]
 
+    def _repair_embed_pil(self, pil):
+        """(embedding, bbox) for the largest face in an IN-MEMORY render — FaceEmbedder.embed
+        is path-only, and the pop-out metrics score renders that never touch disk. Same lock
+        and same lazily-created embedder as _ff_embed_cached, so the model loads once app-wide.
+
+        The unpadded detection gives both the embedding and a usable bbox. The pad-retry
+        fallback (frame-filling faces) returns coordinates in padded-image space, so it
+        contributes the embedding only — texture then measures the whole frame."""
+        if FaceEmbedder is None:
+            return None, None
+        try:
+            import cv2
+            import numpy as np
+            bgr = cv2.cvtColor(np.array(pil.convert("RGB")), cv2.COLOR_RGB2BGR)
+            with self._ff_lock:
+                if getattr(self, "_ff_embedder", None) is None:
+                    self._ff_embedder = FaceEmbedder()
+                self._ff_embedder._ensure_loaded()
+                faces = self._ff_embedder._app.get(bgr)
+                if faces:
+                    f = max(faces, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]))
+                    x1, y1, x2, y2 = (int(v) for v in f.bbox)
+                    h, w = bgr.shape[:2]
+                    bbox = (max(0, x1), max(0, y1), min(w, x2), min(h, y2))
+                    return np.asarray(f.normed_embedding, dtype=np.float32), bbox
+                faces = self._ff_embedder._detect_with_pad_retry(bgr)
+                if faces:
+                    f = max(faces, key=lambda x: (x.bbox[2] - x.bbox[0]) * (x.bbox[3] - x.bbox[1]))
+                    return np.asarray(f.normed_embedding, dtype=np.float32), None
+        except Exception:
+            pass
+        return None, None
+
     def _ff_scan(self):
         if self._ff_busy:
             return
@@ -18388,6 +18460,25 @@ class LoRATrainerGUI:
                     _w.pack(side=tk.LEFT, **({"padx": (0, 2)} if _w is self._repair_ref_strength_label else {}))
             except Exception:
                 pass
+        # H3's engine has no reference path at all (r2v conditioning is out of the workbench's
+        # scope) — a visible row the engine ignores is a lie, and editing it forced a re-render
+        # that changed nothing. The WHOLE row hides under MiniMax; Klein and Krea 2 keep it.
+        for _w in (getattr(self, "_repair_ref_label", None),
+                   getattr(self, "_repair_ref_entry", None),
+                   getattr(self, "_repair_ref_params", None)):
+            try:
+                if _w is None:
+                    continue
+                if fam == "minimax":
+                    _w.grid_remove()
+                else:
+                    _w.grid()
+            except Exception:
+                pass
+        if fam == "minimax" and self.repair_ref_path_var.get().strip():
+            # A path carried over from a Klein session must not sit invisibly in the state.
+            self.repair_ref_path_var.set("")
+            self.repair_state.ref_image_path = ""
 
     def _on_repair_family_changed(self):
         """Family toggle: reset any loaded session (engine type changes), reset the slider
@@ -18575,11 +18666,14 @@ class LoRATrainerGUI:
         # real image). Path + MP cap (downscale-only) + strength (1.0 stock,
         # ~0.85 Klein sweet spot, 0 = off). Carried in SliderState so it survives
         # the Explorer ↔ Repair handover.
-        ttk.Label(parent, text="Reference:").grid(row=r, column=0, sticky=tk.W, padx=4, pady=2)
+        self._repair_ref_label = ttk.Label(parent, text="Reference:")
+        self._repair_ref_label.grid(row=r, column=0, sticky=tk.W, padx=4, pady=2)
         self.repair_ref_path_var = tk.StringVar(value="")
-        ref_entry = ttk.Entry(parent, textvariable=self.repair_ref_path_var, state="readonly")
-        ref_entry.grid(row=r, column=1, sticky=tk.EW, padx=4, pady=2)
+        self._repair_ref_entry = ttk.Entry(parent, textvariable=self.repair_ref_path_var,
+                                           state="readonly")
+        self._repair_ref_entry.grid(row=r, column=1, sticky=tk.EW, padx=4, pady=2)
         ref_params = ttk.Frame(parent)
+        self._repair_ref_params = ref_params
         ref_params.grid(row=r, column=2, columnspan=2, sticky=tk.EW, padx=4, pady=2)
         ttk.Button(ref_params, text="Browse", command=self._browse_repair_ref).pack(side=tk.LEFT, padx=(0, 2))
         ttk.Button(ref_params, text="Clear", command=self._clear_repair_ref).pack(side=tk.LEFT, padx=(0, 10))
@@ -18626,6 +18720,17 @@ class LoRATrainerGUI:
         # panel, which on a 50-block family is a long scroll away from where you tweak.
         ttk.Button(status_row, text="Reset All Sliders",
                    command=self._reset_repair_sliders).pack(side=tk.RIGHT, padx=(0, 12))
+        # The pop-out also opens by clicking either preview image, but nothing on screen SAYS
+        # that — a named, coloured button plus the caption under the previews is how anyone
+        # finds the compare view and its metrics (Peter, 22 Aug: plain ttk wasn't enough).
+        _cmp_btn = tk.Button(
+            status_row, text="⧉ Compare + Metrics", font=(FONT_FAMILY, 10, "bold"),
+            fg="#FFFFFF", bg="#3B6FA0", activeforeground="#FFFFFF", activebackground="#2E5780",
+            relief="flat", bd=0, padx=16, pady=6, cursor="hand2",
+            command=self._repair_popout_preview)
+        _cmp_btn.pack(side=tk.RIGHT, padx=(0, 12))
+        ToolTip(_cmp_btn, "Full-size side-by-side of baseline vs tweaked, with likeness and "
+                          "quality metrics. Clicking either preview image opens it too.")
         # Render progress. H3 and Krea 2 report real denoising steps (determinate); Klein's
         # denoise loop has no hook, so the bar sweeps as a marquee there — and everywhere
         # until the first step lands, so model loads and TE encodes still show life.
@@ -18659,18 +18764,34 @@ class LoRATrainerGUI:
         tweaked_holder.pack_propagate(False)
 
         self.repair_baseline_label = ttk.Label(base_holder, text="(no baseline yet)",
-                                               anchor=tk.CENTER, background="#1c1c1c")
+                                               anchor=tk.CENTER, background="#1c1c1c",
+                                               cursor="hand2")
         self.repair_baseline_label.pack(fill=tk.BOTH, expand=True)
         self.repair_tweaked_label = ttk.Label(tweaked_holder, text="(no preview yet)",
                                               anchor=tk.CENTER, background="#1c1c1c",
                                               cursor="hand2")
         self.repair_tweaked_label.pack(fill=tk.BOTH, expand=True)
+        # Either image opens the compare pop-out — clicking the baseline should not be a dead
+        # zone when the tweaked side isn't.
+        self.repair_baseline_label.bind("<Button-1>", lambda e: self._repair_popout_preview())
         self.repair_tweaked_label.bind("<Button-1>", lambda e: self._repair_popout_preview())
+        # Spell the click affordance out — cursor changes alone weren't discoverable.
+        ttk.Label(parent,
+                  text="🔍 Click either image for the full-size side-by-side compare with "
+                       "likeness + quality metrics",
+                  font=(FONT_FAMILY, 9), foreground=COLORS["text_secondary"],
+                  ).grid(row=2, column=0, columnspan=2, pady=(0, 4))
         self.repair_base_holder = base_holder
         self.repair_tweaked_holder = tweaked_holder
         self._repair_popout_window = None
         self._repair_popout_label = None
         self._repair_popout_tk_img = None
+        # Metrics strip state: reference photo for likeness scoring (remembered via the
+        # workbench table), chip labels, and a generation counter so a slow ArcFace pass
+        # can never paint a stale result over a newer render's numbers.
+        self.repair_metrics_ref_var = tk.StringVar(value="")
+        self._repair_popout_metric_lbls = {}
+        self._repair_metrics_gen = 0
 
         # Redraw on resize. Debounced so a drag doesn't spam Lanczos.
         def _mk_config_cb(which):
@@ -22354,55 +22475,28 @@ class LoRATrainerGUI:
         self._repair_start_btn.configure(text="Start")
 
     def _browse_and_load_primary(self):
-        """Browse for a primary LoRA, and auto-swap if one is already loaded."""
+        """Browse for a primary LoRA. Picking a file changes NOTHING — no reload, no render
+        (Peter, 22 Aug: the user may want to set the prompt/seed/sliders first). The Start
+        button arms as Update; its click does the swap-and-render (_repair_start already
+        handles a changed primary with a full reset + reload)."""
         self._browse_repair_lora(self.repair_primary_var)
         path = self.repair_primary_var.get().strip()
         if not path or not os.path.exists(path):
             return
-        if self.repair_engine is None or self.repair_engine.primary_network is None:
-            return  # not loaded yet — user will click Start
-        # Path changed — auto-swap
-        if self.repair_engine.primary_path != path:
-            if getattr(self, "_repair_loading", False):
-                return
-            # Remember donor path before reset clears it
-            donor_path = self.repair_donor_var.get().strip()
-            self._reset_repair_session()
-            # Force GC + CUDA flush between unload and reload to prevent OOM
-            import gc, torch
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            # Loads run on worker threads — chain donor (if one was set) behind the primary,
-            # and only then refresh the master sliders + schedule the preview.
-            def _after_all():
-                self._on_master_target_changed()
-                self._repair_reset_start_button()
-                self._schedule_preview(force=True)
-
-            if donor_path and os.path.exists(donor_path):
-                self._load_repair_primary(
-                    on_done=lambda: self._load_repair_donor(on_done=_after_all))
-            else:
-                self._load_repair_primary(on_done=_after_all)
+        if self.repair_engine is not None and self.repair_engine.primary_network is not None \
+                and self.repair_engine.primary_path != path:
+            self._repair_mark_update_needed()
 
     def _browse_and_load_donor(self):
-        """Browse for a donor LoRA, and auto-load if primary is loaded."""
+        """Browse for a donor LoRA. Same contract as the primary: picking a file only arms
+        the Update button — the swap happens on the user's click."""
         self._browse_repair_lora(self.repair_donor_var)
         path = self.repair_donor_var.get().strip()
         if not path or not os.path.exists(path):
             return
-        if self.repair_engine is None or self.repair_engine.primary_network is None:
-            return
-        # Swap donor if one is already loaded
-        if self.repair_engine.donor_network is not None:
-            current_donor = self.repair_engine.donor_path
-            if current_donor == path:
-                return  # same file, nothing to do
-            self._unload_repair_donor()
-        self._load_repair_donor()
-        self._repair_reset_start_button()
+        if self.repair_engine is not None and self.repair_engine.primary_network is not None \
+                and self.repair_engine.donor_path != path:
+            self._repair_mark_update_needed()
 
     def _unload_repair_donor(self):
         if self.repair_engine is None or self.repair_engine.donor_network is None:
@@ -22731,6 +22825,7 @@ class LoRATrainerGUI:
             self._repair_redraw_preview("baseline")
             self._repair_redraw_preview("tweaked")
             self._repair_update_popout()
+            self._repair_metrics_refresh()
             self.repair_status_var.set("Ready.")
             print(f"[repair] preview displayed: baseline={baseline_img.size} tweaked={tweaked_img.size}")
         finally:
@@ -22745,8 +22840,25 @@ class LoRATrainerGUI:
                 print("[repair] dirty flag set during preview — refiring")
                 self._schedule_preview(force=True)
 
+    def _repair_popout_compose(self):
+        """Baseline and tweaked side by side on one canvas \u2014 same left/right order as the
+        main panel, 8 px seam. Falls back to whichever image exists alone."""
+        base = self.repair_pil_images.get("baseline")
+        tweak = self.repair_pil_images.get("tweaked")
+        if base is None and tweak is None:
+            return None
+        if base is None or tweak is None:
+            return tweak or base
+        from PIL import Image as _Image
+        gap = 8
+        h = max(base.height, tweak.height)
+        canvas = _Image.new("RGB", (base.width + gap + tweak.width, h), (0, 0, 0))
+        canvas.paste(base, (0, (h - base.height) // 2))
+        canvas.paste(tweak, (base.width + gap, (h - tweak.height) // 2))
+        return canvas
+
     def _repair_popout_preview(self):
-        """Open (or raise) a resizable pop-out window showing the tweaked preview."""
+        """Open (or raise) a resizable pop-out showing baseline and tweaked side by side."""
         if self._repair_popout_window is not None:
             try:
                 if self._repair_popout_window.winfo_exists():
@@ -22757,15 +22869,44 @@ class LoRATrainerGUI:
                 pass
             self._repair_popout_window = None
 
-        pil_img = self.repair_pil_images.get("tweaked")
+        pil_img = self._repair_popout_compose()
         if pil_img is None:
             return
 
         win = tk.Toplevel(self.master)
-        win.title("Repair Studio \u2014 Tweaked Preview")
+        win.title("Repair Studio \u2014 Baseline vs Tweaked")
         win.configure(bg="#000000")
-        win.geometry(f"{pil_img.width}x{pil_img.height}")
+        # Native size, capped to the screen so a 768 pair doesn't open off-monitor.
+        _w = min(pil_img.width, max(640, int(win.winfo_screenwidth() * 0.9)))
+        _h = min(pil_img.height, max(360, int(win.winfo_screenheight() * 0.85)))
+        win.geometry(f"{_w}x{_h}")
         win.minsize(128, 128)
+
+        # Metrics strip along the bottom — packed FIRST so the image label can never
+        # squeeze it out; the fit math below sizes from the LABEL so the image never
+        # overflows behind it.
+        bar = tk.Frame(win, bg=COLORS["bg_deep"])
+        bar.pack(side=tk.BOTTOM, fill=tk.X)
+        tk.Button(bar, text="📷 Reference…", font=(FONT_FAMILY, 9),
+                  bg=COLORS["bg_surface"], fg=COLORS["text_primary"],
+                  activebackground=COLORS["bg_hover"], activeforeground=COLORS["text_primary"],
+                  relief="flat", bd=0, padx=8, pady=2, cursor="hand2",
+                  command=self._browse_repair_metrics_ref).pack(side=tk.LEFT, padx=(8, 2), pady=4)
+        self._repair_popout_ref_lbl = tk.Label(bar, text="", font=(FONT_FAMILY, 9),
+                                               fg=COLORS["text_explain"], bg=COLORS["bg_deep"])
+        self._repair_popout_ref_lbl.pack(side=tk.LEFT, padx=(0, 2))
+        tk.Button(bar, text="✕", font=(FONT_FAMILY, 9), bg=COLORS["bg_deep"],
+                  fg=COLORS["text_muted"], activebackground=COLORS["bg_deep"],
+                  activeforeground=COLORS["text_primary"], relief="flat", bd=0,
+                  padx=4, pady=0, cursor="hand2",
+                  command=self._clear_repair_metrics_ref).pack(side=tk.LEFT, padx=(0, 10))
+        self._repair_popout_metric_lbls = {}
+        for key in ("likeness", "grid", "texture", "clip", "sat"):
+            c = tk.Label(bar, text="", font=(FONT_FAMILY, 9),
+                         fg=COLORS["text_explain"], bg=COLORS["bg_deep"])
+            c.pack(side=tk.LEFT, padx=(0, 14), pady=4)
+            self._repair_popout_metric_lbls[key] = c
+        self._repair_popout_refresh_ref_label()
 
         lbl = tk.Label(win, bg="#000000")
         lbl.pack(fill=tk.BOTH, expand=True)
@@ -22777,6 +22918,7 @@ class LoRATrainerGUI:
             self._repair_popout_window = None
             self._repair_popout_label = None
             self._repair_popout_tk_img = None
+            self._repair_popout_metric_lbls = {}
             win.destroy()
 
         win.protocol("WM_DELETE_WINDOW", _on_close)
@@ -22786,10 +22928,17 @@ class LoRATrainerGUI:
                 self._repair_update_popout()
 
         win.bind("<Configure>", _on_resize)
+        # The fit math sizes from the LABEL, and at this point the label hasn't been laid out
+        # (winfo 1x1) — without these two lines the pop-out opened BLACK and stayed black
+        # until a manual resize. update_idletasks gives the label its real size for the first
+        # paint, and the label's own <Configure> repaints whenever layout hands it new space.
+        lbl.bind("<Configure>", lambda e: self._repair_update_popout())
+        win.update_idletasks()
         self._repair_update_popout()
+        self._repair_metrics_refresh()
 
     def _repair_update_popout(self):
-        """Push the current tweaked PIL image to the pop-out window, scaled to fit."""
+        """Push the current baseline+tweaked pair to the pop-out window, scaled to fit."""
         if self._repair_popout_window is None or self._repair_popout_label is None:
             return
         try:
@@ -22800,13 +22949,15 @@ class LoRATrainerGUI:
             self._repair_popout_window = None
             return
 
-        pil_img = self.repair_pil_images.get("tweaked")
+        pil_img = self._repair_popout_compose()
         if pil_img is None:
             return
 
         from PIL import ImageTk
-        w = self._repair_popout_window.winfo_width()
-        h = self._repair_popout_window.winfo_height()
+        # Size from the LABEL, not the Toplevel — the metrics bar owns part of the window
+        # height, and window-based math scaled the image to overflow behind it.
+        w = self._repair_popout_label.winfo_width()
+        h = self._repair_popout_label.winfo_height()
         if w < 10 or h < 10:
             return
 
@@ -22818,6 +22969,132 @@ class LoRATrainerGUI:
         resized = pil_img.resize((new_w, new_h), resample=3)  # LANCZOS=3
         self._repair_popout_tk_img = ImageTk.PhotoImage(resized)
         self._repair_popout_label.configure(image=self._repair_popout_tk_img)
+
+    # ----- pop-out metrics strip ---------------------------------------------------------
+    # Overbake instrumentation for the side-by-side view: likeness against a user-chosen
+    # reference photo (ArcFace, the app's shared embedder), plus the paired metrics from
+    # repair_studio.metrics (patch grid, face texture, clipping/saturation). Paired deltas
+    # on a same-seed pair are the one honest use of no-reference image metrics.
+
+    def _browse_repair_metrics_ref(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Reference photo for likeness scoring",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.webp *.bmp"), ("All files", "*.*")],
+            initialdir=self._pref_initialdir("input_ref_dir"))
+        if path:
+            self.repair_metrics_ref_var.set(path)
+            self._repair_popout_refresh_ref_label()
+            self._repair_metrics_refresh()
+
+    def _clear_repair_metrics_ref(self):
+        self.repair_metrics_ref_var.set("")
+        self._repair_popout_refresh_ref_label()
+        self._repair_metrics_refresh()
+
+    def _repair_popout_refresh_ref_label(self):
+        lbl = getattr(self, "_repair_popout_ref_lbl", None)
+        if lbl is None or not lbl.winfo_exists():
+            return
+        p = self.repair_metrics_ref_var.get().strip()
+        lbl.config(text=os.path.basename(p) if p else "(none)")
+
+    def _repair_metrics_refresh(self):
+        """Kick the metrics worker for the current image pair, if the pop-out is open."""
+        win = self._repair_popout_window
+        try:
+            if win is None or not win.winfo_exists() or not self._repair_popout_metric_lbls:
+                return
+        except Exception:
+            return
+        base = self.repair_pil_images.get("baseline")
+        tweak = self.repair_pil_images.get("tweaked")
+        if base is None or tweak is None:
+            return
+        self._repair_metrics_gen += 1
+        gen = self._repair_metrics_gen
+        for c in self._repair_popout_metric_lbls.values():
+            c.config(text="…", fg=COLORS["text_muted"])
+        fam = (self.repair_family_var.get()
+               if getattr(self, "repair_family_var", None) is not None else "klein")
+        ref = self.repair_metrics_ref_var.get().strip()
+        threading.Thread(target=self._repair_metrics_worker,
+                         args=(base.copy(), tweak.copy(), fam, ref, gen),
+                         daemon=True).start()
+
+    def _repair_metrics_worker(self, base, tweak, fam, ref_path, gen):
+        try:
+            import numpy as np
+            from fizgig.repair_studio.metrics import PATCH_PITCH, compare
+            base_emb, base_bbox = self._repair_embed_pil(base)
+            tweak_emb, tweak_bbox = self._repair_embed_pil(tweak)
+            ref_emb = (self._ff_embed_cached(ref_path)
+                       if ref_path and os.path.isfile(ref_path) else None)
+            m = compare(np.array(base.convert("RGB")), np.array(tweak.convert("RGB")),
+                        PATCH_PITCH.get(fam, 16), base_bbox, tweak_bbox)
+            m["ref_set"] = bool(ref_path)
+            m["ref_face"] = ref_emb is not None
+            m["like_base"] = (float(np.dot(ref_emb, base_emb))
+                              if ref_emb is not None and base_emb is not None else None)
+            m["like_tweak"] = (float(np.dot(ref_emb, tweak_emb))
+                               if ref_emb is not None and tweak_emb is not None else None)
+        except Exception as e:
+            m = {"error": f"{type(e).__name__}: {e}"}
+        try:
+            self.master.after(0, lambda: self._repair_metrics_apply(m, gen))
+        except Exception:
+            pass    # app shutting down mid-computation — nowhere to paint, nothing to do
+
+    def _repair_metrics_apply(self, m, gen):
+        """Paint the chips — only if these numbers still describe the images on screen."""
+        if gen != self._repair_metrics_gen:
+            return
+        lbls = self._repair_popout_metric_lbls
+        try:
+            if not lbls or not self._repair_popout_window.winfo_exists():
+                return
+        except Exception:
+            return
+        GOOD, BAD, WARM, DIM = "#2ECC71", "#E74C3C", "#F39C12", COLORS["text_explain"]
+        if "error" in m:
+            lbls["likeness"].config(text=f"metrics failed: {m['error'][:60]}", fg=BAD)
+            for k in ("grid", "texture", "clip", "sat"):
+                lbls[k].config(text="", fg=DIM)
+            return
+        # Likeness vs the reference photo
+        if not m["ref_set"]:
+            lbls["likeness"].config(text="Likeness: set a reference photo →", fg=DIM)
+        elif not m["ref_face"]:
+            lbls["likeness"].config(text="Likeness: no face in reference", fg=BAD)
+        elif m["like_base"] is None or m["like_tweak"] is None:
+            lbls["likeness"].config(text="Likeness: no face in render", fg=DIM)
+        else:
+            lb, lt = m["like_base"] * 100, m["like_tweak"] * 100
+            d = lt - lb
+            arrow = "▲" if d > 0.5 else ("▼" if d < -0.5 else "→")
+            lbls["likeness"].config(
+                text=f"Likeness {lb:.0f}% {arrow} {lt:.0f}%",
+                fg=GOOD if d > 0.5 else (BAD if d < -0.5 else DIM))
+        # Patch grid: rising = the model's lattice is showing through (bad)
+        gd = m["grid_delta"]
+        lbls["grid"].config(
+            text=f"Grid {m['grid_base']:.2f} → {m['grid_tweak']:.2f}",
+            fg=BAD if gd > 0.05 else (GOOD if gd < -0.05 else DIM))
+        # Face texture: direction is information, not verdict (plastic vs fried)
+        tb, tt = m["texture_base"], m["texture_tweak"]
+        td = (tt - tb) / max(tb, 1e-6)
+        lbls["texture"].config(
+            text=f"Detail {tb:.0f} → {tt:.0f}",
+            fg=WARM if abs(td) > 0.10 else DIM)
+        # Clipping: blown pixels appearing is the earliest overbake tell
+        cd = m["clip_delta"]
+        lbls["clip"].config(
+            text=f"Clipped {m['clip_base']:.1f}% → {m['clip_tweak']:.1f}%",
+            fg=BAD if cd > 0.2 else (GOOD if cd < -0.2 else DIM))
+        sd = m["sat_delta"]
+        lbls["sat"].config(
+            text=f"Sat {m['sat_base']:.0f} → {m['sat_tweak']:.0f}",
+            fg=WARM if abs(sd) > 12 else DIM)
 
     def _save_repaired_lora_action(self):
         if self.repair_engine is None or self.repair_engine.primary_network is None:
@@ -23332,7 +23609,9 @@ class LoRATrainerGUI:
         if hasattr(self, "repair_preset_combo"):
             self.repair_preset_combo.configure(values=self._repair_preset_list())
 
-    def _apply_repair_state_to_widgets(self, state):
+    def _apply_repair_blocks_to_widgets(self, state):
+        """Sliders only — the shape user presets restore. Prompt, seed, res, reference and
+        the loaded LoRAs are session context, not part of a block recipe (Peter, 19 Aug)."""
         for bid, bs in state.blocks.items():
             v = self.repair_block_vars.get(bid)
             if v is None:
@@ -23341,6 +23620,9 @@ class LoRATrainerGUI:
             v["primary_strength"].set(bs.primary_strength)
             v["donor_enabled"].set(bs.donor_enabled)
             v["donor_strength"].set(bs.donor_strength)
+
+    def _apply_repair_state_to_widgets(self, state):
+        self._apply_repair_blocks_to_widgets(state)
         self.repair_seed_var.set(str(state.seed))
         self.repair_prompt_var.set(state.prompt)
         self.repair_res_var.set(str(state.preview_width))
@@ -23394,20 +23676,13 @@ class LoRATrainerGUI:
             if not messagebox.askokcancel("Overwrite?", f"Overwrite existing preset '{name}'?"):
                 return
         try:
-            # Sync seed/prompt/res from widgets first
-            try:
-                self.repair_state.seed = int(self.repair_seed_var.get() or "42")
-            except ValueError:
-                self.repair_state.seed = 42
-            self.repair_state.prompt = self.repair_prompt_var.get()
-            try:
-                self.repair_state.preview_width = int(self.repair_res_var.get())
-                self.repair_state.preview_height = self.repair_state.preview_width
-            except ValueError:
-                pass
             with open(path, "w", encoding="utf-8") as f:
                 import json as _json
-                _d = self.repair_state.to_json()
+                # SLIDERS ONLY. A preset is a block recipe — prompt, seed, resolution, the
+                # reference image and the loaded LoRAs are the session it gets applied TO,
+                # and saving them meant loading a preset yanked all of them out from under
+                # the user (Peter, 19 Aug).
+                _d = {"blocks": self.repair_state.to_json()["blocks"]}
                 # Self-describing: which family's block ids these are. The folder already
                 # scopes the dropdown; this makes a shared/copied file readable on its own.
                 _d["family"] = (self.repair_family_var.get()
@@ -23438,7 +23713,9 @@ class LoRATrainerGUI:
             with open(path, "r", encoding="utf-8") as f:
                 d = _json.load(f)
             state = SliderState.from_json(d)
-            self._apply_repair_state_to_widgets(state)
+            # Blocks only — a preset saved by an older build carries prompt/seed/res too;
+            # they are deliberately ignored so loading never disturbs the live session.
+            self._apply_repair_blocks_to_widgets(state)
             self._schedule_preview(force=True)
         except Exception:
             import traceback
