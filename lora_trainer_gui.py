@@ -7344,7 +7344,13 @@ class LoRATrainerGUI:
                 text=self._MINIMAX_LIKENESS_HINT_FT if on else self._MINIMAX_LIKENESS_HINT_LORA)
         for w in (getattr(self, "_minimax_blocks_label", None),
                   getattr(self, "_minimax_blocks_frame", None),
-                  getattr(self, "_minimax_blocks_hint", None)):
+                  getattr(self, "_minimax_blocks_hint", None),
+                  # Medium to High LR is a LoRA-mode knob (it rewrites the optimizer's
+                  # param-group LR at boundary steps — machinery FT doesn't have). Hidden
+                  # under FT; the builder also suppresses the flag.
+                  getattr(self, "_minimax_hnlr_label", None),
+                  getattr(self, "_minimax_hnlr_frame", None),
+                  getattr(self, "_minimax_hnlr_hint", None)):
             if w is not None:
                 self._set_widget_visible(w, not on)
         if hasattr(self, "_network_type_rowf"):
@@ -26146,7 +26152,12 @@ class LoRATrainerGUI:
         if _shift is not None:
             cmd += ["--shift", f"{_shift:g}"]
         _hl = minimax_highnoise_lr(self.settings.get("MINIMAX_HIGHNOISE_LR_PCT"))
-        if _hl is not None and abs(_hl - 1.0) > 1e-9:
+        _ft_now = bool(getattr(self, "minimax_finetune_var", None)
+                       and self.minimax_finetune_var.get())
+        # Not under FT: the band multiplier rewrites optimizer param-group LRs, which the
+        # fused fine-tune doesn't have (and rotation rebuilds discard the stash). The GUI
+        # hides the control under FT; a stale saved value must not resurrect the flag.
+        if _hl is not None and abs(_hl - 1.0) > 1e-9 and not _ft_now:
             cmd += ["--highnoise_lr_scale", f"{_hl:g}"]
         # Per-category retirement (mixed visual+voice datasets). One category, one epoch —
         # sent only when the epoch is set: the flag's presence means the run used it.
@@ -26154,7 +26165,9 @@ class LoRATrainerGUI:
             _n = int(str(self.settings.get("MIXED_STOP_EPOCH", "") or "").strip() or 0)
         except ValueError:
             _n = 0
-        if _n > 0:
+        # Retirement anchors ride the same param-group LR machinery as the band multiplier,
+        # so they are LoRA-only too — never emitted under FT.
+        if _n > 0 and not _ft_now:
             _flag = ("visual" if "photo" in
                      str(self.settings.get("MIXED_STOP_CATEGORY", "")).lower() else "audio")
             _mode = ("stop" if "stop" in

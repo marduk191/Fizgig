@@ -2233,6 +2233,20 @@ def train_minimax(
         ema_decay = 0.0
         lr_warmup_epochs = 0.0
         slow_blocks = None
+        # The band multiplier and retirement anchors both work by rewriting the optimizer's
+        # param-group LR at boundary steps — machinery FT doesn't have (fused: no optimizer
+        # object at all; non-fused: rotation rebuilds discard the stashed base LR). Left
+        # armed they crash, not degrade — so they're coerced off, with a line when the user
+        # had actually set them. The GUI hides/suppresses both under FT; this covers the CLI.
+        if abs(float(highnoise_lr_scale or 1.0) - 1.0) > 1e-9:
+            logger.info("[h3-ft] Medium to High LR is a LoRA-mode knob — the fine-tune "
+                        "trains every noise level at the configured rate.")
+        highnoise_lr_scale = 1.0
+        if int(visual_stop_epoch or 0) or int(audio_stop_epoch or 0):
+            logger.info("[h3-ft] category retirement is LoRA-mode machinery — ignored under "
+                        "the fine-tune (use --finetune_scope to filter the dataset instead).")
+        visual_stop_epoch = 0
+        audio_stop_epoch = 0
         # Previews stay ON under FT, but at CYCLE cadence only: they render when every block
         # has had the same number of passes, via a deactivate-all -> standard preview ->
         # reactivate bracket (the Sample-every-N box is overridden with a log line below).
