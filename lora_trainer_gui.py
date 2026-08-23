@@ -4417,6 +4417,82 @@ class LoRATrainerGUI:
                        "Test the result in ComfyUI as a normal Krea 2 model.",
                   foreground="#E67E22", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
         self._krea2_ft_hint.grid(row=65, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 6))
+
+        # --- Full fine-tune (rotating windows) — MiniMax H3. Same idea as the Krea 2 card:
+        # trains the BASE (the int8 checkpoint's own weights), a window of blocks at a time.
+        # Output is a full ~21 GB checkpoint per save. Rows 66-69 (Krea's card is 60-65; each
+        # family's card hides under the other).
+        self.minimax_finetune_var = tk.BooleanVar(
+            value=bool(self.settings.get("MINIMAX_FINETUNE", False)))
+        self._minimax_ft_cb = ttk.Checkbutton(
+            training_content,
+            text="⚗ Fine-tune the BASE MODEL instead of training a LoRA (experimental)",
+            variable=self.minimax_finetune_var,
+            command=lambda: self._on_minimax_ft_toggle(),
+        )
+        self._minimax_ft_cb.grid(row=66, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(10, 0))
+
+        self._minimax_ft_frame = ttk.Frame(training_content)
+        self._minimax_ft_frame.grid(row=67, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(2, 0))
+        ttk.Label(self._minimax_ft_frame, text="Blocks/window:").pack(side=tk.LEFT, padx=(16, 4))
+        self.minimax_ft_blocks_var = tk.StringVar(
+            value=str(self.settings.get("MINIMAX_FT_BLOCKS", "Auto (by VRAM)")))
+        _mftb = ttk.Combobox(self._minimax_ft_frame, textvariable=self.minimax_ft_blocks_var,
+                             values=["Auto (by VRAM)", "4", "8"], state="readonly", width=13)
+        _mftb.pack(side=tk.LEFT)
+        ToolTip(_mftb, "How many of the 50 blocks train at once. Auto sizes it to the VRAM "
+                       "free at launch (needs ~28 GB free at minimum — the int8 base alone is "
+                       "~21 GB resident). H3 runs block mode only: a component window across "
+                       "all 50 blocks is up to 15.4 GB of bf16 and does not fit 32 GB.")
+        ttk.Label(self._minimax_ft_frame, text="Rotate every:").pack(side=tk.LEFT, padx=(14, 4))
+        self.minimax_ft_every_var = tk.StringVar(
+            value=str(self.settings.get("MINIMAX_FT_EVERY", "1")))
+        ttk.Combobox(self._minimax_ft_frame, textvariable=self.minimax_ft_every_var,
+                     values=["1", "2", "3"], state="readonly", width=4).pack(side=tk.LEFT)
+        ttk.Label(self._minimax_ft_frame, text="epoch(s)").pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(self._minimax_ft_frame, text="Train on:").pack(side=tk.LEFT, padx=(14, 4))
+        self.minimax_ft_scope_var = tk.StringVar(
+            value=str(self.settings.get("MINIMAX_FT_SCOPE", "All media")))
+        _mfts = ttk.Combobox(self._minimax_ft_frame, textvariable=self.minimax_ft_scope_var,
+                             values=["All media", "Photos only"], state="readonly", width=11)
+        _mfts.pack(side=tk.LEFT)
+        ToolTip(_mfts, "Photos only skips every clip and voice batch — the photo fine-tune "
+                       "recipe. All media is the full H3 mixed regime (photos + clips + voice).")
+        ttk.Label(self._minimax_ft_frame, text="Blocks:").pack(side=tk.LEFT, padx=(14, 4))
+        self.minimax_ft_blockspec_var = tk.StringVar(
+            value=str(self.settings.get("MINIMAX_FT_BLOCKSPEC", "")))
+        _mftbs = ttk.Entry(self._minimax_ft_frame, textvariable=self.minimax_ft_blockspec_var,
+                           width=10)
+        _mftbs.pack(side=tk.LEFT)
+        ToolTip(_mftbs, "Optional: restrict the rotation cycle to a block range — the whole "
+                        "fine-tune touches only these blocks. '20-49' is the measured likeness "
+                        "recipe (protects the fragile 0-19 trunk) and roughly halves the "
+                        "system-RAM master copy. Empty = the full model.")
+
+        self.minimax_ft_fused_var = tk.BooleanVar(
+            value=bool(self.settings.get("MINIMAX_FT_FUSED", True)))
+        self._minimax_ft_fused_cb = ttk.Checkbutton(
+            training_content,
+            text="Free each gradient as it lands (fits the window; disables gradient clipping)",
+            variable=self.minimax_ft_fused_var,
+        )
+        self._minimax_ft_fused_cb.grid(row=68, column=0, columnspan=2, sticky=tk.W,
+                                       padx=(21, 5), pady=(2, 0))
+
+        self._minimax_ft_hint = ttk.Label(training_content,
+                  text="Trains the base model's own weights, not an adapter. Needs a 32 GB card "
+                       "and ~64 GB of system RAM (the bf16 master copy is ~39 GB for the full "
+                       "model, less with a Blocks range). Only a window of blocks is trainable "
+                       "at a time and the window rotates each epoch — at 4 blocks/window a full "
+                       "cycle is 13 epochs, so run at least one full cycle (the recipe runs "
+                       "two). Use a LOW learning rate — 1e-5 to start; H3 hasn't been "
+                       "calibrated yet, so compare checkpoints. EACH SAVE IS A FULL ~21 GB "
+                       "CHECKPOINT — point the Output Directory somewhere with room. No "
+                       "in-training previews; judge saved checkpoints in ComfyUI, and distil "
+                       "the result to a LoRA with Checkpoint to LoRA.",
+                  foreground="#E67E22", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT,
+                  wraplength=720)
+        self._minimax_ft_hint.grid(row=69, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 6))
         # --- Per-step movement clip (MiniMax only) -----------------------------------------
         # Whichever block sits LAST in the trained range absorbs 2-4x the median block's
         # movement from epoch 1 (measured across four runs; cutting blocks just moves the hot
@@ -5566,6 +5642,12 @@ class LoRATrainerGUI:
             ("KREA2_FAST_FT", "krea2_fast_ft_var", bool),
             ("KREA2_REG_DIR", "krea2_reg_dir_var", str),
             ("KREA2_REG_MULT", "krea2_reg_mult_var", str),
+            ("MINIMAX_FINETUNE", "minimax_finetune_var", bool),
+            ("MINIMAX_FT_BLOCKS", "minimax_ft_blocks_var", str),
+            ("MINIMAX_FT_EVERY", "minimax_ft_every_var", str),
+            ("MINIMAX_FT_SCOPE", "minimax_ft_scope_var", str),
+            ("MINIMAX_FT_BLOCKSPEC", "minimax_ft_blockspec_var", str),
+            ("MINIMAX_FT_FUSED", "minimax_ft_fused_var", bool),
         ]
         _ft_touched = False
         for _key, _attr, _cast in _ft_map:
@@ -5580,6 +5662,8 @@ class LoRATrainerGUI:
             # regularisation block tracks the restored state rather than the previous run's.
             if hasattr(self, "_apply_krea2_ft_visibility"):
                 self._apply_krea2_ft_visibility()
+            if hasattr(self, "_apply_minimax_ft_visibility"):
+                self._apply_minimax_ft_visibility()
             if hasattr(self, "auto_save_dataset_config_silent"):
                 self.auto_save_dataset_config_silent()
 
@@ -6446,6 +6530,12 @@ class LoRATrainerGUI:
         _grab("krea2_ft_blocks_var", "KREA2_FT_BLOCKS")
         _grab("krea2_ft_every_var", "KREA2_FT_EVERY")
         _grab("krea2_ft_fused_var", "KREA2_FT_FUSED")
+        _grab("minimax_finetune_var", "MINIMAX_FINETUNE")
+        _grab("minimax_ft_blocks_var", "MINIMAX_FT_BLOCKS")
+        _grab("minimax_ft_every_var", "MINIMAX_FT_EVERY")
+        _grab("minimax_ft_scope_var", "MINIMAX_FT_SCOPE")
+        _grab("minimax_ft_blockspec_var", "MINIMAX_FT_BLOCKSPEC")
+        _grab("minimax_ft_fused_var", "MINIMAX_FT_FUSED")
         # MiniMax reference distillation. A plain StringVar, so the generic self.entries sweep
         # above does NOT see it — without this a queued distillation run loses its reference
         # and silently becomes an ordinary run (tests/test_minimax_distill_gui.py).
@@ -7156,6 +7246,75 @@ class LoRATrainerGUI:
             self._krea2_ft_blocks_lbl.pack_forget()
             self._krea2_ft_blocks_cb.pack_forget()
 
+    # --- MiniMax H3 rotation fine-tune (mirrors the Krea 2 card) --------------------------
+    MINIMAX_FT_DEFAULTS = {
+        "LEARNING_RATE": "1e-5",          # a starting point, NOT a calibrated H3 recipe —
+                                          # nobody has tuned FT rates on this model yet
+        "MAX_TRAIN_EPOCHS": "26",         # two full 13-window cycles at 4 blocks/window
+        "SAVE_EVERY_N_EPOCHS": "13",      # one save per full cycle — every block has had the
+                                          # same passes, so checkpoints compare like-for-like.
+                                          # ~21 GB each; 2 files over the recipe run
+        "GRADIENT_ACCUMULATION": "1",     # fused backward consumes grads as they land
+        "MAX_GRAD_NORM": "0",             # global clipping is impossible under fused backward
+        "NETWORK_TYPE": "LoRA (standard)",  # FT trains the BASE — reset the adapter selector
+    }
+
+    def _on_minimax_ft_toggle(self):
+        """Recipe pushed on the way ON only, so re-showing the tab never stomps tuned values."""
+        self._apply_minimax_ft_visibility()
+        if bool(self.minimax_finetune_var.get()):
+            self._apply_minimax_ft_defaults()
+
+    def _apply_minimax_ft_defaults(self):
+        """Same shape as _apply_krea2_ft_defaults — one recipe write, with a console report."""
+        changed = []
+        if getattr(self, "adaptive_lr_var", None) is not None and self.adaptive_lr_var.get():
+            self.adaptive_lr_var.set(False)
+            try:
+                self._on_adaptive_lr_toggle()
+            except Exception:
+                pass
+            changed.append("Adaptive LR: on -> off (incompatible with rotation)")
+        for key, val in self.MINIMAX_FT_DEFAULTS.items():
+            entry = self.entries.get(key)
+            if entry is None:
+                continue
+            try:
+                before = entry.get()
+                if str(before).strip() == val:
+                    continue
+                _was = str(entry.cget("state"))
+                if _was == "disabled":
+                    entry.config(state="normal")
+                entry.delete(0, tk.END)
+                entry.insert(0, val)
+                if _was == "disabled":
+                    entry.config(state=_was)
+                changed.append(f"{key.replace('_', ' ').title()}: {before} -> {val}")
+            except Exception:
+                pass
+        if changed:
+            self.update_console("[fine-tune] applied the recommended base-model setup:\n  "
+                                + "\n  ".join(changed) + "\n")
+
+    def _apply_minimax_ft_visibility(self):
+        """FT sub-controls only while the checkbox is on; Network Type row hides under FT
+        (the adapter selector is meaningless when the base itself trains)."""
+        if not hasattr(self, "_minimax_ft_frame"):
+            return
+        on = bool(self.minimax_finetune_var.get())
+        for w in (self._minimax_ft_frame, self._minimax_ft_fused_cb, self._minimax_ft_hint):
+            self._set_widget_visible(w, on)
+        if hasattr(self, "_network_type_rowf"):
+            self._set_widget_visible(self.labels["NETWORK_TYPE"], not on)
+            self._set_widget_visible(self._network_type_rowf, not on)
+            if on:
+                self.hide_row("LOKR_FACTOR")
+                self.show_row("NETWORK_DIM")
+                self.show_row("NETWORK_ALPHA")
+            else:
+                self._on_network_type_changed()
+
     def _refresh_optimizer_choices(self, is_krea2: bool):
         """Point the Optimizer Type dropdown at the selected family's catalog."""
         combo = self.entries.get("OPTIMIZER_TYPE")
@@ -7288,10 +7447,20 @@ class LoRATrainerGUI:
                   self._compile_blocks_label, self.compile_blocks_check, self._compile_blocks_hint):
             self._set_widget_visible(w, is_krea2)
         # The FT sub-controls are gated by the checkbox as well as by the family. Gate on
-        # is_krea2, NOT native: under MiniMax this would run Krea FT visibility logic against
-        # rows master's three-family restructure owns.
+        # the family, NOT native: each family's FT visibility logic also swaps the Network
+        # Type rows, which the other family's logic must never touch. Away from a family,
+        # its FT sub-widgets hide outright (the family loop above only covers the checkbox).
         if is_krea2:
             self._apply_krea2_ft_visibility()
+        elif hasattr(self, "_krea2_ft_frame"):
+            for w in (self._krea2_ft_frame, self._krea2_ft_fused_cb, self._krea2_fast_ft_cb,
+                      self._krea2_reg_frame, self._krea2_ft_hint):
+                self._set_widget_visible(w, False)
+        if is_minimax:
+            self._apply_minimax_ft_visibility()
+        elif hasattr(self, "_minimax_ft_frame"):
+            for w in (self._minimax_ft_frame, self._minimax_ft_fused_cb, self._minimax_ft_hint):
+                self._set_widget_visible(w, False)
         # Network Type (LoRA/LoKR) is wired for BOTH native families (krea2_train and
         # minimax_train take --network_type/--lokr_factor); Klein trains standard only.
         # The row frame carries the combo + hint together. The speed note is Krea 2-only:
@@ -7319,6 +7488,7 @@ class LoRATrainerGUI:
                   self._minimax_capdrop_label, self._minimax_capdrop_frame,
                   self._minimax_capdrop_hint,
                   self._minimax_mc_frame,
+                  self._minimax_ft_cb,
                   ):
             self._set_widget_visible(w, is_minimax)
         # The clean-end box answers to BOTH the family and the dropdown: visible only for MiniMax,
@@ -25975,9 +26145,30 @@ class LoRATrainerGUI:
         # Depth-split LR is RETIRED (Peter, 9 Aug): it was the manual precursor of the limiter
         # + governor, which target whoever actually runs hot instead of a guessed range. The
         # controls are hidden and a stale saved range is deliberately not sent.
+        # Rotation fine-tune. Read from the Tk vars, not self.settings — the Krea builder
+        # learned the hard way that reading settings made the flags silently never fire.
+        _mft_on = bool(getattr(self, "minimax_finetune_var", None)
+                       and self.minimax_finetune_var.get())
+        if _mft_on:
+            _mftb = str(self.minimax_ft_blocks_var.get())
+            if _mftb.startswith("Auto"):
+                cmd += ["--finetune_rotation", "1", "--finetune_rotation_mode", "auto"]
+            else:
+                cmd += ["--finetune_rotation", str(max(1, int(_mftb))),
+                        "--finetune_rotation_mode", "block"]
+            _mfte = str(self.minimax_ft_every_var.get()).strip()
+            cmd += ["--finetune_rotate_every", _mfte if _mfte.isdigit() else "1"]
+            if str(self.minimax_ft_scope_var.get()).startswith("Photos"):
+                cmd += ["--finetune_scope", "photo"]
+            _mftspec = str(self.minimax_ft_blockspec_var.get()).strip()
+            if _mftspec:
+                cmd += ["--finetune_blocks", _mftspec]
+            if not bool(self.minimax_ft_fused_var.get()):
+                cmd += ["--no_finetune_fused_backward"]
         # LoKR (Kronecker) — dim/alpha still ride along above but the trainer ignores them;
-        # the factor is the dial. Same flags as the Krea 2 builder.
-        if str(self.settings.get("NETWORK_TYPE", "")).startswith("LoKR"):
+        # the factor is the dial. Same flags as the Krea 2 builder. Suppressed under FT: the
+        # trainer builds no adapter at all there.
+        if str(self.settings.get("NETWORK_TYPE", "")).startswith("LoKR") and not _mft_on:
             cmd += ["--network_type", "lokr",
                     "--lokr_factor", str(self.settings.get("LOKR_FACTOR", 8))]
         # In-training previews. Prompts come from the Samples tab (same widgets every family
