@@ -326,12 +326,16 @@ def recommend_ft_rotation(free_gb: Optional[float] = None):
 # + N x (0.771 bf16 - 0.386 freed int8) + fused-backward grad transient + activations
 # + ~2 GB context/workspace).
 MINIMAX_FT_TIERS = [
-    # (min_free_gb, mode, blocks, stream, peak_gb)
-    # N=8 MEASURED OOM on a real 32 GB card (30.4 GB allocated at the first backward with
-    # ~32.5 free at plan time — the +3.1 GB net window cost lands on top of the int8
-    # baseline's ~27 GB working peak). 8-block windows need a bigger card.
-    (33.0, "block", 8, False, 30.5),
-    (28.0, "block", 4, False, 27.4),
+    # (min_free_gb, mode, blocks, stream, MEASURED_peak_gb)
+    # Measured on the 5090 (23 Aug), steady post-rotation peaks at 0.25 MP photo FT,
+    # blocks 20-49, fused backward: N=4 24.4 / N=6 26.7 / N=8 28.8 — flat across
+    # rotations, full speed. (An earlier N=8 "OOM at 30.4" was measured WITH the
+    # optimizer zombie leaks aboard and is void.) Thresholds leave ~2.5 GB of WDDM
+    # headroom over the measured peak — the spill cliff is silent 5-10x steps, not
+    # an error, so the margin errs safe.
+    (31.5, "block", 8, False, 28.8),
+    (29.0, "block", 6, False, 26.7),
+    (26.5, "block", 4, False, 24.4),
 ]
 
 

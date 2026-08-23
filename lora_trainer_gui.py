@@ -4439,12 +4439,15 @@ class LoRATrainerGUI:
         self.minimax_ft_blocks_var = tk.StringVar(
             value=str(self.settings.get("MINIMAX_FT_BLOCKS", "Auto (by VRAM)")))
         _mftb = ttk.Combobox(self._minimax_ft_frame, textvariable=self.minimax_ft_blocks_var,
-                             values=["Auto (by VRAM)", "4", "8"], state="readonly", width=13)
+                             values=["Auto (by VRAM)", "4", "6", "8"], state="readonly", width=13)
         _mftb.pack(side=tk.LEFT)
-        ToolTip(_mftb, "How many of the 50 blocks train at once. Auto sizes it to the VRAM "
-                       "free at launch (needs ~28 GB free at minimum — the int8 base alone is "
-                       "~21 GB resident). H3 runs block mode only: a component window across "
-                       "all 50 blocks is up to 15.4 GB of bf16 and does not fit 32 GB.")
+        ToolTip(_mftb, "How many blocks train at once — bigger windows mean shorter cycles, "
+                       "so each block trains more often and previews/checkpoints arrive "
+                       "sooner. Measured peaks (5090, photo FT): 4 -> 24.4 GB, 6 -> 26.7 GB, "
+                       "8 -> 28.8 GB. Auto picks the largest that leaves ~2.5 GB of headroom "
+                       "over the VRAM free at launch (the int8 base alone is ~21 GB). H3 "
+                       "runs block mode only: a component window across all 50 blocks is up "
+                       "to 15.4 GB of bf16 and does not fit 32 GB.")
         ttk.Label(self._minimax_ft_frame, text="Rotate every:").pack(side=tk.LEFT, padx=(14, 4))
         self.minimax_ft_every_var = tk.StringVar(
             value=str(self.settings.get("MINIMAX_FT_EVERY", "1")))
