@@ -2223,10 +2223,15 @@ def train_minimax(
         # always dequantizes from the int8 FILE, so residency never affects its fidelity.)
         base_quant = "nf4" if _ft_component else "int8"
         adaptive_lr = False         # rotation boundaries read as instability to the watcher
-        # photo_blocks is KEPT under FT: it is the likeness intent, honoured with the same
-        # semantics as LoRA mode — photos feed the identity blocks, clips/voice the full
-        # model. Resolution (cycle-tighten vs per-window gating) happens after the dataset
-        # is known, in the rotator construction block.
+        # Likeness mode is LoRA-ONLY (Peter, 24 Aug, reversing the earlier carry-over): real
+        # FT A/Bs trained likeness markedly better WITHOUT the restriction — full-depth
+        # weight updates want the full depth, unlike an adapter concentrating its limited
+        # capacity. --finetune_blocks remains the manual restriction.
+        if photo_blocks:
+            logger.info("[h3-ft] Optimised Likeness Learning is LoRA-only — the fine-tune "
+                        "trains the full selection (fine-tunes measure better without it). "
+                        "Use the Blocks field for a manual restriction.")
+        photo_blocks = None
         network_type = "lora"       # the network is built inert; LoKR keys would just churn
         block_limit = 0.0           # movement governors measure LoRA movement
         adapter_ramp = 0.0
