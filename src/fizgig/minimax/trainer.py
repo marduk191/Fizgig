@@ -3722,7 +3722,27 @@ def train_minimax(
             _gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+        _bracket_parked = False
         try:
+            # Windows has no expandable_segments, so the activate/deactivate churn (worst at
+            # 8-block windows: 6+ GB freed interleaved with fresh int8 allocations) leaves
+            # the allocator fragmented — a bracket preview measured only 3.9 GB free and its
+            # 56-frame sampling spilled to 50 s/step. Same cure the decode phase already
+            # uses: park tail blocks for the render, restore before reactivating.
+            try:
+                from fizgig.utils.device import plannable_free_vram
+                _free_now = plannable_free_vram()
+            except Exception:
+                _free_now = 99.0
+            if _free_now < 8.0:
+                logger.info("[h3-ft] %.1f GB free is too tight for the bracket preview — "
+                            "parking tail blocks for the render.", _free_now)
+                park_dit_partial(dit, need_gb=8.0)
+                import gc as _gc3
+                _gc3.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                _bracket_parked = True
             if _ft_turbo_path:
                 turbo_net, turbo_adaln = load_preview_turbo(dit, _ft_turbo_path,
                                                             turbo_lora_strength)
@@ -3740,6 +3760,9 @@ def train_minimax(
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
         finally:
+            if _bracket_parked:
+                # Back before the window reactivates — training forwards need every block.
+                restore_parked_dit(dit, device, 0)
             if _act:
                 rotator.activate(_act)
                 _ft_rebind_optimizer()
