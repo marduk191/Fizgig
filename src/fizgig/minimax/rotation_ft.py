@@ -20,10 +20,14 @@ which is a different animal in three ways this module exists to handle:
    own storage carries.
 """
 
+import hashlib
+import json
 import logging
 import os
+import shutil
 from typing import Dict, List
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -33,6 +37,183 @@ from fizgig.minimax.convrot import (dequantize_int8_convrot, parse_comfy_quant,
                                     quantize_int8_convrot)
 
 logger = logging.getLogger(__name__)
+
+
+class MasterStore:
+    """Disk-backed bf16 master — the RAM dict's drop-in replacement for big fine-tunes.
+
+    The in-RAM master (37.3 GB full-model) is only IRREPLACEABLE for tensors that have
+    trained; an untouched entry is exactly reproducible by dequantizing the int8 source —
+    and the access pattern is perfectly coarse (nothing between rotations, one window per
+    boundary), so app-managed sequential spill beats letting Windows VM page 4K-at-random.
+    Reads: scratch if the key has trained, else per-tensor dequant from the source (lazy —
+    there is no build step at all). Writes: per-tensor raw .bin (uint16 view of the bf16
+    bytes, np tofile — the house pattern; NO mmap, see the loader's Windows note) + a JSON
+    manifest, both atomic via tmp + os.replace, superseded bytes deleted after. Spilling
+    BF16 preserves the exactness invariant completely — bytes are bytes; an int8 master
+    stays a non-starter (one lossy encode per rotation would compound across cycles).
+    Duck-types the dict surface the rotators use: get / [] / in / keys."""
+
+    def __init__(self, int8_path: str, scratch_dir: str, block_subset=None,
+                 key_prefix: str = "blocks", include_prefixes=()):
+        self.source_path = int8_path
+        self.dir = scratch_dir
+        os.makedirs(scratch_dir, exist_ok=True)
+        self._f = MemoryEfficientSafeOpen(int8_path)
+        keys = set(self._f.keys())
+        allowed = (tuple(f"{key_prefix}.{int(b)}." for b in block_subset)
+                   if block_subset is not None else None)
+        self._quant: Dict[str, str] = {}     # master key -> quantized source stem
+        self._dense: set = set()             # master keys stored dense in the source
+        est_bytes = 0
+        for k in sorted(keys):
+            if not k.endswith(".comfy_quant"):
+                continue
+            stem = k[: -len(".comfy_quant")]
+            if not stem.startswith(f"{key_prefix}."):
+                continue
+            if allowed is not None and not stem.startswith(allowed):
+                continue
+            self._quant[stem + ".weight"] = stem
+            est_bytes += 2 * int(np.prod(self._f.header[stem + ".weight"]["shape"]))
+        for pfx in include_prefixes:
+            for k in sorted(keys):
+                if (k.startswith(f"{pfx}.") and k.endswith(".weight")
+                        and f"{k[:-len('.weight')]}.comfy_quant" not in keys
+                        and k not in self._quant):
+                    self._dense.add(k)
+                    est_bytes += 2 * int(np.prod(self._f.header[k]["shape"]))
+        if not self._quant:
+            raise RuntimeError(
+                f"MasterStore: no ConvRot tensors under '{key_prefix}.' in "
+                f"{os.path.basename(int8_path)} — rotation FT needs the pre-quantized int8 "
+                "checkpoint (the bf16 file has no comfy_quant markers and is not supported)")
+        self.est_gb = est_bytes / 2 ** 30
+        free = shutil.disk_usage(scratch_dir).free
+        if free < est_bytes * 1.1:
+            raise RuntimeError(
+                f"[ft-master] the scratch drive has {free / 2**30:.1f} GB free but a fully "
+                f"trained master spills ~{self.est_gb:.1f} GB — free space on "
+                f"{os.path.splitdrive(scratch_dir)[0] or scratch_dir}, or use "
+                f"--finetune_scratch_dir to point at a bigger fast drive, or "
+                f"--finetune_master ram.")
+        self._manifest_path = os.path.join(scratch_dir, "manifest.json")
+        self._trained: Dict[str, dict] = {}  # key -> {"file", "shape"}
+        if os.path.exists(self._manifest_path):
+            try:
+                with open(self._manifest_path, encoding="utf-8") as mf:
+                    self._trained = json.load(mf).get("trained", {})
+            except Exception:
+                self._trained = {}
+        logger.info("[ft-master] disk-backed master: %d tensors, ~%.1f GB when fully "
+                    "trained, scratch at %s (RAM holds ~one tensor at a time)",
+                    len(self._quant) + len(self._dense), self.est_gb, scratch_dir)
+
+    # ---- dict surface (what the rotators and the save path actually call) --------------
+    def keys(self):
+        return list(self._quant) + sorted(self._dense)
+
+    def __contains__(self, key) -> bool:
+        return key in self._quant or key in self._dense
+
+    def get(self, key, default=None):
+        rec = self._trained.get(key)
+        if rec is not None:
+            arr = np.fromfile(os.path.join(self.dir, rec["file"]), dtype=np.uint16)
+            return (torch.from_numpy(arr).view(torch.bfloat16)
+                    .reshape(tuple(rec["shape"])))
+        if key in self._quant:
+            stem = self._quant[key]
+            conf = parse_comfy_quant(self._f.get_tensor(stem + ".comfy_quant"))
+            return dequantize_int8_convrot(self._f.get_tensor(stem + ".weight"),
+                                           self._f.get_tensor(stem + ".weight_scale"),
+                                           conf, out_dtype=torch.bfloat16)
+        if key in self._dense:
+            return self._f.get_tensor(key).to(torch.bfloat16)
+        return default
+
+    def __getitem__(self, key):
+        t = self.get(key)
+        if t is None:
+            raise KeyError(key)
+        return t
+
+    def __setitem__(self, key, t: torch.Tensor):
+        if key not in self:
+            raise KeyError(f"MasterStore: {key} is not a master tensor")
+        fn = hashlib.sha1(key.encode()).hexdigest()[:16] + ".bin"
+        tmp = os.path.join(self.dir, fn + ".tmp")
+        final = os.path.join(self.dir, fn)
+        t.detach().to("cpu", dtype=torch.bfloat16).contiguous() \
+            .view(torch.uint16).numpy().tofile(tmp)
+        os.replace(tmp, final)               # the old version stays valid until this instant
+        self._trained[key] = {"file": fn, "shape": list(t.shape)}
+        mtmp = self._manifest_path + ".tmp"
+        with open(mtmp, "w", encoding="utf-8") as mf:
+            json.dump({"source": os.path.basename(self.source_path),
+                       "trained": self._trained}, mf)
+        os.replace(mtmp, self._manifest_path)
+
+    def trained_keys(self):
+        return set(self._trained)
+
+    def close(self):
+        try:
+            self._f.file.close()
+        except Exception:
+            pass
+
+    def cleanup(self):
+        """Delete the scratch — call ONLY after the checkpoint that supersedes it is safely
+        on disk (the scratch is the run's live training state until then)."""
+        self.close()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
+class _FlushedView:
+    """master_state_dict for a MasterStore: live (active + always-on) tensors materialize
+    from the GPU per key AT PRODUCTION TIME, everything else streams from the store — the
+    base class's `dict(self.master)` would pull the whole master back into RAM at save."""
+
+    def __init__(self, store, live):
+        self._store, self._live = store, live
+
+    def __getitem__(self, key):
+        fn = self._live.get(key)
+        return fn() if fn is not None else self._store[key]
+
+    def __contains__(self, key):
+        return key in self._live or key in self._store
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def keys(self):
+        return set(self._store.keys()) | set(self._live)
+
+
+def _h3_flushed_state_dict(rotator):
+    """Shared master_state_dict for the H3 rotators: base behavior on a dict master, the
+    lazy view on a MasterStore. Mirrors the base exactly — active window flushed from the
+    live weights, always-on Linears exported unconditionally (dense ones were never in the
+    master but HAVE trained)."""
+    if not isinstance(rotator.master, MasterStore):
+        return BlockRotator.master_state_dict(rotator)
+
+    def _puller(lin):
+        return lambda: lin.weight.detach().to("cpu", dtype=torch.bfloat16).clone()
+
+    live = {}
+    for key, lin in rotator._targets(list(rotator.active)):
+        live[key] = _puller(lin)
+    for prefix, module in rotator.always:
+        for lname, lin in [(n, m) for n, m in module.named_modules()
+                           if isinstance(m, nn.Linear)]:
+            live[f"{prefix}.{lname}.weight"] = _puller(lin)
+    return _FlushedView(rotator.master, live)
 
 
 def _convrot_linears(module: nn.Module) -> List[tuple]:
@@ -95,6 +276,9 @@ class H3BlockRotator(BlockRotator):
             self.touched.add(key)
             n += 1
         return n
+
+    def master_state_dict(self):
+        return _h3_flushed_state_dict(self)
 
     def _deactivate_targets(self, targets) -> int:
         n = 0
@@ -191,6 +375,9 @@ class H3NF4Rotator(BlockRotator):
         from bitsandbytes.nn import Params4bit
         return Params4bit(w.detach().to("cpu", dtype=torch.bfloat16),
                           requires_grad=False, quant_type="nf4").to(device)
+
+    def master_state_dict(self):
+        return _h3_flushed_state_dict(self)
 
     def _targets(self, spec) -> List[tuple]:
         if spec and isinstance(spec[0], str):

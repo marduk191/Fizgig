@@ -16,11 +16,13 @@ So the training target for the model's output is `x0 - noise`.
 import argparse
 import contextlib
 import gc
+import hashlib
 import logging
 import math
 import os
 import random
 import re
+import shutil
 import sys
 import time
 from multiprocessing import Value
@@ -2143,6 +2145,8 @@ def train_minimax(
     finetune_fused_backward: bool = True,
     finetune_scope: str = "all",            # "all" | "photo"
     finetune_blocks: str = None,
+    finetune_master: str = "auto",          # "auto" | "ram" | "disk" — see the mode select
+    finetune_scratch_dir: str = None,       # disk mode's spill dir; default: beside the caches
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
 ):
@@ -2616,16 +2620,64 @@ def train_minimax(
                             "batches train only windows fully inside blocks %s; clips and "
                             "voice train every window — the same photos-protect-the-trunk "
                             "behaviour as LoRA mode.", photo_blocks)
+        # RAM vs disk-backed master. The in-RAM dict is only irreplaceable for TRAINED
+        # tensors; MasterStore reads untouched ones lazily from the int8 file and spills
+        # trained bf16 to scratch — master RAM drops from whole-model to ~one tensor, which
+        # is what fits full-model FT on 64 GB boxes. Auto: disk when the estimated master
+        # would eat >40% of available RAM (so a 128 GB box keeps the field-proven RAM path
+        # for the likeness-sized masters and flips only where it matters).
+        _inc = ("token_refiner",) if _ft_component else ()
+        _n_master_blocks = len(ft_subset) if ft_subset else _n_blocks
+        _est_master_gb = _n_master_blocks * 0.771 + (0.4 if _ft_component else 0.0)
+        _mmode = str(finetune_master or "auto").lower()
+        if _mmode == "auto":
+            try:
+                from fizgig.utils.capabilities import _available_ram_gb
+                _avail_ram, _ = _available_ram_gb()
+            except Exception:
+                _avail_ram = None
+            _mmode = ("disk" if (_avail_ram is not None
+                                 and _est_master_gb > 0.40 * _avail_ram) else "ram")
+            logger.info("[ft-master] auto -> %s (master ~%.1f GB vs %.0f GB RAM available)",
+                        _mmode, _est_master_gb,
+                        _avail_ram if _avail_ram is not None else -1)
+        if _mmode == "disk":
+            from fizgig.minimax.rotation_ft import MasterStore
+            _scratch = finetune_scratch_dir
+            if not _scratch:
+                # Default beside the dataset caches — the cache pref lives on a fast local
+                # drive; the OUTPUT dir must not be assumed fast (checkpoints often land on
+                # a big slow volume).
+                _cd = next((getattr(d, "cache_directory", None) for d in group.datasets
+                            if getattr(d, "cache_directory", None)), None)
+                _base = (os.path.dirname(str(_cd).rstrip("/\\")) if _cd else output_dir)
+                _scratch = os.path.join(
+                    _base, f"ft-scratch-{hashlib.sha1(output_name.encode()).hexdigest()[:8]}")
+            # Fresh run = fresh training state: this run's own stale scratch is wiped
+            # (continuation runs carry state via --dit <checkpoint>, never via scratch),
+            # and crashed siblings older than a week are swept.
+            if os.path.isdir(_scratch):
+                shutil.rmtree(_scratch, ignore_errors=True)
+            try:
+                import glob as _glob
+                import time as _time
+                for _old in _glob.glob(os.path.join(os.path.dirname(_scratch),
+                                                    "ft-scratch-*")):
+                    if (os.path.isdir(_old) and _old != _scratch
+                            and _time.time() - os.path.getmtime(_old) > 7 * 86400):
+                        shutil.rmtree(_old, ignore_errors=True)
+            except Exception:
+                pass
+            master = MasterStore(dit_path, _scratch, block_subset=ft_subset,
+                                 include_prefixes=_inc)
+        else:
+            master = build_bf16_master_h3(dit_path, block_subset=ft_subset,
+                                          include_prefixes=_inc)
         if _ft_component:
             from fizgig.minimax.rotation_ft import H3NF4Rotator, H3_COMPONENT_PREFIXES
-            # The refiner's big Linears are NF4 under this residency, so its always-on
-            # unfreeze needs master entries too — dense in the source file, tiny.
-            master = build_bf16_master_h3(dit_path, block_subset=ft_subset,
-                                          include_prefixes=("token_refiner",))
             rotator = H3NF4Rotator(dit.blocks, master, key_prefix="blocks", device=device,
                                    block_subset=ft_subset)
         else:
-            master = build_bf16_master_h3(dit_path, block_subset=ft_subset)
             rotator = H3BlockRotator(dit.blocks, master, key_prefix="blocks", device=device)
         _refiner = getattr(dit, "token_refiner", None)
         if _refiner is not None:
@@ -4367,6 +4419,10 @@ def train_minimax(
                         **_meta(), "fizgig_next_start_window": str(_next_w)})
                     logger.info("[h3-ft] paused. Continue with: --dit %s "
                                 "--finetune_start_window %d", os.path.basename(_pp), _next_w)
+                    # The checkpoint now carries everything — the scratch is superseded.
+                    from fizgig.minimax.rotation_ft import MasterStore as _MS
+                    if isinstance(rotator.master, _MS):
+                        rotator.master.cleanup()
                 except Exception as _se:
                     logger.error("[pause] checkpoint save FAILED (%s: %s) — there is NO new "
                                  "continuation point for this pause.", type(_se).__name__, _se)
@@ -4399,6 +4455,10 @@ def train_minimax(
                     "normal H3 model, or distil it to a LoRA with Checkpoint to LoRA. To train "
                     "it further: --dit %s --finetune_start_window %d",
                     final, os.path.basename(final), _next_w)
+        # The final checkpoint supersedes the scratch — reclaim the disk.
+        from fizgig.minimax.rotation_ft import MasterStore as _MS
+        if isinstance(rotator.master, _MS):
+            rotator.master.cleanup()
         try:
             os.remove(pause_flag)
         except OSError:

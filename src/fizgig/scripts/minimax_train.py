@@ -253,6 +253,15 @@ def setup_parser() -> argparse.ArgumentParser:
     p.add_argument("--finetune_blocks", default=None,
                    help="Restrict the rotation cycle to a block spec (e.g. '20-49', "
                         "the likeness recipe) — shrinks the CPU master too")
+    p.add_argument("--finetune_master", default="auto", choices=["auto", "ram", "disk"],
+                   help="Where the bf16 master lives. ram = whole master resident "
+                        "(field-proven, ~0.77 GB/block). disk = lazy reads from the int8 "
+                        "file + trained tensors spilled to scratch, ~one tensor in RAM — "
+                        "what fits full-model FT on 64 GB boxes. auto picks disk when the "
+                        "master would eat over 40%% of available RAM.")
+    p.add_argument("--finetune_scratch_dir", default=None,
+                   help="disk master's spill directory (wants a fast local drive). "
+                        "Default: beside the dataset caches.")
     return p
 
 
@@ -347,6 +356,8 @@ def main():
         finetune_fused_backward=args.finetune_fused_backward,
         finetune_scope=args.finetune_scope,
         finetune_blocks=args.finetune_blocks,
+        finetune_master=args.finetune_master,
+        finetune_scratch_dir=args.finetune_scratch_dir,
     )
 
 
