@@ -228,6 +228,28 @@ def setup_parser() -> argparse.ArgumentParser:
     p.add_argument("--metadata_license", default=None)
     p.add_argument("--metadata_tags", default=None)
     p.add_argument("--metadata_trigger_phrase", default=None)
+    # ---- rotation full fine-tune (trains the BASE, not a LoRA) ----
+    p.add_argument("--finetune_rotation", type=int, default=0,
+                   help="Master switch: >0 trains the base model itself, N blocks per "
+                        "rotating window (block mode). The output is a full ~21 GB "
+                        "int8 checkpoint per save.")
+    p.add_argument("--finetune_rotate_every", type=int, default=1,
+                   help="Advance the window every N epochs")
+    p.add_argument("--finetune_rotation_mode", default="auto", choices=["auto", "block"],
+                   help="auto sizes the window to free VRAM. Component mode does not fit "
+                        "H3 at 32 GB and is not offered.")
+    p.add_argument("--finetune_start_window", type=int, default=0,
+                   help="Continue a fine-tune mid-cycle (printed at every save)")
+    p.add_argument("--finetune_fused_backward", action="store_true", default=True,
+                   help="Free each gradient as it lands (per-tensor optimizers; "
+                        "disables grad clipping and accumulation)")
+    p.add_argument("--no_finetune_fused_backward", dest="finetune_fused_backward",
+                   action="store_false")
+    p.add_argument("--finetune_scope", default="all", choices=["all", "photo"],
+                   help="photo = skip clip/voice batches; all = the full mixed regime")
+    p.add_argument("--finetune_blocks", default=None,
+                   help="Restrict the rotation cycle to a block spec (e.g. '20-49', "
+                        "the likeness recipe) — shrinks the CPU master too")
     return p
 
 
@@ -315,6 +337,13 @@ def main():
         turbo_lora_strength=args.turbo_lora_strength,
         sample_audio=args.sample_audio,
         audio_vae_path=args.audio_vae,
+        finetune_rotation=args.finetune_rotation,
+        finetune_rotate_every=args.finetune_rotate_every,
+        finetune_rotation_mode=args.finetune_rotation_mode,
+        finetune_start_window=args.finetune_start_window,
+        finetune_fused_backward=args.finetune_fused_backward,
+        finetune_scope=args.finetune_scope,
+        finetune_blocks=args.finetune_blocks,
     )
 
 
