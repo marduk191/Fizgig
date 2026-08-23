@@ -4717,9 +4717,16 @@ class LoRATrainerGUI:
             foreground=COLORS["text_explain"], font=(FONT_FAMILY, 9, "italic"), justify=tk.LEFT, wraplength=720)
         self._minimax_likeness_hint.grid(row=40, column=0, columnspan=2, sticky=tk.W,
                                          padx=5, pady=(0, 4))
+        self._MINIMAX_LIKENESS_HINT_LORA = self._minimax_likeness_hint.cget("text")
+        self._MINIMAX_LIKENESS_HINT_FT = (
+            f"Under fine-tune this means: the whole fine-tune stays on the identity blocks "
+            f"({MINIMAX_LIKENESS_BLOCKS}) — protecting the fragile front trunk — and the "
+            f"Blocks field above follows this tickbox. Untick to fine-tune the full model "
+            f"(style/scene work), or type your own range in Blocks to override.")
         # trace, not command=: preset loads set the var programmatically and must re-grey too.
         self.entries["MINIMAX_LIKENESS_OPT"].trace_add(
-            "write", lambda *_a: self._sync_minimax_likeness_state())
+            "write", lambda *_a: (self._sync_minimax_likeness_state(),
+                                  self._sync_ft_blocks_from_likeness()))
 
         # Answers "when do changes take effect?" (issue #40) right where people wonder it.
         ttk.Label(training_content,
@@ -7264,28 +7271,42 @@ class LoRATrainerGUI:
         "NETWORK_TYPE": "LoRA (standard)",  # FT trains the BASE — reset the adapter selector
     }
 
+    def _sync_ft_blocks_from_likeness(self):
+        """The Optimised Likeness tickbox keeps its MEANING under FT: ticked = the whole
+        fine-tune stays on the identity blocks, unticked = full model. It drives the FT
+        Blocks field live — but only ever writes over its OWN auto-fill (or an empty box),
+        so a range the user typed survives every toggle."""
+        if not hasattr(self, "minimax_ft_blockspec_var") \
+                or not bool(getattr(self, "minimax_finetune_var", None)
+                            and self.minimax_finetune_var.get()):
+            return
+        ticked = bool(self.entries["MINIMAX_LIKENESS_OPT"].get()) \
+            if self.entries.get("MINIMAX_LIKENESS_OPT") is not None else False
+        cur = self.minimax_ft_blockspec_var.get().strip()
+        auto = getattr(self, "_minimax_ft_blocks_autofill", None)
+        if ticked and (not cur or cur == auto):
+            if cur != MINIMAX_LIKENESS_BLOCKS:
+                self.minimax_ft_blockspec_var.set(MINIMAX_LIKENESS_BLOCKS)
+            self._minimax_ft_blocks_autofill = MINIMAX_LIKENESS_BLOCKS
+        elif not ticked and auto and cur == auto:
+            self.minimax_ft_blockspec_var.set("")
+            self._minimax_ft_blocks_autofill = None
+
     def _on_minimax_ft_toggle(self):
         """Recipe pushed on the way ON only, so re-showing the tab never stomps tuned values."""
         self._apply_minimax_ft_visibility()
         if bool(self.minimax_finetune_var.get()):
             self._apply_minimax_ft_defaults()
-            # Bridge from the LoRA world: Optimised Likeness Learning is adapter machinery
-            # and does nothing under FT — but its INTENT (photos train the identity blocks)
-            # maps exactly onto the FT Blocks field. Carry it over rather than losing it.
-            if (self.settings.get("MINIMAX_LIKENESS_OPT")
-                    or (self.entries.get("MINIMAX_LIKENESS_OPT") is not None
-                        and str(self.entries["MINIMAX_LIKENESS_OPT"].get()) in ("1", "True"))) \
-                    and not self.minimax_ft_blockspec_var.get().strip():
-                self.minimax_ft_blockspec_var.set(MINIMAX_LIKENESS_BLOCKS)
-                self._minimax_ft_blocks_autofill = MINIMAX_LIKENESS_BLOCKS
+            _before = self.minimax_ft_blockspec_var.get().strip()
+            self._sync_ft_blocks_from_likeness()
+            if self.minimax_ft_blockspec_var.get().strip() != _before:
                 self.update_console(
-                    "[fine-tune] Optimised Likeness Learning is a LoRA feature — under "
-                    f"fine-tune its equivalent is Blocks {MINIMAX_LIKENESS_BLOCKS}, which "
-                    "has been filled in for you (the whole fine-tune stays on the identity "
-                    "blocks). Clear the Blocks box to fine-tune the full model.\n")
+                    "[fine-tune] Optimised Likeness Learning is ticked, so the fine-tune "
+                    f"stays on the identity blocks ({MINIMAX_LIKENESS_BLOCKS}) — the Blocks "
+                    "field follows the tickbox. Untick it to fine-tune the full model.\n")
         else:
-            # Unticking clears the bridge — but ONLY if the field still holds our auto-fill.
-            # A range the user typed themselves survives the toggle.
+            # Unticking FT clears the bridge — but ONLY if the field still holds our
+            # auto-fill. A range the user typed themselves survives the toggle.
             _auto = getattr(self, "_minimax_ft_blocks_autofill", None)
             if _auto and self.minimax_ft_blockspec_var.get().strip() == _auto:
                 self.minimax_ft_blockspec_var.set("")
@@ -7333,9 +7354,13 @@ class LoRATrainerGUI:
         on = bool(self.minimax_finetune_var.get())
         for w in (self._minimax_ft_frame, self._minimax_ft_fused_cb, self._minimax_ft_hint):
             self._set_widget_visible(w, on)
-        for w in (getattr(self, "_minimax_likeness_cb", None),
-                  getattr(self, "_minimax_likeness_hint", None),
-                  getattr(self, "_minimax_blocks_label", None),
+        # The likeness tickbox STAYS — same meaning, different mechanism: under FT it drives
+        # the Blocks field (whole fine-tune on the identity blocks) instead of masking photo
+        # steps. Its hint swaps to say so. Blocks to Train is adapter-only and hides.
+        if hasattr(self, "_minimax_likeness_hint"):
+            self._minimax_likeness_hint.config(
+                text=self._MINIMAX_LIKENESS_HINT_FT if on else self._MINIMAX_LIKENESS_HINT_LORA)
+        for w in (getattr(self, "_minimax_blocks_label", None),
                   getattr(self, "_minimax_blocks_frame", None),
                   getattr(self, "_minimax_blocks_hint", None)):
             if w is not None:
