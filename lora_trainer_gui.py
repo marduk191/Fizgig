@@ -7277,11 +7277,19 @@ class LoRATrainerGUI:
                         and str(self.entries["MINIMAX_LIKENESS_OPT"].get()) in ("1", "True"))) \
                     and not self.minimax_ft_blockspec_var.get().strip():
                 self.minimax_ft_blockspec_var.set(MINIMAX_LIKENESS_BLOCKS)
+                self._minimax_ft_blocks_autofill = MINIMAX_LIKENESS_BLOCKS
                 self.update_console(
                     "[fine-tune] Optimised Likeness Learning is a LoRA feature — under "
                     f"fine-tune its equivalent is Blocks {MINIMAX_LIKENESS_BLOCKS}, which "
                     "has been filled in for you (the whole fine-tune stays on the identity "
                     "blocks). Clear the Blocks box to fine-tune the full model.\n")
+        else:
+            # Unticking clears the bridge — but ONLY if the field still holds our auto-fill.
+            # A range the user typed themselves survives the toggle.
+            _auto = getattr(self, "_minimax_ft_blocks_autofill", None)
+            if _auto and self.minimax_ft_blockspec_var.get().strip() == _auto:
+                self.minimax_ft_blockspec_var.set("")
+            self._minimax_ft_blocks_autofill = None
 
     def _apply_minimax_ft_defaults(self):
         """Same shape as _apply_krea2_ft_defaults — one recipe write, with a console report."""
