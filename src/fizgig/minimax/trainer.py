@@ -2542,14 +2542,19 @@ def train_minimax(
                     if is_audio_path(p))
             except Exception:
                 _n_voice_items = 0
-            _photo_only_ds = (_clip_t <= 1) and (_n_voice_items == 0)
-            if _photo_only_ds and ft_subset is None:
+            # 'Train on: Photos only' is a dataset FILTER — with clips and voice skipped, a
+            # mixed dataset is effectively photos-only, so it takes the same tighten path.
+            _photo_only_eff = ((_clip_t <= 1) and (_n_voice_items == 0)) \
+                or finetune_scope == "photo"
+            if _photo_only_eff and ft_subset is None:
                 ft_subset = sorted(_pb_set)
-                logger.info("[h3-ft] Optimised Likeness Learning + photos-only dataset: the "
-                            "whole cycle tightens to blocks %s — exactly equivalent to the "
-                            "LoRA behaviour here, and no epochs are spent on windows photos "
-                            "would never train.", photo_blocks)
-            elif _photo_only_ds:
+                logger.info("[h3-ft] Optimised Likeness Learning + photos-only training "
+                            "(%s): the whole cycle tightens to blocks %s — exactly "
+                            "equivalent to the LoRA behaviour, and no epochs are spent on "
+                            "windows photos would never train.",
+                            "dataset has no clips/voice" if finetune_scope != "photo"
+                            else "Train on: Photos only", photo_blocks)
+            elif _photo_only_eff:
                 logger.info("[h3-ft] likeness is ticked but Blocks is set explicitly (%s) — "
                             "the explicit range wins.", finetune_blocks)
             else:
@@ -2558,11 +2563,6 @@ def train_minimax(
                             "batches train only windows fully inside blocks %s; clips and "
                             "voice train every window — the same photos-protect-the-trunk "
                             "behaviour as LoRA mode.", photo_blocks)
-                if finetune_scope == "photo":
-                    logger.warning("[h3-ft] 'Train on: Photos only' + likeness gating means "
-                                   "front-trunk windows train NOTHING (photos skip them, "
-                                   "clips are skipped everywhere). Consider 'All media', or "
-                                   "Blocks %s.", photo_blocks)
         master = build_bf16_master_h3(dit_path, block_subset=ft_subset)
         rotator = H3BlockRotator(dit.blocks, master, key_prefix="blocks", device=device)
         _refiner = getattr(dit, "token_refiner", None)

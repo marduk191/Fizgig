@@ -4457,10 +4457,12 @@ class LoRATrainerGUI:
         _mfts = ttk.Combobox(self._minimax_ft_frame, textvariable=self.minimax_ft_scope_var,
                              values=["All media", "Photos only"], state="readonly", width=11)
         _mfts.pack(side=tk.LEFT)
-        ToolTip(_mfts, "Photos only skips every clip and voice batch — the photo fine-tune "
-                       "recipe for MIXED datasets. All media is the full H3 regime (photos + "
-                       "clips + voice). A photos-only dataset needs no choice here: there is "
-                       "nothing to skip, so both settings behave identically.")
+        ToolTip(_mfts, "A dataset FILTER, not a mode. All media (default) fine-tunes on "
+                       "everything in the folder — photos, clips, voice. Photos only is the "
+                       "override for a mixed folder: clips and voice are skipped and the run "
+                       "behaves as if the dataset were photos-only (with Optimised Likeness "
+                       "on, the cycle then tightens to the identity blocks). On a dataset "
+                       "that's already just photos this choice changes nothing.")
         ttk.Label(self._minimax_ft_frame, text="Blocks:").pack(side=tk.LEFT, padx=(14, 4))
         self.minimax_ft_blockspec_var = tk.StringVar(
             value=str(self.settings.get("MINIMAX_FT_BLOCKSPEC", "")))
