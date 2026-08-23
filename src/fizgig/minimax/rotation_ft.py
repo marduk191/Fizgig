@@ -159,33 +159,38 @@ class H3NF4Rotator(BlockRotator):
     by that trade: writes still go bf16-master -> int8 ConvRot via save_full_checkpoint_h3,
     so the output deploys exactly like a block-mode one.
 
-    Mechanically simpler than the ConvRot rotator: an NF4 module is a plain nn.Linear whose
-    `weight` is a bnb Params4bit (F.linear dispatches on it — the production NF4 LoRA path
-    runs on exactly that), so activate/deactivate is a straight weight-attribute swap with
-    no class surgery. Discovery is a map built ONCE at construction — Params4bit is only
-    detectable while frozen, so the map must outlive activation."""
+    The loader builds NF4 targets as real bnb Linear4bit modules (meta-context shells,
+    loader.py) — a CLASS with its own forward that asserts on a dense weight. So activation
+    is the same `__class__` swap the ConvRot rotator does (Linear4bit inherits nn.Linear:
+    the stock F.linear forward takes over, the bnb forward returns on restore), plus a
+    weight-attribute swap. Re-encoding on deactivate must stage the weight through CPU:
+    Params4bit only quantizes on the cpu->cuda move, and a cuda-born tensor would stay
+    dense and trip bnb's `assert weight.shape[1] == 1` on the next forward (field crash).
+    Discovery is a map built ONCE at construction — the Linear4bit class is only present
+    while frozen, so the map must outlive activation."""
 
     def __init__(self, blocks: nn.ModuleList, master: Dict[str, torch.Tensor],
                  key_prefix: str = "blocks", device: str = "cuda", block_subset=None):
         super().__init__(blocks, master, key_prefix=key_prefix, device=device)
         self.touched: set = set()
         self.block_subset = set(int(b) for b in block_subset) if block_subset else None
+        self._orig_class = {}            # id(linear) -> Linear4bit subclass, for restore
         # key -> (block_idx, lname, linear). Built while everything is still frozen.
         self._by_key: Dict[str, tuple] = {}
         for bi, block in enumerate(blocks):
             if self.block_subset is not None and bi not in self.block_subset:
                 continue
             for lname, lin in block.named_modules():
-                if (isinstance(lin, nn.Linear)
-                        and type(getattr(lin, "weight", None)).__name__ == "Params4bit"):
+                if type(lin).__name__ == "Linear4bit":
                     self._by_key[self._key(bi, lname)] = (bi, lname, lin)
 
     @staticmethod
     def _nf4(w: torch.Tensor, device) -> nn.Parameter:
-        """Re-encode a bf16 weight exactly as the loader does (quantizes on the .to(cuda))."""
+        """Re-encode a bf16 weight exactly as the loader does. The CPU staging is load-
+        bearing: Params4bit quantizes on the cpu->cuda transition only."""
         from bitsandbytes.nn import Params4bit
-        return Params4bit(w.to(torch.bfloat16), requires_grad=False,
-                          quant_type="nf4").to(device)
+        return Params4bit(w.detach().to("cpu", dtype=torch.bfloat16),
+                          requires_grad=False, quant_type="nf4").to(device)
 
     def _targets(self, spec) -> List[tuple]:
         if spec and isinstance(spec[0], str):
@@ -201,6 +206,8 @@ class H3NF4Rotator(BlockRotator):
             if w is None:
                 logger.warning("[h3-nf4] no master weight for %s — leaving frozen", key)
                 continue
+            self._orig_class[id(lin)] = type(lin)
+            lin.__class__ = nn.Linear      # the bnb 4-bit forward vanishes with the class
             lin.weight = nn.Parameter(w.to(self.device, dtype=torch.bfloat16),
                                       requires_grad=True)
             self.touched.add(key)
@@ -215,24 +222,28 @@ class H3NF4Rotator(BlockRotator):
             trained = lin.weight.detach()
             self.master[key] = trained.to("cpu", dtype=torch.bfloat16).clone()
             lin.weight = self._nf4(trained, self.device)
+            lin.__class__ = self._orig_class.pop(id(lin))
             n += 1
         return n
 
     def activate_always(self, prefix: str, module: nn.Module) -> int:
         """Token refiner (+ condition_proj) under NF4 residency: the refiner's big Linears
-        load as Params4bit too, so they take the master-backed swap; small dense Linears
-        just unfreeze. Master entries for the refiner come from build_bf16_master_h3's
-        include_prefixes — dense in the source file, no dequant involved."""
+        load as Linear4bit too (the loader's NF4 targets include token_refiner.blocks), so
+        they take the same class-swap; small dense Linears just unfreeze. Master entries
+        for the refiner come from build_bf16_master_h3's include_prefixes — dense in the
+        source file, no dequant involved."""
         n_swapped = n_direct = 0
         for lname, lin in [(n, m) for n, m in module.named_modules()
                            if isinstance(m, nn.Linear)]:
             key = f"{prefix}.{lname}.weight"
-            if type(getattr(lin, "weight", None)).__name__ == "Params4bit":
+            if type(lin).__name__ == "Linear4bit":
                 w = self.master.get(key)
                 if w is None:
                     logger.warning("[h3-nf4] no master weight for always-on %s — leaving "
                                    "frozen", key)
                     continue
+                self._orig_class[id(lin)] = type(lin)
+                lin.__class__ = nn.Linear
                 lin.weight = nn.Parameter(w.to(self.device, dtype=torch.bfloat16),
                                           requires_grad=True)
                 self.touched.add(key)

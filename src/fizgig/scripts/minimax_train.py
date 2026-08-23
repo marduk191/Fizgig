@@ -235,9 +235,12 @@ def setup_parser() -> argparse.ArgumentParser:
                         "int8 checkpoint per save.")
     p.add_argument("--finetune_rotate_every", type=int, default=1,
                    help="Advance the window every N epochs")
-    p.add_argument("--finetune_rotation_mode", default="auto", choices=["auto", "block"],
-                   help="auto sizes the window to free VRAM. Component mode does not fit "
-                        "H3 at 32 GB and is not offered.")
+    p.add_argument("--finetune_rotation_mode", default="auto",
+                   choices=["auto", "block", "component"],
+                   help="auto sizes a block window to free VRAM. component trains one "
+                        "matmul (qkv/out/fc1/fc2) across EVERY block per window, on an "
+                        "NF4-resident base — full model depth each epoch; the saved "
+                        "checkpoint is still exact int8.")
     p.add_argument("--finetune_start_window", type=int, default=0,
                    help="Continue a fine-tune mid-cycle (printed at every save)")
     p.add_argument("--finetune_fused_backward", action="store_true", default=True,
