@@ -2909,6 +2909,11 @@ def train_minimax(
         _fused["on"] = True
 
     if rotator is not None:
+        # opt_params is the non-FT path's alias of the FIRST window's param list — under FT
+        # it would pin generation-1 params (3+ GB of bf16) for the whole run after the first
+        # rotation deactivates them (field: peak 23.9 -> 26.8 GB at rotation one, and the
+        # next ~0.6 GB of creep crossed the WDDM spill line at ~9 s/it).
+        opt_params = None
         if finetune_fused_backward:
             _attach_fused(params)
             optimizer, optimizer_label = None, "adafactor (rotation, fused backward)"
@@ -3687,6 +3692,20 @@ def train_minimax(
                 torch.cuda.empty_cache()
             vram_line("finally-done")
 
+    def _ft_rebind_optimizer():
+        """Rebuild the optimizer wiring for the CURRENT window params. Must run after ANY
+        re-activation — rotation or preview bracket — because activation creates fresh
+        Parameter objects: per-tensor fused optimizers keyed on the old objects would keep
+        3+ GB of zombie weights alive while the new params accumulate un-stepped, un-freed
+        gradients (field bug: 29.5 GB peak on a 24 GB window, and the window silently not
+        training after an epoch-0 preview)."""
+        nonlocal params, optimizer
+        params = rotator.trainable_params()
+        if finetune_fused_backward:
+            _attach_fused(params)
+        else:
+            optimizer, _ = _make_ft_optimizer(params)
+
     def _ft_render_previews(n):
         """Cycle-boundary preview under rotation FT: deactivate the whole window so the model
         is a consistent all-ConvRot checkpoint (the master holds every trained weight —
@@ -3723,6 +3742,11 @@ def train_minimax(
         finally:
             if _act:
                 rotator.activate(_act)
+                _ft_rebind_optimizer()
+                import gc as _gc2
+                _gc2.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     # ---- epoch loop ----
     loss_recorder = LossRecorder()
@@ -3826,11 +3850,7 @@ def train_minimax(
                 _ft_update_gate(_want)
                 if torch.cuda.is_available():
                     torch.cuda.reset_peak_memory_stats()   # per-window peak (logged per epoch)
-                params = rotator.trainable_params()
-                if finetune_fused_backward:
-                    _attach_fused(params)
-                else:
-                    optimizer, _ = _make_ft_optimizer(params)
+                _ft_rebind_optimizer()
                 logger.info("[h3-ft] epoch %d: window -> blocks %s (%d trainable tensors)",
                             epoch + 1, _want, len(params))
         _epoch_trained = 0
