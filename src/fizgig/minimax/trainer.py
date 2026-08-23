@@ -2849,7 +2849,9 @@ def train_minimax(
     # deltas stay ACTIVE in the forward; they just don't learn from photos. Refiners and non-block
     # modules always train (same rule as restrict_patterns_to_blocks — text-side, held constant).
     _photo_mask_params, _photo_used = [], ""
-    if photo_blocks:
+    # LoRA-only: under FT there is no network — the likeness intent was already resolved in
+    # the rotator block (cycle-tighten or per-window gating).
+    if photo_blocks and rotator is None:
         _pb_allowed = set(parse_block_spec(photo_blocks, len(dit.blocks)))
         _mask_ids = set()
         for _lora in network.unet_loras:
