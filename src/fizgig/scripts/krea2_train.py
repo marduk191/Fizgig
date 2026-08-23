@@ -82,6 +82,14 @@ def setup_parser() -> argparse.ArgumentParser:
     p.add_argument("--motion_weighted_loss", type=float, default=0.0,
                    help="Paired-image runs: upweight target tokens where source and target "
                         "differ (0-1; ~0.7 strong). Kills the copy shortcut on static regions")
+    p.add_argument("--slider_pairs", action="store_true",
+                   help="Image-pair slider training: training image = positive pole, its "
+                        "control_directory match = negative. The adapter trains at +1/-1 and "
+                        "strength becomes the attribute dial at inference. Keep captions "
+                        "neutral (never name the attribute).")
+    p.add_argument("--slider_diff_weight", type=float, default=1.0,
+                   help="Slider mode: concentrate the loss where the pair differs (0-1). "
+                        "1.0 = full disentanglement weighting; 0 = uniform")
     p.add_argument("--seed", type=int, default=42)
     # previews (sample the fp8 Turbo with the live LoRA)
     p.add_argument("--turbo_dit", default=None, help="Pre-quant fp8 Turbo for previews")
@@ -225,6 +233,8 @@ def main():
         blocks_to_swap=args.blocks_to_swap, shift=args.discrete_flow_shift, seed=args.seed,
         min_timestep=args.min_timestep, max_timestep=args.max_timestep,
         motion_weighted_loss=args.motion_weighted_loss,
+        slider_pairs=args.slider_pairs,
+        slider_diff_weight=args.slider_diff_weight,
         sample_prompts=prompts, turbo_path=args.turbo_dit, turbo_lora_path=args.turbo_lora,
         vae_path=args.vae, te_path=args.text_encoder,
         sample_every_n_epochs=args.sample_every_n_epochs,

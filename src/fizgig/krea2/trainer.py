@@ -432,7 +432,8 @@ def sample_krea2_timesteps(bsize: int, num_img_tokens: int, device, sigmoid_scal
 
 def compute_loss(dit, latent, hidden_states, attention_mask, *, shift=2.5, dtype=torch.bfloat16,
                  device=None, control_latent=None,
-                 min_timestep=0.0, max_timestep=1.0, motion_weight=0.0):
+                 min_timestep=0.0, max_timestep=1.0, motion_weight=0.0,
+                 diff_ref_latent=None, diff_weight=0.0):
     """Flow-matching training loss for Krea 2.
 
     latent:        (B, 16, h, w)         — cached Qwen-Image VAE latent
@@ -506,10 +507,29 @@ def compute_loss(dit, latent, hidden_states, attention_mask, *, shift=2.5, dtype
         # noise and would randomize the weights.
         diff_tokens, _, _ = patchify_block((latent - src).abs(), patch, frame=0.0)
         d = diff_tokens.float().mean(dim=-1)                                # (B, N)
-        r = (d / d.mean(dim=1, keepdim=True).clamp_min(1e-8)).clamp(max=8.0)
+        dm = d.mean(dim=1, keepdim=True)
+        r = (d / dm.clamp_min(1e-8)).clamp(max=8.0)
         w = (1.0 - float(motion_weight)) + float(motion_weight) * r
         w = w / w.mean(dim=1, keepdim=True).clamp_min(1e-8)                 # per-sample mean 1
+        # A DEGENERATE pair (identical images) at weight 1.0 would zero every token's weight
+        # and silently train nothing — fall back to uniform for that sample instead.
+        w = torch.where(dm > 1e-6, w, torch.ones_like(w))
         se = (pred.float() - target_tokens.float()).pow(2).mean(dim=-1)     # (B, N)
+        return (se * w).mean(), float(t.mean().item())
+    if diff_ref_latent is not None and diff_weight > 0.0:
+        # Slider training's disentanglement weight: identical formula to motion weighting,
+        # but on the PLAIN (unpaired) sequence — the reference is the pair's other image,
+        # never packed into the forward. The smile slider learns the mouth, not the haircut.
+        from fizgig.krea2.sampling import patchify_block
+        _ref = diff_ref_latent.to(device=device, dtype=dtype)
+        diff_tokens, _, _ = patchify_block((latent - _ref).abs(), patch, frame=0.0)
+        d = diff_tokens.float().mean(dim=-1)
+        dm = d.mean(dim=1, keepdim=True)
+        r = (d / dm.clamp_min(1e-8)).clamp(max=8.0)
+        w = (1.0 - float(diff_weight)) + float(diff_weight) * r
+        w = w / w.mean(dim=1, keepdim=True).clamp_min(1e-8)
+        w = torch.where(dm > 1e-6, w, torch.ones_like(w))   # same degenerate-pair guard
+        se = (pred.float() - target_tokens.float()).pow(2).mean(dim=-1)
         return (se * w).mean(), float(t.mean().item())
     return F.mse_loss(pred.float(), target_tokens.float()), float(t.mean().item())
 
@@ -1502,6 +1522,12 @@ def train_krea2(
     # Paired-image runs only: upweight target tokens where source and target actually differ
     # (kills the copy shortcut on mostly-static pairs). 0 = off; ~0.7 is a strong setting.
     motion_weighted_loss: float = 0.0,
+    # Image-pair slider training: the adapter learns a signed attribute direction from
+    # positive/negative image pairs (training image = positive, its control_directory match
+    # = negative). Strength is the dial at inference: +N pushes toward the positive pole,
+    # -N away. Captions must NOT name the attribute — the multiplier carries it.
+    slider_pairs: bool = False,
+    slider_diff_weight: float = 1.0,
     # Rotation FT resume: 0-based window the schedule starts at. A resumed run is a fresh
     # process, so without this it re-runs window 0 (attn) instead of the next unfinished one.
     finetune_start_window: int = 0,
@@ -1622,6 +1648,29 @@ def train_krea2(
     logger.info(f"Krea 2 training: {group.num_train_items} items, {max_train_epochs} epochs")
 
     ft_rotation = max(0, int(finetune_rotation or 0))
+
+    if slider_pairs:
+        # Slider mode's structural coercions. FT and sliders are mutually exclusive (a slider
+        # IS an adapter; FT has none). The per-image loss watch and adaptive LR both assume
+        # one target per image — a slider step has two poles, so their signals would be
+        # meaningless noise. Motion weighting is the paired-EDIT path's knob; the slider owns
+        # its pairs and never packs them.
+        if ft_rotation:
+            raise RuntimeError("[slider] slider training and base-model fine-tuning are "
+                               "mutually exclusive — turn one off.")
+        if adaptive_lr:
+            logger.info("[slider] adaptive LR disabled — its plateau signals assume one "
+                        "target per image; a slider step has two poles.")
+            adaptive_lr = False
+        if log_per_image_loss or per_image_lr or auto_recaption or warmup_look_outliers:
+            logger.info("[slider] per-image loss watch disabled for the same reason.")
+            log_per_image_loss = per_image_lr = auto_recaption = warmup_look_outliers = False
+        motion_weighted_loss = 0.0
+        logger.info("[slider] IMAGE-PAIR SLIDER TRAINING: each step trains the adapter at "
+                    "+1 toward the training image and at -1 toward its paired control; "
+                    "diff-weight %.2f concentrates the loss where the pair differs. Keep "
+                    "captions neutral — the attribute must live in the multiplier, not the "
+                    "text.", float(slider_diff_weight))
 
     # Fine-tune trains the BASE weights — the LoRA/LoKR network is built but inert, so a LoKR
     # request would only burn VRAM on parameters that are never trained or saved. Coerce with a
@@ -2394,12 +2443,41 @@ def train_krea2(
                 global_step += 1
                 progress_bar.update(1)
                 continue
-            loss, t_used = compute_loss(dit, batch["latents"], batch["hidden_states"], batch["attention_mask"],
-                                        device=device,
-                                        shift=shift, dtype=dtype,
-                                        control_latent=batch.get("latents_control_0"),
-                                        min_timestep=min_timestep, max_timestep=max_timestep,
-                                        motion_weight=motion_weighted_loss)
+            if slider_pairs:
+                # Image-pair slider step: the training image is the POSITIVE pole, its control
+                # the NEGATIVE. The adapter trains at +1 toward the positive and at -1 toward
+                # the negative — the SAME weights learn a signed direction, which is what makes
+                # strength a dial at inference. The pair is never packed into one sequence
+                # (that's edit-style training); each pole is a plain forward, diff-weighted so
+                # the loss concentrates where the pair actually differs.
+                _neg = batch.get("latents_control_0")
+                if _neg is None:
+                    raise RuntimeError(
+                        "[slider] this item has no pair image. Slider training needs a "
+                        "control_directory with a negative-pole image for every training "
+                        "image (matched by filename stem).")
+                network.set_multiplier(1.0)
+                _l_pos, t_used = compute_loss(dit, batch["latents"], batch["hidden_states"],
+                                              batch["attention_mask"], device=device,
+                                              shift=shift, dtype=dtype,
+                                              min_timestep=min_timestep, max_timestep=max_timestep,
+                                              diff_ref_latent=_neg, diff_weight=slider_diff_weight)
+                network.set_multiplier(-1.0)
+                _l_neg, _ = compute_loss(dit, _neg, batch["hidden_states"],
+                                         batch["attention_mask"], device=device,
+                                         shift=shift, dtype=dtype,
+                                         min_timestep=min_timestep, max_timestep=max_timestep,
+                                         diff_ref_latent=batch["latents"],
+                                         diff_weight=slider_diff_weight)
+                network.set_multiplier(1.0)
+                loss = 0.5 * (_l_pos + _l_neg)
+            else:
+                loss, t_used = compute_loss(dit, batch["latents"], batch["hidden_states"], batch["attention_mask"],
+                                            device=device,
+                                            shift=shift, dtype=dtype,
+                                            control_latent=batch.get("latents_control_0"),
+                                            min_timestep=min_timestep, max_timestep=max_timestep,
+                                            motion_weight=motion_weighted_loss)
             # Per-image LR: scale THIS step's gradient by the image's multiplier (throttle stuck
             # images, boost healthy learned ones). Raw loss is still what gets recorded/averaged below,
             # so avr_loss and the global adaptive-LR watcher see unscaled numbers.
@@ -2739,6 +2817,11 @@ def train_krea2(
     # Record the context LoRA in metadata so users know to pair it at the same strength at
     # inference (the trained LoRA is context-dependent — same contract as Klein).
     extra = {"ss_optimizer": optimizer_label}
+    if slider_pairs:
+        # Deploy contract: the strength dial IS the slider. Tools read these to default
+        # their range (Repair Studio / Royale scrub ±).
+        extra.update({"ss_slider": "image_pairs",
+                      "ss_slider_diff_weight": f"{float(slider_diff_weight):g}"})
     if context_lora_path:
         extra.update({"ss_context_lora": os.path.basename(context_lora_path),
                       "ss_context_lora_strength": str(context_lora_strength)})
