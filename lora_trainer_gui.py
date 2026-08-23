@@ -7341,9 +7341,13 @@ class LoRATrainerGUI:
     def _refresh_minimax_ft_save_box(self):
         """Keep Save-every in step with the cycle the FT controls imply.
 
-        A value that is already a non-zero MULTIPLE of the cycle is the user's own sparser
-        cadence and is left alone; 0 (final-only) is left alone; anything else is rewritten
-        to one-save-per-cycle. Trainer-side snap stays authoritative at launch."""
+        Ownership decides what may be rewritten: a value the GUI itself wrote (tracked in
+        _minimax_ft_save_autoset) is only ever a suggestion and always follows the cycle —
+        without this, rotate-every 1 -> 2 -> 1 stranded the box at 8, because 8 is a
+        multiple of 4 and looked like a user choice (field). A USER-typed value is kept
+        when it's 0 (final-only) or a non-zero multiple of the cycle (a deliberate sparser
+        cadence); anything else is rewritten to one-save-per-cycle. Trainer-side snap stays
+        authoritative at launch."""
         if not bool(getattr(self, "minimax_finetune_var", None)
                     and self.minimax_finetune_var.get()):
             return
@@ -7355,8 +7359,12 @@ class LoRATrainerGUI:
             cur = int(str(entry.get()).strip() or 0)
         except ValueError:
             cur = -1
-        if cur == 0 or (cur > 0 and cur % cyc == 0):
+        if cur == cyc:
+            self._minimax_ft_save_autoset = cyc     # already right — claim it as ours
             return
+        if cur != getattr(self, "_minimax_ft_save_autoset", None):
+            if cur == 0 or (cur > 0 and cur % cyc == 0):
+                return                              # the user's own deliberate cadence
         try:
             _was = str(entry.cget("state"))
             if _was == "disabled":
@@ -7365,6 +7373,7 @@ class LoRATrainerGUI:
             entry.insert(0, str(cyc))
             if _was == "disabled":
                 entry.config(state=_was)
+            self._minimax_ft_save_autoset = cyc
         except Exception:
             pass
 
