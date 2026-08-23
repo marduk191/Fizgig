@@ -4004,6 +4004,18 @@ def train_minimax(
                 # post-deactivate free is too tight for the incoming window.
                 _act_now = list(rotator.active)
                 if _act_now:
+                    # Release the optimizer's grip BEFORE deactivating — the fused opts are
+                    # KEYED on the outgoing window's Parameters, and _ft_rebind_optimizer
+                    # only runs after the next window activates, so without this every
+                    # rotation held BOTH windows at once. Block mode squeaked under the
+                    # ceiling; full-model component mode did not (field: fc1's 15.4 GB
+                    # stayed pinned — orphaned params are invisible to the park, so the
+                    # defrag read 3.4 GB free and fc2's activation OOMed).
+                    params = None
+                    if _fused["on"]:
+                        _detach_fused()
+                    else:
+                        optimizer = None
                     rotator.deactivate(_act_now)
                     import gc as _gcr
                     _gcr.collect()
