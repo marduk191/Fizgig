@@ -4439,15 +4439,20 @@ class LoRATrainerGUI:
         self.minimax_ft_blocks_var = tk.StringVar(
             value=str(self.settings.get("MINIMAX_FT_BLOCKS", "Auto (by VRAM)")))
         _mftb = ttk.Combobox(self._minimax_ft_frame, textvariable=self.minimax_ft_blocks_var,
-                             values=["Auto (by VRAM)", "4", "6", "8"], state="readonly", width=13)
+                             values=["Auto (by VRAM)", "4", "6", "8", "Component (NF4 base)"],
+                             state="readonly", width=19)
         _mftb.pack(side=tk.LEFT)
         ToolTip(_mftb, "How many blocks train at once — bigger windows mean shorter cycles, "
                        "so each block trains more often and previews/checkpoints arrive "
                        "sooner. Measured peaks (5090, photo FT): 4 -> 24.4 GB, 6 -> 26.7 GB, "
                        "8 -> 28.8 GB. Auto picks the largest that leaves ~2.5 GB of headroom "
-                       "over the VRAM free at launch (the int8 base alone is ~21 GB). H3 "
-                       "runs block mode only: a component window across all 50 blocks is up "
-                       "to 15.4 GB of bf16 and does not fit 32 GB.")
+                       "over the VRAM free at launch (the int8 base alone is ~21 GB).  |  "
+                       "Component (NF4 base): each window is one matmul (attention qkv/out, "
+                       "MLP fc1/fc2) across EVERY block, so a concept trains at the model's "
+                       "full depth each epoch — 4 windows per cycle. To fit, the frozen base "
+                       "runs as NF4 (~9.5% quantization error) during training; the saved "
+                       "checkpoint is still exact int8, so it deploys like any other. "
+                       "Experimental — A/B it against block mode on your own dataset.")
         ttk.Label(self._minimax_ft_frame, text="Rotate every:").pack(side=tk.LEFT, padx=(14, 4))
         self.minimax_ft_every_var = tk.StringVar(
             value=str(self.settings.get("MINIMAX_FT_EVERY", "1")))
@@ -26194,6 +26199,8 @@ class LoRATrainerGUI:
             _mftb = str(self.minimax_ft_blocks_var.get())
             if _mftb.startswith("Auto"):
                 cmd += ["--finetune_rotation", "1", "--finetune_rotation_mode", "auto"]
+            elif _mftb.startswith("Component"):
+                cmd += ["--finetune_rotation", "1", "--finetune_rotation_mode", "component"]
             else:
                 cmd += ["--finetune_rotation", str(max(1, int(_mftb))),
                         "--finetune_rotation_mode", "block"]

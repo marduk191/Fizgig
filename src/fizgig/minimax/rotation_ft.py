@@ -141,13 +141,126 @@ class H3BlockRotator(BlockRotator):
         return n_swapped + n_direct
 
 
+# Component windows for H3 (mode="component"): each window is ONE matmul of every block —
+# full model depth per window, ~4 windows per cycle. Per-block bf16 GB at the pruned model's
+# shapes (hidden 5376, ffn 14336, inner 5376): used by the trainer's defrag threshold.
+H3_COMPONENT_PREFIXES = ("attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2")
+H3_COMPONENT_GB_PER_BLOCK = {"attn.qkv_proj": 0.174, "attn.out_proj": 0.058,
+                             "mlp.fc1": 0.308, "mlp.fc2": 0.154}
+
+
+class H3NF4Rotator(BlockRotator):
+    """BlockRotator for an NF4-resident H3 base (component-mode fine-tune).
+
+    The NF4 residency (~10.5 GB vs int8's ~21) is what makes component windows fit 32 GB:
+    one matmul across every block is up to 15.4 GB of bf16 (fc1). The trunk's ~9.5% NF4
+    error is a deliberate trade the user opts into — the active window trains against a
+    coarser frozen context than the deployed int8 base. The SAVED checkpoint is untouched
+    by that trade: writes still go bf16-master -> int8 ConvRot via save_full_checkpoint_h3,
+    so the output deploys exactly like a block-mode one.
+
+    Mechanically simpler than the ConvRot rotator: an NF4 module is a plain nn.Linear whose
+    `weight` is a bnb Params4bit (F.linear dispatches on it — the production NF4 LoRA path
+    runs on exactly that), so activate/deactivate is a straight weight-attribute swap with
+    no class surgery. Discovery is a map built ONCE at construction — Params4bit is only
+    detectable while frozen, so the map must outlive activation."""
+
+    def __init__(self, blocks: nn.ModuleList, master: Dict[str, torch.Tensor],
+                 key_prefix: str = "blocks", device: str = "cuda", block_subset=None):
+        super().__init__(blocks, master, key_prefix=key_prefix, device=device)
+        self.touched: set = set()
+        self.block_subset = set(int(b) for b in block_subset) if block_subset else None
+        # key -> (block_idx, lname, linear). Built while everything is still frozen.
+        self._by_key: Dict[str, tuple] = {}
+        for bi, block in enumerate(blocks):
+            if self.block_subset is not None and bi not in self.block_subset:
+                continue
+            for lname, lin in block.named_modules():
+                if (isinstance(lin, nn.Linear)
+                        and type(getattr(lin, "weight", None)).__name__ == "Params4bit"):
+                    self._by_key[self._key(bi, lname)] = (bi, lname, lin)
+
+    @staticmethod
+    def _nf4(w: torch.Tensor, device) -> nn.Parameter:
+        """Re-encode a bf16 weight exactly as the loader does (quantizes on the .to(cuda))."""
+        from bitsandbytes.nn import Params4bit
+        return Params4bit(w.to(torch.bfloat16), requires_grad=False,
+                          quant_type="nf4").to(device)
+
+    def _targets(self, spec) -> List[tuple]:
+        if spec and isinstance(spec[0], str):
+            return [(k, lin) for k, (bi, lname, lin) in self._by_key.items()
+                    if any(lname.startswith(c) for c in spec)]
+        want = set(int(b) for b in spec)
+        return [(k, lin) for k, (bi, lname, lin) in self._by_key.items() if bi in want]
+
+    def _activate_targets(self, targets) -> int:
+        n = 0
+        for key, lin in targets:
+            w = self.master.get(key)
+            if w is None:
+                logger.warning("[h3-nf4] no master weight for %s — leaving frozen", key)
+                continue
+            lin.weight = nn.Parameter(w.to(self.device, dtype=torch.bfloat16),
+                                      requires_grad=True)
+            self.touched.add(key)
+            n += 1
+        return n
+
+    def _deactivate_targets(self, targets) -> int:
+        n = 0
+        for key, lin in targets:
+            if key not in self.master:
+                continue
+            trained = lin.weight.detach()
+            self.master[key] = trained.to("cpu", dtype=torch.bfloat16).clone()
+            lin.weight = self._nf4(trained, self.device)
+            n += 1
+        return n
+
+    def activate_always(self, prefix: str, module: nn.Module) -> int:
+        """Token refiner (+ condition_proj) under NF4 residency: the refiner's big Linears
+        load as Params4bit too, so they take the master-backed swap; small dense Linears
+        just unfreeze. Master entries for the refiner come from build_bf16_master_h3's
+        include_prefixes — dense in the source file, no dequant involved."""
+        n_swapped = n_direct = 0
+        for lname, lin in [(n, m) for n, m in module.named_modules()
+                           if isinstance(m, nn.Linear)]:
+            key = f"{prefix}.{lname}.weight"
+            if type(getattr(lin, "weight", None)).__name__ == "Params4bit":
+                w = self.master.get(key)
+                if w is None:
+                    logger.warning("[h3-nf4] no master weight for always-on %s — leaving "
+                                   "frozen", key)
+                    continue
+                lin.weight = nn.Parameter(w.to(self.device, dtype=torch.bfloat16),
+                                          requires_grad=True)
+                self.touched.add(key)
+                n_swapped += 1
+            else:
+                lin.weight.requires_grad_(True)
+                self.touched.add(key)
+                n_direct += 1
+            if lin.bias is not None:
+                lin.bias.requires_grad_(True)
+        self.always.append((prefix, module))
+        logger.info("[h3-nf4] always-on: %s (%d Linears trainable for the whole run%s)",
+                    prefix, n_swapped + n_direct,
+                    f"; {n_swapped} de-quantized, {n_direct} already dense" if n_swapped
+                    else "")
+        return n_swapped + n_direct
+
+
 def build_bf16_master_h3(int8_path: str, block_subset=None,
-                         key_prefix: str = "blocks") -> Dict[str, torch.Tensor]:
+                         key_prefix: str = "blocks",
+                         include_prefixes=()) -> Dict[str, torch.Tensor]:
     """The CPU bf16 master for an H3 rotation FT, dequantized from the int8 checkpoint.
 
     Streams tensor-by-tensor (never holds the file whole). block_subset limits the master to
     a --finetune_blocks selection — ~0.77 GB per block, so 20-49 costs ~23 GB instead of the
-    full model's ~38.6. Keys match H3BlockRotator._key(): '<prefix>.<i>.<lname>.weight'."""
+    full model's ~38.6. Keys match H3BlockRotator._key(): '<prefix>.<i>.<lname>.weight'.
+    include_prefixes adds DENSE tensors verbatim (the token refiner for the NF4 rotator's
+    always-on path — unquantized in the source file, so no dequant, just a bf16 copy)."""
     allowed = None
     if block_subset is not None:
         allowed = tuple(f"{key_prefix}.{int(b)}." for b in block_subset)
@@ -169,6 +282,12 @@ def build_bf16_master_h3(int8_path: str, block_subset=None,
                                             conf, out_dtype=torch.bfloat16)
             master[stem + ".weight"] = dense.cpu()
             n += 1
+        for pfx in include_prefixes:
+            for k in sorted(keys):
+                if (k.startswith(f"{pfx}.") and k.endswith(".weight")
+                        and k not in master and f"{k[:-len('.weight')]}.comfy_quant" not in keys):
+                    master[k] = f.get_tensor(k).to(torch.bfloat16).cpu()
+                    n += 1
     gb = sum(t.numel() * t.element_size() for t in master.values()) / 2 ** 30
     logger.info("[h3-rotation] bf16 master built: %d tensors, %.1f GB CPU RAM "
                 "(dequantized from the int8 checkpoint — the deployed ground truth)", n, gb)
