@@ -1649,6 +1649,13 @@ def train_krea2(
 
     ft_rotation = max(0, int(finetune_rotation or 0))
 
+    if ft_rotation:
+        # Driver-level handoff guard, before our first CUDA call: a back-to-back fine-tune
+        # can start while the previous trainer process is still tearing down, and WDDM's
+        # demotion to shared memory is sticky — see wait_for_gpu_handoff's docstring.
+        from fizgig.utils.capabilities import wait_for_gpu_handoff
+        wait_for_gpu_handoff()
+
     if slider_pairs:
         # Slider mode's structural coercions. FT and sliders are mutually exclusive (a slider
         # IS an adapter; FT has none). The per-image loss watch and adaptive LR both assume

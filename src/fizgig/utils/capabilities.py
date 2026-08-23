@@ -370,6 +370,60 @@ def recommend_minimax_ft_rotation(free_gb: Optional[float] = None):
              "rather than OOMing mid-run; a streamed-frozen-blocks mode for 24 GB cards "
              "is a possible v2."])
 
+
+def _nvidia_smi_used_gb() -> Optional[float]:
+    """Total VRAM in use per the DRIVER (every process), in GB. None when unreadable
+    (no nvidia-smi on ROCm, or parsing failed) — callers treat None as 'guard is a no-op'."""
+    smi = shutil.which("nvidia-smi")
+    if smi is None:
+        return None
+    try:
+        import subprocess
+        out = subprocess.run([smi, "--query-gpu=memory.used",
+                              "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=15)
+        return int(out.stdout.strip().splitlines()[0]) / 1024.0
+    except Exception:
+        return None
+
+
+def wait_for_gpu_handoff(threshold_gb: float = 6.0, timeout_s: float = 180.0,
+                         poll_s: float = 5.0) -> None:
+    """Driver-level VRAM handoff guard — call BEFORE a fine-tune claims the card.
+
+    WDDM virtualizes memory per process, so the trainer's own mem_get_info can NEVER see a
+    just-finished trainer that is still tearing down (unwinding a ~38 GB Python heap takes
+    a while after the 'completed' line). Uploading a 21 GB base while the old process still
+    holds its copy overcommits the card, and WDDM's demotion to shared memory is STICKY —
+    the demoted blocks crawl when they first rotate in, so the slowdown surfaces mid-run
+    (field: epochs 6-7 of a back-to-back fine-tune), not at load. nvidia-smi reads the
+    driver's global view, which sees every process — so the guard runs there.
+
+    Must run before this process's first CUDA call: after CUDA init, our own context is
+    part of the total and the threshold arithmetic assumes we hold ~nothing yet."""
+    used = _nvidia_smi_used_gb()
+    if used is None or used < threshold_gb:
+        return
+    import time
+    logger.info(
+        "[ft-guard] another process is still holding ~%.1f GB of VRAM — waiting up to "
+        "%.0f s for it to let go. A just-finished fine-tune can take a minute to fully "
+        "exit; restarting Fizgig between fine-tunes always guarantees a clean handoff.",
+        used, timeout_s)
+    start = time.monotonic()
+    while time.monotonic() - start < timeout_s:
+        time.sleep(poll_s)
+        used = _nvidia_smi_used_gb()
+        if used is None or used < threshold_gb:
+            logger.info("[ft-guard] VRAM released after %.0f s — proceeding.",
+                        time.monotonic() - start)
+            return
+    logger.warning(
+        "[ft-guard] still ~%.1f GB held elsewhere after %.0f s — starting anyway. If this "
+        "run trains slow, close other GPU apps, or restart Fizgig between fine-tunes.",
+        used, timeout_s)
+
+
 def recommend_krea2_strategy(vram_gb: Optional[float] = None,
                              caps: Optional[Capabilities] = None,
                              mp: float = 0.25, batch: int = 1,
