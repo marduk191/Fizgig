@@ -3921,7 +3921,43 @@ def train_minimax(
             # clip_grad_norm_ and the boundary step see the live window, not the old one.
             _want = [_sched_map[i] for i in rot_schedule.active_at(epoch)]
             if _want != list(rotator.active):
-                rotator.rotate_to(_want)
+                # Decomposed rotate_to (deactivate -> activate is exactly what it does) so a
+                # defrag can run at the one moment it helps: after the old window frees,
+                # before the new one allocates. Windows torch has no expandable_segments, and
+                # the ~6 GB in/out churn of every rotation fragments the reserve a little
+                # each epoch — empty_cache only returns fully-EMPTY segments — until driver
+                # memory hits the WDDM ceiling and steps silently crawl (field: a clean
+                # first run pinned at 32.0/32.6 GB by epochs 6-7). The full park/restore
+                # round-trip re-lands everything contiguously; seconds, and only when the
+                # post-deactivate free is too tight for the incoming window.
+                _act_now = list(rotator.active)
+                if _act_now:
+                    rotator.deactivate(_act_now)
+                    import gc as _gcr
+                    _gcr.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                try:
+                    from fizgig.utils.device import plannable_free_vram as _pfv
+                    _free_r = _pfv()
+                except Exception:
+                    _free_r = 99.0
+                _need_r = 0.77 * len(_want) + 2.0
+                if _free_r < _need_r:
+                    logger.info("[h3-ft] %.1f GB free before activating the next window "
+                                "(needs ~%.1f) — defragmenting via a full park/restore "
+                                "round-trip.", _free_r, _need_r)
+                    park_dit_to_cpu(dit)
+                    import gc as _gcr2
+                    _gcr2.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    restore_parked_dit(dit, device, 0)
+                    try:
+                        logger.info("[h3-ft] post-defrag: %.1f GB free", _pfv())
+                    except Exception:
+                        pass
+                rotator.activate(_want)
                 _ft_update_gate(_want)
                 if torch.cuda.is_available():
                     torch.cuda.reset_peak_memory_stats()   # per-window peak (logged per epoch)
