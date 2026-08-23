@@ -2891,6 +2891,13 @@ def train_minimax(
             except Exception:
                 return torch.optim.AdamW(_params, lr=learning_rate), "adamw (rotation)"
 
+    def _detach_fused():
+        for h in _fused["handles"]:
+            h.remove()
+        _fused["handles"].clear()
+        _fused["opts"].clear()
+        _fused["on"] = False
+
     def _attach_fused(_params):
         for h in _fused["handles"]:
             h.remove()
@@ -3714,11 +3721,22 @@ def train_minimax(
         pops each wrapped module's instance `forward` — apply_to deleted the module ref but
         the bound org_forward's __self__ IS the module, and the pre-Turbo forward here is
         always the class-level one, so popping restores it exactly."""
-        nonlocal turbo_net, turbo_adaln
+        nonlocal turbo_net, turbo_adaln, params, optimizer
         import gc as _gc
         _act = list(rotator.active)
         if _act:
             rotator.deactivate(_act)
+            # Drop every optimizer reference to the window's now-orphaned bf16 Parameters —
+            # the fused opts dict is KEYED on them, so without this they stay VRAM-resident
+            # (~6 GB at 8 blocks) through the whole preview. Measured: the bracket saw
+            # 3.7-4.2 GB free on an otherwise-clean card with them pinned. The next epoch's
+            # rotation activates + rebinds through the one normal path, exactly as it does
+            # for the deferred re-activation below.
+            params = None
+            if _fused["on"]:
+                _detach_fused()
+            else:
+                optimizer = None
             _gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -3749,15 +3767,32 @@ def train_minimax(
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 try:
-                    logger.info("[h3-ft] post-defrag: %.1f GB free", plannable_free_vram())
+                    _free_now = plannable_free_vram()
+                    logger.info("[h3-ft] post-defrag: %.1f GB free", _free_now)
                 except Exception:
                     pass
+            # Still tight after the defrag = the shortage is TOTAL VRAM (usually other apps
+            # holding the card), not fragmentation. Spilling turns a 5 s preview step into
+            # 60 s — degrade THIS render to a shorter clip instead, and say so. Temporary:
+            # unlike the crash ladder, the next preview tries the full length again.
+            # Threshold from measured runs: 5.7 GB free rendered full-length fast; 4.1 GB
+            # spilled to 61 s/step. 5.0 splits them.
+            _frames_held = None
+            if _free_now < 5.0 and int(_clip_state.get("frames", 1) or 1) > 22:
+                _frames_held = _clip_state["frames"]
+                _clip_state["frames"] = 22
+                logger.info("[h3-ft] %.1f GB free is not enough for a %d-frame preview "
+                            "without spilling — rendering 22 frames this time. Full length "
+                            "returns automatically when more VRAM is free (closing other "
+                            "GPU apps can help).", _free_now, _frames_held)
             if _ft_turbo_path:
                 turbo_net, turbo_adaln = load_preview_turbo(dit, _ft_turbo_path,
                                                             turbo_lora_strength)
             try:
                 _render_previews(n)
             finally:
+                if _frames_held is not None:
+                    _clip_state["frames"] = _frames_held
                 if turbo_net is not None:
                     for _l in turbo_net.unet_loras:
                         _m = getattr(getattr(_l, "org_forward", None), "__self__", None)
@@ -4019,6 +4054,11 @@ def train_minimax(
             progress_bar.set_postfix(avr_loss=f"{loss_recorder.moving_average:.4f}", refresh=False)
             progress_bar.update(1)
 
+        # The last step's `loss` keeps its whole autograd graph alive across the epoch
+        # boundary, and each leaf AccumulateGrad node holds a STRONG ref to its Parameter —
+        # under rotation FT that pins the entire deactivated window (~6 GB of orphaned bf16
+        # at 8 blocks, census-confirmed) straight through the bracket preview.
+        loss = batch = None
         logger.info(f"epoch {epoch + 1}/{max_train_epochs} done — avr_loss {loss_recorder.moving_average:.4f}")
         if rotator is not None and torch.cuda.is_available():
             # Per-window peak, reset at each rotation: these lines ARE the measured tier
