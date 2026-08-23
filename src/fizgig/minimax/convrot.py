@@ -78,6 +78,25 @@ def dequantize_int8_convrot(qweight: torch.Tensor, scale: torch.Tensor, conf: di
     return rotate(w, group).to(out_dtype)
 
 
+def quantize_int8_convrot(w: torch.Tensor, rot: int = 256):
+    """The ENCODE direction — a TRUE-basis dense weight -> int8 codes + per-row scale.
+
+    Exists for rotation fine-tuning: a trained bf16 window is written back into the frozen
+    model's int8-ConvRot storage. Inverse of dequantize_int8_convrot: rotate into the storage
+    basis (self-inverse Hadamard, same call), then symmetric per-output-row absmax scaling to
+    the int8 grid. Round-trip property the tests pin: encoding a freshly DECODED weight
+    reproduces the original codes exactly — the codes are integers on their own grid and the
+    rowmax recovers the scale — so the only loss on a save is the one quantization step of the
+    weights that actually trained (~0.17% relative, the same class as the base's own storage
+    error). clamp_min guards an all-zero row (a dead output would otherwise divide by zero).
+
+    Returns (codes int8 [out, in], scale fp32 [out, 1])."""
+    wr = rotate(w.to(torch.float32), rot)
+    s = wr.abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / 127.0
+    q = torch.round(wr / s).clamp(-127, 127).to(torch.int8)
+    return q, s
+
+
 class _Int8RotLinearFn(torch.autograd.Function):
     """linear(rotate(x), dequant(q, s)) that does NOT keep the dequantized weight alive.
 
