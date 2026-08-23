@@ -2549,6 +2549,23 @@ def train_minimax(
                         "overriding Sample-every-N: a mid-cycle preview would show blocks "
                         "with unequal training. Rendered via a deactivate/reactivate bracket "
                         "with the Turbo applied fresh each time.", rot_schedule.cycle_epochs)
+        # Save cadence snaps to the cycle too — each save is a full ~21 GB checkpoint, and
+        # per-cycle saves compare like-for-like (every block equally trained). An explicit
+        # multiple of the cycle is respected (sparser is fine); anything else is corrected
+        # so the user never has to derive the cycle arithmetic themselves. 0 = final only.
+        _cyc = rot_schedule.cycle_epochs
+        if save_every_n_epochs and save_every_n_epochs % _cyc != 0:
+            logger.info("[h3-ft] Save every %d epoch(s) doesn't line up with the %d-epoch "
+                        "cycle — saving once per cycle instead (each save is a full ~21 GB "
+                        "checkpoint; multiples of the cycle are also accepted).",
+                        save_every_n_epochs, _cyc)
+            save_every_n_epochs = _cyc
+        if train_blocks:
+            logger.info("[h3-ft] Blocks to Train (%s) is LoRA machinery and does nothing "
+                        "under fine-tune — use the FT card's Blocks field "
+                        "(--finetune_blocks) to restrict the rotation cycle instead.",
+                        train_blocks)
+            train_blocks = None
     # AdaLN targeting is per-checkpoint — see the pattern note at the top of this file.
     include_patterns = user_include_patterns or (
         PRUNED_INCLUDE_PATTERNS if dit.pruned_adaln else DEFAULT_INCLUDE_PATTERNS)

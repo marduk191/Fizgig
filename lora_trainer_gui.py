@@ -4457,7 +4457,9 @@ class LoRATrainerGUI:
                              values=["All media", "Photos only"], state="readonly", width=11)
         _mfts.pack(side=tk.LEFT)
         ToolTip(_mfts, "Photos only skips every clip and voice batch — the photo fine-tune "
-                       "recipe. All media is the full H3 mixed regime (photos + clips + voice).")
+                       "recipe for MIXED datasets. All media is the full H3 regime (photos + "
+                       "clips + voice). A photos-only dataset needs no choice here: there is "
+                       "nothing to skip, so both settings behave identically.")
         ttk.Label(self._minimax_ft_frame, text="Blocks:").pack(side=tk.LEFT, padx=(14, 4))
         self.minimax_ft_blockspec_var = tk.StringVar(
             value=str(self.settings.get("MINIMAX_FT_BLOCKSPEC", "")))
@@ -4480,16 +4482,19 @@ class LoRATrainerGUI:
                                        padx=(21, 5), pady=(2, 0))
 
         self._minimax_ft_hint = ttk.Label(training_content,
-                  text="Trains the base model's own weights, not an adapter. Needs a 32 GB card "
-                       "and ~64 GB of system RAM (the bf16 master copy is ~39 GB for the full "
-                       "model, less with a Blocks range). Only a window of blocks is trainable "
-                       "at a time and the window rotates each epoch — at 4 blocks/window a full "
-                       "cycle is 13 epochs, so run at least one full cycle (the recipe runs "
-                       "two). Use a LOW learning rate — 1e-5 to start; H3 hasn't been "
-                       "calibrated yet, so compare checkpoints. EACH SAVE IS A FULL ~21 GB "
-                       "CHECKPOINT — point the Output Directory somewhere with room. No "
-                       "in-training previews; judge saved checkpoints in ComfyUI, and distil "
-                       "the result to a LoRA with Checkpoint to LoRA.",
+                  text="Trains the base model's own weights, not an adapter — so the LoRA "
+                       "controls (Network Type, Optimised Likeness Learning, Blocks to Train) "
+                       "hide while this is on; the Blocks field above is the fine-tune's own "
+                       "block restriction (20-49 = the likeness recipe, auto-filled if the "
+                       "likeness checkbox was ticked). Needs a 32 GB card and ~64 GB of system "
+                       "RAM. Only a window of blocks trains at a time and the window rotates "
+                       "each epoch; previews render and a full ~21 GB checkpoint saves once "
+                       "per COMPLETED CYCLE (every block equally trained — the save box snaps "
+                       "to the cycle automatically). Photos-only dataset? Leave 'Train on' "
+                       "alone — there's nothing to skip. Use a LOW learning rate (1e-5 to "
+                       "start; H3 is uncalibrated — compare checkpoints). Point the Output "
+                       "Directory somewhere with room, judge results in ComfyUI, and distil "
+                       "to a shareable LoRA with Checkpoint to LoRA.",
                   foreground="#E67E22", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT,
                   wraplength=720)
         self._minimax_ft_hint.grid(row=69, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 6))
@@ -7264,6 +7269,19 @@ class LoRATrainerGUI:
         self._apply_minimax_ft_visibility()
         if bool(self.minimax_finetune_var.get()):
             self._apply_minimax_ft_defaults()
+            # Bridge from the LoRA world: Optimised Likeness Learning is adapter machinery
+            # and does nothing under FT — but its INTENT (photos train the identity blocks)
+            # maps exactly onto the FT Blocks field. Carry it over rather than losing it.
+            if (self.settings.get("MINIMAX_LIKENESS_OPT")
+                    or (self.entries.get("MINIMAX_LIKENESS_OPT") is not None
+                        and str(self.entries["MINIMAX_LIKENESS_OPT"].get()) in ("1", "True"))) \
+                    and not self.minimax_ft_blockspec_var.get().strip():
+                self.minimax_ft_blockspec_var.set(MINIMAX_LIKENESS_BLOCKS)
+                self.update_console(
+                    "[fine-tune] Optimised Likeness Learning is a LoRA feature — under "
+                    f"fine-tune its equivalent is Blocks {MINIMAX_LIKENESS_BLOCKS}, which "
+                    "has been filled in for you (the whole fine-tune stays on the identity "
+                    "blocks). Clear the Blocks box to fine-tune the full model.\n")
 
     def _apply_minimax_ft_defaults(self):
         """Same shape as _apply_krea2_ft_defaults — one recipe write, with a console report."""
@@ -7298,13 +7316,22 @@ class LoRATrainerGUI:
                                 + "\n  ".join(changed) + "\n")
 
     def _apply_minimax_ft_visibility(self):
-        """FT sub-controls only while the checkbox is on; Network Type row hides under FT
-        (the adapter selector is meaningless when the base itself trains)."""
+        """FT sub-controls only while the checkbox is on. Everything that is ADAPTER machinery
+        hides under FT rather than sitting there silently ignored — Network Type, Optimised
+        Likeness Learning, and Blocks to Train (the FT card's own Blocks field is the
+        fine-tune's block restriction)."""
         if not hasattr(self, "_minimax_ft_frame"):
             return
         on = bool(self.minimax_finetune_var.get())
         for w in (self._minimax_ft_frame, self._minimax_ft_fused_cb, self._minimax_ft_hint):
             self._set_widget_visible(w, on)
+        for w in (getattr(self, "_minimax_likeness_cb", None),
+                  getattr(self, "_minimax_likeness_hint", None),
+                  getattr(self, "_minimax_blocks_label", None),
+                  getattr(self, "_minimax_blocks_frame", None),
+                  getattr(self, "_minimax_blocks_hint", None)):
+            if w is not None:
+                self._set_widget_visible(w, not on)
         if hasattr(self, "_network_type_rowf"):
             self._set_widget_visible(self.labels["NETWORK_TYPE"], not on)
             self._set_widget_visible(self._network_type_rowf, not on)
@@ -26120,13 +26147,16 @@ class LoRATrainerGUI:
             cmd += [f"--{_flag}_stop_epoch", str(_n), f"--{_flag}_stop_mode", _mode]
         # Blocks to Train — only sent when it's a real range; "all" is the trainer's own default,
         # and not sending it keeps the flag's presence meaning "this run was a block experiment".
+        _mft_cmd_on = bool(getattr(self, "minimax_finetune_var", None)
+                           and self.minimax_finetune_var.get())
         _blocks = minimax_block_spec(self.settings.get("MINIMAX_BLOCKS", "all"))
-        if _blocks.lower() != "all":
+        if _blocks.lower() != "all" and not _mft_cmd_on:
             cmd += ["--train_blocks", _blocks]
         # Optimised Likeness Learning — photo steps train the identity blocks only, clips train
         # everything. The launch dict already forced MINIMAX_BLOCKS to "all" when this is on, so
-        # the two flags never fight.
-        if self.settings.get("MINIMAX_LIKENESS_OPT"):
+        # the two flags never fight. Both are ADAPTER flags — never emitted under fine-tune
+        # (the FT Blocks field carries the block restriction there).
+        if self.settings.get("MINIMAX_LIKENESS_OPT") and not _mft_cmd_on:
             cmd += ["--photo_blocks", MINIMAX_LIKENESS_BLOCKS]
         # Reference distillation. Both flags travel together; the trainer also needs --vae to
         # encode the reference, which the sample block may already have added.
