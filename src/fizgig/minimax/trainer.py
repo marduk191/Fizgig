@@ -2209,8 +2209,10 @@ def train_minimax(
         blocks_to_swap = 0          # the H2D offloader would fight the rotator for qdata
         base_quant = "int8"         # the master dequantizes from int8 codes — nf4 has none
         adaptive_lr = False         # rotation boundaries read as instability to the watcher
-        photo_blocks = None         # likeness masking is LoRA-module-based; the rotation
-                                    # cycle (finetune_blocks) is FT's block restriction
+        # photo_blocks is KEPT under FT: it is the likeness intent, honoured with the same
+        # semantics as LoRA mode — photos feed the identity blocks, clips/voice the full
+        # model. Resolution (cycle-tighten vs per-window gating) happens after the dataset
+        # is known, in the rotator construction block.
         network_type = "lora"       # the network is built inert; LoKR keys would just churn
         block_limit = 0.0           # movement governors measure LoRA movement
         adapter_ramp = 0.0
@@ -2522,6 +2524,45 @@ def train_minimax(
             if not ft_subset:
                 raise RuntimeError(f"[h3-ft] finetune_blocks {finetune_blocks!r} selects "
                                    "no blocks")
+        # Optimised Likeness Learning under FT — SAME semantics as LoRA mode: photos feed
+        # only the identity blocks, clips and voice train the full model. Mechanism differs
+        # by dataset:
+        #   photos-only  -> tighten the whole cycle to the likeness blocks (exact
+        #                   equivalence, and no wasted front-trunk epochs)
+        #   mixed        -> per-window PHOTO GATING: photo batches skip any window that is
+        #                   not fully inside the likeness set; clips/voice train every window
+        _ft_photo_gate = None
+        if photo_blocks:
+            _pb_set = set(parse_block_spec(photo_blocks, _n_blocks))
+            try:
+                from fizgig.dataset.image_dataset import is_audio_path
+                _n_voice_items = sum(
+                    1 for ds in group.datasets
+                    for p in getattr(getattr(ds, "datasource", None), "image_paths", []) or []
+                    if is_audio_path(p))
+            except Exception:
+                _n_voice_items = 0
+            _photo_only_ds = (_clip_t <= 1) and (_n_voice_items == 0)
+            if _photo_only_ds and ft_subset is None:
+                ft_subset = sorted(_pb_set)
+                logger.info("[h3-ft] Optimised Likeness Learning + photos-only dataset: the "
+                            "whole cycle tightens to blocks %s — exactly equivalent to the "
+                            "LoRA behaviour here, and no epochs are spent on windows photos "
+                            "would never train.", photo_blocks)
+            elif _photo_only_ds:
+                logger.info("[h3-ft] likeness is ticked but Blocks is set explicitly (%s) — "
+                            "the explicit range wins.", finetune_blocks)
+            else:
+                _ft_photo_gate = _pb_set
+                logger.info("[h3-ft] Optimised Likeness Learning on a MIXED dataset: photo "
+                            "batches train only windows fully inside blocks %s; clips and "
+                            "voice train every window — the same photos-protect-the-trunk "
+                            "behaviour as LoRA mode.", photo_blocks)
+                if finetune_scope == "photo":
+                    logger.warning("[h3-ft] 'Train on: Photos only' + likeness gating means "
+                                   "front-trunk windows train NOTHING (photos skip them, "
+                                   "clips are skipped everywhere). Consider 'All media', or "
+                                   "Blocks %s.", photo_blocks)
         master = build_bf16_master_h3(dit_path, block_subset=ft_subset)
         rotator = H3BlockRotator(dit.blocks, master, key_prefix="blocks", device=device)
         _refiner = getattr(dit, "token_refiner", None)
@@ -2539,8 +2580,21 @@ def train_minimax(
             logger.warning("[h3-ft] a full rotation cycle is %d epochs but the run is only "
                            "%d — some blocks will never train. Raise Max Epochs to at least "
                            "the cycle length.", rot_schedule.cycle_epochs, max_train_epochs)
+        # Per-window photo safety for the likeness gate: a window is photo-safe iff EVERY
+        # block in it sits inside the likeness set (a straddling window counts as trunk —
+        # conservative, protecting 0-19 is the whole point). Recomputed at each rotation.
+        _ft_gate = {"photo_safe": True}
+
+        def _ft_update_gate(_blocks_now):
+            _ft_gate["photo_safe"] = (_ft_photo_gate is None
+                                      or set(_blocks_now).issubset(_ft_photo_gate))
+            if _ft_photo_gate is not None and not _ft_gate["photo_safe"]:
+                logger.info("[h3-ft] window %s is outside the likeness blocks — photo "
+                            "batches sit this window out; clips/voice train it.", _blocks_now)
+
         _first = [_sched_map[i] for i in rot_schedule.active_at(0)]
         rotator.activate(_first)
+        _ft_update_gate(_first)
         logger.info("[h3-ft] cycle: %d windows of %d block(s), %d epoch(s) per cycle; "
                     "first window -> blocks %s", rot_schedule.n_windows, ft_rotation,
                     rot_schedule.cycle_epochs, _first)
@@ -3764,6 +3818,7 @@ def train_minimax(
             _want = [_sched_map[i] for i in rot_schedule.active_at(epoch)]
             if _want != list(rotator.active):
                 rotator.rotate_to(_want)
+                _ft_update_gate(_want)
                 if torch.cuda.is_available():
                     torch.cuda.reset_peak_memory_stats()   # per-window peak (logged per epoch)
                 params = rotator.trainable_params()
@@ -3821,6 +3876,16 @@ def train_minimax(
                 # retirement skip — a full clip forward at 4.5k tokens would be pure waste).
                 # Fairness holds across the cycle: windows advance per epoch and every epoch
                 # sees the identical photo subset.
+                if (i + 1) % _accum_n == 0 or (i + 1) >= steps_per_epoch:
+                    _boundary_step()
+                global_step += 1
+                progress_bar.update(1)
+                continue
+            if (rotator is not None and _ft_photo_gate is not None
+                    and _is_photo and not _is_voice and not _ft_gate["photo_safe"]):
+                # Likeness gate (mixed dataset): this window is outside the identity blocks,
+                # so photo batches sit it out — clips and voice carry it. The LoRA-mode
+                # contract, expressed per window instead of per parameter.
                 if (i + 1) % _accum_n == 0 or (i + 1) >= steps_per_epoch:
                     _boundary_step()
                 global_step += 1

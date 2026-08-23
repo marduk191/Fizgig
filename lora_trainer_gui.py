@@ -4415,7 +4415,8 @@ class LoRATrainerGUI:
                        "compare like-for-like (~260 GB over a 40-epoch run). Checkpoints are written to the Output Directory above "
                        "(the usual LoRA folder) — point it somewhere with room, e.g. your ComfyUI models/unet. "
                        "Test the result in ComfyUI as a normal Krea 2 model.",
-                  foreground="#E67E22", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT, wraplength=720)
+                  foreground=COLORS["text_explain"], font=(FONT_FAMILY, 9, "italic"),
+                  justify=tk.LEFT, wraplength=720)
         self._krea2_ft_hint.grid(row=65, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 6))
 
         # --- Full fine-tune (rotating windows) — MiniMax H3. Same idea as the Krea 2 card:
@@ -4482,21 +4483,21 @@ class LoRATrainerGUI:
                                        padx=(21, 5), pady=(2, 0))
 
         self._minimax_ft_hint = ttk.Label(training_content,
-                  text="Trains the base model's own weights, not an adapter — so the LoRA "
-                       "controls (Network Type, Optimised Likeness Learning, Blocks to Train) "
-                       "hide while this is on; the Blocks field above is the fine-tune's own "
-                       "block restriction (20-49 = the likeness recipe, auto-filled if the "
-                       "likeness checkbox was ticked). Needs a 32 GB card and ~64 GB of system "
-                       "RAM. Only a window of blocks trains at a time and the window rotates "
-                       "each epoch; previews render and a full ~21 GB checkpoint saves once "
-                       "per COMPLETED CYCLE (every block equally trained — the save box snaps "
-                       "to the cycle automatically). Photos-only dataset? Leave 'Train on' "
-                       "alone — there's nothing to skip. Use a LOW learning rate (1e-5 to "
-                       "start; H3 is uncalibrated — compare checkpoints). Point the Output "
-                       "Directory somewhere with room, judge results in ComfyUI, and distil "
-                       "to a shareable LoRA with Checkpoint to LoRA.",
-                  foreground="#E67E22", font=(FONT_FAMILY, 8, "italic"), justify=tk.LEFT,
-                  wraplength=720)
+                  text="Trains the base model's own weights, not an adapter — Network Type "
+                       "and Blocks to Train hide while this is on (they're LoRA machinery); "
+                       "Optimised Likeness Learning keeps working with its usual meaning. "
+                       "The Blocks field above is an optional manual restriction of the whole "
+                       "fine-tune. Needs a 32 GB card and ~64 GB of system RAM. Only a window "
+                       "of blocks trains at a time and the window rotates each epoch; previews "
+                       "render and a full ~21 GB checkpoint saves once per COMPLETED CYCLE "
+                       "(every block equally trained — the save box snaps to the cycle "
+                       "automatically). Photos-only dataset? Leave 'Train on' alone — there's "
+                       "nothing to skip. Use a LOW learning rate (1e-5 to start; H3 is "
+                       "uncalibrated — compare checkpoints). Point the Output Directory "
+                       "somewhere with room, judge results in ComfyUI, and distil to a "
+                       "shareable LoRA with Checkpoint to LoRA.",
+                  foreground=COLORS["text_explain"], font=(FONT_FAMILY, 9, "italic"),
+                  justify=tk.LEFT, wraplength=720)
         self._minimax_ft_hint.grid(row=69, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 6))
         # --- Per-step movement clip (MiniMax only) -----------------------------------------
         # Whichever block sits LAST in the trained range absorbs 2-4x the median block's
@@ -4719,14 +4720,15 @@ class LoRATrainerGUI:
                                          padx=5, pady=(0, 4))
         self._MINIMAX_LIKENESS_HINT_LORA = self._minimax_likeness_hint.cget("text")
         self._MINIMAX_LIKENESS_HINT_FT = (
-            f"Under fine-tune this means: the whole fine-tune stays on the identity blocks "
-            f"({MINIMAX_LIKENESS_BLOCKS}) — protecting the fragile front trunk — and the "
-            f"Blocks field above follows this tickbox. Untick to fine-tune the full model "
-            f"(style/scene work), or type your own range in Blocks to override.")
+            f"Under fine-tune this keeps its exact LoRA meaning: photos feed only the "
+            f"identity blocks ({MINIMAX_LIKENESS_BLOCKS}); clips and voice train the full "
+            f"model. On a photos-only dataset the whole cycle tightens to those blocks "
+            f"automatically (no wasted epochs); on a mixed dataset photo batches simply sit "
+            f"out the non-identity windows. Untick for style/scene fine-tunes. An explicit "
+            f"Blocks range above always wins.")
         # trace, not command=: preset loads set the var programmatically and must re-grey too.
         self.entries["MINIMAX_LIKENESS_OPT"].trace_add(
-            "write", lambda *_a: (self._sync_minimax_likeness_state(),
-                                  self._sync_ft_blocks_from_likeness()))
+            "write", lambda *_a: self._sync_minimax_likeness_state())
 
         # Answers "when do changes take effect?" (issue #40) right where people wonder it.
         ttk.Label(training_content,
@@ -7271,46 +7273,16 @@ class LoRATrainerGUI:
         "NETWORK_TYPE": "LoRA (standard)",  # FT trains the BASE — reset the adapter selector
     }
 
-    def _sync_ft_blocks_from_likeness(self):
-        """The Optimised Likeness tickbox keeps its MEANING under FT: ticked = the whole
-        fine-tune stays on the identity blocks, unticked = full model. It drives the FT
-        Blocks field live — but only ever writes over its OWN auto-fill (or an empty box),
-        so a range the user typed survives every toggle."""
-        if not hasattr(self, "minimax_ft_blockspec_var") \
-                or not bool(getattr(self, "minimax_finetune_var", None)
-                            and self.minimax_finetune_var.get()):
-            return
-        ticked = bool(self.entries["MINIMAX_LIKENESS_OPT"].get()) \
-            if self.entries.get("MINIMAX_LIKENESS_OPT") is not None else False
-        cur = self.minimax_ft_blockspec_var.get().strip()
-        auto = getattr(self, "_minimax_ft_blocks_autofill", None)
-        if ticked and (not cur or cur == auto):
-            if cur != MINIMAX_LIKENESS_BLOCKS:
-                self.minimax_ft_blockspec_var.set(MINIMAX_LIKENESS_BLOCKS)
-            self._minimax_ft_blocks_autofill = MINIMAX_LIKENESS_BLOCKS
-        elif not ticked and auto and cur == auto:
-            self.minimax_ft_blockspec_var.set("")
-            self._minimax_ft_blocks_autofill = None
-
     def _on_minimax_ft_toggle(self):
-        """Recipe pushed on the way ON only, so re-showing the tab never stomps tuned values."""
+        """Recipe pushed on the way ON only, so re-showing the tab never stomps tuned values.
+
+        The likeness tickbox needs NO bridging here: --photo_blocks travels under FT and the
+        TRAINER resolves it with LoRA-identical semantics (photos-only dataset -> the cycle
+        tightens to the identity blocks; mixed dataset -> photo batches skip non-identity
+        windows while clips/voice train everything). The Blocks field stays purely manual."""
         self._apply_minimax_ft_visibility()
         if bool(self.minimax_finetune_var.get()):
             self._apply_minimax_ft_defaults()
-            _before = self.minimax_ft_blockspec_var.get().strip()
-            self._sync_ft_blocks_from_likeness()
-            if self.minimax_ft_blockspec_var.get().strip() != _before:
-                self.update_console(
-                    "[fine-tune] Optimised Likeness Learning is ticked, so the fine-tune "
-                    f"stays on the identity blocks ({MINIMAX_LIKENESS_BLOCKS}) — the Blocks "
-                    "field follows the tickbox. Untick it to fine-tune the full model.\n")
-        else:
-            # Unticking FT clears the bridge — but ONLY if the field still holds our
-            # auto-fill. A range the user typed themselves survives the toggle.
-            _auto = getattr(self, "_minimax_ft_blocks_autofill", None)
-            if _auto and self.minimax_ft_blockspec_var.get().strip() == _auto:
-                self.minimax_ft_blockspec_var.set("")
-            self._minimax_ft_blocks_autofill = None
 
     def _apply_minimax_ft_defaults(self):
         """Same shape as _apply_krea2_ft_defaults — one recipe write, with a console report."""
@@ -26187,9 +26159,10 @@ class LoRATrainerGUI:
             cmd += ["--train_blocks", _blocks]
         # Optimised Likeness Learning — photo steps train the identity blocks only, clips train
         # everything. The launch dict already forced MINIMAX_BLOCKS to "all" when this is on, so
-        # the two flags never fight. Both are ADAPTER flags — never emitted under fine-tune
-        # (the FT Blocks field carries the block restriction there).
-        if self.settings.get("MINIMAX_LIKENESS_OPT") and not _mft_cmd_on:
+        # the two flags never fight. The flag TRAVELS under fine-tune too: the trainer honours
+        # the same semantics there (cycle-tighten on photo-only data, per-window photo gating
+        # on mixed). --train_blocks stays adapter-only and is never emitted under FT.
+        if self.settings.get("MINIMAX_LIKENESS_OPT"):
             cmd += ["--photo_blocks", MINIMAX_LIKENESS_BLOCKS]
         # Reference distillation. Both flags travel together; the trainer also needs --vae to
         # encode the reference, which the sample block may already have added.
