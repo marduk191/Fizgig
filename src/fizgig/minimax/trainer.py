@@ -2217,8 +2217,9 @@ def train_minimax(
         ema_decay = 0.0
         lr_warmup_epochs = 0.0
         slow_blocks = None
-        sample_every_n_epochs = 0   # previews park/restore the DiT, incompatible with a
-        sample_at_first = False     # half-activated rotation window (Krea parity)
+        # Previews stay ON under FT, but at CYCLE cadence only: they render when every block
+        # has had the same number of passes, via a deactivate-all -> standard preview ->
+        # reactivate bracket (the Sample-every-N box is overridden with a log line below).
         if finetune_fused_backward:
             max_grad_norm = 0.0             # grads are consumed per-tensor as they land
             gradient_accumulation_steps = 1  # nothing left to accumulate
@@ -2543,6 +2544,11 @@ def train_minimax(
         logger.info("[h3-ft] cycle: %d windows of %d block(s), %d epoch(s) per cycle; "
                     "first window -> blocks %s", rot_schedule.n_windows, ft_rotation,
                     rot_schedule.cycle_epochs, _first)
+        if sample_prompts and te_path:
+            logger.info("[h3-ft] previews render once per COMPLETED CYCLE (every %d epochs), "
+                        "overriding Sample-every-N: a mid-cycle preview would show blocks "
+                        "with unequal training. Rendered via a deactivate/reactivate bracket "
+                        "with the Turbo applied fresh each time.", rot_schedule.cycle_epochs)
     # AdaLN targeting is per-checkpoint — see the pattern note at the top of this file.
     include_patterns = user_include_patterns or (
         PRUNED_INCLUDE_PATTERNS if dit.pruned_adaln else DEFAULT_INCLUDE_PATTERNS)
@@ -2651,11 +2657,16 @@ def train_minimax(
     # The preview Turbo LoRA — a nicety, never a run-killer: any failure logs and trains on.
     turbo_net = None
     turbo_adaln = []
+    _ft_turbo_path = None
     if turbo_lora_path and rotator is not None:
-        # Previews are off under FT, and the Turbo's apply_to would capture bound forwards
-        # the rotator's class-swap orphans — same hazard as the training LoRA. Never load it.
+        # The Turbo must NOT be applied at setup under FT: apply_to captures bound forwards
+        # that the rotator's class-swap would orphan. It is instead applied FRESH at each
+        # cycle-boundary preview (against the fully-deactivated, all-ConvRot model) and
+        # cleanly un-applied before the next window activates.
+        _ft_turbo_path = turbo_lora_path
         turbo_lora_path = None
-        logger.info("[h3-ft] preview Turbo LoRA skipped — previews are off under fine-tune")
+        logger.info("[h3-ft] preview Turbo LoRA deferred — applied per preview, inside the "
+                    "deactivate/reactivate bracket")
     if turbo_lora_path:
         if not os.path.isfile(turbo_lora_path):
             logger.warning(f"[turbo] file not found — previews render without it: "
@@ -3600,11 +3611,51 @@ def train_minimax(
                 torch.cuda.empty_cache()
             vram_line("finally-done")
 
+    def _ft_render_previews(n):
+        """Cycle-boundary preview under rotation FT: deactivate the whole window so the model
+        is a consistent all-ConvRot checkpoint (the master holds every trained weight —
+        reactivation-exactness is test-pinned), apply the Turbo FRESH against it, run the
+        bog-standard preview, then un-apply the Turbo completely and reactivate. The un-apply
+        pops each wrapped module's instance `forward` — apply_to deleted the module ref but
+        the bound org_forward's __self__ IS the module, and the pre-Turbo forward here is
+        always the class-level one, so popping restores it exactly."""
+        nonlocal turbo_net, turbo_adaln
+        import gc as _gc
+        _act = list(rotator.active)
+        if _act:
+            rotator.deactivate(_act)
+            _gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        try:
+            if _ft_turbo_path:
+                turbo_net, turbo_adaln = load_preview_turbo(dit, _ft_turbo_path,
+                                                            turbo_lora_strength)
+            try:
+                _render_previews(n)
+            finally:
+                if turbo_net is not None:
+                    for _l in turbo_net.unet_loras:
+                        _m = getattr(getattr(_l, "org_forward", None), "__self__", None)
+                        if _m is not None:
+                            _m.__dict__.pop("forward", None)
+                    turbo_net.to("cpu")
+                turbo_net, turbo_adaln = None, []
+                _gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        finally:
+            if _act:
+                rotator.activate(_act)
+
     # ---- epoch loop ----
     loss_recorder = LossRecorder()
     if do_previews and sample_at_first and start_epoch == 0:
         try:
-            _render_previews(0)
+            if rotator is not None:
+                _ft_render_previews(0)
+            else:
+                _render_previews(0)
         except Exception as _e0:
             if _clip_state["frames"] > 1:
                 _was = _clip_state["frames"]
@@ -3937,14 +3988,23 @@ def train_minimax(
                                  "dashboard). Training continues; this epoch has no resume "
                                  "point. The epoch checkpoint itself already saved.",
                                  type(_se).__name__, _se)
-        if do_previews and sample_every_n_epochs and (epoch + 1) % sample_every_n_epochs == 0:
+        # Under FT the cadence is CYCLE boundaries, whatever Sample-every-N says: a mid-cycle
+        # preview shows a model where some blocks have trained more than others — noise, not
+        # signal. The user's box still gates whether previews happen at all (via do_previews).
+        _prev_due = (((epoch + 1) % rot_schedule.cycle_epochs == 0) if rotator is not None
+                     else bool(sample_every_n_epochs
+                               and (epoch + 1) % sample_every_n_epochs == 0))
+        if do_previews and _prev_due:
             try:
                 # Previews render on the EMA weights when EMA is on — a preview must show what
                 # the saved checkpoint will look like, not the raw zigzag the EMA exists to hide.
                 if ema is not None:
                     ema.swap_in()
                 try:
-                    _render_previews(epoch + 1)
+                    if rotator is not None:
+                        _ft_render_previews(epoch + 1)
+                    else:
+                        _render_previews(epoch + 1)
                     vram_line("post-preview")
                 finally:
                     if ema is not None:
@@ -3970,7 +4030,8 @@ def train_minimax(
                         f"({'CUDA OOM' if _oom else type(_pe).__name__}); disabling previews for "
                         f"the rest of the run. Training continues and LoRAs still save normally.")
                     do_previews = False
-            network.train()
+            if network is not None:
+                network.train()
         if os.path.exists(pause_flag):
             # Pause = graceful epoch-end exit with FULL state (regardless of the save-state
             # toggles), so Resume continues exactly here — matching Klein/Krea 2. The final
