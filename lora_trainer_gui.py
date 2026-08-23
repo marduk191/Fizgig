@@ -4482,6 +4482,14 @@ class LoRATrainerGUI:
                         "recipe (protects the fragile 0-19 trunk) and roughly halves the "
                         "system-RAM master copy. Empty = the full model.")
 
+        # Save-every follows the CYCLE, and the cycle follows these controls — so the box is
+        # kept live rather than seeded with a stale constant (it used to sit at 13, the old
+        # full-model N=4 cycle, whatever mode was picked; the trainer's launch-time snap then
+        # silently corrected it and the box looked ignored).
+        for _v in (self.minimax_ft_blocks_var, self.minimax_ft_every_var,
+                   self.minimax_ft_blockspec_var):
+            _v.trace_add("write", lambda *_a: self._refresh_minimax_ft_save_box())
+
         self.minimax_ft_fused_var = tk.BooleanVar(
             value=bool(self.settings.get("MINIMAX_FT_FUSED", True)))
         self._minimax_ft_fused_cb = ttk.Checkbutton(
@@ -4713,6 +4721,10 @@ class LoRATrainerGUI:
         # the full model. BooleanVar in self.entries so presets/queue/last-train carry it free.
         self.entries["MINIMAX_LIKENESS_OPT"] = tk.BooleanVar(
             value=bool(self.settings.get("MINIMAX_LIKENESS_OPT", True)))
+        # Under FT the tickbox changes the rotation-cycle length (50 blocks -> the 20-49
+        # tighten), so the Save-every suggestion follows it live.
+        self.entries["MINIMAX_LIKENESS_OPT"].trace_add(
+            "write", lambda *_a: self._refresh_minimax_ft_save_box())
         self._minimax_likeness_cb = ttk.Checkbutton(
             training_content, text="Optimised Likeness Learning",
             variable=self.entries["MINIMAX_LIKENESS_OPT"])
@@ -7274,10 +7286,9 @@ class LoRATrainerGUI:
     MINIMAX_FT_DEFAULTS = {
         "LEARNING_RATE": "1e-5",          # a starting point, NOT a calibrated H3 recipe —
                                           # nobody has tuned FT rates on this model yet
-        "MAX_TRAIN_EPOCHS": "26",         # two full 13-window cycles at 4 blocks/window
-        "SAVE_EVERY_N_EPOCHS": "13",      # one save per full cycle — every block has had the
-                                          # same passes, so checkpoints compare like-for-like.
-                                          # ~21 GB each; 2 files over the recipe run
+        "MAX_TRAIN_EPOCHS": "26",         # several full cycles at any window shape
+        # SAVE_EVERY_N_EPOCHS is NOT a static recipe value: the cycle length depends on the
+        # window mode/size, so _refresh_minimax_ft_save_box keeps the box in step live.
         "GRADIENT_ACCUMULATION": "1",     # fused backward consumes grads as they land
         "MAX_GRAD_NORM": "0",             # global clipping is impossible under fused backward
         "NETWORK_TYPE": "LoRA (standard)",  # FT trains the BASE — reset the adapter selector
@@ -7293,6 +7304,69 @@ class LoRATrainerGUI:
         self._apply_minimax_ft_visibility()
         if bool(self.minimax_finetune_var.get()):
             self._apply_minimax_ft_defaults()
+            self._refresh_minimax_ft_save_box()
+
+    def _minimax_ft_cycle_estimate(self):
+        """Epochs per full rotation cycle, from the FT card's own controls.
+
+        An ESTIMATE the trainer's launch-time snap remains authoritative over — the GUI
+        cannot see the dataset, so the likeness tighten (30 blocks instead of 50) is assumed
+        whenever the tickbox is on, which matches the photos-only runs it exists for."""
+        import math
+        _b = str(self.minimax_ft_blocks_var.get())
+        try:
+            _every = max(1, int(str(self.minimax_ft_every_var.get()).strip() or 1))
+        except ValueError:
+            _every = 1
+        if _b.startswith("Component"):
+            return 4 * _every                      # qkv / out / fc1 / fc2, any block count
+        spec = str(self.minimax_ft_blockspec_var.get()).strip()
+        n_blocks = 50
+        if spec:
+            try:
+                from fizgig.minimax.trainer import parse_block_spec
+                n_blocks = len(parse_block_spec(spec, MINIMAX_NUM_BLOCKS))
+            except Exception:
+                n_blocks = 50
+        else:
+            _lk = self.entries.get("MINIMAX_LIKENESS_OPT")
+            if _lk is not None and bool(_lk.get()):
+                n_blocks = 30                      # the 20-49 tighten
+        try:
+            n = int(_b)                            # explicit window size
+        except ValueError:
+            n = 8                                  # Auto: a clean 32 GB card lands on 8
+        return math.ceil(n_blocks / max(1, n)) * _every
+
+    def _refresh_minimax_ft_save_box(self):
+        """Keep Save-every in step with the cycle the FT controls imply.
+
+        A value that is already a non-zero MULTIPLE of the cycle is the user's own sparser
+        cadence and is left alone; 0 (final-only) is left alone; anything else is rewritten
+        to one-save-per-cycle. Trainer-side snap stays authoritative at launch."""
+        if not bool(getattr(self, "minimax_finetune_var", None)
+                    and self.minimax_finetune_var.get()):
+            return
+        entry = self.entries.get("SAVE_EVERY_N_EPOCHS")
+        if entry is None:
+            return
+        cyc = self._minimax_ft_cycle_estimate()
+        try:
+            cur = int(str(entry.get()).strip() or 0)
+        except ValueError:
+            cur = -1
+        if cur == 0 or (cur > 0 and cur % cyc == 0):
+            return
+        try:
+            _was = str(entry.cget("state"))
+            if _was == "disabled":
+                entry.config(state="normal")
+            entry.delete(0, tk.END)
+            entry.insert(0, str(cyc))
+            if _was == "disabled":
+                entry.config(state=_was)
+        except Exception:
+            pass
 
     def _apply_minimax_ft_defaults(self):
         """Same shape as _apply_krea2_ft_defaults — one recipe write, with a console report."""
