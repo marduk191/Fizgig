@@ -3696,6 +3696,8 @@ def train_minimax(
             _want = [_sched_map[i] for i in rot_schedule.active_at(epoch)]
             if _want != list(rotator.active):
                 rotator.rotate_to(_want)
+                if torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats()   # per-window peak (logged per epoch)
                 params = rotator.trainable_params()
                 if finetune_fused_backward:
                     _attach_fused(params)
@@ -3827,6 +3829,12 @@ def train_minimax(
             progress_bar.update(1)
 
         logger.info(f"epoch {epoch + 1}/{max_train_epochs} done — avr_loss {loss_recorder.moving_average:.4f}")
+        if rotator is not None and torch.cuda.is_available():
+            # Per-window peak, reset at each rotation: these lines ARE the measured tier
+            # table (the shipped MINIMAX_FT_TIERS numbers are estimates until real runs
+            # replace them — capabilities.py says so).
+            logger.info("[h3-ft] window peak VRAM: %.1f GB",
+                        torch.cuda.max_memory_allocated() / 2 ** 30)
         if rotator is not None and finetune_scope == "photo" and _epoch_trained == 0:
             raise RuntimeError(
                 "[h3-ft] photo-scope fine-tune trained ZERO steps this epoch — the dataset "
