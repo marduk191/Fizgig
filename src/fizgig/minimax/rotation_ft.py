@@ -507,6 +507,12 @@ def save_full_checkpoint_h3(rotator: H3BlockRotator, src_path: str, out_path: st
     diff-to-LoRA). Trained dense tensors (the always-on refiner) overlay in the source
     dtype. Every untouched tensor copies through bit-exact. One tensor in memory at a time
     (stream_save_file); atomic via tmp + os.replace."""
+    # Announced up front: this streams a ~21 GB file and the progress bar sits still the
+    # whole time — without a line here the run looks hung at every cycle boundary (field).
+    logger.info("[h3-ft] saving full checkpoint -> %s (~%.0f GB) — this can take a few "
+                "minutes, training resumes when it's done...",
+                os.path.basename(out_path),
+                os.path.getsize(src_path) / 2 ** 30 if os.path.isfile(src_path) else 21)
     flushed = rotator.master_state_dict()
     touched_stems = {k[: -len(".weight")] for k in rotator.touched if k.endswith(".weight")}
 
