@@ -319,58 +319,6 @@ def recommend_ft_rotation(free_gb: Optional[float] = None):
              "Rotating fine-tune cannot reach 16 GB cards in any configuration."])
 
 
-# MiniMax H3 rotation FT. H3 is structurally different from Krea 2 here: whole-model
-# component windows DO NOT FIT 32 GB (fc1 across 50 blocks is 15.4 GB of bf16 on its own),
-# so H3 runs block mode only, no frozen-block streaming in v1. ESTIMATED tiers — replace
-# with measured peaks from the first real runs (the estimate: ~21 GB int8 residency
-# + N x (0.771 bf16 - 0.386 freed int8) + fused-backward grad transient + activations
-# + ~2 GB context/workspace).
-MINIMAX_FT_TIERS = [
-    # (min_free_gb, mode, blocks, stream, MEASURED_peak_gb)
-    # Measured on the 5090 (23 Aug), steady post-rotation peaks at 0.25 MP photo FT,
-    # blocks 20-49, fused backward: N=4 24.4 / N=6 26.7 / N=8 28.8 — flat across
-    # rotations, full speed. (An earlier N=8 "OOM at 30.4" was measured WITH the
-    # optimizer zombie leaks aboard and is void.) Thresholds leave ~2.5 GB of WDDM
-    # headroom over the measured peak — the spill cliff is silent 5-10x steps, not
-    # an error, so the margin errs safe.
-    (31.5, "block", 8, False, 28.8),
-    (29.0, "block", 6, False, 26.7),
-    (26.5, "block", 4, False, 24.4),
-]
-
-
-def recommend_minimax_ft_rotation(free_gb: Optional[float] = None):
-    """H3 analogue of recommend_ft_rotation. Returns (mode, blocks, stream, reasons).
-
-    Uses plannable_free_vram (honours the FIZGIG_SIM_VRAM_GB small-card simulator) rather
-    than raw mem_get_info, so the tier decision is testable like every other planner."""
-    if free_gb is None:
-        try:
-            from fizgig.utils.device import plannable_free_vram
-            free_gb = plannable_free_vram()
-        except Exception:
-            free_gb = None
-    if free_gb is None:
-        return ("block", 4, False,
-                ["could not read free VRAM — falling back to block mode, 4 blocks/window"])
-
-    for min_free, mode, blocks, stream, peak in MINIMAX_FT_TIERS:
-        if free_gb >= min_free:
-            return (mode, blocks, stream,
-                    [f"{free_gb:.1f} GB free -> block mode, {blocks} blocks per window "
-                     f"(estimated peak {peak:.1f} GB; measured tiers land with the first "
-                     "real runs)",
-                     "Component mode does not fit H3 at 32 GB — a single component across "
-                     "all 50 blocks is up to 15.4 GB of bf16 before gradients."])
-
-    lo = MINIMAX_FT_TIERS[-1]
-    return (None, 0, False,
-            [f"{free_gb:.1f} GB free is below the ~{lo[0]:.0f} GB H3 rotation FT needs at "
-             "its smallest window — the int8 base alone is ~21 GB resident. Refusing "
-             "rather than OOMing mid-run; a streamed-frozen-blocks mode for 24 GB cards "
-             "is a possible v2."])
-
-
 def _nvidia_smi_used_gb() -> Optional[float]:
     """Total VRAM in use per the DRIVER (every process), in GB. None when unreadable
     (no nvidia-smi on ROCm, or parsing failed) — callers treat None as 'guard is a no-op'."""

@@ -625,6 +625,12 @@ MINIMAX_NUM_BLOCKS = 50          # H3's DiT block count (MiniMaxH3Config.num_lay
 # photo gradients deform anatomy. One place to tweak as the add-back ladder refines the figures.
 MINIMAX_LIKENESS_BLOCKS = "20-49"
 
+# Voice routing — the block set audio-only steps train. 34-49 per the block map (audio core
+# 38-48 peak 41-42, shoulder 34-37) and Peter's A/B (24 Aug): audio-only trained at 34-49 is
+# clean; at 20-49 the audio training corrupted the visual blocks. Clips still train the full
+# model (pending the same test for video).
+MINIMAX_AUDIO_BLOCKS = "34-49"
+
 # Base Precision — the label the user sees, and the --base_quant value it sends. Auto plans the
 # quantisation and the block-swap count together (see plan_base_quant in minimax/trainer.py);
 # an explicit pick is never overridden, the swap plan is built around it instead.
@@ -4445,25 +4451,11 @@ class LoRATrainerGUI:
 
         self._minimax_ft_frame = ttk.Frame(training_content)
         self._minimax_ft_frame.grid(row=67, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(2, 0))
-        ttk.Label(self._minimax_ft_frame, text="Blocks/window:").pack(side=tk.LEFT, padx=(16, 4))
-        self.minimax_ft_blocks_var = tk.StringVar(
-            value=str(self.settings.get("MINIMAX_FT_BLOCKS", "Auto (by VRAM)")))
-        _mftb = ttk.Combobox(self._minimax_ft_frame, textvariable=self.minimax_ft_blocks_var,
-                             values=["Auto (by VRAM)", "4", "6", "8", "Component (NF4 base)"],
-                             state="readonly", width=19)
-        _mftb.pack(side=tk.LEFT)
-        ToolTip(_mftb, "How many blocks train at once — bigger windows mean shorter cycles, "
-                       "so each block trains more often and previews/checkpoints arrive "
-                       "sooner. Measured peaks (5090, photo FT): 4 -> 24.4 GB, 6 -> 26.7 GB, "
-                       "8 -> 28.8 GB. Auto picks the largest that leaves ~2.5 GB of headroom "
-                       "over the VRAM free at launch (the int8 base alone is ~21 GB).  |  "
-                       "Component (NF4 base): each window is one matmul (attention qkv/out, "
-                       "MLP fc1/fc2) across EVERY block, so a concept trains at the model's "
-                       "full depth each epoch — 4 windows per cycle. To fit, the frozen base "
-                       "runs as NF4 (~9.5% quantization error) during training; the saved "
-                       "checkpoint is still exact int8, so it deploys like any other. "
-                       "Experimental — A/B it against block mode on your own dataset.")
-        ttk.Label(self._minimax_ft_frame, text="Rotate every:").pack(side=tk.LEFT, padx=(14, 4))
+        # Component windows are THE mode (24 Aug: the old Blocks/window picker with its
+        # 4/6/8-block windows is gone — block mode never matched component's likeness speed).
+        # Each window is one matmul (attention qkv/out, MLP fc1/fc2) across EVERY block:
+        # full model depth per window, 4 windows per cycle, on an NF4-resident base.
+        ttk.Label(self._minimax_ft_frame, text="Rotate every:").pack(side=tk.LEFT, padx=(16, 4))
         self.minimax_ft_every_var = tk.StringVar(
             value=str(self.settings.get("MINIMAX_FT_EVERY", "1")))
         ttk.Combobox(self._minimax_ft_frame, textvariable=self.minimax_ft_every_var,
@@ -4496,8 +4488,7 @@ class LoRATrainerGUI:
         # kept live rather than seeded with a stale constant (it used to sit at 13, the old
         # full-model N=4 cycle, whatever mode was picked; the trainer's launch-time snap then
         # silently corrected it and the box looked ignored).
-        for _v in (self.minimax_ft_blocks_var, self.minimax_ft_every_var,
-                   self.minimax_ft_blockspec_var):
+        for _v in (self.minimax_ft_every_var, self.minimax_ft_blockspec_var):
             _v.trace_add("write", lambda *_a: self._refresh_minimax_ft_save_box())
 
         self.minimax_ft_fused_var = tk.BooleanVar(
@@ -4514,16 +4505,18 @@ class LoRATrainerGUI:
                   text="Trains the base model's own weights, not an adapter — Network Type "
                        "and Blocks to Train hide while this is on (they're LoRA machinery); "
                        "Optimised Likeness Learning keeps working with its usual meaning. "
-                       "The Blocks field above is an optional manual restriction of the whole "
-                       "fine-tune. Needs a 32 GB card and ~64 GB of system RAM. Only a window "
-                       "of blocks trains at a time and the window rotates each epoch; previews "
-                       "render and a full ~21 GB checkpoint saves once per COMPLETED CYCLE "
-                       "(every block equally trained — the save box snaps to the cycle "
-                       "automatically). Photos-only dataset? Leave 'Train on' alone — there's "
-                       "nothing to skip. Use a LOW learning rate (1e-5 to start; H3 is "
-                       "uncalibrated — compare checkpoints). Point the Output Directory "
-                       "somewhere with room, judge results in ComfyUI, and distil to a "
-                       "shareable LoRA with Checkpoint to LoRA.",
+                       "Each window is one matmul (attention qkv/out, MLP fc1/fc2) across "
+                       "every block — full model depth per window, 4 windows per cycle, on "
+                       "an NF4-resident base (the saved checkpoint is still exact int8). "
+                       "The Blocks field above is an optional manual restriction of the "
+                       "whole fine-tune. Needs a 32 GB card and ~64 GB of system RAM. "
+                       "Previews render and a full ~21 GB checkpoint saves once per "
+                       "COMPLETED CYCLE (every block equally trained — the save box snaps "
+                       "to the cycle automatically). Photos-only dataset? Leave 'Train on' "
+                       "alone — there's nothing to skip. Use a LOW learning rate (1e-5 to "
+                       "start; H3 is uncalibrated — compare checkpoints). Point the Output "
+                       "Directory somewhere with room, judge results in ComfyUI, and distil "
+                       "to a shareable LoRA with Checkpoint to LoRA.",
                   foreground=COLORS["text_explain"], font=(FONT_FAMILY, 9, "italic"),
                   justify=tk.LEFT, wraplength=720)
         self._minimax_ft_hint.grid(row=69, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 6))
@@ -4742,10 +4735,11 @@ class LoRATrainerGUI:
                                        padx=5, pady=(8, 0))
         self._minimax_likeness_hint = ttk.Label(
             training_content,
-            text=f"Photos train the identity blocks ({MINIMAX_LIKENESS_BLOCKS}) only — "
+            text=f"Photos train the identity blocks ({MINIMAX_LIKENESS_BLOCKS}) only and "
+                 f"voice recordings train the audio zone ({MINIMAX_AUDIO_BLOCKS}) only — "
                  "protecting the base model's rendering, anatomy and prompt following — while "
-                 "video and audio clips always train the full model. Measured result: sharper, "
-                 "more prompt-responsive, better sound, faster to converge. Untick for style or "
+                 "video clips train the full model. Measured result: sharper, more "
+                 "prompt-responsive, better sound, faster to converge. Untick for style or "
                  "scene training (the Style preset does).",
             foreground=COLORS["text_explain"], font=(FONT_FAMILY, 9, "italic"), justify=tk.LEFT, wraplength=720)
         self._minimax_likeness_hint.grid(row=40, column=0, columnspan=2, sticky=tk.W,
@@ -4753,11 +4747,13 @@ class LoRATrainerGUI:
         self._MINIMAX_LIKENESS_HINT_LORA = self._minimax_likeness_hint.cget("text")
         self._MINIMAX_LIKENESS_HINT_FT = (
             f"Under fine-tune this keeps its exact LoRA meaning: photos feed only the "
-            f"identity blocks ({MINIMAX_LIKENESS_BLOCKS}); clips and voice train the full "
-            f"model. On a photos-only dataset the whole cycle tightens to those blocks "
-            f"automatically (no wasted epochs); on a mixed dataset photo batches simply sit "
-            f"out the non-identity windows. Untick for style/scene fine-tunes. An explicit "
-            f"Blocks range above always wins.")
+            f"identity blocks ({MINIMAX_LIKENESS_BLOCKS}), voice feeds only the audio zone "
+            f"({MINIMAX_AUDIO_BLOCKS}), clips train the full model. The rotation cycle "
+            f"tightens automatically to the union of what your dataset actually trains "
+            f"(photos-only -> {MINIMAX_LIKENESS_BLOCKS}; voice-only -> "
+            f"{MINIMAX_AUDIO_BLOCKS}; add clips and it spans the full model). Untick for "
+            f"style/scene fine-tunes — voice still routes to its zone either way. An "
+            f"explicit Blocks range above always wins.")
         # trace, not command=: preset loads set the var programmatically and must re-grey too.
         self.entries["MINIMAX_LIKENESS_OPT"].trace_add(
             "write", lambda *_a: self._sync_minimax_likeness_state())
@@ -5689,7 +5685,6 @@ class LoRATrainerGUI:
             ("KREA2_REG_DIR", "krea2_reg_dir_var", str),
             ("KREA2_REG_MULT", "krea2_reg_mult_var", str),
             ("MINIMAX_FINETUNE", "minimax_finetune_var", bool),
-            ("MINIMAX_FT_BLOCKS", "minimax_ft_blocks_var", str),
             ("MINIMAX_FT_EVERY", "minimax_ft_every_var", str),
             ("MINIMAX_FT_SCOPE", "minimax_ft_scope_var", str),
             ("MINIMAX_FT_BLOCKSPEC", "minimax_ft_blockspec_var", str),
@@ -6577,7 +6572,6 @@ class LoRATrainerGUI:
         _grab("krea2_ft_every_var", "KREA2_FT_EVERY")
         _grab("krea2_ft_fused_var", "KREA2_FT_FUSED")
         _grab("minimax_finetune_var", "MINIMAX_FINETUNE")
-        _grab("minimax_ft_blocks_var", "MINIMAX_FT_BLOCKS")
         _grab("minimax_ft_every_var", "MINIMAX_FT_EVERY")
         _grab("minimax_ft_scope_var", "MINIMAX_FT_SCOPE")
         _grab("minimax_ft_blockspec_var", "MINIMAX_FT_BLOCKSPEC")
@@ -6956,6 +6950,9 @@ class LoRATrainerGUI:
         self.entries["MIXED_STOP_EPOCH"].insert(
             0, str(self.settings.get("MIXED_STOP_EPOCH", "")))
         self.entries["MIXED_STOP_EPOCH"].pack(side=tk.LEFT, padx=(0, 8))
+        # Under FT the hint shows live where a typed epoch will land (cycle-boundary snap).
+        self.entries["MIXED_STOP_EPOCH"].bind(
+            "<KeyRelease>", lambda _e: self._refresh_mixed_stop_hint())
         self.entries["MIXED_STOP_MODE"] = ttk.Combobox(_msf, values=_RETIRE_MODES, width=26,
                                                        state="readonly")
         self.entries["MIXED_STOP_MODE"].set(
@@ -6971,6 +6968,10 @@ class LoRATrainerGUI:
                          "its steps entirely: faster epochs, but that category goes unwatched.",
             font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
             justify=tk.LEFT, wraplength=720)
+        self._MIXED_STOP_HINT_LORA = self._mixed_stop_hint.cget("text")
+        # FT text is rebuilt live by _refresh_mixed_stop_hint (the cycle length rides on
+        # Rotate every); this placeholder is only ever shown for a frame at build time.
+        self._MIXED_STOP_HINT_FT = ""
 
         # The raw share, revealed only under Custom — the named options are the point.
         self._minimax_shift_label = ttk.Label(parent, text="Clean-end share:")
@@ -7307,46 +7308,24 @@ class LoRATrainerGUI:
     def _on_minimax_ft_toggle(self):
         """Recipe pushed on the way ON only, so re-showing the tab never stomps tuned values.
 
-        The likeness tickbox needs NO bridging here: --photo_blocks travels under FT and the
-        TRAINER resolves it with LoRA-identical semantics (photos-only dataset -> the cycle
-        tightens to the identity blocks; mixed dataset -> photo batches skip non-identity
-        windows while clips/voice train everything). The Blocks field stays purely manual."""
+        The likeness tickbox needs NO bridging here: --photo_blocks (and --audio_blocks)
+        travel under FT and the TRAINER resolves them — the cycle tightens to the union of
+        what the dataset trains, and each modality is confined to its own blocks per batch.
+        The Blocks field stays purely manual."""
         self._apply_minimax_ft_visibility()
         if bool(self.minimax_finetune_var.get()):
             self._apply_minimax_ft_defaults()
             self._refresh_minimax_ft_save_box()
 
     def _minimax_ft_cycle_estimate(self):
-        """Epochs per full rotation cycle, from the FT card's own controls.
-
-        An ESTIMATE the trainer's launch-time snap remains authoritative over — the GUI
-        cannot see the dataset, so the likeness tighten (30 blocks instead of 50) is assumed
-        whenever the tickbox is on, which matches the photos-only runs it exists for."""
-        import math
-        _b = str(self.minimax_ft_blocks_var.get())
+        """Epochs per full rotation cycle. Component windows are the only mode, so this is
+        EXACT, not an estimate: 4 windows (qkv / out / fc1 / fc2) x rotate-every, whatever
+        the block span — the span changes the master size and speed, never the cycle."""
         try:
             _every = max(1, int(str(self.minimax_ft_every_var.get()).strip() or 1))
         except ValueError:
             _every = 1
-        if _b.startswith("Component"):
-            return 4 * _every                      # qkv / out / fc1 / fc2, any block count
-        spec = str(self.minimax_ft_blockspec_var.get()).strip()
-        n_blocks = 50
-        if spec:
-            try:
-                from fizgig.minimax.trainer import parse_block_spec
-                n_blocks = len(parse_block_spec(spec, MINIMAX_NUM_BLOCKS))
-            except Exception:
-                n_blocks = 50
-        else:
-            _lk = self.entries.get("MINIMAX_LIKENESS_OPT")
-            if _lk is not None and bool(_lk.get()):
-                n_blocks = 30                      # the 20-49 tighten
-        try:
-            n = int(_b)                            # explicit window size
-        except ValueError:
-            n = 8                                  # Auto: a clean 32 GB card lands on 8
-        return math.ceil(n_blocks / max(1, n)) * _every
+        return 4 * _every
 
     def _refresh_minimax_ft_save_box(self):
         """Keep Save-every in step with the cycle the FT controls imply.
@@ -7358,6 +7337,12 @@ class LoRATrainerGUI:
         when it's 0 (final-only) or a non-zero multiple of the cycle (a deliberate sparser
         cadence); anything else is rewritten to one-save-per-cycle. Trainer-side snap stays
         authoritative at launch."""
+        # The stop-epoch hint quotes the same cycle length — keep the two in step (cheap,
+        # and this refresh fires on every cycle-affecting control).
+        try:
+            self._refresh_mixed_stop_hint()
+        except Exception:
+            pass
         if not bool(getattr(self, "minimax_finetune_var", None)
                     and self.minimax_finetune_var.get()):
             return
@@ -7455,6 +7440,41 @@ class LoRATrainerGUI:
                 self.show_row("NETWORK_ALPHA")
             else:
                 self._on_network_type_changed()
+        # 'Finish one category early' STAYS under FT (retirement works there now, stop-only
+        # at cycle boundaries) — its mode picker hides and its hint swaps.
+        self._refresh_mixed_stop_hint()
+
+    def _refresh_mixed_stop_hint(self):
+        """Swap the 'Finish one category early' hint and hide the anchor/stop picker under
+        FT — retirement there is stop-only and lands on rotation-cycle boundaries. The FT
+        text is rebuilt live: the cycle length rides on Rotate every, and a typed epoch
+        gets its snap target spelled out (the trainer's snap stays authoritative)."""
+        if not hasattr(self, "_mixed_stop_hint"):
+            return
+        on = bool(getattr(self, "minimax_finetune_var", None)
+                  and self.minimax_finetune_var.get())
+        _mode = self.entries.get("MIXED_STOP_MODE")
+        if _mode is not None:
+            self._set_widget_visible(_mode, not on)
+        if not on:
+            self._mixed_stop_hint.config(text=self._MIXED_STOP_HINT_LORA)
+            return
+        cyc = self._minimax_ft_cycle_estimate()
+        try:
+            _n = int(str(self.entries["MIXED_STOP_EPOCH"].get()).strip() or 0)
+        except (ValueError, KeyError, tk.TclError):
+            _n = 0
+        _snap = ((_n + cyc - 1) // cyc) * cyc if _n > 0 else 0
+        _ex = (f" Your epoch {_n} lands at {_snap}."
+               if _n > 0 and _snap != _n else "")
+        self._MIXED_STOP_HINT_FT = (
+            "Under fine-tune the finished category STOPS outright (no anchor mode), and "
+            "the stop lands on a rotation-cycle boundary — epochs snap UP to the next "
+            f"multiple of the {cyc}-epoch cycle, so every window sees the same data mix "
+            f"for equal passes before it changes.{_ex} Great for a polish tail: stop "
+            "photos & clips and let the voice keep refining its own blocks, or the "
+            "reverse.")
+        self._mixed_stop_hint.config(text=self._MIXED_STOP_HINT_FT)
 
     def _refresh_optimizer_choices(self, is_krea2: bool):
         """Point the Optimizer Type dropdown at the selected family's catalog."""
@@ -26406,13 +26426,13 @@ class LoRATrainerGUI:
             _n = int(str(self.settings.get("MIXED_STOP_EPOCH", "") or "").strip() or 0)
         except ValueError:
             _n = 0
-        # Retirement anchors ride the same param-group LR machinery as the band multiplier,
-        # so they are LoRA-only too — never emitted under FT.
-        if _n > 0 and not _ft_now:
+        if _n > 0:
             _flag = ("visual" if "photo" in
                      str(self.settings.get("MIXED_STOP_CATEGORY", "")).lower() else "audio")
-            _mode = ("stop" if "stop" in
-                     str(self.settings.get("MIXED_STOP_MODE", "")).lower() else "anchor")
+            # Under FT only "stop" exists (the anchor rides param-group LR machinery FT
+            # doesn't have) and the trainer snaps the epoch to a rotation-cycle boundary.
+            _mode = ("stop" if (_ft_now or "stop" in
+                     str(self.settings.get("MIXED_STOP_MODE", "")).lower()) else "anchor")
             cmd += [f"--{_flag}_stop_epoch", str(_n), f"--{_flag}_stop_mode", _mode]
         # Blocks to Train — only sent when it's a real range; "all" is the trainer's own default,
         # and not sending it keeps the flag's presence meaning "this run was a block experiment".
@@ -26424,10 +26444,16 @@ class LoRATrainerGUI:
         # Optimised Likeness Learning — photo steps train the identity blocks only, clips train
         # everything. The launch dict already forced MINIMAX_BLOCKS to "all" when this is on, so
         # the two flags never fight. The flag TRAVELS under fine-tune too: the trainer honours
-        # the same semantics there (cycle-tighten on photo-only data, per-window photo gating
-        # on mixed). --train_blocks stays adapter-only and is never emitted under FT.
+        # the same semantics there (cycle-tighten on photo-only data, per-parameter photo
+        # freezing on mixed). --train_blocks stays adapter-only and is never emitted under FT.
         if self.settings.get("MINIMAX_LIKENESS_OPT"):
             cmd += ["--photo_blocks", MINIMAX_LIKENESS_BLOCKS]
+        # Voice routing — audio steps train only the measured voice zone (34-49): outside it
+        # they corrupt the visual blocks (A/B, 24 Aug). Under FT it always travels (the
+        # trainer also tightens the cycle to the union of what the dataset trains); in LoRA
+        # mode it is part of Optimised Likeness Learning. Harmless without audio files.
+        if _ft_now or self.settings.get("MINIMAX_LIKENESS_OPT"):
+            cmd += ["--audio_blocks", MINIMAX_AUDIO_BLOCKS]
         # Reference distillation. Both flags travel together; the trainer also needs --vae to
         # encode the reference, which the sample block may already have added.
         if self.settings.get("MINIMAX_DISTILL"):
@@ -26450,14 +26476,8 @@ class LoRATrainerGUI:
         _mft_on = bool(getattr(self, "minimax_finetune_var", None)
                        and self.minimax_finetune_var.get())
         if _mft_on:
-            _mftb = str(self.minimax_ft_blocks_var.get())
-            if _mftb.startswith("Auto"):
-                cmd += ["--finetune_rotation", "1", "--finetune_rotation_mode", "auto"]
-            elif _mftb.startswith("Component"):
-                cmd += ["--finetune_rotation", "1", "--finetune_rotation_mode", "component"]
-            else:
-                cmd += ["--finetune_rotation", str(max(1, int(_mftb))),
-                        "--finetune_rotation_mode", "block"]
+            # Component is the only mode (24 Aug — block/numeric windows removed).
+            cmd += ["--finetune_rotation", "1", "--finetune_rotation_mode", "component"]
             _mfte = str(self.minimax_ft_every_var.get()).strip()
             cmd += ["--finetune_rotate_every", _mfte if _mfte.isdigit() else "1"]
             if str(self.minimax_ft_scope_var.get()).startswith("Photos"):

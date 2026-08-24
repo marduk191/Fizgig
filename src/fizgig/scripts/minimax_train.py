@@ -157,6 +157,13 @@ def setup_parser() -> argparse.ArgumentParser:
                         "the full model. '20-49' is the measured likeness recipe — photo "
                         "gradients into the front trunk erode rendering and anatomy while "
                         "identity lives in the back blocks. Composes with --train_blocks.")
+    p.add_argument("--audio_blocks", default=None, metavar="SPEC",
+                   help="Voice routing: audio-only training steps update only these DiT "
+                        "blocks (the refiner always trains). '34-49' is the measured voice "
+                        "zone (core 38-48 + shoulder) — audio gradients outside it "
+                        "measurably corrupt the visual blocks (A/B, 24 Aug). Applies "
+                        "under the rotation fine-tune, and in LoRA mode alongside "
+                        "--photo_blocks.")
     p.add_argument("--base_quant", default="auto", choices=["auto", "int8", "nf4"],
                    help="Frozen-base precision. 'int8' keeps the checkpoint's own ConvRot "
                         "weights (~0.17%% base error, ~21 GB) — what the reference trainer "
@@ -230,14 +237,13 @@ def setup_parser() -> argparse.ArgumentParser:
     p.add_argument("--metadata_trigger_phrase", default=None)
     # ---- rotation full fine-tune (trains the BASE, not a LoRA) ----
     p.add_argument("--finetune_rotation", type=int, default=0,
-                   help="Master switch: >0 trains the base model itself, N blocks per "
-                        "rotating window (block mode). The output is a full ~21 GB "
-                        "int8 checkpoint per save.")
+                   help="Master switch: >0 trains the base model itself in component "
+                        "windows. The output is a full ~21 GB int8 checkpoint per save.")
     p.add_argument("--finetune_rotate_every", type=int, default=1,
                    help="Advance the window every N epochs")
-    p.add_argument("--finetune_rotation_mode", default="auto",
-                   choices=["auto", "block", "component"],
-                   help="auto sizes a block window to free VRAM. component trains one "
+    p.add_argument("--finetune_rotation_mode", default="component",
+                   choices=["component"],
+                   help="component (the only mode) trains one "
                         "matmul (qkv/out/fc1/fc2) across EVERY block per window, on an "
                         "NF4-resident base — full model depth each epoch; the saved "
                         "checkpoint is still exact int8.")
@@ -308,6 +314,7 @@ def main():
         include_patterns=args.include_patterns,
         train_blocks=args.train_blocks,
         photo_blocks=args.photo_blocks,
+        audio_blocks=args.audio_blocks,
         distill=args.distill,
         distill_weight=args.distill_weight,
         distill_phase1_epochs=args.distill_phase1_epochs,

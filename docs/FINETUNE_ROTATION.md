@@ -119,26 +119,41 @@ training at 0.25 MP, and a matched A/B against a LoRA.
 
 ## MiniMax H3 — the recommended recipe (25 Aug, settled by matched A/Bs)
 
-H3 rotation FT is fully ported (`H3BlockRotator` / `H3NF4Rotator` in
-`src/fizgig/minimax/rotation_ft.py`) and the recipe below is not a guess — every element was
-chosen by a matched real-run comparison on valid checkpoints:
+H3 rotation FT is fully ported (`H3NF4Rotator` in `src/fizgig/minimax/rotation_ft.py`) and
+the recipe below is not a guess — every element was chosen by a matched real-run comparison
+on valid checkpoints:
 
-**Component mode + Optimised Likeness Learning ON + LR 1e-4.** One checkbox each:
+**Component windows + Optimised Likeness Learning ON + LR 1e-4.** One checkbox each:
 
-- **Component mode** (Blocks/window → *Component (NF4 base)*): each window is one matmul
+- **Component windows** (the only mode since 24 Aug — the old 4/6/8-block windows are
+  removed; they never matched component's likeness speed): each window is one matmul
   (qkv / out / fc1 / fc2) across every block, so a concept trains at full model depth every
-  epoch — 4 windows per cycle. Measured against block mode at the same LR: likeness learns
-  **far faster**. The frozen trunk runs as NF4 during training; the saved checkpoint is
-  still exact int8 and deploys in ComfyUI like the base model.
-- **Optimised Likeness Learning ON** (the default): on a photos-only dataset the whole cycle
-  tightens to the identity blocks (20-49). Matched 64-epoch A/B against full-model training:
-  **vastly better looking and vastly better prompt adherence** — full-model photo gradients
-  bend the 0-19 trunk (composition, motion, prompt binding) toward photo reconstruction,
-  and protecting it preserves the base model's rendering while identity concentrates where
-  it lives. Bonus: 30-block windows (faster epochs, ~23 GB master, peaks that brush a
-  24 GB card). Untick only for style/scene fine-tunes, where the trunk IS the target.
-  (An earlier "better without it" verdict was an artifact of the likeness-save bug below —
-  it did not survive the fix.)
+  epoch — 4 windows per cycle, whatever the block span. The frozen trunk runs as NF4
+  during training; the saved checkpoint is still exact int8 and deploys in ComfyUI like
+  the base model.
+- **Optimised Likeness Learning ON** (the default) — per-modality routing: photos feed the
+  identity blocks (20-49), voice feeds the audio zone (34-49), clips train the full model.
+  The cycle tightens automatically to the union of what the dataset actually trains
+  (photos-only → 20-49; audio-only → 34-49; photos+voice → 20-49 with voice confined to
+  its zone per step; add clips and the cycle spans the full model with photos and voice
+  each still confined). Matched 64-epoch A/B against full-model training: **vastly better
+  looking and vastly better prompt adherence** — full-model photo gradients bend the 0-19
+  trunk (composition, motion, prompt binding) toward photo reconstruction. Bonus on
+  photo-led datasets: 30-block cycles (faster epochs, ~23 GB master, peaks that brush a
+  24 GB card). Untick only for style/scene fine-tunes, where the trunk IS the target —
+  voice still routes to its zone either way. An explicit Blocks range wins over all
+  routing. (An earlier "better without it" verdict was an artifact of the likeness-save
+  bug below — it did not survive the fix.)
+- **Voice → 34-49, always** (24 Aug A/B): an audio-only fine-tune at 34-49 learns the
+  voice cleanly; the same audio at 20-49 measurably **corrupted the visual blocks** —
+  audio gradients do real damage outside the audio zone (core 38-48, shoulder 34-37; see
+  RESEARCH_h3_block_map.md). This is why the routing is unconditional.
+- **Per-modality run length** (`Finish one category early`, now live under FT): a mixed
+  dataset's smaller category can finish (or start to overbake) well before the larger one
+  — stop photos & clips at epoch N and let the voice keep refining its own blocks, or the
+  reverse. Under FT the retired category stops outright (no anchor mode) and the stop
+  lands on a rotation-cycle boundary — epochs snap UP to the next multiple of the cycle,
+  so every window sees the identical data mix for equal passes before the mix changes.
 - **Stochastic-rounding saves** (automatic, not a setting): trained tensors re-encode to
   int8 with stochastic rounding at save. Nearest rounding is biased back to the base's
   codes, so an FT's 0.2-1% deltas — below the int8 grid step — used to round HOME: previews
