@@ -3833,6 +3833,31 @@ def train_minimax(
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            # Fragmentation guard for tight cards (#92, David Maybank's 12 GB report): the
+            # preview's block up/down churn + the 4.85 GB decoder round-trip fragment the
+            # allocator reserve (his post-preview census: ~4.8 GB inactive split), and
+            # Windows torch has no expandable_segments — the NEXT training step's first
+            # contiguous allocation then OOMs even though everything was restored. Same
+            # disease and same cure as the FT bracket previews: a full park/restore round
+            # trip re-lands the resident set contiguously. Seconds, and only when free VRAM
+            # is actually tight — a 32 GB card never triggers this.
+            if torch.cuda.is_available():
+                try:
+                    from fizgig.utils.device import plannable_free_vram as _pfv2
+                    _free_after = _pfv2()
+                except Exception:
+                    _free_after = 99.0
+                if _free_after < 4.0:
+                    logger.info(f"[preview] {_free_after:.1f} GB free after the preview — "
+                                "defragmenting via a full park/restore round-trip so the "
+                                "next training step doesn't fight the fragments.")
+                    park_dit_to_cpu(dit)
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    restore_parked_dit(dit, device, n_swap)
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    vram_line("post-defrag")
             vram_line("finally-done")
 
     def _ft_rebind_optimizer():

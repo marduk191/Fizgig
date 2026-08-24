@@ -12,8 +12,7 @@ Fizgig runs on AMD Radeon with ROCm — RDNA1 through RDNA4, Strix Point / Halo,
   launch with `run_fizgig_rocm.bat`. The installer detects your GPU and pulls the right wheels.
 - **Linux** is available but highly experimental — driver resets and crashes are common on newer
   cards. Use Windows ROCm or NVIDIA Linux for production training.
-- The status-bar VRAM readout works on AMD too, and RDNA4 cards get a known ROCm GEMM slowdown
-  worked around automatically.
+- The status-bar VRAM readout works on AMD too.
 - Full install details are in the README. NVIDIA installs are completely untouched — the AMD
   path is separate files, separate venv steps.
 

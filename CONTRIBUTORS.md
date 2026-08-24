@@ -7,13 +7,21 @@ Fizgig is written by [Peter Neill (shootthesound)](https://github.com/shoottheso
 [scryptio](https://github.com/scryptio) built the **AMD ROCm support** that headlines v4.3.0
 ([#53](https://github.com/shootthesound/Fizgig/pull/53)): the Windows and Linux ROCm install
 paths and launchers, GPU architecture detection, cross-platform VRAM monitoring for the status
-bar, and the RDNA4 batched-GEMM workaround — a lot of building and testing on real hardware.
+bar — a lot of building and testing on real hardware.
 Along the way the same investigation pinned down the torch.compile recompile cost on
 ROCm, now handled automatically. The PR thread was a group effort:
 [tsubasasora](https://github.com/tsubasasora) ran repeated from-scratch Linux installs on an
 R9700 that shook out real install bugs, [FNGarvin](https://github.com/FNGarvin) pushed for the
 wheel pinning that made the install materially safer, and
 [taisunyoung](https://github.com/taisunyoung) contributed expert ROCm performance diagnostics.
+
+They then diagnosed and fixed the **captioning slowdown**
+([#90](https://github.com/shootthesound/Fizgig/issues/90) →
+[#93](https://github.com/shootthesound/Fizgig/pull/93)): AI captioning held GPU memory inside
+the GUI process, which silently poisoned the next training run's memory planning (measured
+~4x slower steps). Their fix moves captioning into a persistent worker subprocess — the same
+architecture training and caching already use — so the VRAM genuinely returns, with a warm
+worker keeping single-image Regenerate instant. Validated on AMD by them and on NVIDIA here.
 
 ## rintic-13
 
@@ -36,6 +44,15 @@ output, bringing identity distillation to 16 GB cards
 for a preview corrupted the H2D ring buffer's shared slot storage, killing training at step 0
 with a misleading CUDA error far from the cause. The instrumented diagnosis was exact and the
 fix minimal — verified and merged the same day.
+
+## mabseyuk
+
+**u/mabseyuk** proved MiniMax H3 LoRA training runs on a **12 GB card** — an RTX 5070 field
+report with instrumented diagnosis of the two crashes in the way, both fixed in v4.3.1
+([#92](https://github.com/shootthesound/Fizgig/issues/92)): the checkpoint-save MemoryError
+in the optional hash metadata (landed with co-author credit, e54b0d3) and the post-preview
+fragmentation OOM. Confirmed training otherwise fully stable at 12 GB — epoch 14 with
+checkpoints throughout when they first reported.
 
 ## FNGarvin
 
