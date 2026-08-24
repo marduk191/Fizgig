@@ -540,7 +540,16 @@ def save_full_checkpoint_h3(rotator: H3BlockRotator, src_path: str, out_path: st
     _reader = {"f": None}
 
     def _encode(stem):
-        return quantize_int8_convrot(flushed[stem + ".weight"], rot_by_stem.get(stem, 256))
+        # Stochastic rounding for TRAINED stems — nearest is biased back to the base codes,
+        # so sub-grid training deltas (the 0.2-1% an FT actually produces) rounded to
+        # near-zero training signal in the file while previews (which render the exact
+        # master) showed full likeness (field, 24 Aug — the checkpoint-vs-preview mystery).
+        # Deterministic per-stem seed so re-saving the same master gives the same bytes.
+        gen = torch.Generator()
+        gen.manual_seed(int.from_bytes(hashlib.sha1(stem.encode()).digest()[:8], "big")
+                        & 0x7FFFFFFFFFFFFFFF)
+        return quantize_int8_convrot(flushed[stem + ".weight"], rot_by_stem.get(stem, 256),
+                                     stochastic=True, generator=gen)
 
     def make_producer(key):
         info = header[key]

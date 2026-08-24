@@ -78,7 +78,8 @@ def dequantize_int8_convrot(qweight: torch.Tensor, scale: torch.Tensor, conf: di
     return rotate(w, group).to(out_dtype)
 
 
-def quantize_int8_convrot(w: torch.Tensor, rot: int = 256):
+def quantize_int8_convrot(w: torch.Tensor, rot: int = 256, stochastic: bool = False,
+                          generator: torch.Generator = None):
     """The ENCODE direction — a TRUE-basis dense weight -> int8 codes + per-row scale.
 
     Exists for rotation fine-tuning: a trained bf16 window is written back into the frozen
@@ -86,14 +87,31 @@ def quantize_int8_convrot(w: torch.Tensor, rot: int = 256):
     basis (self-inverse Hadamard, same call), then symmetric per-output-row absmax scaling to
     the int8 grid. Round-trip property the tests pin: encoding a freshly DECODED weight
     reproduces the original codes exactly — the codes are integers on their own grid and the
-    rowmax recovers the scale — so the only loss on a save is the one quantization step of the
-    weights that actually trained (~0.17% relative, the same class as the base's own storage
-    error). clamp_min guards an all-zero row (a dead output would otherwise divide by zero).
+    rowmax recovers the scale. clamp_min guards an all-zero row (a dead output would
+    otherwise divide by zero).
+
+    stochastic=True is the FT-save mode. Nearest rounding is systematically biased back to
+    the base's codes: a training delta below the grid step rounds HOME, so a fine-tune's
+    0.2-1% weight movement saved with nearest carries near-zero training signal (measured:
+    direction-cosine 0.02 at a 0.3% delta). Stochastic rounding rounds each weight up/down
+    with probability equal to its fractional position — per-weight ±1-code dither (the
+    error class the base already carries) but the delta is preserved IN EXPECTATION, and
+    the network integrates the coherent delta while averaging out the random dither
+    (measured: cosine 0.36 at 0.3%, ~10x the weight-space SNR of the NF4 trunk that
+    in-training previews render likeness through). Weights exactly ON the grid have zero
+    fractional part, so untouched tensors still roundtrip byte-exact.
 
     Returns (codes int8 [out, in], scale fp32 [out, 1])."""
     wr = rotate(w.to(torch.float32), rot)
     s = wr.abs().amax(dim=1, keepdim=True).clamp_min(1e-12) / 127.0
-    q = torch.round(wr / s).clamp(-127, 127).to(torch.int8)
+    v = wr / s
+    if stochastic:
+        fl = torch.floor(v)
+        rdev = generator.device if generator is not None else v.device
+        r = torch.rand(v.shape, generator=generator, device=rdev).to(v.device)
+        q = (fl + (r < (v - fl)).to(v.dtype)).clamp(-127, 127).to(torch.int8)
+    else:
+        q = torch.round(v).clamp(-127, 127).to(torch.int8)
     return q, s
 
 
