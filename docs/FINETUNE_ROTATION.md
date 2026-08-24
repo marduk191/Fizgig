@@ -164,8 +164,10 @@ on valid checkpoints:
 - **Memory**: the bf16 master auto-selects RAM or disk (`--finetune_master`, auto = disk
   when the master would eat >40% of available RAM). Disk mode measured a **3.8 GB** trainer
   working set vs 90.7 GB for the RAM path — full-model FT fits 64 GB boxes easily.
-- Previews render once per completed cycle via a deactivate/reactivate bracket; saves are
-  full ~21 GB int8 checkpoints, cadence snapped to the cycle; continuation is
+- Previews follow checkpoint saves (24 Aug): one preview per saved checkpoint, plus the
+  final one — every sample in the gallery maps to a file you can deploy. Saves are full
+  ~21 GB int8 checkpoints, cadence snapped to the cycle (so previews keep the
+  equal-training honesty); rendered via a deactivate/reactivate bracket; continuation is
   `--dit <checkpoint> --finetune_start_window N` (printed at every save).
 
 ---

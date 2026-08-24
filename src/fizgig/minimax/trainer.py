@@ -2743,11 +2743,6 @@ def train_minimax(
                     "%d epoch(s) per cycle; first window -> %s",
                     rot_schedule.n_windows, list(rot_schedule.components),
                     _cycle_n, rot_schedule.cycle_epochs, _first)
-        if sample_prompts and te_path:
-            logger.info("[h3-ft] previews render once per COMPLETED CYCLE (every %d epochs), "
-                        "overriding Sample-every-N: a mid-cycle preview would show blocks "
-                        "with unequal training. Rendered via a deactivate/reactivate bracket "
-                        "with the Turbo applied fresh each time.", rot_schedule.cycle_epochs)
         # Save cadence snaps to the cycle too — each save is a full ~21 GB checkpoint, and
         # per-cycle saves compare like-for-like (every block equally trained). An explicit
         # multiple of the cycle is respected (sparser is fine); anything else is corrected
@@ -2759,6 +2754,13 @@ def train_minimax(
                         "checkpoint; multiples of the cycle are also accepted).",
                         save_every_n_epochs, _cyc)
             save_every_n_epochs = _cyc
+        if sample_prompts and te_path:
+            logger.info("[h3-ft] previews follow CHECKPOINT SAVES (every %d epoch(s), plus "
+                        "the final one) — each sample is the rehearsal of a checkpoint you "
+                        "can deploy, overriding Sample-every-N. Rendered via a "
+                        "deactivate/reactivate bracket with the Turbo applied fresh each "
+                        "time.",
+                        save_every_n_epochs if save_every_n_epochs else max_train_epochs)
 
         # Category retirement lands at cycle boundaries only: every window must see the
         # identical data mix for equal passes before the mix changes, or late-cycle
@@ -4480,10 +4482,18 @@ def train_minimax(
                                  "dashboard). Training continues; this epoch has no resume "
                                  "point. The epoch checkpoint itself already saved.",
                                  type(_se).__name__, _se)
-        # Under FT the cadence is CYCLE boundaries, whatever Sample-every-N says: a mid-cycle
-        # preview shows a model where some blocks have trained more than others — noise, not
-        # signal. The user's box still gates whether previews happen at all (via do_previews).
-        _prev_due = (((epoch + 1) % rot_schedule.cycle_epochs == 0) if rotator is not None
+        # Under FT previews FOLLOW CHECKPOINT SAVES (Peter, 24 Aug): one preview per saved
+        # checkpoint, so the sample gallery maps 1:1 onto files you can actually deploy.
+        # Saves only land on cycle boundaries, so the old per-cycle equal-training honesty
+        # is preserved; a sparser save cadence (a multiple of the cycle) now previews
+        # sparser too, and Save-every 0 (final only) previews only at the end. The final
+        # epoch always previews — its checkpoint is the final save after the loop.
+        # Sample-every-N still doesn't apply; the Samples tab still gates previews on/off.
+        _ft_saved_this_epoch = bool(save_every_n_epochs
+                                    and (epoch + 1) % save_every_n_epochs == 0
+                                    and (epoch + 1) < max_train_epochs)
+        _prev_due = ((_ft_saved_this_epoch or (epoch + 1) >= max_train_epochs)
+                     if rotator is not None
                      else bool(sample_every_n_epochs
                                and (epoch + 1) % sample_every_n_epochs == 0))
         if do_previews and _prev_due:
