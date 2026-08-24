@@ -4511,9 +4511,9 @@ class LoRATrainerGUI:
                                        padx=(21, 5), pady=(2, 0))
 
         self._minimax_ft_hint = ttk.Label(training_content,
-                  text="Trains the base model's own weights, not an adapter — Network Type, "
-                       "Blocks to Train and Optimised Likeness Learning hide while this is "
-                       "on (they're LoRA machinery; fine-tunes train better unrestricted). "
+                  text="Trains the base model's own weights, not an adapter — Network Type "
+                       "and Blocks to Train hide while this is on (they're LoRA machinery); "
+                       "Optimised Likeness Learning keeps working with its usual meaning. "
                        "The Blocks field above is an optional manual restriction of the whole "
                        "fine-tune. Needs a 32 GB card and ~64 GB of system RAM. Only a window "
                        "of blocks trains at a time and the window rotates each epoch; previews "
@@ -4731,6 +4731,10 @@ class LoRATrainerGUI:
         # the full model. BooleanVar in self.entries so presets/queue/last-train carry it free.
         self.entries["MINIMAX_LIKENESS_OPT"] = tk.BooleanVar(
             value=bool(self.settings.get("MINIMAX_LIKENESS_OPT", True)))
+        # Under FT the tickbox changes the rotation-cycle length (50 blocks -> the 20-49
+        # tighten), so the Save-every suggestion follows it live.
+        self.entries["MINIMAX_LIKENESS_OPT"].trace_add(
+            "write", lambda *_a: self._refresh_minimax_ft_save_box())
         self._minimax_likeness_cb = ttk.Checkbutton(
             training_content, text="Optimised Likeness Learning",
             variable=self.entries["MINIMAX_LIKENESS_OPT"])
@@ -4747,8 +4751,13 @@ class LoRATrainerGUI:
         self._minimax_likeness_hint.grid(row=40, column=0, columnspan=2, sticky=tk.W,
                                          padx=5, pady=(0, 4))
         self._MINIMAX_LIKENESS_HINT_LORA = self._minimax_likeness_hint.cget("text")
-        # No FT variant: likeness mode is LoRA-only (24 Aug — real FT A/Bs trained better
-        # without it), so the whole row hides under FT instead of swapping its hint.
+        self._MINIMAX_LIKENESS_HINT_FT = (
+            f"Under fine-tune this keeps its exact LoRA meaning: photos feed only the "
+            f"identity blocks ({MINIMAX_LIKENESS_BLOCKS}); clips and voice train the full "
+            f"model. On a photos-only dataset the whole cycle tightens to those blocks "
+            f"automatically (no wasted epochs); on a mixed dataset photo batches simply sit "
+            f"out the non-identity windows. Untick for style/scene fine-tunes. An explicit "
+            f"Blocks range above always wins.")
         # trace, not command=: preset loads set the var programmatically and must re-grey too.
         self.entries["MINIMAX_LIKENESS_OPT"].trace_add(
             "write", lambda *_a: self._sync_minimax_likeness_state())
@@ -7298,9 +7307,10 @@ class LoRATrainerGUI:
     def _on_minimax_ft_toggle(self):
         """Recipe pushed on the way ON only, so re-showing the tab never stomps tuned values.
 
-        Likeness mode is LoRA-only (24 Aug): the tickbox hides under FT, --photo_blocks is
-        never emitted there, and the trainer coerces it off. The Blocks field stays purely
-        manual."""
+        The likeness tickbox needs NO bridging here: --photo_blocks travels under FT and the
+        TRAINER resolves it with LoRA-identical semantics (photos-only dataset -> the cycle
+        tightens to the identity blocks; mixed dataset -> photo batches skip non-identity
+        windows while clips/voice train everything). The Blocks field stays purely manual."""
         self._apply_minimax_ft_visibility()
         if bool(self.minimax_finetune_var.get()):
             self._apply_minimax_ft_defaults()
@@ -7309,9 +7319,9 @@ class LoRATrainerGUI:
     def _minimax_ft_cycle_estimate(self):
         """Epochs per full rotation cycle, from the FT card's own controls.
 
-        An ESTIMATE the trainer's launch-time snap remains authoritative over. Likeness mode
-        no longer factors in — it's LoRA-only, so an FT cycle spans the Blocks field's
-        selection or the full 50."""
+        An ESTIMATE the trainer's launch-time snap remains authoritative over — the GUI
+        cannot see the dataset, so the likeness tighten (30 blocks instead of 50) is assumed
+        whenever the tickbox is on, which matches the photos-only runs it exists for."""
         import math
         _b = str(self.minimax_ft_blocks_var.get())
         try:
@@ -7328,6 +7338,10 @@ class LoRATrainerGUI:
                 n_blocks = len(parse_block_spec(spec, MINIMAX_NUM_BLOCKS))
             except Exception:
                 n_blocks = 50
+        else:
+            _lk = self.entries.get("MINIMAX_LIKENESS_OPT")
+            if _lk is not None and bool(_lk.get()):
+                n_blocks = 30                      # the 20-49 tighten
         try:
             n = int(_b)                            # explicit window size
         except ValueError:
@@ -7415,14 +7429,13 @@ class LoRATrainerGUI:
         on = bool(self.minimax_finetune_var.get())
         for w in (self._minimax_ft_frame, self._minimax_ft_fused_cb, self._minimax_ft_hint):
             self._set_widget_visible(w, on)
-        # Likeness mode is LoRA-ONLY (Peter, 24 Aug, reversing the earlier keep-visible call):
-        # real FT A/Bs showed fine-tunes learn better WITHOUT the restriction — full-depth
-        # updates want the full depth — so the tickbox hides under FT and the builder never
-        # emits --photo_blocks there. The FT card's Blocks field remains the manual way to
-        # restrict a fine-tune.
-        for w in (getattr(self, "_minimax_likeness_cb", None),
-                  getattr(self, "_minimax_likeness_hint", None),
-                  getattr(self, "_minimax_blocks_label", None),
+        # The likeness tickbox STAYS — same meaning, different mechanism: under FT it drives
+        # the Blocks field (whole fine-tune on the identity blocks) instead of masking photo
+        # steps. Its hint swaps to say so. Blocks to Train is adapter-only and hides.
+        if hasattr(self, "_minimax_likeness_hint"):
+            self._minimax_likeness_hint.config(
+                text=self._MINIMAX_LIKENESS_HINT_FT if on else self._MINIMAX_LIKENESS_HINT_LORA)
+        for w in (getattr(self, "_minimax_blocks_label", None),
                   getattr(self, "_minimax_blocks_frame", None),
                   getattr(self, "_minimax_blocks_hint", None),
                   # Medium to High LR is a LoRA-mode knob (it rewrites the optimizer's
@@ -26410,10 +26423,10 @@ class LoRATrainerGUI:
             cmd += ["--train_blocks", _blocks]
         # Optimised Likeness Learning — photo steps train the identity blocks only, clips train
         # everything. The launch dict already forced MINIMAX_BLOCKS to "all" when this is on, so
-        # the two flags never fight. LoRA-ONLY (Peter, 24 Aug, from real FT A/Bs): fine-tunes
-        # train BETTER without the restriction — full-depth updates want the full depth — so
-        # the flag is never emitted under FT and the tickbox hides there.
-        if self.settings.get("MINIMAX_LIKENESS_OPT") and not _ft_now:
+        # the two flags never fight. The flag TRAVELS under fine-tune too: the trainer honours
+        # the same semantics there (cycle-tighten on photo-only data, per-window photo gating
+        # on mixed). --train_blocks stays adapter-only and is never emitted under FT.
+        if self.settings.get("MINIMAX_LIKENESS_OPT"):
             cmd += ["--photo_blocks", MINIMAX_LIKENESS_BLOCKS]
         # Reference distillation. Both flags travel together; the trainer also needs --vae to
         # encode the reference, which the sample block may already have added.
