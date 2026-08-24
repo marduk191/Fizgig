@@ -219,3 +219,31 @@ Wire figures: `T = (px/16)² + 512` tokens × 6144 × 2 bytes, doubled for the b
 Compression ratios quoted from `torch-nvenc-compress/docs/findings.md` (LOO-validated 6.1× at
 QP=10 / cos 0.991 on FLUX.2 Klein mid-block activations) — **an activation figure being applied
 to a gradient question, which is open question 1 above.**
+
+---
+
+## Addendum (24 Aug 2026) — comfyui-mesh is the wire, and the numbers were pessimistic
+
+Two updates that upgrade this study from feasibility to eventually-scheduled:
+
+1. **The transport exists and is field-proven.** Peter''s
+   [comfyui-mesh](https://github.com/shootthesound/comfyui-mesh) (Icarus client /
+   Daedalus server) already does pipeline-parallel INFERENCE splits of FLUX.2 and
+   LTX 2.3 over TCP with NVENC activation compression (3-10x), reconnection, and a
+   measured 4.4 s/image for Klein 1024^2 across a 5090+4090 on gigabit. Training adds
+   the backward leg (the boundary gradient — same size as the forward tensor, already
+   in the tables above), an optimizer per half, and checkpoint assembly from two
+   masters. Engineering, not physics.
+
+2. **The wire numbers above were effectively measured on 100 Mbit** — the test machine
+   turned out not to be linked at gigabit. True gigabit has ~10x the headroom this doc
+   assumed: 768 px training is comfortable UNCOMPRESSED, and 1024 px no longer depends
+   on the codec.
+
+The compounding insight: **a mesh split composes with rotation.** Each machine hosts
+half the blocks, so its frozen trunk AND its share of the active window halve together
+— two 24 GB cards run full H3 component mode with margin, and two 32 GB cards could
+plausibly hold the trunk in raw bf16, skipping NF4 and its trained-against-noise
+context entirely (see the 24 Aug stochastic-rounding findings). Target shape: a Fizgig
+server mode on the second machine, LAN discovery, auto-split. Eventually — after the
+FT program ships.
