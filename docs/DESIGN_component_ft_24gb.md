@@ -4,6 +4,14 @@ Status: **scheduled — part of the FT program** (Peter, 24 Aug 2026: "too good 
 Route A is the deliverable for the program's release; Route B follows measurement.
 Written the night the disk-backed master landed. FT-branch only until the program merges.
 
+**Scope update (25 Aug)**: the fair-trial verdict made **likeness ON the recommended H3 FT
+recipe** (vastly better output and prompt adherence than full-model), and the likeness
+component run's measured window peaks — 18.4 / 19.0 / 20.3 / 22.8 GB — already brush a
+24 GB card's usable ceiling with NO window splitting. So the recommended config may fit
+24 GB today (needs one gate on a simulated 24 GB budget; 22.8 vs ~23 usable is tight), and
+Route A's main customer shrinks to likeness-OFF runs (style/scene fine-tunes) plus safety
+margin for the recommended path.
+
 ## Why 24 GB is currently out
 
 Component mode's VRAM peak is set by ONE window: `mlp.fc1` across all 50 blocks is

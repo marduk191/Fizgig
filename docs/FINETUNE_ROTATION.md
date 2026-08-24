@@ -117,6 +117,44 @@ training at 0.25 MP, and a matched A/B against a LoRA.
 
 ---
 
+## MiniMax H3 — the recommended recipe (25 Aug, settled by matched A/Bs)
+
+H3 rotation FT is fully ported (`H3BlockRotator` / `H3NF4Rotator` in
+`src/fizgig/minimax/rotation_ft.py`) and the recipe below is not a guess — every element was
+chosen by a matched real-run comparison on valid checkpoints:
+
+**Component mode + Optimised Likeness Learning ON + LR 1e-4.** One checkbox each:
+
+- **Component mode** (Blocks/window → *Component (NF4 base)*): each window is one matmul
+  (qkv / out / fc1 / fc2) across every block, so a concept trains at full model depth every
+  epoch — 4 windows per cycle. Measured against block mode at the same LR: likeness learns
+  **far faster**. The frozen trunk runs as NF4 during training; the saved checkpoint is
+  still exact int8 and deploys in ComfyUI like the base model.
+- **Optimised Likeness Learning ON** (the default): on a photos-only dataset the whole cycle
+  tightens to the identity blocks (20-49). Matched 64-epoch A/B against full-model training:
+  **vastly better looking and vastly better prompt adherence** — full-model photo gradients
+  bend the 0-19 trunk (composition, motion, prompt binding) toward photo reconstruction,
+  and protecting it preserves the base model's rendering while identity concentrates where
+  it lives. Bonus: 30-block windows (faster epochs, ~23 GB master, peaks that brush a
+  24 GB card). Untick only for style/scene fine-tunes, where the trunk IS the target.
+  (An earlier "better without it" verdict was an artifact of the likeness-save bug below —
+  it did not survive the fix.)
+- **Stochastic-rounding saves** (automatic, not a setting): trained tensors re-encode to
+  int8 with stochastic rounding at save. Nearest rounding is biased back to the base's
+  codes, so an FT's 0.2-1% deltas — below the int8 grid step — used to round HOME: previews
+  showed full likeness while every saved checkpoint deployed without it. Measured
+  direction-cosine of the saved delta: 0.02 nearest → 0.36 stochastic at a 0.3% delta,
+  ~10× the weight-space SNR of the NF4 trunk previews render through. Field-validated in
+  ComfyUI the same day.
+- **Memory**: the bf16 master auto-selects RAM or disk (`--finetune_master`, auto = disk
+  when the master would eat >40% of available RAM). Disk mode measured a **3.8 GB** trainer
+  working set vs 90.7 GB for the RAM path — full-model FT fits 64 GB boxes easily.
+- Previews render once per completed cycle via a deactivate/reactivate bracket; saves are
+  full ~21 GB int8 checkpoints, cadence snapped to the cycle; continuation is
+  `--dit <checkpoint> --finetune_start_window N` (printed at every save).
+
+---
+
 ## Usage
 
 **GUI** — Training tab, Krea 2 only: tick **⚗ Fine-tune the BASE MODEL instead of training a
