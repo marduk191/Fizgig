@@ -1,7 +1,8 @@
 # Component-mode H3 fine-tune on 24 GB (and maybe 16 GB) — design note
 
-Status: **idea, not scheduled**. Written 24 Aug 2026, the night the disk-backed master
-landed. FT-branch only — do not merge to master ahead of the FT program.
+Status: **scheduled — part of the FT program** (Peter, 24 Aug 2026: "too good not to").
+Route A is the deliverable for the program's release; Route B follows measurement.
+Written the night the disk-backed master landed. FT-branch only until the program merges.
 
 ## Why 24 GB is currently out
 
