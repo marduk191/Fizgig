@@ -7362,15 +7362,22 @@ class LoRATrainerGUI:
         if cur != getattr(self, "_minimax_ft_save_autoset", None):
             if cur == 0 or (cur > 0 and cur % cyc == 0):
                 return                              # the user's own deliberate cadence
+        # A user-typed non-multiple snaps UP to the next cycle multiple (10 on a 4-cycle
+        # -> 12): the typed number expressed how SPARSE they want 20 GB saves — and,
+        # since previews follow saves, previews — so one-per-cycle would be 2.5x what
+        # they asked for. A GUI-owned value just tracks the cycle itself.
+        _target = (((cur + cyc - 1) // cyc) * cyc
+                   if cur > 0 and cur != getattr(self, "_minimax_ft_save_autoset", None)
+                   else cyc)
         try:
             _was = str(entry.cget("state"))
             if _was == "disabled":
                 entry.config(state="normal")
             entry.delete(0, tk.END)
-            entry.insert(0, str(cyc))
+            entry.insert(0, str(_target))
             if _was == "disabled":
                 entry.config(state=_was)
-            self._minimax_ft_save_autoset = cyc
+            self._minimax_ft_save_autoset = _target
         except Exception:
             pass
 
@@ -7445,6 +7452,11 @@ class LoRATrainerGUI:
         # 'Finish one category early' STAYS under FT (retirement works there now, stop-only
         # at cycle boundaries) — its mode picker hides and its hint swaps.
         self._refresh_mixed_stop_hint()
+        # A restored session can come up with FT already ON and a stale non-multiple in
+        # the save box (field: 10 survived an app restart and the trainer silently snapped
+        # it) — visibility runs on every restore/arch-switch, so re-snap here too. No-op
+        # when FT is off (the refresh early-returns).
+        self._refresh_minimax_ft_save_box()
 
     def _refresh_mixed_stop_hint(self):
         """Swap the 'Finish one category early' hint and hide the anchor/stop picker under

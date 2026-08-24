@@ -2744,16 +2744,20 @@ def train_minimax(
                     rot_schedule.n_windows, list(rot_schedule.components),
                     _cycle_n, rot_schedule.cycle_epochs, _first)
         # Save cadence snaps to the cycle too — each save is a full ~21 GB checkpoint, and
-        # per-cycle saves compare like-for-like (every block equally trained). An explicit
-        # multiple of the cycle is respected (sparser is fine); anything else is corrected
-        # so the user never has to derive the cycle arithmetic themselves. 0 = final only.
+        # per-cycle saves compare like-for-like (every block equally trained). A multiple
+        # of the cycle is respected; anything else snaps UP to the next multiple — the
+        # typed number expressed how SPARSE the user wants 20 GB saves (and, since
+        # previews follow saves, previews), so rounding down to one-per-cycle would give
+        # 2.5x the saves they asked for (field: 10 on a 4-cycle silently became 4).
+        # 0 = final only.
         _cyc = rot_schedule.cycle_epochs
         if save_every_n_epochs and save_every_n_epochs % _cyc != 0:
+            _snapped_save = ((save_every_n_epochs + _cyc - 1) // _cyc) * _cyc
             logger.info("[h3-ft] Save every %d epoch(s) doesn't line up with the %d-epoch "
-                        "cycle — saving once per cycle instead (each save is a full ~21 GB "
-                        "checkpoint; multiples of the cycle are also accepted).",
-                        save_every_n_epochs, _cyc)
-            save_every_n_epochs = _cyc
+                        "cycle — snapping to %d, the next multiple (each save is a full "
+                        "~21 GB checkpoint, and previews ride along with saves).",
+                        save_every_n_epochs, _cyc, _snapped_save)
+            save_every_n_epochs = _snapped_save
         if sample_prompts and te_path:
             logger.info("[h3-ft] previews follow CHECKPOINT SAVES (every %d epoch(s), plus "
                         "the final one) — each sample is the rehearsal of a checkpoint you "
