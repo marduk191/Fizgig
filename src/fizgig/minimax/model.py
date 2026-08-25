@@ -22,6 +22,7 @@ adaln_proj.linear.weight, video_patch_proj, condition_proj, time_embedder.proj_i
 token_refiner.blocks.N..., final_layer...), so a LoRA/FT trained here maps back onto the base.
 """
 
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Optional
@@ -29,6 +30,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 
 # --- config ------------------------------------------------------------------------------
@@ -286,7 +289,12 @@ class TimeEmbedder(nn.Module):
         freqs = torch.exp(-math.log(10000.0) * torch.arange(half, dtype=torch.float32, device=t.device) / half)
         args = t.to(torch.float32)[:, None] * freqs[None]
         emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        return self.proj_out(F.silu(self.proj_in(emb)))
+        # The sinusoid is built fp32 for precision; the projections load at the compute
+        # dtype (bf16) on a bf16 checkpoint — feed them their own dtype or F.linear
+        # rejects the mix. (Pre-existing: the bf16-checkpoint path could never forward;
+        # unnoticed because everyone trains the pruned int8 file, which has no
+        # time_embedder at all. Found by the NF4-ring bf16-shape test, 25 Aug.)
+        return self.proj_out(F.silu(self.proj_in(emb.to(self.proj_in.weight.dtype))))
 
 
 class Attention(nn.Module):
@@ -538,9 +546,13 @@ class MiniMaxH3DiT(nn.Module):
         (uint8, 0.5 B/param) through the moves, so a parked block costs ~¼ of its GPU footprint
         in system RAM and one PCIe round-trip per pass.
 
-        h2d_only=True (int8 ConvRot bases only, #73 @rintic-13) streams the frozen int8
-        tensors host→device through a ring buffer on a copy stream instead — no writeback, the
-        prefetch overlaps compute. h2d_only=None KEEPS the previously requested mode: the
+        h2d_only=True streams the frozen tensors host→device through a ring buffer on a
+        copy stream instead — no writeback, the prefetch overlaps compute. The ring class
+        is picked by MODULE TYPE in the swapped tail: ConvRot int8 → H3Int8H2DOffloader
+        (#73 @rintic-13); bnb Linear4bit (NF4) → H3NF4H2DOffloader (@mabseyuk) — type,
+        not residency, so a bare re-entry after a full CPU park can't mis-dispatch. Ring
+        construction failure falls back to classic parking with a warning rather than
+        killing the run. h2d_only=None KEEPS the previously requested mode: the
         preview-decode path parks the whole DiT and re-calls this bare, and it must come back
         in the mode it left, with the stale offloader rebuilt (a whole-model .to() replaces
         every tensor storage this machinery caches)."""
@@ -557,22 +569,76 @@ class MiniMaxH3DiT(nn.Module):
             for blk in self.blocks:
                 if hasattr(blk, "_h2d_offloader"):
                     blk._h2d_offloader = None
+            # Drop the reference NOW: the old ring's CPU staging dict would otherwise
+            # stay alive through the new ring's construction below, doubling the pinned
+            # staging at every preview rebuild (up to ~13 GB extra on a 40-block bf16
+            # plan — audit, 25 Aug). The module bindings keep each old flat alive only
+            # until its block rebinds, so the peak drops to ~one block's worth.
+            old = None
 
         n = max(0, min(int(blocks_to_swap), len(self.blocks) - 2))   # keep >=2 resident
         self._swap_from = len(self.blocks) - n
 
         if self._h2d_requested and n > 0:
-            from .h3_h2d_offload import H3Int8H2DOffloader
-            dev = next((m.qdata.device for b in self.blocks for m in b.modules()
-                        if m.__class__.__name__ == "ConvRotInt8Linear"
-                        and m.qdata.is_cuda), None) or torch.device("cuda")
-            self._h2d_offloader = H3Int8H2DOffloader(self.blocks, self._swap_from,
-                                                     device=dev, ring_size=ring_size)
-            self._h2d_offloader.move_static_weights_to_gpu()
-            self._h2d_offloader.prepare()
-            for blk in self.blocks:
-                blk._h2d_offloader = self._h2d_offloader
-            return n
+            # Dispatch by module TYPE in the swapped tail, not residency: after a full
+            # park every tensor is CPU-resident, and the bare re-entry from
+            # restore_parked_dit must still find the same ring class it left.
+            _tail_types = {m.__class__.__name__
+                           for i in range(self._swap_from, len(self.blocks))
+                           for m in self.blocks[i].modules()}
+            try:
+                if "ConvRotInt8Linear" in _tail_types:
+                    from .h3_h2d_offload import H3Int8H2DOffloader
+                    _cls = H3Int8H2DOffloader
+                    dev = next((m.qdata.device for b in self.blocks for m in b.modules()
+                                if m.__class__.__name__ == "ConvRotInt8Linear"
+                                and m.qdata.is_cuda), None) or torch.device("cuda")
+                elif "Linear4bit" in _tail_types:
+                    from .h3_nf4_h2d_offload import H3NF4H2DOffloader
+                    _cls = H3NF4H2DOffloader
+                    # Derive the device from the resident head rather than assuming
+                    # device 0 (the int8 branch derives from live qdata for the same
+                    # reason) — a non-default CUDA index would otherwise put the ring
+                    # slots and copy stream on the wrong card.
+                    dev = next((p.device for p in self.blocks[0].parameters()
+                                if p.is_cuda), None) or torch.device("cuda")
+                else:
+                    raise RuntimeError(
+                        f"no ring-streamable modules in the swapped tail "
+                        f"(saw {sorted(_tail_types)[:6]}...)")
+                self._h2d_offloader = _cls(self.blocks, self._swap_from,
+                                           device=dev, ring_size=ring_size)
+                self._h2d_offloader.move_static_weights_to_gpu()
+                self._h2d_offloader.prepare()
+                for blk in self.blocks:
+                    blk._h2d_offloader = self._h2d_offloader
+                return n
+            except Exception as _e:
+                # The ring is strictly better when constructible; classic parking is the
+                # safety net, never a crash. _h2d_requested resets so bare re-entries
+                # don't retry a construction that already failed.
+                logger.warning("[vram] H2D ring construction failed (%s: %s) — falling "
+                               "back to classic parking swap for this run: blocks will "
+                               "cross PCIe every step, several times slower. Lower "
+                               "Target Megapixels or free VRAM to need less swap.",
+                               type(_e).__name__, _e)
+                # A failure AFTER construction (move_static/prepare OOM — the case this
+                # fallback exists for) leaves a LIVE half-built ring: its backward hooks
+                # would fire mid-training over classic-parked blocks and rebind their
+                # weights to ring views (crash or silent corruption), and its pinned
+                # staging would stay resident on the exact machine that just ran out.
+                # release() removes the hooks, rebinds modules to their CPU masters, and
+                # synchronizes the copy stream — which also makes the .to("cpu") parking
+                # below race-free (review, 25 Aug).
+                _bad = self._h2d_offloader
+                self._h2d_offloader = None
+                if _bad is not None:
+                    try:
+                        _bad.release()
+                    except Exception:
+                        pass
+                    _bad = None
+                self._h2d_requested = False
 
         self._h2d_offloader = None
         for i in range(self._swap_from, len(self.blocks)):
@@ -625,7 +691,11 @@ class MiniMaxH3DiT(nn.Module):
             text_states = self.token_refiner(self.condition_proj(text_states))
         # video: patchify -> patch proj
         video_rows = patchify_video(video_latent.to(torch.float32), self.patch_size)
-        video_embed = self.video_patch_proj(video_rows).to(dtype)
+        # Rows are built fp32 for precision, but the projection loads at whatever dtype
+        # the checkpoint stored (fp32 island on the pruned file, bf16 elsewhere) — feed
+        # it its own dtype, same rule as TimeEmbedder (review, 25 Aug).
+        video_embed = self.video_patch_proj(
+            video_rows.to(self.video_patch_proj.weight.dtype)).to(dtype)
 
         # r2v reference condition rows. Same patchify + projection as the target, but blended
         # with a trace of noise first: r = aug*r + (1-aug)*noise. The reference restarts the SAME
@@ -642,7 +712,8 @@ class MiniMaxH3DiT(nn.Module):
                     r = visual_cond_noise_aug * r + (1.0 - visual_cond_noise_aug) * noise
                 _rows.append(r)
                 ref_shapes.append((z.shape[-2], z.shape[-1]))
-            ref_embed = self.video_patch_proj(torch.cat(_rows, dim=0)).to(dtype)
+            ref_embed = self.video_patch_proj(
+                torch.cat(_rows, dim=0).to(self.video_patch_proj.weight.dtype)).to(dtype)
 
         # audio: silence (x0 = 0) noised on the audio schedule at the same schedule position as
         # the video rows. Present because the base model has never seen a pack without it.
@@ -677,7 +748,8 @@ class MiniMaxH3DiT(nn.Module):
                     eps = torch.randn(n_audio_latents * AUDIO_CHANNELS, self.config.audio_latents_dim,
                                       device=device, dtype=torch.float32)
                 _arows = sigma_a * eps.to(device=device, dtype=torch.float32)
-            audio_embed = self.audio_patch_proj(_arows).to(dtype)
+            audio_embed = self.audio_patch_proj(
+                _arows.to(self.audio_patch_proj.weight.dtype)).to(dtype)
 
         # pack [text | refs | audio | video] — the reference's segment order
         parts = ([text_states.to(dtype)]
@@ -813,7 +885,8 @@ class MiniMaxH3DiT(nn.Module):
             if text_states.shape[-1] != self.hidden_size:
                 text_states = self.token_refiner(self.condition_proj(text_states))
             video_rows = patchify_video(video_latent.to(torch.float32), self.patch_size)
-            video_embed = self.video_patch_proj(video_rows).to(dtype)
+            video_embed = self.video_patch_proj(
+                video_rows.to(self.video_patch_proj.weight.dtype)).to(dtype)
 
             t_val = t.reshape(-1)[:1].to(torch.float32) if torch.is_tensor(t) else torch.tensor([float(t)], device=device)
             t_val = t_val.to(device)
@@ -833,7 +906,8 @@ class MiniMaxH3DiT(nn.Module):
                     _arows = sigma_a * torch.randn(n_audio_latents * AUDIO_CHANNELS,
                                                    self.config.audio_latents_dim,
                                                    device=device, dtype=torch.float32)
-                audio_embed = self.audio_patch_proj(_arows).to(dtype)
+                audio_embed = self.audio_patch_proj(
+                    _arows.to(self.audio_patch_proj.weight.dtype)).to(dtype)
 
             parts = ([text_states.to(dtype)]
                      + ([audio_embed] if audio_embed is not None else [])

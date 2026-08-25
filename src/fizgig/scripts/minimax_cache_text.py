@@ -25,7 +25,6 @@ from fizgig.dataset.config import (
     load_user_config,
 )
 from fizgig.scripts.cache_text import prepare_cache_files_and_paths, process_batches, post_process
-from fizgig.minimax.embedder import load_minimax_h3_te
 from fizgig.minimax.caching import encode_and_save_text
 from fizgig.training.metadata import ARCHITECTURE_MINIMAX
 
@@ -57,6 +56,33 @@ def setup_parser() -> argparse.ArgumentParser:
                              "copy the answer). Needs the vision tower, so the TE loads ~1 GB "
                              "larger, and needs latents cached first.")
     return parser
+
+
+def _clear_reference_slots(datasets, reason):
+    """Delete every `*_teref{N}.safetensors` in each dataset's cache dir.
+
+    The trainer picks a reference slot purely by file EXISTENCE (image_dataset.py), so a
+    stale slot is not disk bloat — it is a live input: a run launched WITHOUT references
+    after a run that used them would silently keep training the distillation branch
+    against the old teacher conditioning. The general stale-cache sweeps never match
+    these files (latents glob `*_{arch}.safetensors`, text glob `*_{arch}_te.safetensors`),
+    so this is their one owner."""
+    import glob as _glob
+    cleared = 0
+    for ds in datasets:
+        cache_dir = getattr(ds, "cache_directory", "") or ""
+        if not cache_dir or not os.path.isdir(cache_dir):
+            continue
+        for _p in _glob.glob(os.path.join(_glob.escape(cache_dir),
+                                          f"*{ARCHITECTURE_MINIMAX}_teref*.safetensors")):
+            try:
+                os.remove(_p)
+                cleared += 1
+            except OSError as _e:
+                logger.warning("[reference] could not clear %s (%s)", _p, _e)
+    if cleared:
+        logger.info("[reference] cleared %d stale reference slot file(s) — %s",
+                    cleared, reason)
 
 
 def _cache_reference_conditioning(args, datasets, all_files, all_paths, encoder):
@@ -152,17 +178,7 @@ def _cache_reference_conditioning(args, datasets, all_files, all_paths, encoder)
         # Safe because the pass below rewrites slots 0..kk-1 for every image in this dataset;
         # nothing is deleted that is not about to be regenerated. Scoped to this cache dir, so a
         # second subject's references are untouched.
-        if cache_dir and os.path.isdir(cache_dir):
-            _stale = [p for p in _glob.glob(os.path.join(_glob.escape(cache_dir),
-                                                         f"*{ARCHITECTURE_MINIMAX}_teref*.safetensors"))]
-            for _p in _stale:
-                try:
-                    os.remove(_p)
-                except OSError as _e:
-                    logger.warning("[reference] could not clear %s (%s)", _p, _e)
-            if _stale:
-                logger.info("[reference] cleared %d stale reference slot file(s) in %s",
-                            len(_stale), cache_dir)
+        _clear_reference_slots([ds], "re-caching rewrites slots 0..k-1 for every image")
 
         process_batches(args, [ds], [all_files[ds_i]], [all_paths[ds_i]],
                         lambda batch: encode_and_save_reference_text(encoder, batch, reference_for),
@@ -263,10 +279,16 @@ def main():
 
     process_batches(args, datasets, all_files, all_paths, _encode)
 
-    # r2v conditioning for the teacher. Written AFTER the plain cache and to sibling files, so
-    # a run without --reference_count is byte-identical to before.
+    # r2v conditioning for the teacher. Written AFTER the plain cache and to sibling files.
     if _refs:
         _cache_reference_conditioning(args, datasets, all_files, all_paths, encoder)
+    else:
+        # References OFF must mean OFF: the trainer picks slots by file existence, so
+        # teref files surviving from a previous with-references run would silently keep
+        # every still on the distillation branch against a stale teacher.
+        _clear_reference_slots(datasets, "this run has no references; the trainer picks "
+                                         "slots by existence, so leftovers would still "
+                                         "be trained against")
 
     _uncond = encoder.encode("")[0].detach().cpu().contiguous()      # (L=1, 5120)
     del encoder
