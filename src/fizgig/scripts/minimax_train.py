@@ -268,6 +268,12 @@ def setup_parser() -> argparse.ArgumentParser:
     p.add_argument("--finetune_scratch_dir", default=None,
                    help="disk master's spill directory (wants a fast local drive). "
                         "Default: beside the dataset caches.")
+    p.add_argument("--reg_lr_multiplier", type=float, default=0.2,
+                   help="Fine-tune only: LR multiplier for images in a dataset block marked "
+                        "`is_reg = true`. They anchor the model's prior rather than teaching "
+                        "a subject, so they train as a nudge (0.1-0.3). They follow the photo "
+                        "routing and stop with the visual category. Ignored when no reg block "
+                        "is present; ignored (with a warning) on LoRA runs.")
     return p
 
 
@@ -365,6 +371,7 @@ def main():
         finetune_blocks=args.finetune_blocks,
         finetune_master=args.finetune_master,
         finetune_scratch_dir=args.finetune_scratch_dir,
+        reg_lr_multiplier=args.reg_lr_multiplier,
     )
 
 

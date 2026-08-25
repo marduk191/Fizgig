@@ -4501,6 +4501,38 @@ class LoRATrainerGUI:
         self._minimax_ft_fused_cb.grid(row=68, column=0, columnspan=2, sticky=tk.W,
                                        padx=(21, 5), pady=(2, 0))
 
+        # Optional regularisation set — same doctrine as the Krea 2 FT card (real photos of
+        # the broader class, trained at a fixed low LR as a prior anchor), with H3-specific
+        # lifecycle: reg stills follow the photo routing (likeness window) and stop with the
+        # visual category under 'Finish one category early'. Entirely optional — empty = off.
+        self._minimax_reg_frame = ttk.Frame(training_content)
+        self._minimax_reg_frame.grid(row=69, column=0, columnspan=2, sticky=tk.W,
+                                     padx=(21, 5), pady=(6, 0))
+        ttk.Label(self._minimax_reg_frame, text="Regularisation images (optional):").pack(side=tk.LEFT)
+        self.minimax_reg_dir_var = tk.StringVar(value=str(self.settings.get("MINIMAX_REG_DIR", "")))
+        _mregent = ttk.Entry(self._minimax_reg_frame, textvariable=self.minimax_reg_dir_var, width=40)
+        _mregent.pack(side=tk.LEFT, padx=(6, 4))
+        ttk.Button(self._minimax_reg_frame, text="Browse", width=8,
+                   command=self._browse_minimax_reg_dir).pack(side=tk.LEFT)
+        self.minimax_reg_dir_var.trace_add(
+            "write", lambda *_a: self.auto_save_dataset_config_silent())
+        ttk.Label(self._minimax_reg_frame, text="LR ×").pack(side=tk.LEFT, padx=(14, 2))
+        self.minimax_reg_mult_var = tk.StringVar(value=str(self.settings.get("MINIMAX_REG_MULT", "0.2")))
+        ttk.Combobox(self._minimax_reg_frame, textvariable=self.minimax_reg_mult_var,
+                     values=["0.05", "0.1", "0.2", "0.3", "0.5", "0.75", "1.0"],
+                     state="normal", width=5).pack(side=tk.LEFT)
+        ToolTip(_mregent,
+                "A folder of ordinary REAL photos of the broader class — people, faces — with "
+                "normal detailed captions. Leave empty to train without one.\n\n"
+                "A full fine-tune moves the base weights with nothing bounding the drift; these "
+                "anchor the model's prior while your subject data pulls it. Real photos, not "
+                "model output — generated images anchor the model to its own artifacts.\n\n"
+                "They train at the LR multiplier beside this box (0.1-0.3 keeps them a nudge), "
+                "follow the same photo routing as your subject stills, and stop when photos & "
+                "clips stop under 'Finish one category early' — once subject pressure ends, the "
+                "counter-pressure ends with it. Stills only: they tether the visual prior; the "
+                "audio prior is protected by voice routing instead.")
+
         self._minimax_ft_hint = ttk.Label(training_content,
                   text="Trains the base model's own weights, not an adapter — Network Type "
                        "and Blocks to Train hide while this is on (they're LoRA machinery); "
@@ -4521,7 +4553,7 @@ class LoRATrainerGUI:
                        "to a shareable LoRA with Checkpoint to LoRA.",
                   foreground=COLORS["text_explain"], font=(FONT_FAMILY, 9, "italic"),
                   justify=tk.LEFT, wraplength=720)
-        self._minimax_ft_hint.grid(row=69, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 6))
+        self._minimax_ft_hint.grid(row=70, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 6))
         # --- Per-step movement clip (MiniMax only) -----------------------------------------
         # Whichever block sits LAST in the trained range absorbs 2-4x the median block's
         # movement from epoch 1 (measured across four runs; cutting blocks just moves the hot
@@ -5691,6 +5723,8 @@ class LoRATrainerGUI:
             ("MINIMAX_FT_SCOPE", "minimax_ft_scope_var", str),
             ("MINIMAX_FT_BLOCKSPEC", "minimax_ft_blockspec_var", str),
             ("MINIMAX_FT_FUSED", "minimax_ft_fused_var", bool),
+            ("MINIMAX_REG_DIR", "minimax_reg_dir_var", str),
+            ("MINIMAX_REG_MULT", "minimax_reg_mult_var", str),
         ]
         _ft_touched = False
         for _key, _attr, _cast in _ft_map:
@@ -6582,6 +6616,8 @@ class LoRATrainerGUI:
         _grab("minimax_ft_scope_var", "MINIMAX_FT_SCOPE")
         _grab("minimax_ft_blockspec_var", "MINIMAX_FT_BLOCKSPEC")
         _grab("minimax_ft_fused_var", "MINIMAX_FT_FUSED")
+        _grab("minimax_reg_dir_var", "MINIMAX_REG_DIR")
+        _grab("minimax_reg_mult_var", "MINIMAX_REG_MULT")
         # MiniMax reference distillation. A plain StringVar, so the generic self.entries sweep
         # above does NOT see it — without this a queued distillation run loses its reference
         # and silently becomes an ordinary run (tests/test_minimax_distill_gui.py).
@@ -7271,6 +7307,15 @@ class LoRATrainerGUI:
             self.krea2_reg_dir_var.set(d)
             self.auto_save_dataset_config_silent()   # the TOML carries the reg block
 
+    def _browse_minimax_reg_dir(self):
+        """Pick the optional regularisation image folder (MiniMax H3 fine-tune)."""
+        from tkinter import filedialog
+        d = filedialog.askdirectory(title="Regularisation images (optional)",
+                                    initialdir=self.minimax_reg_dir_var.get() or None)
+        if d:
+            self.minimax_reg_dir_var.set(d)
+            self.auto_save_dataset_config_silent()   # the TOML carries the reg block
+
     def _apply_krea2_ft_visibility(self):
         """Show the fine-tune knobs only when base-model fine-tuning is on, and the
         blocks-per-window picker only in block mode (component windows are fixed)."""
@@ -7425,7 +7470,8 @@ class LoRATrainerGUI:
         if not hasattr(self, "_minimax_ft_frame"):
             return
         on = bool(self.minimax_finetune_var.get())
-        for w in (self._minimax_ft_frame, self._minimax_ft_fused_cb, self._minimax_ft_hint):
+        for w in (self._minimax_ft_frame, self._minimax_ft_fused_cb,
+                  self._minimax_reg_frame, self._minimax_ft_hint):
             self._set_widget_visible(w, on)
         # The likeness tickbox STAYS — same meaning, different mechanism: under FT it drives
         # the Blocks field (whole fine-tune on the identity blocks) instead of masking photo
@@ -7638,7 +7684,8 @@ class LoRATrainerGUI:
         if is_minimax:
             self._apply_minimax_ft_visibility()
         elif hasattr(self, "_minimax_ft_frame"):
-            for w in (self._minimax_ft_frame, self._minimax_ft_fused_cb, self._minimax_ft_hint):
+            for w in (self._minimax_ft_frame, self._minimax_ft_fused_cb,
+                      self._minimax_reg_frame, self._minimax_ft_hint):
                 self._set_widget_visible(w, False)
         # Network Type (LoRA/LoKR) is wired for BOTH native families (krea2_train and
         # minimax_train take --network_type/--lokr_factor); Klein trains standard only.
@@ -24647,15 +24694,24 @@ class LoRATrainerGUI:
                 except ValueError:
                     pass
 
-            # Optional regularisation set (Krea 2 fine-tune): a second dataset block marked
-            # is_reg, so the cache scripts pick it up for free and the trainer can find its
-            # items. Only written when a folder is set — no folder, no block, nothing changes.
-            # Fine-tune only: with FT off the block must not be written at all, or the reg
-            # images would be cached and trained as ordinary subjects at full LR.
-            reg_dir = (self.krea2_reg_dir_var.get().strip().replace("\\", "/")
-                       if hasattr(self, "krea2_reg_dir_var") else "")
-            reg_on = bool(getattr(self, "krea2_finetune_var", None)
-                          and self.krea2_finetune_var.get())
+            # Optional regularisation set (fine-tune only, per family): a second dataset
+            # block marked is_reg, so the cache scripts pick it up for free and the trainer
+            # can find its items. Only written when a folder is set — no folder, no block,
+            # nothing changes. Fine-tune only: with FT off the block must not be written at
+            # all, or the reg images would be cached and trained as ordinary subjects at
+            # full LR. Arch-scoped: each family's reg row + FT toggle only speak for their
+            # own family (a stale toggle from the other family must not leak a block in).
+            if self._is_minimax_arch():
+                reg_dir = (self.minimax_reg_dir_var.get().strip().replace("\\", "/")
+                           if hasattr(self, "minimax_reg_dir_var") else "")
+                reg_on = bool(getattr(self, "minimax_finetune_var", None)
+                              and self.minimax_finetune_var.get())
+            else:
+                reg_dir = (self.krea2_reg_dir_var.get().strip().replace("\\", "/")
+                           if hasattr(self, "krea2_reg_dir_var") else "")
+                reg_on = bool(self._is_krea2_arch()
+                              and getattr(self, "krea2_finetune_var", None)
+                              and self.krea2_finetune_var.get())
             if reg_on and reg_dir and os.path.isdir(reg_dir) and not is_jsonl and not is_video:
                 toml_lines.append("")
                 toml_lines.append("[[datasets]]")
@@ -26647,6 +26703,16 @@ class LoRATrainerGUI:
                 cmd += ["--finetune_blocks", _mftspec]
             if not bool(self.minimax_ft_fused_var.get()):
                 cmd += ["--no_finetune_fused_backward"]
+            # Regularisation LR multiplier — only meaningful when the TOML carries the
+            # is_reg block (same gate as the block writer: FT on + a real folder).
+            _mreg = (self.minimax_reg_dir_var.get().strip()
+                     if hasattr(self, "minimax_reg_dir_var") else "")
+            if _mreg and os.path.isdir(_mreg):
+                try:
+                    _mrm = float(self.minimax_reg_mult_var.get())
+                except ValueError:
+                    _mrm = 0.2
+                cmd += ["--reg_lr_multiplier", str(max(0.0, _mrm))]
         # LoKR (Kronecker) — dim/alpha still ride along above but the trainer ignores them;
         # the factor is the dial. Same flags as the Krea 2 builder. Suppressed under FT: the
         # trainer builds no adapter at all there.

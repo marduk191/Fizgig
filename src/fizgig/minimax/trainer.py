@@ -2249,6 +2249,7 @@ def train_minimax(
     finetune_blocks: str = None,
     finetune_master: str = "auto",          # "auto" | "ram" | "disk" — see the mode select
     finetune_scratch_dir: str = None,       # disk mode's spill dir; default: beside the caches
+    reg_lr_multiplier: float = 0.2,         # FT only: LR nudge for `is_reg` dataset blocks
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
 ):
@@ -3323,6 +3324,40 @@ def train_minimax(
                     "References come from the dataset itself (each image paired with others by "
                     "the caching pass); no image is ever its own reference.",
                     distill_weight, 1.0 - distill_weight)
+
+    # Regularisation images (`is_reg = true` dataset blocks) — a PRIOR ANCHOR, not a subject
+    # (same doctrine as Krea 2 FT): a full fine-tune moves the base weights with no low-rank
+    # bound, so a handful of subjects drifts the model's whole notion of people. Reg stills
+    # pull back, and only work as a fixed reduced-LR nudge. Their lifecycle rides the visual
+    # category for free: they are stills, so likeness routing confines them to the photo
+    # window and 'Finish photos & clips early' stops them with the photos (by design —
+    # once subject-visual pressure stops, the counter-pressure must stop too). LoRA runs
+    # ignore them with a warning: the update is rank-bounded, the problem doesn't exist.
+    reg_keys = set()
+    reg_mult = float(reg_lr_multiplier)
+    if rotator is not None:
+        for _ds in group.datasets:
+            if not getattr(_ds, "is_reg", False):
+                continue
+            _bm = getattr(_ds, "batch_manager", None)
+            if _bm is None:
+                continue
+            for _bucket in _bm.buckets.values():
+                for _it in _bucket:
+                    reg_keys.add(str(_it.item_key))
+        if reg_keys:
+            logger.info(f"[reg] {len(reg_keys)} regularisation image(s) at x{reg_mult:g} LR "
+                        f"({group.num_train_items - len(reg_keys)} subject items). They follow "
+                        "the photo routing and the visual category's stop epoch.")
+            if len(reg_keys) >= group.num_train_items - len(reg_keys):
+                logger.warning("[reg] regularisation images are at least half the training "
+                               "set — keep them the minority or the multiplier stops reading "
+                               "as a nudge.")
+    elif any(getattr(_ds, "is_reg", False) for _ds in group.datasets):
+        logger.warning("[reg] the dataset config has a regularisation block, but this is a "
+                       "LoRA run — regularisation images are a fine-tune feature and are "
+                       "IGNORED here. They will train as ordinary images at full LR; remove "
+                       "the `is_reg` block from the TOML if that is not what you want.")
 
     collator = _Collator(shared_epoch, group)
     loader = DataLoader(group, batch_size=1, shuffle=True, collate_fn=collator, num_workers=0)
@@ -4457,9 +4492,16 @@ def train_minimax(
             # Appended for EVERY executed backward (distill path included — a retired visual
             # category's distillation steps anchor exactly like its plain ones).
             _cat_acc.append(ANCHOR_LR_SCALE if _retired else 1.0)
+            # Regularisation images (FT): scale THIS step's gradient down to the nudge —
+            # loss scaling, because the fused per-tensor update has no optimizer object
+            # whose LR could be rewritten. The RAW loss is what the ledgers record below,
+            # so avr_loss and the drift lines see unscaled numbers (Krea 2 FT parity).
+            _bk = loss
+            if reg_keys and any(str(k) in reg_keys for k in (batch.get("item_keys") or ())):
+                _bk = loss * reg_mult
             # Divide so the accumulated gradient is the MEAN over the window, not the sum —
             # otherwise the effective LR scales with the accumulation count.
-            (loss / _accum_n if _accum_n > 1 else loss).backward()
+            (_bk / _accum_n if _accum_n > 1 else _bk).backward()
             for _p in _frz:
                 _p.requires_grad_(True)
             _pending[0] += 1
