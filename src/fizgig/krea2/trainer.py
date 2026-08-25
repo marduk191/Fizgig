@@ -241,7 +241,9 @@ def load_dit_for_training(
     # With a turbo net staged, its enabled flag becomes a dynamo guard: the first preview
     # compiles a second graph variant (enabled=True), after which both states are cached.
     if compile_blocks:
-        _compile_blocks(dit, blocks_to_swap)
+        # fp8_scaled here is the RESOLVED value (int8/NF4 force it False above), so the
+        # guard sees the base that actually loaded.
+        _compile_blocks(dit, blocks_to_swap, fp8_scaled=fp8_scaled)
     return dit, network, turbo_net, turbo_diffb
 
 
@@ -337,7 +339,7 @@ def _find_host_compiler() -> bool:
     return False
 
 
-def _compile_blocks(dit, blocks_to_swap: int) -> None:
+def _compile_blocks(dit, blocks_to_swap: int, fp8_scaled: bool = False) -> None:
     """Compile each transformer block. Opt-in — see the roadmap for what it is and isn't worth.
 
     The win is real on the quantised path (inductor fuses the per-matmul quantise/dequantise
@@ -345,13 +347,34 @@ def _compile_blocks(dit, blocks_to_swap: int) -> None:
     first step, and a recompile for every new latent shape a bucketed dataset presents.
 
     Refused under block swap: compiled graphs assume their weights stay put, and swap moves them
-    between CPU and GPU every step.
+    between CPU and GPU every step. Also refused for the fp8 base on pre-Ada GPUs: inductor
+    lowers the fp8 dequant to an fp8e4nv Triton kernel that only SM 8.9+ silicon has, and the
+    resulting ValueError escapes dynamo's suppress_errors and kills the run before step one
+    (#97, RTX 3090).
     """
     if blocks_to_swap > 0:
         logger.warning("[compile] ignored — block swap moves weights between devices every step, "
                        "which invalidates compiled graphs. Quantise instead of swapping if you "
                        "want both.")
         return
+    if fp8_scaled:
+        _cc = None
+        try:
+            # `import torch as _torch`, NOT the bare name: the `import torch._dynamo`
+            # further down makes `torch` function-LOCAL, so referencing it here raises
+            # UnboundLocalError — which the except below would silently eat, and the
+            # guard would never fire (caught by the #97 regression test's tracer).
+            import torch as _torch
+            if _torch.cuda.is_available():
+                _cc = _torch.cuda.get_device_capability()
+        except Exception:
+            pass
+        if _cc is not None and _cc < (8, 9):
+            logger.warning("[compile] ignored — the fp8 base needs fp8 Triton kernels "
+                           "(fp8e4nv), which need SM 8.9+ (RTX 40-series or newer); this GPU "
+                           "is SM %d.%d. Pick INT8 or NF4 Base Precision to compile on this "
+                           "card. Training continues uncompiled.", _cc[0], _cc[1])
+            return
     try:
         import triton  # noqa: F401
     except Exception:

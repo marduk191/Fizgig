@@ -6143,7 +6143,11 @@ class LoRATrainerGUI:
         self.start_training()
         # start_training can decline (validation, disk warning declined). The item's settings
         # are in the GUI either way; put it back at the head so nothing is silently lost.
-        if getattr(self, "training_state", "idle") != "running":
+        # _training_start_pending counts as LAUNCHED: with a warm caption worker the real
+        # launch is marshalled through after(0) and training_state is still "idle" here —
+        # re-inserting then would run the same item twice (review agent, 25 Aug).
+        if (getattr(self, "training_state", "idle") != "running"
+                and not getattr(self, "_training_start_pending", False)):
             self.training_queue.insert(0, item)
             self._save_training_queue()
             self._refresh_queue_button()
@@ -24433,9 +24437,89 @@ class LoRATrainerGUI:
             with open(output_path, "w", encoding="utf-8") as f:
                 f.write(toml_content)
             self._dataset_config_var.set(output_path)
-            self.settings["DATASET_CONFIG"] = output_path
+            # Deliberately NOT settings["DATASET_CONFIG"] (#98): during a run that key
+            # points at the run's frozen snapshot, and this writer fires on every edit —
+            # re-pointing it mid-pipeline is exactly the dataset-swap race. The launch
+            # collects the live path from _dataset_config_var itself.
         except Exception:
             pass  # Silently fail - user can manually save if needed
+
+    _RUN_SNAPSHOT_DIRNAME = "run_snapshots"
+
+    def _snapshot_dataset_config_for_run(self, live_path, resuming=False, prev_config=None):
+        """Copy the dataset TOML to an immutable per-run file and return its path (#98).
+
+        Each launched run trains from its own frozen copy of the config, so edits made on
+        the Start tab while a run initialises (or trains) can never retarget it. On
+        resume, the run's EXISTING snapshot (prev_config — captured by the launch BEFORE
+        the settings collection overwrites the key with the live path) is kept: a paused
+        run must finish on the dataset it started with, not whatever the Start tab shows
+        now. Any failure falls back to the live path — the pre-#98 behaviour, never
+        worse. Deliberately NOT _persist_disabled-guarded: snapshots are ephemeral,
+        pruned, gitignored copies, and the guard would make this untestable — headless
+        tests patch DATASET_DIR instead."""
+        import shutil as _shutil
+        import time as _time
+        try:
+            if resuming:
+                prev = str(prev_config or "")
+                if (os.path.basename(os.path.dirname(prev)) == self._RUN_SNAPSHOT_DIRNAME
+                        and os.path.isfile(prev)):
+                    return prev
+            if not live_path or not os.path.isfile(live_path):
+                return live_path
+            snap_dir = os.path.join(DATASET_DIR, self._RUN_SNAPSHOT_DIRNAME)
+            os.makedirs(snap_dir, exist_ok=True)
+            _name = re.sub(r"[^A-Za-z0-9._-]+", "_",
+                           str(self.settings.get("LORA_NAME", "") or "run")) or "run"
+            snap = os.path.join(snap_dir, f"{_name}-{int(_time.time() * 1000)}.toml")
+            _shutil.copyfile(live_path, snap)
+        except Exception:
+            return live_path
+        # Prune AFTER the snapshot is secured, in its own guard — a prune hiccup must
+        # never un-freeze the run (the copy above already succeeded). Rule: the newest 12
+        # always stay, and older files go only once they are ALSO older than 30 days —
+        # so a paused run's frozen config outlives any burst of launches, whatever
+        # output dir its sidecar lives in (no sidecar lookup: at this point the settings
+        # already describe the LAUNCHING run, not the paused one).
+        try:
+            import glob as _glob
+            _cutoff = _time.time() - 30 * 86400
+            olds = sorted(_glob.glob(os.path.join(_glob.escape(snap_dir), "*.toml")),
+                          key=lambda p: (os.path.getmtime(p) if os.path.exists(p) else 0),
+                          reverse=True)
+            for p in olds[12:]:
+                try:
+                    if (os.path.normpath(p) != os.path.normpath(snap)
+                            and os.path.getmtime(p) < _cutoff):
+                        os.remove(p)
+                except OSError:
+                    pass
+        except Exception:
+            pass
+        return snap
+
+    def _verify_frozen_dataset_config(self, path):
+        """-> list of Start-tab folders MISSING from the frozen TOML, or None when all
+        present (#98 follow-up). The auto-saver skips its rewrite silently when a dataset
+        field fails to parse, so without this check a launch could freeze — and train —
+        the PREVIOUS dataset under the new run's name. Unreadable/absent file returns
+        None: existence is validate_inputs' job, and refusing here would double-report."""
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except Exception:
+            return None
+
+        def _norm(p):
+            return str(p).strip().lower().replace("\\", "/").rstrip("/")
+
+        listed = {_norm(m) for m in
+                  re.findall(r'^\s*image_directory\s*=\s*"([^"]*)"', text, re.M)}
+        if not listed:
+            return None                    # not a TOML this writer produced — don't judge it
+        missing = [f for f in self._dataset_folders() if f and _norm(f) not in listed]
+        return missing or None
 
     def _build_dataset_toml_text(self):
         """-> (dataset_name, toml text), or None when the config is not writable yet.
@@ -24801,6 +24885,10 @@ class LoRATrainerGUI:
         _check_num("Max Grad Norm", self.entries["MAX_GRAD_NORM"].get(), float, 0)
         _check_num("Network Dropout", self.entries["NETWORK_DROPOUT"].get(), float, 0)
         _check_num("Batch Size (Dataset)", self.dataset_batch_size_var.get(), int, 1)
+        # An unparseable megapixels value makes the TOML auto-saver skip its rewrite
+        # SILENTLY (#98 follow-up) — catch it here with a named error instead of the
+        # launch-time stale-config refusal.
+        _check_num("Target Megapixels (Dataset)", self.dataset_megapixels_var.get(), float, 0)
         if "KEEP_LAST_N_STATES" in self.entries:
             _check_num("Keep Last (states)", self.entries["KEEP_LAST_N_STATES"].get(), int, 1)
 
@@ -25296,6 +25384,12 @@ class LoRATrainerGUI:
                 _lr_val = 1e-4  # ignored by the trainer under adaptive
             else:
                 raise
+        # Captured BEFORE the update below overwrites DATASET_CONFIG with the live editor
+        # path: on a resume this still holds the paused run's frozen snapshot (in-session
+        # from the original launch, cross-restart from the startup sidecar restore), and
+        # the freeze call needs it — reading settings AFTER the update made the resume
+        # keep-rule dead code (three independent review agents, same finding).
+        _prev_dataset_config = str(self.settings.get("DATASET_CONFIG", "") or "")
         self.settings.update({
             "ARCHITECTURE": arch,
             "MODEL_TYPE": self.entries["MODEL_TYPE"].get() if config["uses_model_type"] else "",
@@ -25407,6 +25501,35 @@ class LoRATrainerGUI:
             "ENABLE_BUCKET": self.dataset_enable_bucket_var.get(),
             "BUCKET_NO_UPSCALE": self.dataset_no_upscale_var.get(),
         })
+
+        # Freeze THIS run's dataset config (#98): the pipeline's stages each read the
+        # dataset TOML at their own start, and the Start tab auto-saves that TOML on
+        # every edit — so changing the dataset folder while run 1 initialised (e.g. to
+        # queue run 2) retargeted run 1: dataset 2 trained under run 1's name and
+        # settings. From here on, settings["DATASET_CONFIG"] is the run's immutable
+        # snapshot; the live TOML belongs to the editor alone.
+        self.settings["DATASET_CONFIG"] = self._snapshot_dataset_config_for_run(
+            self.settings.get("DATASET_CONFIG", ""), resuming=_is_resuming_clear,
+            prev_config=_prev_dataset_config)
+
+        # The frozen config must describe the folders on the Start tab (#98 follow-up):
+        # a dataset-field parse failure (e.g. Target Megapixels typed as "1,0") makes the
+        # auto-saver skip its rewrite SILENTLY, so the launch would freeze a STALE toml —
+        # and the previous dataset would train under this run's name. Never on a resume:
+        # there the frozen config deliberately predates the Start tab.
+        if not _is_resuming_clear:
+            _missing = self._verify_frozen_dataset_config(self.settings["DATASET_CONFIG"])
+            if _missing:
+                self.stop_samples_watcher()
+                _msg = ("The dataset config on disk does not include the training "
+                        "folder(s) shown on the Start tab:\n\n"
+                        + "\n".join(_missing)
+                        + "\n\nThis usually means a dataset field failed to parse — check "
+                        "Target Megapixels and Batch Size for typos — so the config was "
+                        "never rewritten. Fix the value and press Start again.")
+                self.update_console(f"[dataset] launch refused — {_msg}\n")
+                messagebox.showerror("Dataset config out of date", _msg)
+                return
 
         # Build training command based on architecture
         command = self.build_training_command(config)
@@ -26160,12 +26283,35 @@ class LoRATrainerGUI:
         # A value persisted from Klein (or from before it was hidden) must not leak into a
         # Krea 2 run through a control the user can no longer see.
         _auto_i8 = getattr(self, "_auto_quant_int8", "")
+        # An EXPLICIT INT8 pick must not depend on Blocks Swap being on Auto (#97): the auto
+        # strategy is the only writer of _auto_quant_int8, and a manual swap value clears it
+        # (the stale-leak guard in _parse_blocks_swap), so "Base Precision: INT8" plus a
+        # manual swap silently fell back to the fp8 base — which Compile Blocks then dies on
+        # for SM 8.6 cards (no fp8e4nv Triton support). At swap 0 the pick is honoured
+        # directly. At swap N the fp8 fallback stays (INT8 weights don't ride the swap —
+        # that pairing is the OOM the stale-leak guard exists for) but is now SAID, not
+        # silent.
+        try:
+            _swap_now = int(str(self.settings.get("BLOCKS_SWAP", 0)).strip() or 0)
+        except (TypeError, ValueError):
+            _swap_now = 0
+        try:
+            _explicit_i8 = self._base_precision() == "int8"
+        except Exception:
+            _explicit_i8 = False
         if self.settings.get("QUANT_4BIT", False):
             cmd.append("--quantize_4bit")
+        elif _explicit_i8 and _swap_now == 0:
+            cmd += ["--quant_int8", "bf16"]
         elif _auto_i8:
             # Chosen by the auto strategy when there is VRAM for it: faster than NF4 and ~7x
             # more accurate, with exact gradients.
             cmd += ["--quant_int8", _auto_i8]
+        elif _explicit_i8:
+            self.update_console(
+                f"[precision] INT8 needs Blocks Swap 0 — INT8 weights don't ride the swap. "
+                f"Running the fp8 base with swap {_swap_now}; set Blocks Swap to 0 or Auto "
+                f"to train on INT8.\n")
 
         # Per-image loss watch: detection logs/reports stuck images (Problem Images window);
         # per-image LR also throttles them (the trainer runs detection when either flag is on).
@@ -26978,6 +27124,13 @@ class LoRATrainerGUI:
             state_path = meta.get("state_path", "")
             if state_path and os.path.isdir(state_path):
                 self.paused_state_path = state_path
+                # Restore the paused run's frozen dataset config (#98) so a cross-restart
+                # resume trains the dataset it started with — the resume launch keeps an
+                # existing snapshot instead of re-freezing whatever the Start tab shows.
+                _dc = str(meta.get("dataset_config", "") or "")
+                if (os.path.basename(os.path.dirname(_dc)) == self._RUN_SNAPSHOT_DIRNAME
+                        and os.path.isfile(_dc)):
+                    self.settings["DATASET_CONFIG"] = _dc
                 self.training_state = "paused"
                 self._refresh_training_buttons()
                 self.update_console(
