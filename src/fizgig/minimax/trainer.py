@@ -2128,6 +2128,22 @@ def _save_lora(network, path, network_dim, network_alpha, dtype, extra_metadata=
     network.save_weights(path, dtype, metadata)
 
 
+def _reg_subject_keys(datasets):
+    """(reg item_keys, subject item_keys) across the dataset group — bare stems, the same
+    strings the collate puts in batch['item_keys']. Split out of train_minimax so the
+    collision handling is pinnable without a full trainer boot."""
+    reg, subj = set(), set()
+    for _ds in datasets:
+        _bm = getattr(_ds, "batch_manager", None)
+        if _bm is None:
+            continue
+        _tgt = reg if getattr(_ds, "is_reg", False) else subj
+        for _bucket in _bm.buckets.values():
+            for _it in _bucket:
+                _tgt.add(str(_it.item_key))
+    return reg, subj
+
+
 def train_minimax(
     dataset_config: str,
     output_dir: str,
@@ -3336,15 +3352,19 @@ def train_minimax(
     reg_keys = set()
     reg_mult = float(reg_lr_multiplier)
     if rotator is not None:
-        for _ds in group.datasets:
-            if not getattr(_ds, "is_reg", False):
-                continue
-            _bm = getattr(_ds, "batch_manager", None)
-            if _bm is None:
-                continue
-            for _bucket in _bm.buckets.values():
-                for _it in _bucket:
-                    reg_keys.add(str(_it.item_key))
+        reg_keys, _subj_keys = _reg_subject_keys(group.datasets)
+        # item_keys are bare image stems — a subject and a reg image sharing a filename
+        # would silently throttle the SUBJECT to reg LR for the whole run. Never punish
+        # the subject: colliding stems leave the reg set (that reg image then trains
+        # unthrottled, which the warning says out loud).
+        _clash = reg_keys & _subj_keys
+        if _clash:
+            reg_keys -= _clash
+            logger.warning(
+                f"[reg] {len(_clash)} filename(s) appear in BOTH the subject and the "
+                f"regularisation folders ({', '.join(sorted(_clash)[:5])}"
+                f"{'...' if len(_clash) > 5 else ''}) — those items train as ordinary "
+                "subjects at full LR. Rename the regularisation copies to re-anchor them.")
         if reg_keys:
             logger.info(f"[reg] {len(reg_keys)} regularisation image(s) at x{reg_mult:g} LR "
                         f"({group.num_train_items - len(reg_keys)} subject items). They follow "
@@ -3353,6 +3373,17 @@ def train_minimax(
                 logger.warning("[reg] regularisation images are at least half the training "
                                "set — keep them the minority or the multiplier stops reading "
                                "as a nudge.")
+            if not finetune_fused_backward and max_grad_norm and max_grad_norm > 0:
+                # The boundary clip renormalises the whole gradient to max_grad_norm —
+                # a x0.2 reg gradient and a full subject gradient both land at the SAME
+                # norm, so the multiplier is erased. Fused FT is immune (grad clipping
+                # is structurally off there).
+                logger.warning(
+                    "[reg] gradient clipping is ON (non-fused fine-tune, max_grad_norm="
+                    f"{max_grad_norm:g}) — it renormalises every step to the same norm, "
+                    "which CANCELS the regularisation multiplier. Re-tick 'Free each "
+                    "gradient as it lands' or pass --max_grad_norm 0 for the anchor to "
+                    "work.")
     elif any(getattr(_ds, "is_reg", False) for _ds in group.datasets):
         logger.warning("[reg] the dataset config has a regularisation block, but this is a "
                        "LoRA run — regularisation images are a fine-tune feature and are "
@@ -4496,6 +4527,16 @@ def train_minimax(
             # loss scaling, because the fused per-tensor update has no optimizer object
             # whose LR could be rewritten. The RAW loss is what the ledgers record below,
             # so avr_loss and the drift lines see unscaled numbers (Krea 2 FT parity).
+            #
+            # Honesty note (review, 26 Aug — and the exception to _boundary_step's
+            # "never the loss" doctrine): Adafactor's second-moment normalisation
+            # partially cancels a constant gradient scale, so x0.2 realises as roughly
+            # x0.2-0.25 ONLY while reg steps are the minority feeding each tensor's EMA
+            # (the [reg] majority warning above is that condition). The very first step
+            # after each rotation rebind is fully UNthrottled (fresh state: beta2t=0
+            # makes the update scale-invariant) — ~one stray full-LR reg step per
+            # rotation at typical reg ratios. Krea 2 FT has identical behaviour; the
+            # doctrine comment stays right for everything that CAN ride param-group LR.
             _bk = loss
             if reg_keys and any(str(k) in reg_keys for k in (batch.get("item_keys") or ())):
                 _bk = loss * reg_mult

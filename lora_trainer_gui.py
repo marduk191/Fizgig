@@ -4527,11 +4527,16 @@ class LoRATrainerGUI:
                 "A full fine-tune moves the base weights with nothing bounding the drift; these "
                 "anchor the model's prior while your subject data pulls it. Real photos, not "
                 "model output — generated images anchor the model to its own artifacts.\n\n"
-                "They train at the LR multiplier beside this box (0.1-0.3 keeps them a nudge), "
+                "They train at the LR multiplier beside this box (0.1-0.3 keeps them a nudge; "
+                "keep them the MINORITY of the dataset or the nudge stops reading as one), "
                 "follow the same photo routing as your subject stills, and stop when photos & "
                 "clips stop under 'Finish one category early' — once subject pressure ends, the "
                 "counter-pressure ends with it. Stills only: they tether the visual prior; the "
-                "audio prior is protected by voice routing instead.")
+                "audio prior is protected by voice routing instead.\n\n"
+                "With Optimised Likeness on, the anchor pulls only on the likeness blocks — "
+                "the same territory your subject photos train, which is the point. On an "
+                "audio-only dataset, adding reg stills widens the rotation cycle to include "
+                "the photo blocks (the console prints the new span).")
 
         self._minimax_ft_hint = ttk.Label(training_content,
                   text="Trains the base model's own weights, not an adapter — Network Type "
@@ -26712,7 +26717,9 @@ class LoRATrainerGUI:
                     _mrm = float(self.minimax_reg_mult_var.get())
                 except ValueError:
                     _mrm = 0.2
-                cmd += ["--reg_lr_multiplier", str(max(0.0, _mrm))]
+                # Floor 0.01: 0.0 would still pay a full forward/backward per reg step
+                # for a near-zero update — clearing the folder is how you disable this.
+                cmd += ["--reg_lr_multiplier", str(max(0.01, _mrm))]
         # LoKR (Kronecker) — dim/alpha still ride along above but the trainer ignores them;
         # the factor is the dial. Same flags as the Krea 2 builder. Suppressed under FT: the
         # trainer builds no adapter at all there.
