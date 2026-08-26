@@ -590,18 +590,23 @@ def plan_base_quant(free_gb: float, pruned: bool, mp: float = 0.25, adapter_gb: 
                                transient_gb=_INT8_TRANSIENT_GB, adapter_gb=adapter_gb)
     if i_swap == 0:
         return "int8", i_swap, i_ckpt, "int8 fits with no block swap — the most accurate base"
-    # The int8 streaming path has only been validated with 16 GB-class headroom (~14.2 GB
-    # free). Its arithmetic can make a 12 GB card look viable by streaming almost every
-    # block, but the non-streamed residual + ring + CUDA transients leave no reliable
-    # device margin there — @mabseyuk's 5070 crashed before step one on exactly that plan.
-    # Below the tested floor, Auto goes straight to the smaller 4-bit base (which now
-    # streams through its own NF4 ring rather than classic-parking).
+    # The int8 streaming path was originally validated with 16 GB-class headroom (~14.2 GB
+    # free) — @mabseyuk's 5070 crashed before step one on a 12 GB int8-streaming plan,
+    # which is where this floor came from. That crash predates the v4.4.0 pin fallback and
+    # ring hardening, and the SAME card now runs an EXPLICIT int8 pick at ~1.1 s/it with
+    # 40 streamed blocks (#101) — but at ~15 GB of pinned system RAM, which a 16 GB-RAM
+    # box cannot survive. So Auto keeps the conservative floor (nf4 stays on-card and
+    # stages nothing) and the reason string hands big-RAM users the explicit escape hatch;
+    # relaxing Auto itself is #101 and wants a RAM-aware gate plus measurement first.
     if free_gb < _MIN_INT8_H2D_FREE_GB:
         n_swap, n_ckpt = plan_vram(free_gb, mp=mp, resident_gb=_RESIDENT_PRUNED_GB,
                                    adapter_gb=adapter_gb)
         return ("nf4", n_swap, n_ckpt,
                 f"{free_gb:.1f} GB free is below the tested int8-streaming floor "
-                f"({_MIN_INT8_H2D_FREE_GB:.1f} GB) — using the smaller 4-bit base")
+                f"({_MIN_INT8_H2D_FREE_GB:.1f} GB) — using the smaller 4-bit base. "
+                f"(A machine with 48 GB+ of system RAM can pick Base Precision: int8 "
+                f"explicitly — the accurate base streams through the ring at this tier, "
+                f"staging ~15 GB in pinned RAM)")
     # H2D-specific arithmetic — the classic anchors are WRONG for streaming and would refuse
     # cards that measurably work. Classic swap's 7.5 GB backward transient is engine-held
     # recompute segments of physically-moving blocks; H2D blocks never move — the transient is
@@ -2552,23 +2557,40 @@ def train_minimax(
                 # from a traceback. Transient/per-block match how the swap actually
                 # runs: ring-streamed blocks never round-trip, so their backward
                 # transient is the ring, not classic parking's recompute segments.
+                _swap_t = (_H2D_TRANSIENT_GB if _ring_planned()
+                           else _SWAP_TRANSIENT_GB)
                 _short = plan_swap_shortfall_gb(
                     _free_gb, mp=_mp, resident_gb=_resident,
                     transient_gb=_INT8_TRANSIENT_GB if _mode == "int8" else 0.0,
                     adapter_gb=_adapter,
-                    swap_transient_gb=(_H2D_TRANSIENT_GB if _ring_planned()
-                                       else _SWAP_TRANSIENT_GB),
+                    swap_transient_gb=_swap_t,
                     per_block_gb=(_H2D_PER_BLOCK_GB if _mode == "int8"
                                   else _PER_BLOCK_GB))
-                if _short > 0.5:
+                # Margins are not shortfall (#101, MEASURED): the arithmetic's "need"
+                # includes the reserve and the swap transient, which exist for spikes —
+                # plans it called 0.9 GB short (field 5070) and 2.5 GB short (sim-12
+                # gate, HARD allocator cap) both trained at ~1.3 s/it with headroom.
+                # Crying wolf there costs the warning its credibility, so it fires only
+                # once the deficit eats THROUGH the margins — the 8-12 GB monster-clip
+                # holes it was built for (the 4090 report) sail past this bar.
+                _margins = _RESERVE_GB + _swap_t
+                if _short > _margins + 0.5:
                     logger.warning(
-                        f"[vram] this plan does NOT fit: even at the 40-block swap cap it "
-                        f"is ~{_short:.1f} GB short for the heaviest item in this dataset "
-                        f"({_mp:.2f} effective MP — spatial size x clip frames). Expect an "
+                        f"[vram] this plan does NOT fit: even at the 40-block swap cap, "
+                        f"and with every safety margin spent, it is ~{_short - _margins:.1f} "
+                        f"GB short for the heaviest item in this dataset ({_mp:.2f} "
+                        f"effective MP — spatial size x clip frames). Expect an "
                         f"out-of-memory error at the first training step, or a severe "
                         f"slowdown if Windows spills to shared memory. Lower Target "
                         f"Megapixels, shorten or downscale the heaviest clips, or free "
                         f"VRAM and re-launch.")
+                elif _short > 0.5:
+                    logger.info(
+                        f"[vram] tight fit: the plan leans ~{_short:.1f} GB into its "
+                        f"safety margins at the 40-block cap — training measured fine "
+                        f"at this tier, but previews may downgrade or switch off "
+                        f"(training and checkpoints are never at risk). Close other "
+                        f"GPU apps if the first step OOMs.")
         else:
             n_swap, _ckpt_auto = 0, False
     else:
