@@ -113,7 +113,11 @@ def component_gb_per_block(block: nn.Module, prefixes) -> dict:
             continue
         for p in prefixes:
             if name.startswith(p):
-                out[p] += m.weight.numel() * 2 / 1e9
+                # Logical shape, NOT weight.numel(): what we are sizing is the TRAINABLE
+                # bf16 window, which is the same however the frozen copy is stored — and
+                # NF4 empties `.weight` to a 0-element tensor, so measuring it reported
+                # every component as 0 GB and the planner divided by zero.
+                out[p] += m.out_features * m.in_features * 2 / 1e9
                 break
     return out
 
@@ -141,6 +145,12 @@ def plan_component_windows(usable_gb, span, n_blocks, comp_gb, overhead_gb,
     def _chunk(prefix, max_gb):
         """Even depth-chunks of `span` whose bf16 window fits max_gb, or None."""
         g = comp_gb[prefix]
+        if g <= 0:
+            # A component that measures as weightless means the sizer could not see this
+            # storage scheme — fail loudly rather than divide by zero or, worse, plan a
+            # cycle for windows it thinks are free.
+            raise ValueError(f"component {prefix!r} measured 0 GB per block — the window "
+                             f"sizer does not understand this model's weight storage")
         max_len = int(max_gb / g)
         if max_len < 1:
             return None
@@ -205,19 +215,33 @@ def plan_component_windows(usable_gb, span, n_blocks, comp_gb, overhead_gb,
 # block 13/28, JIT-streamer in-flight allowance 1.5 (RotationOffloader prefetches one
 # block, no flat ring slots).
 K2FT_COMPONENT_PREFIXES = ("attn", "mlp.gate", "mlp.up", "mlp.down")
-_K2FT_OVERHEAD_GB = 16.0
-_K2FT_FP8_GB_PER_BLOCK = 0.464
+_K2FT_OVERHEAD_GB = 16.0        # fp8 trunk (~13 GB) + activations + margin
+_K2FT_FP8_GB_PER_BLOCK = 0.464  # 13.0 / 28
+# NF4 trunk: measured 6.08 GB packed for the same 224 Linears (24.31 GB of bf16/fp8
+# freed), i.e. the frozen base costs less than half. The overhead constant drops by the
+# same difference; both are still estimates until the per-window peak lines confirm them.
+_K2FT_NF4_OVERHEAD_GB = 9.5
+_K2FT_NF4_GB_PER_BLOCK = 0.217  # 6.08 / 28
 _K2FT_STREAM_SLOTS_GB = 1.5
 
 
-def plan_krea2_ft_windows(usable_gb, comp_gb, n_blocks=28, allow_stream=True):
+def krea2_trunk_gb_per_block(nf4: bool = False) -> float:
+    """Frozen-trunk cost per block, for the caller that has to add it back to `usable`."""
+    return _K2FT_NF4_GB_PER_BLOCK if nf4 else _K2FT_FP8_GB_PER_BLOCK
+
+
+def plan_krea2_ft_windows(usable_gb, comp_gb, n_blocks=28, allow_stream=True,
+                          nf4: bool = False):
     """The Krea 2 component-window plan: (windows, stream, reasons).
 
     comp_gb comes from component_gb_per_block on a real block (exact, no architecture
-    guessing); the constants above are the calibration. Same contract as the H3 twin."""
+    guessing); the constants above are the calibration. `nf4` selects the 4-bit trunk's
+    much smaller footprint, which is what lets a small card keep its window RESIDENT
+    instead of streaming it. Same contract as the H3 twin."""
     return plan_component_windows(
         usable_gb, range(int(n_blocks)), n_blocks, dict(comp_gb),
-        overhead_gb=_K2FT_OVERHEAD_GB, trunk_gb_per_block=_K2FT_FP8_GB_PER_BLOCK,
+        overhead_gb=_K2FT_NF4_OVERHEAD_GB if nf4 else _K2FT_OVERHEAD_GB,
+        trunk_gb_per_block=krea2_trunk_gb_per_block(nf4),
         slots_gb=_K2FT_STREAM_SLOTS_GB, allow_stream=allow_stream)
 
 
@@ -242,13 +266,22 @@ def component_entry_matches(entry, lname: str, block_idx: int) -> bool:
     return lname.startswith(prefix) and int(lo) <= int(block_idx) <= int(hi)
 
 
+def is_rotatable_linear(m: nn.Module) -> bool:
+    """A frozen, quantized Linear the rotator can swap to bf16 and back.
+
+    Two storage schemes qualify. fp8 keeps the weight in `.weight` with a companion
+    `scale_weight`; NF4 (modules/nf4.py) empties `.weight` to a 0-element tensor and
+    parks the real bytes in `_nf4_packed` / `_nf4_state` behind a patched forward.
+    Both are frozen and both are reconstructible from the bf16 master, which is all
+    rotation needs — so both rotate, and `_activate_targets`/`_deactivate_targets`
+    branch per module rather than per model (a mixed model is handled for free)."""
+    return isinstance(m, nn.Linear) and (hasattr(m, "scale_weight")
+                                         or getattr(m, "_is_nf4", False))
+
+
 def _linears_with_scale(module: nn.Module) -> List[tuple]:
-    """(qualified_name, linear) for every fp8-patched Linear under `module`."""
-    out = []
-    for name, m in module.named_modules():
-        if isinstance(m, nn.Linear) and hasattr(m, "scale_weight"):
-            out.append((name, m))
-    return out
+    """(qualified_name, linear) for every rotatable quantized Linear under `module`."""
+    return [(name, m) for name, m in module.named_modules() if is_rotatable_linear(m)]
 
 
 def _all_linears(module: nn.Module) -> List[tuple]:
@@ -349,9 +382,18 @@ class BlockRotator:
             if w is None:
                 logger.warning("[rotation] no master weight for %s — leaving frozen", key)
                 continue
-            # Stash the fp8 forward so deactivate() can put it back verbatim.
+            # Stash the quantized forward (fp8 dequant or NF4 dequant) so deactivate()
+            # can put it back verbatim. Popping it exposes the class-level nn.Linear
+            # forward, which reads the bf16 .weight we install next.
             self._patched_forward[id(lin)] = lin.__dict__.pop("forward", None)
             lin.weight = nn.Parameter(w.to(self.device, dtype=torch.bfloat16), requires_grad=True)
+            if getattr(lin, "_is_nf4", False):
+                # Drop the 4-bit copy for as long as this Linear trains: it is pure
+                # duplication now (the master is the source of truth and deactivate
+                # re-encodes from the trained weight), and holding both is what the
+                # small-card tiers cannot afford.
+                lin._nf4_packed = None
+                lin._nf4_state = None
             if lin.bias is not None:
                 lin.bias = nn.Parameter(lin.bias.detach().to(torch.bfloat16), requires_grad=True)
             n += 1
@@ -368,24 +410,46 @@ class BlockRotator:
             if key not in self.master:
                 continue
             trained = lin.weight.detach()
-            # Master is the source of truth — save BEFORE the lossy re-quantize.
+            # Master is the source of truth — save BEFORE the lossy re-quantize. This is
+            # also why the re-encode below can round to NEAREST: the residency copy is
+            # only the frozen forward CONTEXT for later windows, never the training
+            # signal, and activate() always reads the master back, so nothing compounds
+            # across cycles. (H3 needed stochastic rounding for its SAVE, where trained
+            # int8 deltas smaller than the grid step rounded home; Krea 2 saves bf16
+            # straight from this master, so it has no lossy save to protect.)
             self.master[key] = trained.to("cpu", dtype=torch.bfloat16).clone()
-            q, scale = quantize_weight(key, trained.float(), self.fp8_dtype,
-                                       max_value, min_value,
-                                       quantization_mode=self.quantization_mode,
-                                       block_size=self.block_size)
-            lin.weight = nn.Parameter(q.to(self.device), requires_grad=False)
-            sw = scale.to(self.device, dtype=lin.scale_weight.dtype).reshape(lin.scale_weight.shape)
-            lin.scale_weight.copy_(sw)
+            if getattr(lin, "_is_nf4", False):
+                from bitsandbytes.functional import quantize_nf4
+                from fizgig.modules.nf4 import nf4_linear_forward_patch
+                packed, state = quantize_nf4(trained.contiguous(),
+                                             compress_statistics=False)
+                lin._nf4_packed = packed
+                lin._nf4_state = state
+                # apply_nf4_quantization's own convention: keep the Parameter object
+                # (module identity and in/out_features stay intact) but empty it.
+                lin.weight.data = torch.empty(0, device=packed.device,
+                                              dtype=torch.bfloat16)
+                lin.weight.requires_grad_(False)
+                saved = self._patched_forward.pop(id(lin), None)
+                lin.forward = (saved if saved is not None
+                               else nf4_linear_forward_patch.__get__(lin, type(lin)))
+            else:
+                q, scale = quantize_weight(key, trained.float(), self.fp8_dtype,
+                                           max_value, min_value,
+                                           quantization_mode=self.quantization_mode,
+                                           block_size=self.block_size)
+                lin.weight = nn.Parameter(q.to(self.device), requires_grad=False)
+                sw = scale.to(self.device, dtype=lin.scale_weight.dtype).reshape(lin.scale_weight.shape)
+                lin.scale_weight.copy_(sw)
+                saved = self._patched_forward.pop(id(lin), None)
+                if saved is not None:
+                    lin.forward = saved
+                else:
+                    def _fwd(self_, x, _p=fp8_linear_forward_patch):
+                        return _p(self_, x, False, None)
+                    lin.forward = _fwd.__get__(lin, type(lin))
             if lin.bias is not None:
                 lin.bias.requires_grad_(False)
-            saved = self._patched_forward.pop(id(lin), None)
-            if saved is not None:
-                lin.forward = saved
-            else:
-                def _fwd(self_, x, _p=fp8_linear_forward_patch):
-                    return _p(self_, x, False, None)
-                lin.forward = _fwd.__get__(lin, type(lin))
             # RELEASE THE ORPHAN — see the H3 twin in rotation_ft.py for the measurement.
             # Rebinding lin.weight above does not free the old bf16: a C++-side autograd
             # referrer keeps its storage alive and the whole outgoing window survives into
@@ -512,6 +576,14 @@ class RotationOffloader:
     def _to(self, idx: int, dev: torch.device):
         from fizgig.krea2.offloading import weighs_to_device
         weighs_to_device(self.blocks[idx], dev)
+        # NF4 blocks keep their real bytes in `_nf4_packed` / `_nf4_state`, which are
+        # plain attributes that weighs_to_device (and nn.Module.to) cannot see — so a
+        # block would "move" while its 4-bit weight stayed put, and the dequant forward
+        # then met mat2 on the wrong device (field: RuntimeError at the first rotation
+        # boundary of an NF4 fine-tune). move_nf4_to_device exists for exactly this and
+        # no-ops on an fp8 block.
+        from fizgig.modules.nf4 import move_nf4_to_device
+        move_nf4_to_device(self.blocks[idx], dev)
         self.moves += 1
 
     def _move_task(self, idx: int, dev: torch.device, after):

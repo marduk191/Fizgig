@@ -957,20 +957,23 @@ def _build_bf16_master(raw_path: str, dit) -> dict:
     copy: the GPU weights have already been through fp8, so dequantizing them would bake the
     quantization error into the master and we'd fine-tune a degraded model.
     """
-    import torch.nn as _nn
     from safetensors.torch import load_file
+    from fizgig.krea2.rotation import is_rotatable_linear
 
+    # Discovery must match what the rotator will actually target — an NF4 base has no
+    # `scale_weight`, so an fp8-only test here would build an EMPTY master and the run
+    # would train nothing while looking healthy.
     wanted = set()
     for bi, block in enumerate(dit.blocks):
         for name, m in block.named_modules():
-            if isinstance(m, _nn.Linear) and hasattr(m, "scale_weight"):
+            if is_rotatable_linear(m):
                 wanted.add(f"blocks.{bi}.{name}.weight")
     # txtfusion sits outside dit.blocks, so rotation never reaches it — but it's the stack
     # that fuses the text embeddings, so it's held always-on rather than left frozen.
     txtf = getattr(dit, "txtfusion", None)
     if txtf is not None:
         for name, m in txtf.named_modules():
-            if isinstance(m, _nn.Linear) and hasattr(m, "scale_weight"):
+            if is_rotatable_linear(m):
                 wanted.add(f"txtfusion.{name}.weight")
 
     sd = load_file(raw_path)          # mmap'd; we copy out only the keys we need
@@ -1831,16 +1834,28 @@ def train_krea2(
             blocks_to_swap = 0
             ft_stream_frozen = True
         if quant_4bit:
-            logger.info("[ft-rotation] 4-bit base is incompatible with rotation "
-                        "(weights live packed in _nf4_packed) — using fp8 instead.")
-            quant_4bit = False
+            # NF4 is now a first-class rotation base (27 Aug). The rotator branches per
+            # module: activate reads the bf16 master and frees `_nf4_packed`; deactivate
+            # re-encodes with quantize_nf4 and restores the patched forward. The trunk
+            # halves (~13 GB fp8 -> ~6.5 GB), which is what buys a small card enough room
+            # to keep its window RESIDENT rather than streaming it — and streaming is
+            # what fragmented the allocator to death at 16 GB.
+            # The trade, exactly as on H3: the frozen CONTEXT the active window trains
+            # against carries NF4's error. The saved checkpoint does not — it is written
+            # bf16 from the master, which never sees a quantizer.
+            logger.info("[ft-rotation] 4-bit base: the frozen trunk holds NF4 (~half the "
+                        "fp8 footprint) while the trainable window runs bf16 from the "
+                        "master. The window trains against a coarser frozen context; the "
+                        "saved checkpoint is unaffected (bf16, straight from the master).")
+            fp8_scaled = False
         if quant_int8:
             # Same reason as 4-bit: int8 keeps its own packed weights + scales, which the
             # bf16-master round-trip would have to undo and redo every window.
             logger.info("[ft-rotation] INT8 base is incompatible with rotation — using fp8 instead.")
             quant_int8 = ""
-        if not fp8_scaled:
-            logger.info("[ft-rotation] rotation needs the fp8-frozen base to fit — enabling fp8.")
+        if not fp8_scaled and not quant_4bit:
+            logger.info("[ft-rotation] rotation needs a quantized frozen base to fit — "
+                        "enabling fp8. (4-bit is the lighter option on small cards.)")
             fp8_scaled = True
 
     # Resolve quantisation/swap interactions BEFORE anything reads blocks_to_swap —
@@ -2009,16 +2024,18 @@ def train_krea2(
             from fizgig.krea2.rotation import (component_gb_per_block,
                                                plan_krea2_ft_windows,
                                                K2FT_COMPONENT_PREFIXES,
-                                               _K2FT_FP8_GB_PER_BLOCK)
+                                               krea2_trunk_gb_per_block)
             _comp_gb = component_gb_per_block(dit.blocks[0], K2FT_COMPONENT_PREFIXES)
+            _trunk_per_block = krea2_trunk_gb_per_block(bool(quant_4bit))
             try:
                 from fizgig.utils.device import plannable_free_vram as _pfv0
-                _usable = _pfv0() + _K2FT_FP8_GB_PER_BLOCK * len(dit.blocks) - 1.5
+                _usable = _pfv0() + _trunk_per_block * len(dit.blocks) - 1.5
             except Exception:
                 _usable = 99.0
             _k2_windows, _k2_stream, _plan_why = plan_krea2_ft_windows(
                 _usable, _comp_gb, n_blocks=len(dit.blocks),
-                allow_stream=os.environ.get("FIZGIG_NO_FT_STREAM") != "1")
+                allow_stream=os.environ.get("FIZGIG_NO_FT_STREAM") != "1",
+                nf4=bool(quant_4bit))
             for _line in _plan_why:
                 logger.info("[ft-rotation] %s", _line)
             if _k2_windows is None:
