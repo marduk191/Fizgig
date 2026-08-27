@@ -319,8 +319,10 @@ the model's full depth from the very first epoch.
 - **Use unique trigger tokens** — strongly recommended: an invented token gives the fine-tune
   somewhere clean to bind, where a common word drags its existing meaning along with it.
 - **Budget steps for big datasets.** Large datasets are where fine-tuning shines, and they can
-  easily take **~30× the steps** you're used to from LoRA runs to converge — plan run length
-  (and disk) accordingly.
+  easily take **~30× the steps** you're used to from LoRA runs to converge. That figure comes
+  from the standard 4-window rotation: only one component of the model trains at a time, where a
+  LoRA trains all of its weights every step — so a full pass of learning costs a full cycle, not
+  an epoch. Plan run length (and disk) accordingly.
 - **Voice and mixed datasets train too** — voice stays confined to its measured blocks (34–49),
   photos to theirs, and the per-category **stop epoch** counts across Pause/Resume: pause a
   mixed run, set the stop to the current epoch, Resume, and it finishes voice-only.
