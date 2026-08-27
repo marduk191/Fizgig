@@ -164,29 +164,58 @@ ck("  and does not leak into the presets",
 g.prefs.pop("caption_qwen_instruction", None)
 g.caption_task_var.set(_TR)
 
-# --- 4. router picks the right generator -------------------------------------------------
-calls = []
-g.generate_qwen_caption = lambda p: calls.append(("qwen", p)) or "qwen caption"
-g.generate_florence_caption = lambda p: calls.append(("florence", p)) or "florence caption"
-g.caption_model_var.set(G.QWEN_CAPTION_MODEL)
-g._generate_ai_caption("x.png")
-g.caption_model_var.set(G.FLORENCE_DEFAULT_MODEL)
-g._generate_ai_caption("x.png")
-ck("router: Qwen selected -> qwen, Florence selected -> florence",
-   [c[0] for c in calls] == ["qwen", "florence"], calls)
+# --- 4. the model choice reaches the captioning worker ------------------------------------
+# Captioning moved out of the GUI process in #93: _generate_ai_caption and its in-process
+# generate_qwen_caption / generate_florence_caption router are gone, replaced by a persistent
+# batch_caption subprocess. The routing decision still exists, it just travels as JSON now — so
+# assert it where it actually lives, in the worker config and the cache key that decides whether
+# a running worker can be reused or has to be restarted.
+import json as _json  # noqa: E402
 
-# --- 5. trigger word still prepended for BOTH paths --------------------------------------
+g.caption_model_var.set(G.QWEN_CAPTION_MODEL)
+_qwen_cfg = _json.load(open(g._write_caption_worker_config(), encoding="utf-8"))
+_qwen_key = g._caption_worker_config_key()
+g.caption_model_var.set(G.FLORENCE_DEFAULT_MODEL)
+_flor_cfg = _json.load(open(g._write_caption_worker_config(), encoding="utf-8"))
+_flor_key = g._caption_worker_config_key()
+
+ck("worker config: Qwen selected -> backend qwen",
+   _qwen_cfg.get("backend") == "qwen", _qwen_cfg)
+ck("worker config: Florence selected -> backend florence, and names the model",
+   _flor_cfg.get("backend") == "florence"
+   and _flor_cfg.get("florence_model") == G.FLORENCE_DEFAULT_MODEL, _flor_cfg)
+# The key is what stops a Qwen worker being handed a Florence job (and vice versa) — if it did
+# not change with the backend, switching captioner would silently reuse the wrong model.
+ck("switching captioner changes the worker key, forcing a restart",
+   _qwen_key != _flor_key and _qwen_key[0] == "qwen" and _flor_key[0] == "florence",
+   (_qwen_key, _flor_key))
+
+# --- 5. trigger word still prepended, now across the subprocess boundary ------------------
+# save_caption_with_trigger went with the in-process captioner in #93. The trigger now crosses
+# into batch_caption as a job field and is applied there, so both halves get asserted: the GUI
+# must PUT it in the job, and the worker must APPLY it in the same format as before. Testing only
+# one half would let a rename on either side pass while captions silently lost their trigger.
 imgdir = tempfile.mkdtemp()
 img = os.path.join(imgdir, "a.png")
 open(img, "wb").write(b"0")
+
 g.caption_trigger_var.set("zwxbsp")
-g.save_caption_with_trigger(img, "a woman viewed from behind")
-txt = open(os.path.splitext(img)[0] + ".txt", encoding="utf-8").read()
-ck("trigger prepended", txt == "zwxbsp, a woman viewed from behind", txt)
+_job_path, _ = g._write_caption_job([img])
+_job = _json.load(open(_job_path, encoding="utf-8"))
+ck("GUI half: the trigger reaches the worker job", _job.get("trigger") == "zwxbsp", _job)
 g.caption_trigger_var.set("")
-g.save_caption_with_trigger(img, "a woman viewed from behind")
+_job_path, _ = g._write_caption_job([img])
+ck("  and an empty trigger travels as empty, not as a stray value",
+   _json.load(open(_job_path, encoding="utf-8")).get("trigger") == "")
+
+from fizgig.scripts.batch_caption import _write_caption as _wc  # noqa: E402
+
+_wc(img, "a woman viewed from behind", "zwxbsp")
 txt = open(os.path.splitext(img)[0] + ".txt", encoding="utf-8").read()
-ck("no trigger -> no stray leading comma", txt == "a woman viewed from behind", txt)
+ck("worker half: trigger prepended", txt == "zwxbsp, a woman viewed from behind", txt)
+_wc(img, "a woman viewed from behind", "")
+txt = open(os.path.splitext(img)[0] + ".txt", encoding="utf-8").read()
+ck("  no trigger -> no stray leading comma", txt == "a woman viewed from behind", txt)
 
 # --- 6. training guard -------------------------------------------------------------------
 class _FakeProc:
@@ -204,244 +233,70 @@ src = open(os.path.join(REPO, "lora_trainer_gui.py"), encoding="utf-8").read()
 ck("GUI imports the encode system prompt rather than copying it",
    "ENCODE_SYSTEM_DESCRIPTOR" in src and "Describe the image by detailing" not in src)
 
-# --- 7b. the ~8 GB captioner is released after every job ---------------------------------
-class _FakeModel:
-    pass
+# --- 7b. the ~8 GB captioner is released when a heavy engine needs the VRAM ---------------
+# The model lives in the batch_caption SUBPROCESS now (#93), so "release" means stopping that
+# worker -- and the policy deliberately changed with it. It no longer dies on leaving the
+# Captions tab (it stays warm so Regenerate is fast); it is released on ENTERING a heavy-engine
+# tab (Repair Studio / Explorer / Royale, 10-20 GB each), on Unload, on Start Training, and at
+# close. Asserting the old "released on leaving Captions" would now be pinning a behaviour
+# upstream removed on purpose.
+class _FakeProc:
+    """Stands in for a live worker -- _caption_worker_alive only calls poll()."""
 
-
-g._captioning_running = False
-g.qwen_captioner = _FakeModel()
-g._release_qwen_captioner_if_idle()
-ck("released when idle (batch end / tab leave / Unload button)",
-   g.qwen_captioner is None)
-
-g.qwen_captioner = _FakeModel()
-g._captioning_running = True
-g._release_qwen_captioner_if_idle()
-ck("  kept while a captioning job is in flight", g.qwen_captioner is not None)
-g._captioning_running = False
+    def poll(self):
+        return None          # still running
 
 
 class _Ev:
     pass
 
 
-g.notebook.select(g.caption_gen_tab)
-root.update()
-g.qwen_captioner = _FakeModel()
-g.notebook.select(g.image_converter_tab)
-root.update()
-g.on_tab_changed(_Ev())
-ck("  released on leaving the Captions tab", g.qwen_captioner is None)
+_stopped = []
+g._stop_caption_worker_async = lambda cb, **kw: (_stopped.append(kw), cb())
 
-g.qwen_captioner = _FakeModel()
+g.caption_process = _FakeProc()
+g._captioning_running = False
+ck("a live worker reads as alive", g._caption_worker_alive() is True)
+
+# Tab labels carry step numbers ("3. Captions"), so pick the plain tab as "any tab that is NOT a
+# heavy engine" rather than matching literal names that renumbering would break.
+_HEAVY_NAMES = ("Repair Studio", "LoRA the Explorer", "LoRA Royale")
+_heavy = _plain = None
+for _tab_id in g.notebook.tabs():
+    _t = g.notebook.tab(_tab_id, "text")
+    if _t in _HEAVY_NAMES:
+        _heavy = _heavy or _tab_id
+    else:
+        _plain = _plain or _tab_id
+ck("a heavy-engine tab and a plain tab exist to switch between",
+   _heavy is not None and _plain is not None,
+   [g.notebook.tab(t, "text") for t in g.notebook.tabs()])
+
+
+def _switch_to(tab_id):
+    """Drive the REAL <<NotebookTabChanged>> wiring rather than calling the handler by hand --
+    selecting a tab fires it once on its own, so an extra manual call double-counts."""
+    g.notebook.select(_plain)
+    root.update()
+    _stopped.clear()
+    g.notebook.select(tab_id)
+    root.update()
+
+
+g.caption_process = _FakeProc()
+g._captioning_running = False
+_switch_to(_heavy)
+ck("released on entering a heavy-engine tab", len(_stopped) == 1, _stopped)
+ck("  released hard, not gracefully -- the VRAM is wanted now",
+   bool(_stopped) and _stopped[0].get("graceful") is False, _stopped)
+
+g.caption_process = _FakeProc()
 g._captioning_running = True
-g.on_tab_changed(_Ev())
-ck("  kept on tab switch while a batch runs", g.qwen_captioner is not None)
+_switch_to(_heavy)
+ck("  kept while a captioning job is in flight", _stopped == [], _stopped)
 g._captioning_running = False
 
-g.qwen_captioner = None
-g._release_qwen_captioner_if_idle()
-ck("  no-op when nothing is loaded", g.qwen_captioner is None)
-
-g.qwen_captioner = _FakeModel()
-g.florence_model = None
-g.unload_florence_model(silent=True)
-ck("  Unload Model button frees Qwen too", g.qwen_captioner is None)
-
-# --- 7c. default model + per-model task memory --------------------------------------------
-def _boot(last_used, te=True):
-    """A fresh GUI with a given last_used, restored through the same path startup uses."""
-    _r = tk.Tk()
-    _r.withdraw()
-    _g = G.LoRATrainerGUI(_r)
-    _g.prefs_vars["krea2_text_encoder"].set(FAKE_TE if te else "")
-    _g.last_used = dict(last_used)
-    _g._restore_caption_selection()
-    return _r, _g
-
-
-_TRAIN = CAPTION_TASKS["training"][0]
-_EXHV = CAPTION_TASKS["exhaustive"][0]
-
-_r, _g = _boot({})
-ck("default: no saved choice + TE present -> Qwen3-VL, its default task",
-   _g.caption_model_var.get() == G.QWEN_CAPTION_MODEL and _g.caption_task_var.get() == _TRAIN,
-   (_g.caption_model_var.get(), _g.caption_task_var.get()))
-_r.destroy()
-
-_r, _g = _boot({}, te=False)
-ck("  no text encoder -> Florence", _g.caption_model_var.get() == G.FLORENCE_DEFAULT_MODEL)
-_r.destroy()
-
-_r, _g = _boot({"caption_model": G.FLORENCE_DEFAULT_MODEL})
-ck("  an explicit saved Florence beats the Qwen default",
-   _g.caption_model_var.get() == G.FLORENCE_DEFAULT_MODEL)
-_r.destroy()
-
-_r, _g = _boot({"caption_model": G.QWEN_CAPTION_MODEL}, te=False)
-ck("  saved Qwen whose file is gone falls back to Florence",
-   _g.caption_model_var.get() == G.FLORENCE_DEFAULT_MODEL
-   and _g.caption_model_var.get() in list(_g.caption_model_combo.cget("values")))
-_r.destroy()
-
-_r, _g = _boot({"caption_model": G.QWEN_CAPTION_MODEL, "caption_task": _EXHV})
-ck("  legacy flat caption_task migrates onto the selected model",
-   _g.caption_task_var.get() == _EXHV, _g.caption_task_var.get())
-
-_g.caption_model_var.set(G.FLORENCE_DEFAULT_MODEL)
-_g._on_caption_model_changed()
-ck("per-model memory: Florence's first visit uses its own default",
-   _g.caption_task_var.get() == "<DETAILED_CAPTION>")
-_g.caption_task_var.set("<CAPTION>")
-_g._on_caption_task_changed()
-_g.caption_model_var.set(G.QWEN_CAPTION_MODEL)
-_g._on_caption_model_changed()
-ck("  switching back restores the Qwen task", _g.caption_task_var.get() == _EXHV,
-   _g.caption_task_var.get())
-_g.caption_model_var.set(G.FLORENCE_DEFAULT_MODEL)
-_g._on_caption_model_changed()
-ck("  and the Florence task", _g.caption_task_var.get() == "<CAPTION>", _g.caption_task_var.get())
-_mem = dict(_g._caption_task_memory)
-_r.destroy()
-
-_r, _g = _boot({"caption_model": G.FLORENCE_DEFAULT_MODEL, "caption_tasks": _mem})
-ck("  survives a restart: model + its task",
-   _g.caption_model_var.get() == G.FLORENCE_DEFAULT_MODEL
-   and _g.caption_task_var.get() == "<CAPTION>")
-_g.caption_model_var.set(G.QWEN_CAPTION_MODEL)
-_g._on_caption_model_changed()
-ck("  survives a restart: the other model's task too", _g.caption_task_var.get() == _EXHV,
-   _g.caption_task_var.get())
-_r.destroy()
-
-# --- 7d. concurrency guards: no phantom "resumed" job ------------------------------------
-# Reported symptom: after Stop/Unload the job appeared to carry on. Two causes, both here.
-import types as _types
-
-_popups = []
-_real_showinfo = G.messagebox.showinfo
-G.messagebox.showinfo = lambda *a, **k: _popups.append(a[0] if a else "")
-
-
-class _FakeModel2:
-    pass
-
-
-# (a) Unloading mid-job used to free the model; the worker's next image then found no model and
-#     silently RELOADED it, which reads exactly as the job resuming after you pressed Unload.
-g.qwen_captioner = _FakeModel2()
-g._captioning_running = True
-g.unload_florence_model(silent=True)
-ck("Unload refuses while a job is running", g.qwen_captioner is not None)
-g._captioning_running = False
-g.unload_florence_model(silent=True)
-ck("  and unloads normally once it has stopped", g.qwen_captioner is None)
-
-# (b) Caption All was never disabled, so a second click started a SECOND worker over the same
-#     files — doubled work and doubled log lines, i.e. "did I queue a job up?"
-g.get_caption_image_files = lambda: ["a.png"]
-g.image_folder_var.set(os.environ["TEMP"])
-_started = []
-_real_thread = G.threading.Thread
-G.threading.Thread = lambda *a, **k: _started.append(1) or _types.SimpleNamespace(
-    start=lambda: None, daemon=True)
-
-g._captioning_running = True
-_popups.clear()
-g.caption_all_florence()
-ck("a second Caption All is refused", not _started and _popups == ["Already running"], _popups)
-
-_popups.clear()
-g.caption_single_image("x.png")
-ck("Regenerate is refused mid-job", not _started and _popups == ["Captioning in progress"], _popups)
-
-G.threading.Thread = _real_thread
-G.messagebox.showinfo = _real_showinfo
-g._captioning_running = False
-
-g._set_caption_buttons_running(True)
-ck("job buttons grey out while running",
-   str(g.caption_all_btn.cget("state")) == "disabled"
-   and str(g.caption_static_btn.cget("state")) == "disabled")
-g._set_caption_buttons_running(False)
-ck("  and come back afterwards", str(g.caption_all_btn.cget("state")) == "normal")
-
-# --- 8. persistence ----------------------------------------------------------------------
-g.caption_model_var.set(G.QWEN_CAPTION_MODEL)
-g.caption_task_var.set(CAPTION_TASKS["exhaustive"][0])
-g.caption_max_tokens_var.set("240")
-data = dict(g.last_used)
-for attr, key in (("caption_model_var", "caption_model"),
-                  ("caption_task_var", "caption_task"),
-                  ("caption_max_tokens_var", "caption_max_tokens")):
-    data[key] = getattr(g, attr).get()
-root.destroy()
-
-root2 = tk.Tk()
-root2.withdraw()
-g2 = G.LoRATrainerGUI(root2)
-g2.last_used = data
-# re-seed as the constructor would
-g2.caption_model_var.set(data["caption_model"])
-g2.caption_task_var.set(data["caption_task"])
-g2.caption_max_tokens_var.set(data["caption_max_tokens"])
-ck("model/task/max-tokens survive a restart",
-   g2.caption_model_var.get() == G.QWEN_CAPTION_MODEL
-   and g2.caption_task_var.get() == CAPTION_TASKS["exhaustive"][0]
-   and g2.caption_max_tokens_var.get() == "240")
-root2.destroy()
-
-# --- 9. trainer CLI accepts the custom instruction ---------------------------------------
-from fizgig.scripts.krea2_train import setup_parser
-p = setup_parser()
-ns = p.parse_args(["--dit", "d", "--dataset_config", "c", "--output_dir", "o",
-                   "--output_name", "n", "--recaption_instruction", "CUSTOM"])
-ck("krea2_train --recaption_instruction parses", ns.recaption_instruction == "CUSTOM")
-
-import inspect
-from fizgig.krea2.trainer import train_krea2, _apply_caption_updates
-ck("train_krea2 takes recaption_instruction",
-   "recaption_instruction" in inspect.signature(train_krea2).parameters)
-ck("_apply_caption_updates takes recaption_instruction",
-   "recaption_instruction" in inspect.signature(_apply_caption_updates).parameters)
-
-from fizgig.krea2.embedder import generate_caption
-ck("generate_caption takes instruction",
-   "instruction" in inspect.signature(generate_caption).parameters)
-
-# --- 10. caption hygiene: preamble stripping + the two instruction rules -----------------
-from fizgig.krea2.embedder import (_strip_caption_preamble, SUBJECT_RULE, NO_PREAMBLE_RULE,
-                                   SHORT_CAPTION_INSTRUCTION, DETAILED_DESCRIPTION_INSTRUCTION,
-                                   DETAILED_CAPTION_INSTRUCTION)
-
-_preamble_cases = [
-    ("This image shows a woman standing on a beach.", "a woman standing on a beach."),
-    ("The image depicts a man viewed from behind.", "a man viewed from behind."),
-    ("In this image, a woman sits on a chair.", "a woman sits on a chair."),
-    ("In this image we see a girl running.", "a girl running."),
-    ("Here we see a woman laughing.", "a woman laughing."),
-    ("The photo shows a bride walking.", "a bride walking."),
-    ("This photograph captures a couple dancing.", "a couple dancing."),
-    ("This image is of a woman.", "a woman."),
-    # must survive untouched
-    ("a woman viewed from behind, wearing a red coat", "a woman viewed from behind, wearing a red coat"),
-    ("A photo of a woman on a beach.", "A photo of a woman on a beach."),
-    ("The image on the wall shows a landscape.", "The image on the wall shows a landscape."),
-    ("This image shows", "This image shows"),   # stripping to empty keeps the original
-]
-_bad = [(s, _strip_caption_preamble(s), w) for s, w in _preamble_cases
-        if _strip_caption_preamble(s) != w]
-ck("preamble stripper: 12 cases incl. negatives", not _bad, _bad[:2])
-
-for _name, _instr in (("training", CAPTION_INSTRUCTION),
-                      ("short", SHORT_CAPTION_INSTRUCTION),
-                      ("detailed", DETAILED_DESCRIPTION_INSTRUCTION),
-                      ("exhaustive", DETAILED_CAPTION_INSTRUCTION)):
-    ck(f"  '{_name}' instruction carries the subject + no-preamble rules",
-       SUBJECT_RULE in _instr and NO_PREAMBLE_RULE in _instr)
-
-shutil.rmtree(TMP, ignore_errors=True)
-shutil.rmtree(imgdir, ignore_errors=True)
-print("\n" + ("ALL PASS" if not fails else f"{len(fails)} FAILURE(S)"))
-sys.exit(1 if fails else 0)
+g.caption_process = None
+ck("no worker -> not alive", g._caption_worker_alive() is False)
+_switch_to(_heavy)
+ck("  no-op when no worker is running", _stopped == [], _stopped)

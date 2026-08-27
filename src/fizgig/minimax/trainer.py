@@ -267,6 +267,10 @@ def restore_parked_dit(dit, device, n_swap: int):
         for _blk in dit.blocks:
             if hasattr(_blk, "_h2d_offloader"):
                 _blk._h2d_offloader = None
+        # Drop the reference before enable_block_swap builds the fresh ring below —
+        # holding it doubled the CPU staging transient at every preview restore
+        # (audit, 25 Aug; twin of the fix in enable_block_swap's own teardown).
+        _old = None
     keep = len(dit.blocks) - n
     for i, blk in enumerate(dit.blocks):
         blk.to(device if i < keep else "cpu")
@@ -419,6 +423,12 @@ _SWAP_TRANSIENT_GB = 7.5     # extra backward-time peak whenever swap is active 
 _H2D_PER_BLOCK_GB = 0.39     # one streamed int8 block's VRAM share (checkpoint header: 0.385)
 _H2D_TRANSIENT_GB = 2.0      # ring (2 x 0.39) + margin — validated on a simulated 16 GB card
                              # at BOTH 0.25 MP and 1 MP buckets, swap 40 (~1.85 s/it at 1 MP)
+_MIN_INT8_H2D_FREE_GB = 13.5  # INT8 H2D was validated at ~14.2 GB free (16 GB-class cards).
+                              # A 12 GB card tops out below this and must stay on NF4: letting
+                              # the streaming arithmetic alone approve 38-40 streamed INT8
+                              # blocks made Auto pick a larger base that crashed before step
+                              # one (@mabseyuk's 5070 field report). Explicit int8 remains
+                              # available for anyone benchmarking new floors.
 _RESERVE_GB = 1.5            # display / allocator / fragmentation headroom
 # Skipping checkpointing has to EARN it. Measured on H3, recompute costs ~0.1 s/step and saves
 # ~5 GB — so choosing "no checkpointing" on a thin margin trades five gigabytes of headroom for
@@ -539,15 +549,31 @@ def plan_base_quant(free_gb: float, pruned: bool, mp: float = 0.25, adapter_gb: 
                                transient_gb=_INT8_TRANSIENT_GB, adapter_gb=adapter_gb)
     if i_swap == 0:
         return "int8", i_swap, i_ckpt, "int8 fits with no block swap — the most accurate base"
+    # The int8 streaming path was originally validated with 16 GB-class headroom (~14.2 GB
+    # free) — @mabseyuk's 5070 crashed before step one on a 12 GB int8-streaming plan,
+    # which is where this floor came from. That crash predates the v4.4.0 pin fallback and
+    # ring hardening, and the SAME card now runs an EXPLICIT int8 pick at ~1.1 s/it with
+    # 40 streamed blocks (#101) — but at ~15 GB of pinned system RAM, which a 16 GB-RAM
+    # box cannot survive. So Auto keeps the conservative floor (nf4 stays on-card and
+    # stages nothing) and the reason string hands big-RAM users the explicit escape hatch;
+    # relaxing Auto itself is #101 and wants a RAM-aware gate plus measurement first.
+    if free_gb < _MIN_INT8_H2D_FREE_GB:
+        n_swap, n_ckpt = plan_vram(free_gb, mp=mp, resident_gb=_RESIDENT_PRUNED_GB,
+                                   adapter_gb=adapter_gb)
+        return ("nf4", n_swap, n_ckpt,
+                f"{free_gb:.1f} GB free is below the tested int8-streaming floor "
+                f"({_MIN_INT8_H2D_FREE_GB:.1f} GB) — using the smaller 4-bit base. "
+                f"(A machine with 48 GB+ of system RAM can pick Base Precision: int8 "
+                f"explicitly — the accurate base streams through the ring at this tier, "
+                f"staging ~15 GB in pinned RAM)")
     # H2D-specific arithmetic — the classic anchors are WRONG for streaming and would refuse
     # cards that measurably work. Classic swap's 7.5 GB backward transient is engine-held
     # recompute segments of physically-moving blocks; H2D blocks never move — the transient is
     # the ring (2 x 0.39 GB) plus margin. And an int8 block frees _H2D_PER_BLOCK_GB = 0.39
     # (measured from the checkpoint header), not NF4's 0.34. Validated: a simulated 16 GB
     # card (14.2 GB free) ran swap 40 for six epochs at ~1.35 s/it, peak within budget.
-    _base = _RESIDENT_INT8_GB + _INT8_TRANSIENT_GB + float(adapter_gb)
-    _scale = max(0.25, float(mp)) / 0.25
-    _need = _base + _ACT_GB_CKPT * _scale + _RESERVE_GB + _H2D_TRANSIENT_GB
+    _need = (_ckpt_need_gb(mp, 1, _RESIDENT_INT8_GB, _INT8_TRANSIENT_GB, adapter_gb)
+             + _H2D_TRANSIENT_GB)
     _h2d_swap = int((_need - free_gb) / _H2D_PER_BLOCK_GB + 0.999)
     # H2D staging lives in SYSTEM RAM — and on Windows so does the GPU itself: WDDM backs
     # GPU allocations with commit charge, so exhausting RAM makes the driver refuse even
@@ -636,6 +662,41 @@ def _max_effective_mp(group):
     return best_mp, best_t
 
 
+# The 0.5 GB / 0.25 MP checkpointed-activation anchor was MEASURED at 0.25 MP; everything
+# above it is linear extrapolation, and attention workspaces do not owe us linearity (4090
+# field OOM, 25 Aug — video items plan at effective MP 10-50x the anchor). The extrapolated
+# PORTION of the activation term gets this safety fraction — exactly zero at the anchor, so
+# every validated stills-tier plan is bit-identical.
+_ACT_EXTRAP_FRAC = 0.15
+
+
+def _ckpt_need_gb(mp, batch, resident, transient_gb, adapter_gb):
+    """Checkpointed-VRAM need (GB) before any swap — shared by plan_vram, plan_base_quant's
+    H2D branch, and plan_swap_shortfall_gb so the three can never drift apart."""
+    base = float(resident) + float(transient_gb) + float(adapter_gb)
+    scale = max(0.25, float(mp)) / 0.25 * max(1, int(batch))
+    act = _ACT_GB_CKPT * scale
+    act += _ACT_EXTRAP_FRAC * max(0.0, act - _ACT_GB_CKPT)
+    return base + act + _RESERVE_GB
+
+
+def plan_swap_shortfall_gb(free_gb, mp=0.25, batch=1, resident_gb=None, transient_gb=0.0,
+                           adapter_gb=0.0, swap_transient_gb=None, per_block_gb=None):
+    """GB the swap plan is still short AFTER the 40-block cap — 0.0 when the cap covers it.
+
+    plan_vram's `min(40, ...)` is a CAP, not a guarantee (4090 field OOM, 25 Aug): at
+    video-tier effective MP the deficit can exceed what 40 parked blocks free, and the old
+    planner proceeded anyway — a confident [vram] line, then an OOM at the first training
+    step. Pure like plan_vram so the truth table pins on CPU. Callers pass the transient
+    and per-block numbers matching how the swap actually runs (ring vs classic)."""
+    resident = _RESIDENT_GB if resident_gb is None else float(resident_gb)
+    swap_t = _SWAP_TRANSIENT_GB if swap_transient_gb is None else float(swap_transient_gb)
+    per_block = _PER_BLOCK_GB if per_block_gb is None else float(per_block_gb)
+    need = _ckpt_need_gb(mp, batch, resident, transient_gb, adapter_gb)
+    deficit = need + swap_t - float(free_gb)
+    return max(0.0, deficit - 40 * per_block)
+
+
 def plan_vram(free_gb: float, mp: float = 0.25, batch: int = 1, resident_gb: float = None,
               transient_gb: float = 0.0, adapter_gb: float = 0.0):
     """Pure planner: (blocks_to_swap, gradient_checkpointing) from free VRAM + token load.
@@ -655,7 +716,7 @@ def plan_vram(free_gb: float, mp: float = 0.25, batch: int = 1, resident_gb: flo
     need_nockpt = base + _ACT_GB_NOCKPT * scale + _RESERVE_GB + _NOCKPT_MARGIN_GB
     if free_gb >= need_nockpt:
         return 0, False
-    need_ckpt = base + _ACT_GB_CKPT * scale + _RESERVE_GB
+    need_ckpt = _ckpt_need_gb(mp, batch, resident, transient_gb, adapter_gb)
     if free_gb >= need_ckpt:
         return 0, True
     deficit = need_ckpt + _SWAP_TRANSIENT_GB - free_gb
@@ -2248,6 +2309,17 @@ def train_minimax(
                   else ("int8" if is_pruned_checkpoint(dit_path) else "nf4"))
     if not quantize:
         _base_mode = "none"
+    # Any swap on a quantized base rides an H2D ring now — int8 through rintic-13's
+    # ConvRot ring (#73), NF4 through @mabseyuk's Linear4bit ring. Planner-owned, no
+    # opt-in; FIZGIG_NO_NF4_H2D=1 is the debug kill-switch back to classic parking.
+    # Evaluated at USE time, not here: _base_mode is reassigned to the planner's
+    # RESOLVED mode below (Auto's pre-plan guess of int8 can resolve to nf4 under the
+    # streaming floor), and a snapshot taken now made the kill-switch dead on exactly
+    # the default path where the NF4 ring is reached (audit, 25 Aug).
+    def _ring_planned():
+        return (_base_mode == "int8"
+                or (_base_mode == "nf4"
+                    and os.environ.get("FIZGIG_NO_NF4_H2D") != "1"))
     if str(blocks_to_swap).lower() == "auto":
         if torch.cuda.is_available() and quantize:
             from fizgig.utils.device import plannable_free_vram
@@ -2301,11 +2373,56 @@ def train_minimax(
                     "inference. To force the accurate base, set Base Precision to int8 — expect "
                     "block swap and a several-times-slower run — or close other GPU apps and "
                     "re-launch.")
-            if n_swap > 0:
+            if n_swap > 0 and not _ring_planned():
+                # Only the CLASSIC parking swap earns the scary line — ring-streamed
+                # blocks (int8 and NF4 alike) cross PCIe one-way with prefetch and cost
+                # a fraction of that. The ring path logs its own line at activation.
                 logger.warning(
                     f"[vram] {n_swap} of 50 blocks will live on CPU and cross PCIe every step, "
                     f"which is several times slower. Lower Target Megapixels, or free VRAM, to "
                     f"avoid it.")
+            if n_swap >= 40:
+                # A plan AT the cap may be a plan that doesn't fit at all (4090 field
+                # OOM): say so loudly with the number, instead of a confident plan line
+                # followed by a step-1 OOM. The run still proceeds — Windows can spill
+                # to shared memory and limp — but nobody should discover an ~8 GB hole
+                # from a traceback. Transient/per-block match how the swap actually
+                # runs: ring-streamed blocks never round-trip, so their backward
+                # transient is the ring, not classic parking's recompute segments.
+                _swap_t = (_H2D_TRANSIENT_GB if _ring_planned()
+                           else _SWAP_TRANSIENT_GB)
+                _short = plan_swap_shortfall_gb(
+                    _free_gb, mp=_mp, resident_gb=_resident,
+                    transient_gb=_INT8_TRANSIENT_GB if _mode == "int8" else 0.0,
+                    adapter_gb=_adapter,
+                    swap_transient_gb=_swap_t,
+                    per_block_gb=(_H2D_PER_BLOCK_GB if _mode == "int8"
+                                  else _PER_BLOCK_GB))
+                # Margins are not shortfall (#101, MEASURED): the arithmetic's "need"
+                # includes the reserve and the swap transient, which exist for spikes —
+                # plans it called 0.9 GB short (field 5070) and 2.5 GB short (sim-12
+                # gate, HARD allocator cap) both trained at ~1.3 s/it with headroom.
+                # Crying wolf there costs the warning its credibility, so it fires only
+                # once the deficit eats THROUGH the margins — the 8-12 GB monster-clip
+                # holes it was built for (the 4090 report) sail past this bar.
+                _margins = _RESERVE_GB + _swap_t
+                if _short > _margins + 0.5:
+                    logger.warning(
+                        f"[vram] this plan does NOT fit: even at the 40-block swap cap, "
+                        f"and with every safety margin spent, it is ~{_short - _margins:.1f} "
+                        f"GB short for the heaviest item in this dataset ({_mp:.2f} "
+                        f"effective MP — spatial size x clip frames). Expect an "
+                        f"out-of-memory error at the first training step, or a severe "
+                        f"slowdown if Windows spills to shared memory. Lower Target "
+                        f"Megapixels, shorten or downscale the heaviest clips, or free "
+                        f"VRAM and re-launch.")
+                elif _short > 0.5:
+                    logger.info(
+                        f"[vram] tight fit: the plan leans ~{_short:.1f} GB into its "
+                        f"safety margins at the 40-block cap — training measured fine "
+                        f"at this tier, but previews may downgrade or switch off "
+                        f"(training and checkpoints are never at risk). Close other "
+                        f"GPU apps if the first step OOMs.")
         else:
             n_swap, _ckpt_auto = 0, False
     else:
@@ -2396,24 +2513,36 @@ def train_minimax(
                               adaln_fp32=not train_adaln)
     dit.requires_grad_(False)                                   # frozen base (QLoRA-style)
     if n_swap > 0:
-        # int8 bases stream H2D-only (#73, @rintic-13): the base is frozen, so the classic
-        # swap's writeback half was always waste — a ring buffer + copy stream prefetches
-        # each block while the previous computes. NF4 keeps the classic parking (the
-        # offloader is ConvRot-specific). The later preview-restore calls re-enter
-        # enable_block_swap bare and inherit this mode.
-        _use_h2d = (_base_mode == "int8")
+        # Quantized bases stream H2D-only: the base is frozen, so the classic swap's
+        # writeback half was always waste — a ring buffer + copy stream prefetches each
+        # block while the previous computes. int8 rides rintic-13's ConvRot ring (#73);
+        # NF4 rides @mabseyuk's Linear4bit ring (the tier 12 GB cards land on — his 5070
+        # went from 12-14 s/step parked to ~1 s/step streamed). enable_block_swap
+        # dispatches by module type and falls back to classic parking if a ring can't
+        # build; the later preview-restore calls re-enter it bare and inherit this mode.
+        _use_h2d = _ring_planned()
         n_swap = dit.enable_block_swap(n_swap, h2d_only=_use_h2d, ring_size=2)
-        if _use_h2d:
+        _off = getattr(dit, "_h2d_offloader", None)
+        if _off is not None:
             _staging = ("pinned in RAM"
-                        if not getattr(getattr(dit, "_h2d_offloader", None),
-                                       "_pin_failed", False)
-                        else "staged in ordinary RAM — OS pin limit, copies synchronous")
+                        if not getattr(_off, "_pin_failed", False)
+                        else "staged in ordinary RAM (pinning unavailable or RAM too "
+                             "tight) — copies synchronous")
+            # Both ring classes declare kind/staged_gb; the explicit None test matters
+            # because `or` would swallow a legitimate 0.0 into the int8 estimate.
+            _kind = getattr(_off, "kind", "?")
+            _gb = getattr(_off, "staged_gb", None)
+            if _gb is None:
+                _gb = n_swap * 0.39
             logger.info(f"[vram] block swap active: last {n_swap} blocks streamed H2D-only "
-                        f"(int8, ring 2, ~{n_swap * 0.39:.1f} GB {_staging}) — no "
+                        f"({_kind}, ring 2, ~{_gb:.1f} GB {_staging}) — no "
                         f"writeback, prefetch overlaps compute")
         else:
+            # Classic parking: the planned NF4 path with the kill-switch on, OR any
+            # base whose ring failed to build — so name the mode rather than assuming.
             logger.info(f"[vram] block swap active: last {n_swap} blocks parked on CPU "
-                        f"(~{n_swap * 0.34:.1f} GB VRAM freed, packed NF4 in RAM)")
+                        f"(~{n_swap * 0.34:.1f} GB VRAM freed, packed {_base_mode} "
+                        f"in RAM)")
     if use_ckpt:
         dit.enable_gradient_checkpointing()
         logger.info("[vram] gradient checkpointing ON")
@@ -3408,6 +3537,31 @@ def train_minimax(
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            # Fragmentation guard for tight cards (#92, David Maybank's 12 GB report): the
+            # preview's block up/down churn + the 4.85 GB decoder round-trip fragment the
+            # allocator reserve (his post-preview census: ~4.8 GB inactive split), and
+            # Windows torch has no expandable_segments — the NEXT training step's first
+            # contiguous allocation then OOMs even though everything was restored. Same
+            # disease and same cure as the FT bracket previews: a full park/restore round
+            # trip re-lands the resident set contiguously. Seconds, and only when free VRAM
+            # is actually tight — a 32 GB card never triggers this.
+            if torch.cuda.is_available():
+                try:
+                    from fizgig.utils.device import plannable_free_vram as _pfv2
+                    _free_after = _pfv2()
+                except Exception:
+                    _free_after = 99.0
+                if _free_after < 4.0:
+                    logger.info(f"[preview] {_free_after:.1f} GB free after the preview — "
+                                "defragmenting via a full park/restore round-trip so the "
+                                "next training step doesn't fight the fragments.")
+                    park_dit_to_cpu(dit)
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    restore_parked_dit(dit, device, n_swap)
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    vram_line("post-defrag")
             vram_line("finally-done")
 
     # ---- epoch loop ----

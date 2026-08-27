@@ -37,15 +37,23 @@ def sc(kind, vram, mp=None, steps=LONG, swap=0):
                           swap, vram_gb=vram, caps=CAPS, **kwargs)
 
 
-# --- 1. the 0.25 MP default is byte-identical to the pre-change behaviour -----------------
-# Goldens written against the shipped logic: flat INT8 gate at 21.5 GB, no NF4 gate at all.
-for vram, want in ((30.0, True), (21.5, True), (21.4, False), (10.0, False)):
+# --- 1. the 0.25 MP default -----------------------------------------------------------------
+# should_compile became THREE-valued in #99: True = compile with the gradient checkpoint inside
+# the graph, 'outside' = compile with it outside (eager-level stashes, measured ~27% faster than
+# eager at 1 MP), False = decline. 'outside' is truthy, so bool callers are unaffected — but a
+# test comparing `ok == False` silently breaks, because the cases that used to DECLINE for want
+# of VRAM now take the outside boundary instead. That is the improvement, not a regression.
+for vram, want in ((30.0, True), (21.5, True), (21.4, "outside"), (10.0, False)):
     ok, why = sc("int8", vram)
-    ck(f"int8 @0.25MP default, {vram} GB free -> {'compile' if want else 'decline'}",
-       ok == want, why)
+    ck(f"int8 @0.25MP default, {vram} GB free -> {want!r}", ok == want, f"{ok!r}  {why}")
+# The flat-peak wording belongs to a REAL decline, so assert it where one still happens: at
+# 10 GB even the outside boundary does not fit.
+ok, why = sc("int8", 10.0)
+ck("  a true decline uses the flat-peak wording (no MP mention)",
+   not ok and "peaks near 20 GB" in why and "MP" not in why, why)
 ok, why = sc("int8", 21.4)
-ck("  the decline reason is the flat-peak wording (no MP mention)",
-   "peaks near 20 GB and" in why and "MP" not in why, why)
+ck("  the outside fallback says so, and why it is worth taking",
+   ok == "outside" and "OUTSIDE" in why and "faster than eager" in why, why)
 for vram in (30.0, 14.0, 8.0):
     ok, why = sc("nf4", vram)
     ck(f"nf4 @0.25MP default, {vram} GB free -> compile (no VRAM gate, as before)", ok, why)
@@ -58,11 +66,13 @@ for kind in ("int8", "nf4"):
            sc(kind, vram) == sc(kind, vram, mp=0.25))
 
 # --- 2. above 0.25 MP the gate grows ------------------------------------------------------
-# The run that motivated this: 0.98 MP, ~30 GB free, INT8 -> must now decline.
+# The run that motivated this: 0.98 MP, ~30 GB free, INT8. It used to OOM with the checkpoint
+# inside the graph; the resolution term caught that and declined. Since #99 it does better than
+# declining — it compiles with the boundary outside, which measured ~18.7 GB net there.
 ok, why = sc("int8", 30.0, mp=0.98)
-ck("int8 @0.98MP, 30 GB free -> DECLINED (the OOM run)", not ok, why)
-ck("  reason names the resolution and the fix",
-   "0.98 MP" in why and "Target Megapixels" in why, why)
+ck("int8 @0.98MP, 30 GB free -> 'outside' (was the OOM run)", ok == "outside", f"{ok!r}  {why}")
+ck("  reason names the resolution and the boundary it moved to",
+   "0.98 MP" in why and "OUTSIDE" in why, why)
 ok, why = sc("int8", 32.5, mp=0.98)
 ck("int8 @0.98MP with enough free VRAM still compiles", ok, why)
 
@@ -76,8 +86,12 @@ ck("nf4 @1.0MP, 30 GB free -> still compiles", ok, why)
 # The thresholds are exactly base + slope*(mp-0.25) + headroom — no hidden constants.
 _mp = 0.75
 _gate = _INT8_COMPILE_PEAK_GB + _COMPILE_GB_PER_MP * (_mp - 0.25) + _HEADROOM_GB
-ck("int8 gate sits exactly at the formula",
-   sc("int8", _gate + 0.01, mp=_mp)[0] and not sc("int8", _gate - 0.01, mp=_mp)[0])
+# For INT8 the gate now separates INSIDE from OUTSIDE rather than compile from decline — below
+# it, compiling still happens, just at the safer boundary.
+ck("int8 gate sits exactly at the formula (inside above, outside below)",
+   sc("int8", _gate + 0.01, mp=_mp)[0] is True
+   and sc("int8", _gate - 0.01, mp=_mp)[0] == "outside",
+   (sc("int8", _gate + 0.01, mp=_mp)[0], sc("int8", _gate - 0.01, mp=_mp)[0]))
 _gate = _NF4_COMPILE_PEAK_GB + _COMPILE_GB_PER_MP * (_mp - 0.25) + _HEADROOM_GB
 ck("nf4 gate sits exactly at the formula",
    sc("nf4", _gate + 0.01, mp=_mp)[0] and not sc("nf4", _gate - 0.01, mp=_mp)[0])

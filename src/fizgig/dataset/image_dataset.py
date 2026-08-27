@@ -1050,7 +1050,25 @@ class ImageDataset(torch.utils.data.Dataset):
                     # launch.
                     dims = k[len("latent_"):].split("x")
                     a, b = dims[-2], dims[-1]
-                    return {int(a), int(b)} == expected
+                    if {int(a), int(b)} == expected:
+                        return True
+                    # A CLIP cached BELOW its bucket is a legitimate state, not staleness:
+                    # the VRAM cap (_plan_clip_bucket) shrinks a clip to what the VAE can
+                    # encode in the free memory at cache time, so demanding exact equality
+                    # dropped every capped clip at train time — a clips-only dataset then
+                    # crashed with "No training items" straight after a clean cache run
+                    # (field report, 16 GB card). "smaller" lets the trainer accept it
+                    # (loudly) while --skip_existing stays strict (`is not True`), so a
+                    # fresh cache run still re-attempts full size. Stills keep the exact
+                    # check — the v3.0.0 silent-stale incident was a still, and stills
+                    # are never VRAM-capped.
+                    if len(dims) == 3:
+                        _c = sorted((int(a), int(b)))
+                        _e = sorted((int(bucket_reso[0]) // factor,
+                                     int(bucket_reso[1]) // factor))
+                        if _c[0] <= _e[0] and _c[1] <= _e[1]:
+                            return "smaller"
+                    return False
                 except Exception:
                     return None
         return None
@@ -1086,6 +1104,7 @@ class ImageDataset(torch.utils.data.Dataset):
                           if is_audio_path(f)}
         skipped_stale = 0
         skipped_wrong_reso = 0
+        accepted_smaller_clips = 0
 
         bucketed: dict[Tuple, list[ItemInfo]] = {}   # (w, h), or ("audio", w, h) for voice items
         for cache_file in latent_cache_files:
@@ -1118,9 +1137,20 @@ class ImageDataset(torch.utils.data.Dataset):
                 # A cache written at a different Target Megapixels has the SAME filename (it
                 # encodes the original size, not the bucket) — training on it would silently run
                 # at the old resolution. Skip it and tell the user to re-run cache preparation.
-                if self.latent_cache_matches_reso(cache_file, bucket_reso, self.architecture) is False:
+                _reso_ok = self.latent_cache_matches_reso(cache_file, bucket_reso, self.architecture)
+                if _reso_ok is False:
                     skipped_wrong_reso += 1
                     continue
+                if _reso_ok == "smaller":
+                    # A VRAM-capped clip (or one cached at an older, lower Target Megapixels)
+                    # — train it at its cached size rather than dropping it: dropping made a
+                    # clips-only dataset crash with "No training items" right after a clean
+                    # cache run. Batch size 1 only: mixed sizes cannot stack into one batch
+                    # (H3 always runs batch 1, so this guard is belt-and-braces).
+                    if self.batch_size != 1:
+                        skipped_wrong_reso += 1
+                        continue
+                    accepted_smaller_clips += 1
                 bucket_key = bucket_reso
             item_info = ItemInfo(item_key, "", image_size, bucket_reso, latent_cache_path=cache_file)
             item_info.text_encoder_output_cache_path = te_cache
@@ -1140,6 +1170,12 @@ class ImageDataset(torch.utils.data.Dataset):
                 f"[dataset] ignored {skipped_wrong_reso} cache file(s) written at a DIFFERENT "
                 f"resolution than this run's Target Megapixels — re-run cache preparation "
                 f"(latent + text) to train at the current setting.")
+        if accepted_smaller_clips:
+            logger.info(
+                f"[dataset] {accepted_smaller_clips} clip(s) are cached below their bucket size "
+                f"(VRAM-capped at encode time, or cached at an older Target Megapixels) — "
+                f"training them at the cached size. Re-running cache preparation with more "
+                f"free VRAM re-encodes them at full size.")
 
         self.batch_manager = BucketBatchManager(bucketed, self.batch_size, num_timestep_buckets=num_timestep_buckets)
         self.batch_manager.show_bucket_info()

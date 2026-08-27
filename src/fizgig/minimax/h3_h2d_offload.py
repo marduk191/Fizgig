@@ -43,6 +43,15 @@ logger = logging.getLogger(__name__)
 class H3Int8H2DOffloader:
     """Streams the last N blocks' int8 tensors host→device through a ring buffer."""
 
+    # The trainer's activation log reads these off whichever ring is live; the NF4 ring
+    # defines both, and relying on getattr fallbacks here meant any future ring class
+    # would silently report itself as int8 at 0.39 GB/block (audit, 25 Aug).
+    kind = "int8"
+
+    @property
+    def staged_gb(self):
+        return sum(x.numel() for x in self.cpu_flat.values()) / 1e9
+
     def __init__(self, blocks, swap_from: int, device: torch.device, ring_size: int = 2):
         self.blocks = blocks
         self.swap_from = swap_from

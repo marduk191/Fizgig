@@ -1180,12 +1180,26 @@ class LoRANetwork(torch.nn.Module):
         if os.path.splitext(file)[1] == ".safetensors":
             from safetensors.torch import save_file
 
-            # Precalculate model hashes to save time on indexing
             if metadata is None:
                 metadata = {}
-            model_hash, legacy_hash = _precalculate_safetensors_hashes(state_dict, metadata)
-            metadata["sshs_model_hash"] = model_hash
-            metadata["sshs_legacy_hash"] = legacy_hash
+            # The sshs_* hashes serialize the ENTIRE state dict into memory a second time —
+            # at the end of an epoch that is the moment RAM is tightest, and on constrained
+            # boxes it raised MemoryError (or a safetensors-rust PanicException) BEFORE the
+            # checkpoint was written, killing the run over optional indexing metadata
+            # (#92, diagnosed by David Maybank on a 12 GB / 64 GB box). Optional metadata
+            # must never cost a checkpoint: on those two failures, skip the hashes and save;
+            # anything else is a real bug and still raises.
+            try:
+                model_hash, legacy_hash = _precalculate_safetensors_hashes(state_dict, metadata)
+                metadata["sshs_model_hash"] = model_hash
+                metadata["sshs_legacy_hash"] = legacy_hash
+            except BaseException as e:
+                if not (isinstance(e, MemoryError)
+                        or type(e).__name__ == "PanicException"):
+                    raise
+                logger.warning("skipping optional sshs_* hash metadata — not enough memory "
+                               "to compute it (%s). The checkpoint itself saves normally.",
+                               type(e).__name__)
 
             save_file(state_dict, file, metadata)
         else:

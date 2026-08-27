@@ -227,7 +227,12 @@ def load_dit_for_training(
     # With a turbo net staged, its enabled flag becomes a dynamo guard: the first preview
     # compiles a second graph variant (enabled=True), after which both states are cached.
     if compile_blocks:
-        _compile_blocks(dit, blocks_to_swap)
+        # fp8_scaled here is the RESOLVED value (int8/NF4 force it False above), so the
+        # guard sees the base that actually loaded. compile_blocks may be the string
+        # "outside" (high-res boundary, #99) — any other truthy value means "inside".
+        _compile_blocks(dit, blocks_to_swap, fp8_scaled=fp8_scaled,
+                        boundary=("outside" if str(compile_blocks).lower() == "outside"
+                                  else "inside"))
     return dit, network, turbo_net, turbo_diffb
 
 
@@ -323,21 +328,51 @@ def _find_host_compiler() -> bool:
     return False
 
 
-def _compile_blocks(dit, blocks_to_swap: int) -> None:
+def _compile_blocks(dit, blocks_to_swap: int, fp8_scaled: bool = False,
+                    boundary: str = "inside") -> None:
     """Compile each transformer block. Opt-in — see the roadmap for what it is and isn't worth.
 
     The win is real on the quantised path (inductor fuses the per-matmul quantise/dequantise
     elementwise work that bounds INT8), and small on dense bf16. It costs compile time on the
     first step, and a recompile for every new latent shape a bucketed dataset presents.
 
+    `boundary` places the gradient checkpoint relative to the compiled region (#99):
+    "inside" (default) compiles the checkpoint INTO the graph — worth 1.19x per block, but
+    inductor's partitioner stashes far more intermediates as tokens grow (measured >32 GB
+    at 1 MP on the INT8 path, vs ~18 GB eager). "outside" compiles the raw block and keeps
+    the checkpoint wrapper eager: recompute reruns the compiled graph, stashes stay at
+    eager checkpointing's level, and the kernel-fusion win on the quantise/dequantise
+    traffic survives — the high-resolution fit.
+
     Refused under block swap: compiled graphs assume their weights stay put, and swap moves them
-    between CPU and GPU every step.
+    between CPU and GPU every step. Also refused for the fp8 base on pre-Ada GPUs: inductor
+    lowers the fp8 dequant to an fp8e4nv Triton kernel that only SM 8.9+ silicon has, and the
+    resulting ValueError escapes dynamo's suppress_errors and kills the run before step one
+    (#97, RTX 3090).
     """
     if blocks_to_swap > 0:
         logger.warning("[compile] ignored — block swap moves weights between devices every step, "
                        "which invalidates compiled graphs. Quantise instead of swapping if you "
                        "want both.")
         return
+    if fp8_scaled:
+        _cc = None
+        try:
+            # `import torch as _torch`, NOT the bare name: the `import torch._dynamo`
+            # further down makes `torch` function-LOCAL, so referencing it here raises
+            # UnboundLocalError — which the except below would silently eat, and the
+            # guard would never fire (caught by the #97 regression test's tracer).
+            import torch as _torch
+            if _torch.cuda.is_available():
+                _cc = _torch.cuda.get_device_capability()
+        except Exception:
+            pass
+        if _cc is not None and _cc < (8, 9):
+            logger.warning("[compile] ignored — the fp8 base needs fp8 Triton kernels "
+                           "(fp8e4nv), which need SM 8.9+ (RTX 40-series or newer); this GPU "
+                           "is SM %d.%d. Pick INT8 or NF4 Base Precision to compile on this "
+                           "card. Training continues uncompiled.", _cc[0], _cc[1])
+            return
     try:
         import triton  # noqa: F401
     except Exception:
@@ -369,6 +404,16 @@ def _compile_blocks(dit, blocks_to_swap: int) -> None:
     # (8.817 -> 7.428 ms/block-step).
     checkpointing = bool(getattr(dit, "gradient_checkpointing", False))
     n = 0
+    if boundary == "outside":
+        for i, block in enumerate(dit.blocks):
+            dit.blocks[i] = _CheckpointedBlock(torch.compile(block, fullgraph=True),
+                                               checkpointing)
+            n += 1
+        logger.info("[compile] %d blocks compiled (fullgraph, checkpoint OUTSIDE the "
+                    "compiled region — recompute reruns the compiled graph, so activation "
+                    "stashes stay at eager level; the high-resolution fit) — the first "
+                    "step of each new shape pauses to compile", n)
+        return
     for i, block in enumerate(dit.blocks):
         dit.blocks[i] = torch.compile(_CheckpointedBlock(block, checkpointing), fullgraph=True)
         n += 1
@@ -1457,23 +1502,38 @@ def train_krea2(
     # is knowable here because the dataset is already built. Short runs are a straight loss, so the
     # default must not simply turn it on. "on"/"off" are the explicit overrides.
     _do_compile = str(compile_blocks).lower() in ("1", "true", "on", "yes")
+    if str(compile_blocks).lower() == "outside":
+        # Explicit high-res boundary (#99): checkpoint outside the compiled region.
+        _do_compile = "outside"
+    # The largest ACTUAL bucket, not the Target Megapixels box — bucket_no_upscale can land
+    # buckets well below the target, and it's the real token count that sets compiled-path
+    # VRAM. Batch rides along because it multiplies tokens per step the same way. Unreadable
+    # values fall back to the defaults, i.e. the pre-shape-aware behaviour.
+    _mp_max, _batch_max = 0.25, 1
+    try:
+        _mp_max = max(w * h / 1e6 for ds in group.datasets
+                      for (w, h) in ds.batch_manager.bucket_resos)
+        _batch_max = max(int(ds.batch_size) for ds in group.datasets)
+    except Exception:
+        pass
+    if _do_compile is True:
+        # Explicit On means ON — but the checkpoint boundary is still placed where it
+        # fits (#99): forced inside-the-graph at 1 MP measured >32 GB and OOM'd on a
+        # 32 GB card; outside completed in ~18.7 GB at ~27% faster than eager.
+        from fizgig.utils.capabilities import compile_boundary
+        _b = compile_boundary(quant_4bit, quant_int8, mp=_mp_max, batch=_batch_max)
+        if _b == "outside":
+            logger.info("[compile] on: inside-the-graph won't fit at this token load — "
+                        "compiling with the checkpoint OUTSIDE the region instead.")
+            _do_compile = "outside"
     if str(compile_blocks).lower() == "auto":
         from fizgig.utils.capabilities import should_compile
         _steps_est = group.num_train_items * max_train_epochs
-        # The largest ACTUAL bucket, not the Target Megapixels box — bucket_no_upscale can land
-        # buckets well below the target, and it's the real token count that sets compiled-path
-        # VRAM. Batch rides along because it multiplies tokens per step the same way. Unreadable
-        # values fall back to the defaults, i.e. the pre-shape-aware behaviour.
-        _mp_max, _batch_max = 0.25, 1
-        try:
-            _mp_max = max(w * h / 1e6 for ds in group.datasets
-                          for (w, h) in ds.batch_manager.bucket_resos)
-            _batch_max = max(int(ds.batch_size) for ds in group.datasets)
-        except Exception:
-            pass
         _do_compile, _why = should_compile(_steps_est, quant_4bit, quant_int8, blocks_to_swap,
                                            mp=_mp_max, batch=_batch_max)
-        logger.info("[compile] auto: %s — %s", "ENABLED" if _do_compile else "off", _why)
+        logger.info("[compile] auto: %s — %s",
+                    ("ENABLED (checkpoint outside)" if _do_compile == "outside"
+                     else ("ENABLED" if _do_compile else "off")), _why)
 
     # Preview setup: pre-encode prompts (frees the 8GB encoder) + load the VAE BEFORE the RAW DiT,
     # so the encoder never coexists with the resident base.

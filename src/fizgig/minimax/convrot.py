@@ -91,11 +91,52 @@ class _Int8RotLinearFn(torch.autograd.Function):
     Net effect: this stores less than an ordinary Linear would.
     """
 
+    # rintic-13's fused W8A16 Triton GEMM (#89) — test-branch default ON. Opt out with
+    # FIZGIG_NO_TRITON_W8A16=1. Falls back to the eager path when Triton is missing, the
+    # input is not CUDA-bf16, or the kernel ever raises (logged once).
+    _w8a16_state = {"checked": False, "use": False, "announced": False}
+
+    @classmethod
+    def _use_w8a16(cls, x, dt):
+        st = cls._w8a16_state
+        if not st["checked"]:
+            st["checked"] = True
+            import os as _os
+            if _os.environ.get("FIZGIG_NO_TRITON_W8A16") == "1":
+                st["use"] = False
+            else:
+                try:
+                    from fizgig.minimax.convrot_w8a16_triton import TRITON_AVAILABLE
+                    st["use"] = bool(TRITON_AVAILABLE)
+                except Exception:
+                    st["use"] = False
+        # Training steps only: previews run under no_grad on razor-thin margins (56-frame
+        # clips at 11 GB free), where Triton's first-use overhead — JIT cubins, autotune
+        # benchmarking, context growth outside torch's allocator — tipped a working preview
+        # into OOM (field). The kernel buys nothing in a 6-step preview anyway; the win is
+        # the thousands of training forwards.
+        if not (st["use"] and dt == torch.bfloat16 and x.is_cuda
+                and torch.is_grad_enabled()):
+            return False
+        if not st["announced"]:
+            st["announced"] = True
+            print("[convrot] fused W8A16 Triton kernel active (issue #89, rintic-13)",
+                  flush=True)
+        return True
+
     @staticmethod
     def forward(ctx, x, qdata, wscale, bias, rot, dt):
         ctx.save_for_backward(qdata, wscale)
         ctx.rot, ctx.dt = rot, dt
         xr = rotate(x.to(dt), rot) if rot > 1 else x.to(dt)
+        if _Int8RotLinearFn._use_w8a16(xr, dt):
+            try:
+                from fizgig.minimax.convrot_w8a16_triton import fused_w8a16_gemm
+                return fused_w8a16_gemm(xr, qdata, wscale, bias)
+            except Exception as _ke:
+                _Int8RotLinearFn._w8a16_state["use"] = False
+                print(f"[convrot] W8A16 kernel failed ({type(_ke).__name__}: {_ke}) — "
+                      "falling back to the eager path for the rest of the run.", flush=True)
         # Scale on the OUTPUT, not the weight. wscale is per output ROW, so
         #     y[t,o] = sum_i xr[t,i]*q[o,i]*s[o] = (xr @ q^T)[t,o] * s[o]
         # is exact, and it buys two things. The int8 CODES are integers <= 127, so they survive

@@ -4,10 +4,6 @@
 bitsandbytes needs BNB_ROCM_VERSION to match the ROCm SDK bundled with the PyTorch wheel
 (e.g. 714 for ROCm 7.14, 715 for 7.15). run_fizgig_rocm.bat and run_fizgig_rocm.sh source these.
 
-On gfx1200/gfx1201, also exports ROCBLAS_USE_HIPBLASLT_BATCHED=0 - Tensile for batched
-GEMMs (ROCm#5344). Blunt ROCBLAS_USE_HIPBLASLT=0 is NOT set (hurts ROCm 7.15). Opt out at
-launch: FIZGIG_NO_ROCBLAS_BATCHED_WA=1.
-
 With --experimental (Windows floating install): omit BNB_ROCM_VERSION so bitsandbytes
 auto-selects its highest matching lib (falls back with a warning if exact ROCm minor is
 missing). Distinct from Linux ROCM_CHANNEL=nightly.
@@ -26,8 +22,6 @@ OUT_BAT = SCRIPT_DIR / "rocm_env.bat"
 OUT_SH = SCRIPT_DIR / "rocm_env.sh"
 DEFAULT_BNB_LINUX = "714"  # libbitsandbytes_rocm714.so - matches stable repo.amd.com torch
 DEFAULT_BNB_WIN = "715"  # Windows 0xDELUXA wheel / pinned multi-arch torch (+rocm7.15)
-# Batched hipBLASLt GEMM underperforms on RDNA4 - see ROCm/ROCm#5344.
-GFX12_HIPBLASLT_BATCHED_WA = frozenset({"gfx1200", "gfx1201"})
 
 
 def _bnb_lib_ext() -> str:
@@ -211,7 +205,6 @@ def main(argv: list[str] | None = None) -> int:
         src = f"{src}; BNB_ROCM_VERSION omitted (--experimental / bitsandbytes auto)"
 
     gfx = detect_gfx_target()
-    gfx12_batched_wa = gfx in GFX12_HIPBLASLT_BATCHED_WA if gfx else False
 
     rocm_core_win = SCRIPT_DIR / "venv" / "Lib" / "site-packages" / "_rocm_sdk_core"
     try:
@@ -243,16 +236,10 @@ def main(argv: list[str] | None = None) -> int:
             bat_lines.append(f'set "PATH={path_prefix};%PATH%"')
         if gfx:
             bat_lines.append(f'REM GPU gfx target: {gfx}')
-        if gfx12_batched_wa:
-            bat_lines.append(
-                "REM gfx12: Tensile for batched GEMM (ROCm#5344). "
-                "Opt out: set FIZGIG_NO_ROCBLAS_BATCHED_WA=1 before launch."
-            )
-            bat_lines.append('set "ROCBLAS_USE_HIPBLASLT_BATCHED=0"')
         bat_lines.append("")
         OUT_BAT.write_text("\r\n".join(bat_lines), encoding="utf-8")
         bnb_msg = "BNB_ROCM_VERSION unset" if omit_bnb else f"BNB_ROCM_VERSION={bnb}"
-        extra = f"  gfx={gfx}  ROCBLAS_USE_HIPBLASLT_BATCHED=0" if gfx12_batched_wa else (f"  gfx={gfx}" if gfx else "")
+        extra = f"  gfx={gfx}" if gfx else ""
         print(f"Wrote {OUT_BAT.name}: {bnb_msg}  ({src}){extra}")
 
     if rocm_core_linux is not None:
@@ -274,16 +261,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         if gfx:
             sh_lines.append(f"# GPU gfx target: {gfx}")
-        if gfx12_batched_wa:
-            sh_lines.append(
-                "# gfx12: Tensile for batched GEMM (ROCm#5344). "
-                "Opt out: FIZGIG_NO_ROCBLAS_BATCHED_WA=1"
-            )
-            sh_lines.append('export ROCBLAS_USE_HIPBLASLT_BATCHED=0')
         sh_lines.append("")
         OUT_SH.write_text("\n".join(sh_lines), encoding="utf-8")
         bnb_msg = "BNB_ROCM_VERSION unset" if omit_bnb else f"BNB_ROCM_VERSION={bnb}"
-        extra = f"  gfx={gfx}  ROCBLAS_USE_HIPBLASLT_BATCHED=0" if gfx12_batched_wa else (f"  gfx={gfx}" if gfx else "")
+        extra = f"  gfx={gfx}" if gfx else ""
         print(f"Wrote {OUT_SH.name}: {bnb_msg}  ({src}){extra}")
 
     if not rocm_core_win.is_dir() and rocm_core_linux is None:
