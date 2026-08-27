@@ -350,12 +350,19 @@ class H3NF4Rotator(BlockRotator):
             # justification, as park_dit_partial. Safe here because the value is already
             # saved to the master above and _nf4 re-encodes from its own CPU copy, so
             # nothing legitimate reads this storage again.
+            # GUARDED, because "frees the bytes under every tensor sharing the storage"
+            # cuts both ways: if a re-encode ever returned a VIEW of the trained weight
+            # rather than its own copy, this would hand the module a zero-byte weight and
+            # the next forward would die on a size-0 storage. Real bnb packs to fresh
+            # uint8 so it cannot alias, but that is the encoder's property, not ours —
+            # assert it here rather than trusting every future one to keep it.
             _orphan = trained.untyped_storage()
             del trained
-            try:
-                _orphan.resize_(0)
-            except Exception:
-                pass
+            if lin.weight.untyped_storage().data_ptr() != _orphan.data_ptr():
+                try:
+                    _orphan.resize_(0)
+                except Exception:
+                    pass
             n += 1
         return n
 

@@ -454,15 +454,23 @@ class BlockRotator:
             # Rebinding lin.weight above does not free the old bf16: a C++-side autograd
             # referrer keeps its storage alive and the whole outgoing window survives into
             # the next epoch, so a rotation costs two windows instead of one. Nothing
-            # legitimate reads it again — the master holds a CPU clone and the fp8
-            # re-quantize took its own float copy — and resize_(0) leaves any phantom
-            # holder a zero-byte husk, exactly as park_dit_partial does.
+            # legitimate reads it again — the master holds a CPU clone and both encoders
+            # take their own copy (fp8 via .float(), NF4 by packing to uint8) — and
+            # resize_(0) leaves any phantom holder a zero-byte husk, exactly as
+            # park_dit_partial does.
+            # GUARDED against the mirror hazard: freeing a storage the module still reads
+            # would hand it a zero-byte weight and kill the next forward. That both
+            # encoders copy is THEIR property, not ours, so check it rather than assume
+            # it — the NF4 bytes live in _nf4_packed, not in the emptied .weight.
             _orphan = trained.untyped_storage()
             del trained
-            try:
-                _orphan.resize_(0)
-            except Exception:
-                pass
+            _live = [lin.weight, getattr(lin, "_nf4_packed", None)]
+            if all(t is None or t.untyped_storage().data_ptr() != _orphan.data_ptr()
+                   for t in _live):
+                try:
+                    _orphan.resize_(0)
+                except Exception:
+                    pass
             n += 1
         return n
 
