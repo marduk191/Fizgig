@@ -2087,8 +2087,18 @@ def train_krea2(
             # submit_move_blocks_forward whenever blocks_to_swap is truthy, so no model change.
             # Window 0 here; the epoch loop re-pins to the correct window on the first
             # iteration (and on resume, since want != rotator.active triggers a rotation).
+            # Constructed claiming EVERYTHING is resident — which is the truth at this
+            # moment, the whole fp8 base is on the card — and then narrowed. The
+            # constructor only RECORDS the resident set; eviction is just-in-time during
+            # the forward, so building it with the target set directly would leave the
+            # full base resident until the first step. The window's bf16 then lands on
+            # top of it and a 16 GB card OOMs inside the very first `rotate_to` (field,
+            # 27 Aug: 14.30 GiB of a 14.83 GiB cap, before a single training step).
+            # set_resident() does the up-front eviction with the one proven call.
+            # H3 solves the same problem by rescoping its ring before activating.
             dit.offloader = RotationOffloader(dit.blocks, torch.device(device),
-                                              _ft_resident_blocks(rot_schedule.active_at(0)))
+                                              range(len(dit.blocks)))
+            dit.offloader.set_resident(_ft_resident_blocks(rot_schedule.active_at(0)))
             dit.blocks_to_swap = 1
             logger.info("[ft-rotation] streaming frozen blocks from CPU — only the trainable "
                         "window stays resident.")

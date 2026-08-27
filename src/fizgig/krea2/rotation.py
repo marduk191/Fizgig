@@ -567,10 +567,14 @@ class RotationOffloader:
         for idx in list(self._futures):     # settle everything before re-planning
             self._await(idx)
         new = set(int(i) for i in resident)
-        for idx in sorted(new - self.resident):
-            self._to(idx, self.device)
+        # EVICT BEFORE LOADING. The reverse order holds the outgoing and incoming
+        # windows on the card at once — a transient of one full window, which is what
+        # tips a tight card over (the H3 twin was fixed the same way, 27 Aug). Blocks in
+        # both sets appear in neither difference, so they are never touched.
         for idx in sorted(self.resident - new):
             self._to(idx, self.cpu)
+        for idx in sorted(new - self.resident):
+            self._to(idx, self.device)
         self.resident = new
         logger.info("[rotation-swap] resident blocks now %s (others stream from CPU)", sorted(new))
 
