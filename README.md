@@ -239,10 +239,11 @@ bottleneck — on a single consumer GPU. Tick **⚗ Fine-tune the BASE MODEL ins
 LoRA** on the Training tab.
 
 > **Note on VRAM:** the "trains on 8 GB" figures elsewhere in this README are for **LoRA**
-> training. Full fine-tuning is a different animal — but it now **tiers itself to your card** on
-> both families: ~32 GB runs the classic full-depth windows at full speed, ~24 GB depth-splits
-> them (still full speed), and ~16 GB streams the frozen blocks from system RAM at a step-speed
-> cost. The planner prints the chosen plan at launch.
+> training. Full fine-tuning is a different animal — but it now **tiers itself to your card**:
+> ~32 GB runs the classic full-depth windows at full speed, ~24 GB depth-splits them into more
+> (still full speed), and on MiniMax H3 a 16 GB card streams the frozen blocks from system RAM
+> at ~1.5× the step time. Krea 2 currently reaches 24 GB, not 16. The planner measures your
+> free VRAM at launch and prints the plan it chose.
 
 **Which model files.** Fine-tuning uses the same training bases you already have — nothing new to
 download:
@@ -306,14 +307,19 @@ to it: **component windows only** — each window trains one attention or MLP ma
 blocks (4 windows per cycle), with the token refiner trainable throughout, so every window spans
 the model's full depth from the very first epoch.
 
-- **VRAM — it sizes itself to your card.** On 32 GB the classic 4-window cycle runs at full
-  speed. On **24 GB** the planner **depth-splits the fat windows** (fc1 trains in two slices —
-  a 5-window cycle, still full speed, no offloading). On **16 GB** the frozen out-of-window
-  blocks **stream from system RAM** (~10.5 GB staged) — steps slow down for the PCIe trips,
-  but it's a full fine-tune of a 33B video model on a 16 GB card. The console prints the
-  chosen plan and why. **Optimised Likeness Learning** stays the recommendation on every tier
-  — matched runs came out clearly better on both look and prompt adherence than full-model
-  fine-tuning, and it shrinks the windows further.
+- **VRAM — it sizes itself to your card.** Measured with **Optimised Likeness Learning** on,
+  which is the recommendation on every tier (matched runs came out clearly better on both look
+  and prompt adherence than full-model fine-tuning — and it shrinks the windows, so the tiers
+  below assume it). On 32 GB the classic 4-window cycle runs at full speed. On **24 GB** the
+  planner **depth-splits the fat windows** — `mlp.fc1` trains in two slices, a 5-window cycle,
+  still full speed, no offloading; measured peaks 19.1–21.5 GB. On **16 GB** the frozen
+  out-of-window blocks also **stream from system RAM** (~7 GB staged, a 9-window cycle):
+  measured peaks 8.8–12.3 GB at **~1.5× the step time** — a full fine-tune of a 33B video model
+  on a 16 GB card. The console prints the chosen plan and why.
+- **Full-model fine-tuning (likeness off) is the heavy path**, and it is what any dataset
+  containing video clips uses, since clips train the whole model. Measured on a 5090 it peaks
+  ~29 GB — it fits a 32 GB card, but with little room, and the small-card tiers are much
+  tighter for it.
 - **System RAM:** the bf16 master copy is ~23 GB (likeness) to ~38 GB (full model), and spills
   to disk automatically when RAM is tight — full-model fine-tuning runs on a 64 GB box.
 - **Disk:** each save is a full **~21 GB** int8 checkpoint.
@@ -378,10 +384,11 @@ extraction is nearly free. (Details and the experiments behind it: **[docs/FINET
 
 Being straight about the trade-offs, because they're real:
 
-- **VRAM tiers itself, both families**: 32 GB runs the classic full-depth component cycle at
-  full speed; **24 GB** stays in component mode with depth-split windows (still full speed);
-  **16 GB** adds frozen-block streaming from RAM (slower steps). The console prints each run's
-  plan; too little VRAM refuses cleanly instead of OOMing.
+- **VRAM tiers itself**: 32 GB runs the classic full-depth component cycle at full speed, and
+  **24 GB** stays in component mode with depth-split windows — still full speed, both families.
+  **16 GB** adds frozen-block streaming from RAM at ~1.5× the step time, and is **MiniMax H3
+  only**; Krea 2 fine-tuning currently stops at 24 GB. The console prints each run's plan; too
+  little VRAM refuses cleanly instead of OOMing.
 - **System RAM** for the bf16 master copy, on top of VRAM: ~24 GB on Krea 2, ~23–38 GB on H3
   (H3's spills to disk automatically when RAM is tight).
 - **Disk.** Every save is a full checkpoint — ~26 GB on Krea 2, ~21 GB on H3. Saving once per
@@ -447,10 +454,11 @@ Fizgig ships as a ready-made cloud image — the **whole app in a browser tab**,
 - **Python** — 3.10 – 3.13.
 - **Disk** — ~10 GB for the venv, plus ~40 GB for model files.
 - **Full fine-tuning** (experimental, Krea 2 & MiniMax H3) asks for more than the above, and
-  tiers itself to your card on both families: **32 GB** runs the classic full-depth component
-  cycle at full speed, **24 GB** depth-splits the windows (still full speed), and **16 GB**
-  streams the frozen blocks from system RAM (slower steps). Add the bf16 master in RAM (spilled
-  to disk automatically on H3), and disk for saves — **~26 GB per Krea 2 checkpoint, ~21 GB per
+  tiers itself to your card: **32 GB** runs the classic full-depth component cycle at full
+  speed and **24 GB** depth-splits the windows (still full speed) on both families; **16 GB**
+  streams the frozen blocks from RAM at ~1.5× the step time, **MiniMax H3 only** — Krea 2
+  fine-tuning currently stops at 24 GB. Add the bf16 master in RAM (spilled to disk
+  automatically on H3), and disk for saves — **~26 GB per Krea 2 checkpoint, ~21 GB per
   H3 one**. Each
   family fine-tunes its normal training base — Krea 2 the RAW bf16 model, H3 the pruned int8
   checkpoint (H3's ~66 GB bf16 file works for LoRA training only, not fine-tuning).

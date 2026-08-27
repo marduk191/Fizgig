@@ -1,6 +1,29 @@
 # Component-mode H3 fine-tune on 24 GB (and 16 GB) — design note
 
-Status: **BUILT (27 Aug 2026) — field gate pending.** Route A shipped as designed
+Status: **BUILT AND FIELD-GATED (27 Aug 2026).** Gate results, all under real allocator
+caps (`FIZGIG_SIM_VRAM_GB`), likeness config on H3:
+  * **H3 24 GB — PASS.** The 5-window Route A plan exactly as designed below (only
+    `mlp.fc1` splits), peaks 19.1–21.5 GB, full cycle + checkpoint.
+  * **H3 16 GB — PASS.** 9 windows, 15 blocks resident / 35 streamed, peaks 8.8–12.3 GB,
+    **~1.5× step time — far better than the 2–4× feared below**, and the bracket preview
+    renders with the ring live. Needed three fixes at the rescope: drop the old ring ref
+    before rebuilding (the CPU-staging doubling `enable_block_swap` already solved),
+    evict-before-bind, and a **ring-aware defrag** (park the DiT at each rotation before
+    clearing the offloader refs, so `empty_cache` can return whole segments).
+  * **Krea 2 24 GB — PASS.** 8 windows, peaks 15.6–17.6 GB. Needed evict-before-allocate
+    at setup: its offloader's constructor only RECORDS the resident set, so the full
+    ~13 GB fp8 base was still on the card when the first window's bf16 landed.
+  * **Krea 2 16 GB — FAILS**, on allocator fragmentation rather than arithmetic
+    (7.35 GiB live vs 7.40 GiB stranded). Its `RotationOffloader` moves whole blocks with
+    fresh allocations each time, where H3's ring reuses flat buffers plus the boundary
+    defrag. Closing it means porting the flat-buffer ring to Krea 2, adding a periodic
+    defrag, or accepting 24 GB as Krea 2's floor — an architectural call, not attempted.
+  * Constant corrected: `_FT_OVERHEAD_GB` 13.3 → **14.5**. The per-window table below is
+    in **GiB** and was being subtracted as GB — a ~7% systematic underestimate. Krea 2's
+    `_K2FT_OVERHEAD_GB = 16.0` is conservative but was left alone; it cannot be isolated
+    from a single run.
+
+Route A shipped as designed
 (depth-split windows, planner-selected: `plan_h3_ft_windows` in rotation_ft.py, 41 CPU
 pins in tests/test_ft_small_cards.py). The 16 GB tier shipped NOT as Route B's classic
 parking swap but as the stronger option that became possible after this note was
@@ -10,8 +33,8 @@ conflict that forced swap off under FT. The ring rescopes at every rotation
 (`_ft_rebuild_ring`), streamed blocks stage ~10.5 GB in RAM, and the resident window
 rides `bind_block_packed_to` past the bnb re-quantize trap. GPU parity battery:
 tests/test_ft_ring_scope.py. `FIZGIG_NO_FT_STREAM=1` is the kill-switch back to the
-resident-only plan. Neither tier has run on a real 24/16 GB card yet — the measured
-constants below are the calibration; the trainer's per-window peak logs correct them.
+resident-only plan. Still unrun: pause/resume on the streamed tiers, and a ballast run
+for genuine physical scarcity (the simulator caps this process, not the card).
 Original note follows.
 
 Route A is the deliverable for the program's release; Route B follows measurement.
