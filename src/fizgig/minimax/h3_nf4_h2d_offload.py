@@ -60,14 +60,52 @@ def _wrapped_weight(module, packed, state):
     return p
 
 
+def bind_block_packed_to(block, device):
+    """Move one block's packed NF4 weights (+ quant-state tensors) to `device` WITHOUT
+    the bnb re-quantize trap: Params4bit re-quantizes on a cpu->cuda move, so an
+    already-packed weight .to(cuda) turns into garbage. The raw byte tensors are copied
+    and re-wrapped instead. Non-quantized params and buffers move normally. Used by the
+    rotation fine-tune when a previously-streamed block becomes resident."""
+    dev = torch.device(device)
+    for module in block.modules():
+        if isinstance(module, Linear4bit):
+            weight = module.weight
+            state = (getattr(weight, "quant_state", None)
+                     or getattr(module, "quant_state", None))
+            if state is not None:
+                packed = weight.data.to(dev)
+                views = [t.to(dev) for t in _state_tensors(state)]
+                module.weight = _wrapped_weight(module, packed,
+                                                _state_from_views(state, views))
+            if module.bias is not None:
+                module.bias.data = module.bias.data.to(dev)
+            continue
+        for param in module.parameters(recurse=False):
+            if param is not None:
+                param.data = param.data.to(dev)
+        for name, buf in module.named_buffers(recurse=False):
+            if buf is not None:
+                module._buffers[name] = buf.to(dev)
+
+
 class H3NF4H2DOffloader:
-    """Streams the last N blocks' packed NF4 tensors host-to-device through a ring."""
+    """Streams frozen blocks' packed NF4 tensors host-to-device through a ring.
+
+    `swap_from` is an int (stream the tail from that index — the classic LoRA-mode swap)
+    OR an explicit iterable of block indices (an arbitrary streamed set — the rotation
+    fine-tune's frozen out-of-window blocks, which form a head+tail around the active
+    depth chunk). The forward visits streamed blocks in ascending order either way, so
+    the ring walks by RANK — a block's position in the sorted streamed list — and the
+    tail case is just the special ranking where rank == block_idx - swap_from."""
 
     kind = "nf4"
 
-    def __init__(self, blocks, swap_from: int, device: torch.device, ring_size: int = 2):
+    def __init__(self, blocks, swap_from, device: torch.device, ring_size: int = 2):
         self.blocks = blocks
-        self.swap_from = swap_from
+        if isinstance(swap_from, int):
+            self.swap_list = list(range(swap_from, len(blocks)))
+        else:
+            self.swap_list = sorted(int(b) for b in swap_from)
         self.device = torch.device(device)
         self.ring_size = max(1, int(ring_size))
         self.stream = torch.cuda.Stream(device=self.device)
@@ -88,6 +126,10 @@ class H3NF4H2DOffloader:
         self.n_swap = len(self.specs)
         if not self.n_swap:
             raise RuntimeError("H3NF4H2DOffloader: no swapped Linear4bit blocks found")
+        # Rank = walk order. Built from the blocks that actually HAVE specs, so a block
+        # with no Linear4bit in the requested set can never skew the arithmetic.
+        self._ranked = sorted(self.specs)
+        self._rank_of = {b: r for r, b in enumerate(self._ranked)}
         # RAM-aware pinning (audit, 25 Aug): the staged bytes must live in RAM whether
         # they ring-stream or classic-park — but they don't have to be PAGE-LOCKED. On
         # a bf16-checkpoint plan (adaln streams too, ~333 MB/block, up to ~13 GB at the
@@ -119,7 +161,7 @@ class H3NF4H2DOffloader:
                 self.remove_handles.append(block.register_full_backward_hook(hook))
 
     def _collect_specs(self):
-        for block_idx in range(self.swap_from, len(self.blocks)):
+        for block_idx in self.swap_list:
             block_specs = []
             for module in self.blocks[block_idx].modules():
                 if not isinstance(module, Linear4bit):
@@ -170,7 +212,7 @@ class H3NF4H2DOffloader:
 
     def move_static_weights_to_gpu(self):
         """Keep biases, norms, AdaLN and LoRA-side tensors resident; stream NF4 only."""
-        for block_idx in range(self.swap_from, len(self.blocks)):
+        for block_idx in self.swap_list:
             for module in self.blocks[block_idx].modules():
                 if isinstance(module, Linear4bit):
                     if module.bias is not None:
@@ -224,7 +266,7 @@ class H3NF4H2DOffloader:
         return self.gpu_bindings[key]
 
     def _load(self, rank, slot):
-        block_idx = self.swap_from + rank
+        block_idx = self._ranked[rank]
         if self.loaded_block[slot] == block_idx:
             self._bind(self._bindings_for_slot(block_idx, slot))
             return
@@ -258,7 +300,7 @@ class H3NF4H2DOffloader:
     def wait_for_block(self, block_idx):
         if block_idx not in self.specs:
             return
-        rank = block_idx - self.swap_from
+        rank = self._rank_of[block_idx]
         slot = rank % self.ring_size
         if self.loaded_block[slot] != block_idx:
             self._load(rank, slot)
@@ -269,7 +311,7 @@ class H3NF4H2DOffloader:
     def submit_move_blocks_forward(self, block_idx):
         if block_idx not in self.specs:
             return
-        rank = block_idx - self.swap_from
+        rank = self._rank_of[block_idx]
         slot = rank % self.ring_size
         self.free_event[slot] = torch.cuda.current_stream().record_event()
         next_rank = rank + self.ring_size
@@ -279,7 +321,7 @@ class H3NF4H2DOffloader:
     def _create_backward_hook(self, block_idx):
         if block_idx not in self.specs:
             return None
-        rank = block_idx - self.swap_from
+        rank = self._rank_of[block_idx]
 
         def hook(_module, _grad_input, _grad_output):
             slot = rank % self.ring_size

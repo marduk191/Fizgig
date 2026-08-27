@@ -7400,9 +7400,12 @@ class LoRATrainerGUI:
             self._refresh_minimax_ft_save_box()
 
     def _minimax_ft_cycle_estimate(self):
-        """Epochs per full rotation cycle. Component windows are the only mode, so this is
-        EXACT, not an estimate: 4 windows (qkv / out / fc1 / fc2) x rotate-every, whatever
-        the block span — the span changes the master size and speed, never the cycle."""
+        """Epochs per full rotation cycle — the 32 GB BASELINE of 4 component windows
+        (qkv / out / fc1 / fc2) x rotate-every. Since the small-card tiers landed this is
+        an estimate, not exact: the trainer's window planner depth-splits fat windows on
+        24 GB (5 windows) and streams on 16 GB (more), resolved from free VRAM at LAUNCH —
+        unknowable here. The trainer's own cycle snap stays authoritative and logs when
+        it corrects the Save-every box."""
         try:
             _every = max(1, int(str(self.minimax_ft_every_var.get()).strip() or 1))
         except ValueError:

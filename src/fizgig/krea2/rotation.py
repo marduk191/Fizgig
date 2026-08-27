@@ -82,7 +82,8 @@ class RotationSchedule:
         return ((int(epoch) // self.rotate_every) + self.start_window) % self.n_windows
 
     def active_at(self, epoch: int):
-        """Block indices (block mode) or component name prefixes (component mode)."""
+        """Block indices (block mode) or component window entries (component mode) — an
+        entry is a bare prefix string (full depth) or a (prefix, lo, hi) depth-split."""
         w = self.window_at(epoch)
         if self.mode == "component":
             return [self.components[w]]
@@ -91,12 +92,35 @@ class RotationSchedule:
 
     def describe(self) -> str:
         if self.mode == "component":
-            return (f"component windows {self.components} across all {self.n_blocks} blocks, "
+            _names = [c if isinstance(c, str) else f"{c[0]}@{c[1]}-{c[2]}"
+                      for c in self.components]
+            return (f"component windows {_names} across all {self.n_blocks} blocks, "
                     f"rotating every {self.rotate_every} epoch(s) — {self.n_windows} windows, "
-                    f"{self.cycle_epochs} epochs per full cycle (every window spans full depth)")
+                    f"{self.cycle_epochs} epochs per full cycle")
         return (f"{self.active} of {self.n_blocks} blocks per window, rotating every "
                 f"{self.rotate_every} epoch(s) — {self.n_windows} windows, "
                 f"{self.cycle_epochs} epochs per full cycle")
+
+
+def is_component_spec(spec) -> bool:
+    """True when a rotation spec lists component windows rather than block indices.
+
+    Component entries are prefix strings ("mlp.fc1") or (prefix, lo, hi) depth-split
+    tuples; block-mode entries are plain ints. Shared by every _targets implementation
+    so the two encodings can never drift apart."""
+    return bool(spec) and isinstance(spec[0], (str, tuple))
+
+
+def component_entry_matches(entry, lname: str, block_idx: int) -> bool:
+    """Does a component window entry claim this (linear name, block index)?
+
+    A bare prefix claims the Linear at every depth; a (prefix, lo, hi) tuple claims it
+    only for blocks lo..hi inclusive — the depth-split that lets a fat window (fc1 is
+    15.4 GB of bf16 across 50 H3 blocks) fit a smaller card in slices."""
+    if isinstance(entry, str):
+        return lname.startswith(entry)
+    prefix, lo, hi = entry
+    return lname.startswith(prefix) and int(lo) <= int(block_idx) <= int(hi)
 
 
 def _linears_with_scale(module: nn.Module) -> List[tuple]:
@@ -182,14 +206,15 @@ class BlockRotator:
     def _targets(self, spec) -> List[tuple]:
         """(key, linear) pairs for a window spec.
 
-        spec is either block indices (block mode) or component name prefixes such as
-        "attn"/"mlp" (component mode), in which case the window spans EVERY block.
+        spec is either block indices (block mode) or component window entries (component
+        mode) — a bare prefix such as "attn"/"mlp" spans EVERY block, a (prefix, lo, hi)
+        tuple spans only that depth slice (the split that fits fat windows on small cards).
         """
         out = []
-        if spec and isinstance(spec[0], str):
+        if is_component_spec(spec):
             for bi, block in enumerate(self.blocks):
                 for lname, lin in _linears_with_scale(block):
-                    if any(lname.startswith(c) for c in spec):
+                    if any(component_entry_matches(c, lname, bi) for c in spec):
                         out.append((self._key(bi, lname), lin))
         else:
             for bi in spec:
@@ -249,8 +274,10 @@ class BlockRotator:
         spec = list(spec)
         n = self._activate_targets(self._targets(spec))
         # Keep self.active in step — trainable_params() and master_state_dict() read it.
+        # Component entries (strings / (prefix, lo, hi) tuples) keep their order; only
+        # block-index specs get sorted.
         merged = list(self.active) + [x for x in spec if x not in self.active]
-        self.active = sorted(merged) if merged and not isinstance(merged[0], str) else merged
+        self.active = merged if is_component_spec(merged) else sorted(merged)
         logger.info("[rotation] activated %s (%d Linears now trainable)", spec, n)
         return n
 

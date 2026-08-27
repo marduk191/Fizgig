@@ -307,10 +307,14 @@ to it: **component windows only** — each window trains one attention or MLP ma
 blocks (4 windows per cycle), with the token refiner trainable throughout, so every window spans
 the model's full depth from the very first epoch.
 
-- **VRAM:** with **Optimised Likeness Learning** ticked — the recommendation: photos train the
-  identity blocks, and matched runs came out clearly better on both look and prompt adherence
-  than full-model fine-tuning — measured per-window peaks are **18.4–22.8 GB, so it fits a
-  24 GB card**. Full-model (likeness off) peaks ~24.7 GB and wants 32 GB.
+- **VRAM — it sizes itself to your card.** On 32 GB the classic 4-window cycle runs at full
+  speed. On **24 GB** the planner **depth-splits the fat windows** (fc1 trains in two slices —
+  a 5-window cycle, still full speed, no offloading). On **16 GB** the frozen out-of-window
+  blocks **stream from system RAM** (~10.5 GB staged) — steps slow down for the PCIe trips,
+  but it's a full fine-tune of a 33B video model on a 16 GB card. The console prints the
+  chosen plan and why. **Optimised Likeness Learning** stays the recommendation on every tier
+  — matched runs came out clearly better on both look and prompt adherence than full-model
+  fine-tuning, and it shrinks the windows further.
 - **System RAM:** the bf16 master copy is ~23 GB (likeness) to ~38 GB (full model), and spills
   to disk automatically when RAM is tight — full-model fine-tuning runs on a 64 GB box.
 - **Disk:** each save is a full **~21 GB** int8 checkpoint.
@@ -377,7 +381,8 @@ Being straight about the trade-offs, because they're real:
 
 - **A 32 GB card** for Krea 2's good mode — 24 GB works but drops to block mode with streaming
   (~2–3× slower per step, and a learning shape that hasn't been quality-tested yet); 16 GB can't
-  run it. MiniMax H3 fits **24 GB** with likeness on, 32 GB for full-model.
+  run it. MiniMax H3 tiers itself: 32 GB full speed, **24 GB** with depth-split windows (still
+  full speed), **16 GB** with streamed frozen blocks (slower steps).
 - **System RAM** for the bf16 master copy, on top of VRAM: ~24 GB on Krea 2, ~23–38 GB on H3
   (H3's spills to disk automatically when RAM is tight).
 - **Disk.** Every save is a full checkpoint — ~26 GB on Krea 2, ~21 GB on H3. Saving once per
@@ -445,8 +450,9 @@ Fizgig ships as a ready-made cloud image — the **whole app in a browser tab**,
 - **Full fine-tuning** (experimental, Krea 2 & MiniMax H3) asks for more than the above.
   **Krea 2**: a **32 GB card** for the best mode — 24 GB works at ~2–3× slower steps, 16 GB not
   at all — plus ~24 GB of free system RAM and **~26 GB of disk per saved checkpoint**.
-  **MiniMax H3**: a **24 GB card** with Optimised Likeness Learning on (full-model wants 32 GB),
-  the bf16 master in RAM or spilled to disk automatically, and **~21 GB per checkpoint**. Each
+  **MiniMax H3**: 32 GB at full speed, **24 GB** with depth-split windows (still full speed),
+  or **16 GB** with the frozen blocks streamed from RAM (slower steps) — plus the bf16 master
+  in RAM or spilled to disk automatically, and **~21 GB per checkpoint**. Each
   family fine-tunes its normal training base — Krea 2 the RAW bf16 model, H3 the pruned int8
   checkpoint (H3's ~66 GB bf16 file works for LoRA training only, not fine-tuning).
 - **Visual Studio Build Tools** (Windows only) — for InsightFace and the torch.compile speedup: **[aka.ms/vs/17/release/vs_BuildTools.exe](https://aka.ms/vs/17/release/vs_BuildTools.exe)**, tick **"Desktop development with C++"**. Without it everything still works minus the compile speedup.

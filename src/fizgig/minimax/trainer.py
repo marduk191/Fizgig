@@ -2327,6 +2327,10 @@ def train_minimax(
     rotator = None
     ft_subset = None
     ft_epoch_offset = 0
+    # FT streaming state — defined unconditionally so closures shared with LoRA mode
+    # (e.g. _encode_override) can test it without tripping a NameError.
+    ft_stream = False
+    _ft_ring = {"ring": None}
     if ft_rotation:
         from fizgig.utils.capabilities import wait_for_gpu_handoff, wait_for_ram_recovery
         # Before OUR first CUDA call (the recommender's free-VRAM read inits the context):
@@ -2782,6 +2786,10 @@ def train_minimax(
         # int8 codes. Krea builds its network inert; H3 cannot even do that.
         from fizgig.krea2.rotation import RotationSchedule
         from fizgig.minimax.rotation_ft import build_bf16_master_h3
+        # The LoRA-path ring (enable_block_swap) must not be armed here — it spans a tail
+        # that includes trainable blocks and would fight the rotator for qdata. FT's OWN
+        # ring (built below when the plan streams) is different: scoped to fully-frozen
+        # out-of-window blocks only, rebuilt at every rotation.
         assert getattr(dit, "_h2d_offloader", None) is None, \
             "[h3-ft] H2D offloader present under FT — it would fight the rotator for qdata"
         _n_blocks = len(dit.blocks)
@@ -2902,7 +2910,29 @@ def train_minimax(
         else:
             master = build_bf16_master_h3(dit_path, block_subset=ft_subset,
                                           include_prefixes=_inc)
-        from fizgig.minimax.rotation_ft import H3NF4Rotator, H3_COMPONENT_PREFIXES
+        from fizgig.minimax.rotation_ft import (H3NF4Rotator, H3_COMPONENT_PREFIXES,
+                                                H3_COMPONENT_GB_PER_BLOCK,
+                                                plan_h3_ft_windows)
+        # Window plan: how many depth-splits (and whether the frozen out-of-window blocks
+        # must stream from CPU) this card's budget forces. Measured AFTER the NF4 base
+        # loaded, so the trunk it already holds is added back — the plan's model counts
+        # the whole process footprint. FIZGIG_NO_FT_STREAM=1 is the debug kill-switch to
+        # the resident-only plan (the streaming tier then refuses rather than OOMs).
+        try:
+            from fizgig.utils.device import plannable_free_vram as _pfv0
+            _usable = _pfv0() + 0.21 * _n_blocks - 1.5      # + resident trunk − reserve
+        except Exception:
+            _usable = 99.0
+        _windows, ft_stream, _plan_why = plan_h3_ft_windows(
+            _usable, subset=ft_subset, n_blocks=_n_blocks,
+            allow_stream=os.environ.get("FIZGIG_NO_FT_STREAM") != "1")
+        for _line in _plan_why:
+            logger.info("[h3-ft] %s", _line)
+        if _windows is None:
+            raise RuntimeError(
+                f"[h3-ft] ~{_usable:.1f} GB of usable VRAM is below what the rotation "
+                "fine-tune needs even with depth-split windows and streamed frozen blocks. "
+                "Close other GPU apps, or train a LoRA instead.")
         rotator = H3NF4Rotator(dit.blocks, master, key_prefix="blocks", device=device,
                                block_subset=ft_subset)
         _refiner = getattr(dit, "token_refiner", None)
@@ -2915,18 +2945,101 @@ def train_minimax(
         rot_schedule = RotationSchedule(_cycle_n, active=ft_rotation,
                                         rotate_every=max(1, int(finetune_rotate_every or 1)),
                                         mode="component",
-                                        components=H3_COMPONENT_PREFIXES,
+                                        components=_windows,
                                         start_window=int(finetune_start_window or 0))
+        # Continuation across a different card/plan: the stamped window index only lines
+        # up when the window COUNT matches. A mismatch is survivable (the cycle re-walks
+        # from an approximate position) but must not be silent.
+        if ft_epoch_offset:
+            try:
+                from safetensors import safe_open as _so_w
+                with _so_w(dit_path, framework="pt") as _fw:
+                    _prev_nw = int((_fw.metadata() or {}).get("fizgig_ft_n_windows", 0))
+            except Exception:
+                _prev_nw = 0
+            if _prev_nw and _prev_nw != rot_schedule.n_windows:
+                logger.warning("[h3-ft] this card's plan has %d windows; the checkpoint "
+                               "was trained with %d — the rotation cycle cannot line up "
+                               "exactly across the change, so expect one cycle of mild "
+                               "imbalance while it settles.",
+                               rot_schedule.n_windows, _prev_nw)
 
         def _ft_want(_epoch):
-            """The rotation spec for an epoch: component prefixes, verbatim."""
+            """The rotation spec for an epoch: component window entries, verbatim."""
             return list(rot_schedule.active_at(_epoch))
+
+        def _ft_window_gb(spec):
+            """Projected bf16 size of a window spec (bare prefixes and depth-splits)."""
+            _span_l = ft_subset if ft_subset else range(_n_blocks)
+            total = 0.0
+            for _e in spec:
+                if isinstance(_e, str):
+                    total += H3_COMPONENT_GB_PER_BLOCK.get(_e, 0.31) * len(list(_span_l))
+                else:
+                    _p, _lo, _hi = _e
+                    _nb = sum(1 for b in _span_l if _lo <= b <= _hi)
+                    total += H3_COMPONENT_GB_PER_BLOCK.get(_p, 0.31) * _nb
+            return total
+
+        _ft_span_set = set(ft_subset) if ft_subset else set(range(_n_blocks))
+
+        def _ft_resident_blocks(spec):
+            """Blocks holding trainable Linears under `spec` — the set that must stay
+            GPU-resident when the frozen remainder streams."""
+            res = set()
+            for _e in spec:
+                if isinstance(_e, str):
+                    res |= _ft_span_set
+                else:
+                    _p, _lo, _hi = _e
+                    res |= {b for b in _ft_span_set if _lo <= b <= _hi}
+            return res
+
+        def _ft_rebuild_ring(spec):
+            """(Re)scope the NF4 H2D ring to the frozen out-of-window blocks.
+
+            Called BEFORE each window activates (setup and every rotation): evicting the
+            streamed set first is what makes room for the incoming bf16 window — the
+            other order OOMs at setup on the 16 GB tier. Every resident block is pushed
+            to the GPU through bind_block_packed_to (idempotent for blocks already
+            there), so this is also the restore path after an override-encode park."""
+            if not ft_stream:
+                return
+            from fizgig.minimax.h3_nf4_h2d_offload import (H3NF4H2DOffloader,
+                                                           bind_block_packed_to)
+            old = _ft_ring["ring"]
+            if old is not None:
+                old.release()
+                _ft_ring["ring"] = None
+                dit._h2d_offloader = None
+                for _blk in dit.blocks:
+                    _blk._h2d_offloader = None
+            resident = _ft_resident_blocks(spec)
+            streamed = [i for i in range(len(dit.blocks)) if i not in resident]
+            for i in sorted(resident):
+                bind_block_packed_to(dit.blocks[i], device)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            ring = H3NF4H2DOffloader(dit.blocks, streamed, torch.device(device))
+            ring.move_static_weights_to_gpu()
+            ring.prepare()
+            dit._h2d_offloader = ring
+            for _blk in dit.blocks:
+                _blk._h2d_offloader = ring
+            dit._swap_from = 0      # every block consults the ring; residents no-op inside it
+            _ft_ring["ring"] = ring
+            logger.info("[h3-ft] streaming ring rescoped: %d resident block(s) [%s], "
+                        "%d streamed (~%.1f GB staged in RAM)", len(resident),
+                        format_block_spec(sorted(resident)), len(streamed), ring.staged_gb)
+
         if rot_schedule.cycle_epochs > max_train_epochs:
             logger.warning("[h3-ft] a full rotation cycle is %d epochs but the run is only "
                            "%d — some blocks will never train. Raise Max Epochs to at least "
                            "the cycle length.", rot_schedule.cycle_epochs, max_train_epochs)
 
         _first = _ft_want(0)
+        _ft_rebuild_ring(_first)      # evict the streamed set BEFORE the window allocates
         rotator.activate(_first)
         logger.info("[h3-ft] cycle: %d component windows %s across %d block(s), "
                     "%d epoch(s) per cycle; first window -> %s",
@@ -3710,16 +3823,33 @@ def train_minimax(
         from fizgig.utils.device import plannable_free_vram
         _free = plannable_free_vram() if torch.cuda.is_available() else 0.0
         _park = torch.cuda.is_available() and _free < 17.0     # TE + headroom
+        _ring_was_live = _ft_ring["ring"] is not None
         if _park:
             logger.info(f"[sample override] parking the base on CPU to fit the text encoder "
                         f"({_free:.1f} GB free) — one-off for this prompt")
+            if _ring_was_live:
+                # The ring's GPU slots go too, and its CPU-bound flats must never ride a
+                # dit.to(device) restore (that would materialize the whole base) — so the
+                # ring is torn down here and rebuilt below through its one normal path.
+                _ft_ring["ring"].release()
+                _ft_ring["ring"] = None
+                dit._h2d_offloader = None
+                for _blk in dit.blocks:
+                    _blk._h2d_offloader = None
             park_dit_to_cpu(dit)
             gc.collect()
             torch.cuda.empty_cache()
         try:
             return encode_sample_prompts(te_path, [prompt], device=device, quantize=quantize)
         finally:
-            if _park:
+            if _park and _ring_was_live:
+                for _cname, _child in dit.named_children():
+                    if _cname != "blocks":
+                        _child.to(device)
+                _ft_rebuild_ring(list(rotator.active))   # residents back up, ring re-armed
+                gc.collect()
+                torch.cuda.empty_cache()
+            elif _park:
                 restore_parked_dit(dit, device, n_swap)   # swap-aware: never the whole base
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -4173,7 +4303,7 @@ def train_minimax(
                     _free_after = _pfv2()
                 except Exception:
                     _free_after = 99.0
-                if _free_after < 4.0:
+                if _free_after < 4.0 and _ft_ring["ring"] is None:
                     logger.info(f"[preview] {_free_after:.1f} GB free after the preview — "
                                 "defragmenting via a full park/restore round-trip so the "
                                 "next training step doesn't fight the fragments.")
@@ -4184,6 +4314,11 @@ def train_minimax(
                     gc.collect()
                     torch.cuda.empty_cache()
                     vram_line("post-defrag")
+                elif _free_after < 4.0:
+                    logger.info(f"[preview] {_free_after:.1f} GB free after the preview — "
+                                "the park/restore defrag is unavailable while the FT "
+                                "streaming ring is live; the next rotation's ring rebuild "
+                                "re-lands the resident set instead.")
             vram_line("finally-done")
 
     def _ft_rebind_optimizer():
@@ -4244,7 +4379,14 @@ def train_minimax(
                 _free_now = plannable_free_vram()
             except Exception:
                 _free_now = 99.0
-            if _free_now < 8.0:
+            if _free_now < 8.0 and _ft_ring["ring"] is not None:
+                # Never park/restore over a live ring: the restore's dit.to(device) would
+                # push the streamed CPU flats up and materialize the whole base. The ring
+                # itself keeps residency low; the render proceeds with what's free.
+                logger.info("[h3-ft] %.1f GB free before the bracket preview — the "
+                            "park/restore defrag is unavailable while the streaming ring "
+                            "is live; rendering with what's free.", _free_now)
+            elif _free_now < 8.0:
                 logger.info("[h3-ft] %.1f GB free before the bracket preview — defragmenting "
                             "via a full park/restore round-trip.", _free_now)
                 import gc as _gc3
@@ -4444,12 +4586,11 @@ def train_minimax(
                     _free_r = _pfv()
                 except Exception:
                     _free_r = 99.0
-                # Component window: size = per-block GB of each selected matmul, over
-                # however many blocks the run actually trains.
-                from fizgig.minimax.rotation_ft import H3_COMPONENT_GB_PER_BLOCK
-                _need_r = sum(H3_COMPONENT_GB_PER_BLOCK.get(c, 0.31) for c in _want) \
-                    * _cycle_n + 2.0
-                if _free_r < _need_r:
+                # Component window: projected bf16 size of the incoming spec — depth-split
+                # entries count only their slice, so a 17-block fc1 chunk no longer reads
+                # as the full-depth 15.4 GB.
+                _need_r = _ft_window_gb(_want) + 2.0
+                if _free_r < _need_r and not ft_stream:
                     logger.info("[h3-ft] %.1f GB free before activating the next window "
                                 "(needs ~%.1f) — defragmenting via a full park/restore "
                                 "round-trip.", _free_r, _need_r)
@@ -4463,6 +4604,15 @@ def train_minimax(
                         logger.info("[h3-ft] post-defrag: %.1f GB free", _pfv())
                     except Exception:
                         pass
+                elif _free_r < _need_r:
+                    # Streaming: the ring rebuild below evicts the streamed set before the
+                    # window allocates — that IS the defrag here. A park/restore round-trip
+                    # would push the ring's CPU-bound flats through dit.to(device) and
+                    # materialize the whole base, so it never runs while the ring is live.
+                    logger.info("[h3-ft] %.1f GB free before the next window (needs ~%.1f) "
+                                "— the streaming ring rebuild reclaims the streamed set "
+                                "first.", _free_r, _need_r)
+                _ft_rebuild_ring(_want)   # evict the outgoing/streamed set, then activate
                 rotator.activate(_want)
                 if torch.cuda.is_available():
                     torch.cuda.reset_peak_memory_stats()   # per-window peak (logged per epoch)
@@ -4722,6 +4872,7 @@ def train_minimax(
                 _next_w = rot_schedule.window_at(epoch + 1)
                 save_full_checkpoint_h3(rotator, dit_path, ckpt, extra_metadata={
                     **_meta(), "fizgig_next_start_window": str(_next_w),
+                    "fizgig_ft_n_windows": str(rot_schedule.n_windows),
                     "fizgig_ft_epochs_done": str(epoch + 1 + ft_epoch_offset)})
                 ft_ckpt_saved_this_epoch = True
                 logger.info("[h3-ft] to continue from this checkpoint: --dit %s "
@@ -4824,6 +4975,7 @@ def train_minimax(
                     if not ft_ckpt_saved_this_epoch:
                         save_full_checkpoint_h3(rotator, dit_path, _pp, extra_metadata={
                             **_meta(), "fizgig_next_start_window": str(_next_w),
+                            "fizgig_ft_n_windows": str(rot_schedule.n_windows),
                             "fizgig_ft_epochs_done": str(epoch + 1 + ft_epoch_offset)})
                     logger.info("[h3-ft] paused. Continue with: --dit %s "
                                 "--finetune_start_window %d", os.path.basename(_pp), _next_w)
@@ -4859,6 +5011,7 @@ def train_minimax(
         _next_w = rot_schedule.window_at(max_train_epochs)
         save_full_checkpoint_h3(rotator, dit_path, final, extra_metadata={
             **_meta(), "fizgig_next_start_window": str(_next_w),
+            "fizgig_ft_n_windows": str(rot_schedule.n_windows),
             "fizgig_ft_epochs_done": str(max_train_epochs + ft_epoch_offset)})
         logger.info("[h3-ft] saved final fine-tuned checkpoint: %s — test it in ComfyUI as a "
                     "normal H3 model, or distil it to a LoRA with Checkpoint to LoRA. To train "

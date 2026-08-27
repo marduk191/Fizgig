@@ -1,6 +1,19 @@
-# Component-mode H3 fine-tune on 24 GB (and maybe 16 GB) — design note
+# Component-mode H3 fine-tune on 24 GB (and 16 GB) — design note
 
-Status: **scheduled — part of the FT program** (Peter, 24 Aug 2026: "too good not to").
+Status: **BUILT (27 Aug 2026) — field gate pending.** Route A shipped as designed
+(depth-split windows, planner-selected: `plan_h3_ft_windows` in rotation_ft.py, 41 CPU
+pins in tests/test_ft_small_cards.py). The 16 GB tier shipped NOT as Route B's classic
+parking swap but as the stronger option that became possible after this note was
+written: the **NF4 H2D ring generalized to an arbitrary streamed set** — depth-splitting
+makes out-of-window blocks FULLY frozen again, which dissolves the ring-vs-rotator
+conflict that forced swap off under FT. The ring rescopes at every rotation
+(`_ft_rebuild_ring`), streamed blocks stage ~10.5 GB in RAM, and the resident window
+rides `bind_block_packed_to` past the bnb re-quantize trap. GPU parity battery:
+tests/test_ft_ring_scope.py. `FIZGIG_NO_FT_STREAM=1` is the kill-switch back to the
+resident-only plan. Neither tier has run on a real 24/16 GB card yet — the measured
+constants below are the calibration; the trainer's per-window peak logs correct them.
+Original note follows.
+
 Route A is the deliverable for the program's release; Route B follows measurement.
 Written the night the disk-backed master landed. FT-branch only until the program merges.
 
