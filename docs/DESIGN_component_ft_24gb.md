@@ -13,15 +13,35 @@ caps (`FIZGIG_SIM_VRAM_GB`), likeness config on H3:
   * **Krea 2 24 GB — PASS.** 8 windows, peaks 15.6–17.6 GB. Needed evict-before-allocate
     at setup: its offloader's constructor only RECORDS the resident set, so the full
     ~13 GB fp8 base was still on the card when the first window's bf16 landed.
-  * **Krea 2 16 GB — FAILS**, on allocator fragmentation rather than arithmetic
-    (7.35 GiB live vs 7.40 GiB stranded). Its `RotationOffloader` moves whole blocks with
-    fresh allocations each time, where H3's ring reuses flat buffers plus the boundary
-    defrag. Closing it means porting the flat-buffer ring to Krea 2, adding a periodic
-    defrag, or accepting 24 GB as Krea 2's floor — an architectural call, not attempted.
+  * **Krea 2 16 GB — PASS, via an NF4 frozen trunk.** On fp8 it FAILED on allocator
+    fragmentation rather than arithmetic (7.35 GiB live vs 7.40 GiB stranded), because its
+    `RotationOffloader` moves whole blocks with fresh allocations each time where H3's ring
+    reuses flat buffers plus the boundary defrag. The fix was not to port the ring but to
+    halve what the streamer moves: Krea 2 FT had REFUSED 4-bit outright, so its trunk was
+    always ~13 GB of fp8. Lifting that gives a **6.08 GB packed trunk** and ~6.1 GB staged
+    instead of 13.0 — 12 windows, peaks **8.7–11.0 GB** under a 15.9 GB cap, ~2.8 s/it,
+    boundaries clean, and pause/resume verified across a rotation. Fragmentation never
+    bit, because there is half as much to fragment. The checkpoint is unaffected: Krea 2
+    saves bf16 straight from the CPU master, so NF4 is only the frozen forward CONTEXT
+    (which is also why the residency re-encode can round to nearest — pinned: 10
+    activate/deactivate cycles leave the master bit-identical).
+    **Reachability caveat:** "Auto" resolves through a LoRA-shaped recommender with no FT
+    awareness, which prefers INT8, and the FT branch then coerces INT8 → fp8 — so NF4 is
+    never chosen automatically. The user must pin Base precision to 4-bit NF4. The trainer
+    now warns when it lands on fp8 below ~20 GB free; changing the Auto policy is Peter's
+    call, not done.
   * Constant corrected: `_FT_OVERHEAD_GB` 13.3 → **14.5**. The per-window table below is
     in **GiB** and was being subtracted as GB — a ~7% systematic underestimate. Krea 2's
-    `_K2FT_OVERHEAD_GB = 16.0` is conservative but was left alone; it cannot be isolated
-    from a single run.
+    fp8 `_K2FT_OVERHEAD_GB = 16.0` is conservative but was left alone; it cannot be
+    isolated from a single run. The NF4 path has its own pair
+    (`_K2FT_NF4_OVERHEAD_GB` / `_K2FT_NF4_GB_PER_BLOCK`).
+  * Both rotators' `_deactivate_targets` now RELEASE the outgoing bf16 by resizing its
+    storage to 0 — rebinding `lin.weight` does not free it (a C++-side autograd referrer
+    keeps it alive and it is no longer a module parameter for gc or the park walk to
+    find), so every rotation was costing TWO windows. That, not the budget, is what failed
+    full-model H3 at 24 GB. The release is guarded on the re-encoded weight not sharing
+    that storage: freeing by storage frees every tensor sharing it, so an encoder that
+    returned a view instead of a copy would be handed a zero-byte weight.
 
 Route A shipped as designed
 (depth-split windows, planner-selected: `plan_h3_ft_windows` in rotation_ft.py, 41 CPU

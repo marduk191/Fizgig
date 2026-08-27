@@ -1857,6 +1857,29 @@ def train_krea2(
             logger.info("[ft-rotation] rotation needs a quantized frozen base to fit — "
                         "enabling fp8. (4-bit is the lighter option on small cards.)")
             fp8_scaled = True
+        if fp8_scaled and not quant_4bit:
+            # Say so BEFORE the load, because neither path above can pick 4-bit for the
+            # user and both can land a small card on fp8: "Auto" resolves through a
+            # LoRA-shaped recommender with no fine-tune awareness, which prefers INT8 —
+            # and the branch above then coerces INT8 to fp8. So the one base precision
+            # that closes the 16 GB tier is never chosen automatically.
+            # The bands are measured, not guessed: the fp8 trunk (~13 GB) fine-tunes at
+            # 24 GB but dies at 16 on allocator fragmentation, while the NF4 trunk
+            # (6.08 GB packed) completes a 16 GB run with ~5 GB spare. Warn only in the
+            # band between, and warn rather than switch — 4-bit gives the active window a
+            # coarser frozen context to train against, which is the user's call to make.
+            try:
+                from fizgig.utils.device import plannable_free_vram as _pfv_warn
+                _free_now = _pfv_warn()
+            except Exception:
+                _free_now = None
+            if _free_now is not None and _free_now < 20.0:
+                logger.warning(
+                    "[ft-rotation] fp8 frozen base on a ~%.0f GB card: measured, fp8 "
+                    "fine-tunes at 24 GB but runs out of usable memory below ~20 GB. "
+                    "Set Base precision to '4-bit NF4' (CLI --quantize_4bit) — its trunk "
+                    "is half the size and completes a 16 GB run. Auto will not pick it "
+                    "for you.", _free_now)
 
     # Resolve quantisation/swap interactions BEFORE anything reads blocks_to_swap —
     # should_compile used to be consulted with a swap value the NF4 branch zeroed a few
