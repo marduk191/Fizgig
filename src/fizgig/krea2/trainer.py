@@ -1561,6 +1561,12 @@ def train_krea2(
     reg_lr_multiplier: float = 0.2,
     quant_4bit: bool = False,
     quant_int8: str = "",
+    # FINE-TUNE ONLY. NF4 is the fine-tune default; this is the escape hatch back to an fp8
+    # frozen trunk. It exists because at the CLI "fp8" and "said nothing" are the same thing
+    # (fp8_scaled = not --no_fp8, i.e. True by default), so without an explicit signal the
+    # new default would silently swallow a deliberate fp8 pick and turn the GUI's fp8 option
+    # into a lie. Ignored outside rotation.
+    ft_base_fp8: bool = False,
     blocks_to_swap: int = 0,
     shift: float = 2.5,
     # Timestep window (0-1 scale): restrict training to a noise band. High-t-only training
@@ -1833,41 +1839,66 @@ def train_krea2(
                         "fixed-prefix offloader (--blocks_to_swap value ignored).")
             blocks_to_swap = 0
             ft_stream_frozen = True
+        # NF4 IS THE FINE-TUNE DEFAULT (Peter, 27 Aug: "lets make FT default to NF4").
+        # Measured on the same dataset and the same budget, NF4 beats fp8 at BOTH tested
+        # tiers, and at 24 GB it changes the plan shape rather than merely fitting:
+        #   24 GB fp8 -> 8 windows, depth-split AND streamed, ~3.0 s/it
+        #   24 GB NF4 -> 4 FULL-DEPTH windows, resident, ~1.02 s/it (peaks 15.7-16.0 GB)
+        #   16 GB fp8 -> does not complete (allocator fragmentation)
+        #   16 GB NF4 -> completes, peaks 8.6-11.0 GB
+        # So it is ~3x the step speed AND half the cycle (4 epochs per full pass, not 8).
+        # This applies to the FINE-TUNE path only — the LoRA recommender is untouched, and
+        # is exactly why "Auto" could never reach 4-bit here: it is LoRA-shaped, has no
+        # fine-tune awareness, and prefers INT8 (which rotation cannot use at all).
+        # An EXPLICIT fp8 pin is still honoured; this only fills the gap where the user
+        # expressed no usable preference.
+        # NOTE ON WHY THIS IS NOT JUST `if not fp8_scaled`: fp8_scaled arrives as
+        # `not args.no_fp8`, i.e. TRUE unless the user asked for a bf16 base. So "the user
+        # wants fp8" and "the user said nothing" are the SAME value here, and a default
+        # keyed on it would never fire. The explicit signal is ft_base_fp8.
+        if quant_int8 and not ft_base_fp8:
+            # int8 keeps its own packed weights + scales, which the bf16-master round-trip
+            # would have to undo and redo every window. It is not a choice we can keep, so
+            # substitute the best base that rotation CAN use rather than the middle one.
+            logger.info("[ft-rotation] INT8 base is incompatible with rotation — using "
+                        "4-bit NF4 instead (the fastest base rotation supports: measured "
+                        "~3x fp8's step speed at 24 GB, and the only one that fits 16 GB).")
+            quant_int8 = ""
+            quant_4bit = True
+        elif quant_int8:
+            logger.info("[ft-rotation] INT8 base is incompatible with rotation — honouring "
+                        "the explicit fp8 request instead.")
+            quant_int8 = ""
+        if not quant_4bit and not ft_base_fp8:
+            logger.info("[ft-rotation] frozen base: 4-bit NF4 (the fine-tune default). It "
+                        "keeps full-depth component windows resident on a 24 GB card — 4 "
+                        "windows at ~3x fp8's step speed — and is what makes 16 GB "
+                        "possible at all. Choose fp8 in Base precision (CLI --ft_base_fp8) "
+                        "for the fp8 trunk instead.")
+            quant_4bit = True
+        elif ft_base_fp8 and not quant_4bit:
+            logger.info("[ft-rotation] frozen base: fp8, by explicit request (the "
+                        "fine-tune default is 4-bit NF4).")
+            fp8_scaled = True
         if quant_4bit:
-            # NF4 is now a first-class rotation base (27 Aug). The rotator branches per
-            # module: activate reads the bf16 master and frees `_nf4_packed`; deactivate
-            # re-encodes with quantize_nf4 and restores the patched forward. The trunk
-            # halves (~13 GB fp8 -> ~6.5 GB), which is what buys a small card enough room
-            # to keep its window RESIDENT rather than streaming it — and streaming is
-            # what fragmented the allocator to death at 16 GB.
-            # The trade, exactly as on H3: the frozen CONTEXT the active window trains
-            # against carries NF4's error. The saved checkpoint does not — it is written
-            # bf16 from the master, which never sees a quantizer.
+            # Announced AFTER resolution, not before it: the branches above can turn 4-bit
+            # on, so a banner placed earlier would stay silent on exactly the runs that
+            # took the new default — the class of lie this file has been fixing all day.
+            # The rotator branches per module: activate reads the bf16 master and frees
+            # `_nf4_packed`; deactivate re-encodes with quantize_nf4 and restores the
+            # patched forward. The trade, as on H3: the frozen CONTEXT the active window
+            # trains against carries NF4's error. The saved checkpoint does not — it is
+            # written bf16 from the master, which never sees a quantizer.
+            fp8_scaled = False
             logger.info("[ft-rotation] 4-bit base: the frozen trunk holds NF4 (~half the "
                         "fp8 footprint) while the trainable window runs bf16 from the "
                         "master. The window trains against a coarser frozen context; the "
                         "saved checkpoint is unaffected (bf16, straight from the master).")
-            fp8_scaled = False
-        if quant_int8:
-            # Same reason as 4-bit: int8 keeps its own packed weights + scales, which the
-            # bf16-master round-trip would have to undo and redo every window.
-            logger.info("[ft-rotation] INT8 base is incompatible with rotation — using fp8 instead.")
-            quant_int8 = ""
-        if not fp8_scaled and not quant_4bit:
-            logger.info("[ft-rotation] rotation needs a quantized frozen base to fit — "
-                        "enabling fp8. (4-bit is the lighter option on small cards.)")
-            fp8_scaled = True
         if fp8_scaled and not quant_4bit:
-            # Say so BEFORE the load, because neither path above can pick 4-bit for the
-            # user and both can land a small card on fp8: "Auto" resolves through a
-            # LoRA-shaped recommender with no fine-tune awareness, which prefers INT8 —
-            # and the branch above then coerces INT8 to fp8. So the one base precision
-            # that closes the 16 GB tier is never chosen automatically.
-            # The bands are measured, not guessed: the fp8 trunk (~13 GB) fine-tunes at
-            # 24 GB but dies at 16 on allocator fragmentation, while the NF4 trunk
-            # (6.08 GB packed) completes a 16 GB run with ~5 GB spare. Warn only in the
-            # band between, and warn rather than switch — 4-bit gives the active window a
-            # coarser frozen context to train against, which is the user's call to make.
+            # Only reachable now by an EXPLICIT fp8 choice — the defaults above never land
+            # here. Measured bands, not guesses: the fp8 trunk (~13 GB) fine-tunes at 24 GB
+            # but runs out of usable memory below ~20; NF4 (6.08 GB packed) completes a
+            # 16 GB run with ~5 GB spare. Honour the pin, but say what it costs.
             try:
                 from fizgig.utils.device import plannable_free_vram as _pfv_warn
                 _free_now = _pfv_warn()
@@ -1875,11 +1906,11 @@ def train_krea2(
                 _free_now = None
             if _free_now is not None and _free_now < 20.0:
                 logger.warning(
-                    "[ft-rotation] fp8 frozen base on a ~%.0f GB card: measured, fp8 "
-                    "fine-tunes at 24 GB but runs out of usable memory below ~20 GB. "
-                    "Set Base precision to '4-bit NF4' (CLI --quantize_4bit) — its trunk "
-                    "is half the size and completes a 16 GB run. Auto will not pick it "
-                    "for you.", _free_now)
+                    "[ft-rotation] fp8 frozen base was requested explicitly on a ~%.0f GB "
+                    "card: measured, fp8 fine-tunes at 24 GB but runs out of usable memory "
+                    "below ~20 GB. Drop the fp8 pick (or pass --quantize_4bit) to get the "
+                    "4-bit default back — half the trunk, and it completes a 16 GB run.",
+                    _free_now)
 
     # Resolve quantisation/swap interactions BEFORE anything reads blocks_to_swap —
     # should_compile used to be consulted with a swap value the NF4 branch zeroed a few

@@ -242,9 +242,9 @@ LoRA** on the Training tab.
 > training. Full fine-tuning is a different animal — but it now **tiers itself to your card**:
 > ~32 GB runs the classic full-depth windows at full speed, ~24 GB depth-splits them into more
 > (still full speed), and 16 GB streams the frozen blocks from system RAM at ~1.5× the step
-> time. Both families reach 16 GB — on Krea 2, set **Base precision** to **4-bit NF4**, which
-> halves the frozen base and is what makes 16 GB fit (Auto won't choose it for you). The
-> planner measures your free VRAM at launch and prints the plan it chose.
+> time. Both families reach 16 GB: fine-tuning defaults to a **4-bit NF4** frozen base, which
+> halves the model held on the card and is what makes 16 GB fit. The planner measures your
+> free VRAM at launch and prints the plan it chose.
 
 **Which model files.** Fine-tuning uses the same training bases you already have — nothing new to
 download:
@@ -290,11 +290,17 @@ why. Measured Krea 2 peaks (RTX 5090, past a rotation boundary — which is wher
 | component + **4-bit NF4** base, full-depth windows | 16.0 GB | ~1.0 s/it | **24 GB** |
 | component + **4-bit NF4** base + streaming | 11.0 GB | ~2.8 s/it | **16 GB** |
 
-On a 24 GB card the **4-bit NF4** base is the one to pick: it halves the frozen base, which is
-enough to keep the classic full-depth component windows resident instead of depth-splitting and
-streaming them. That is **4 windows instead of 8** — a full pass over every weight in 4 epochs
-rather than 8 — at roughly **3× the step speed** (measured ~1.0 s/it against ~3.0 s/it for the
-fp8 base on the same dataset and the same 24 GB budget). Auto does not choose it for you.
+**4-bit NF4 is the fine-tune default**, and you don't have to do anything to get it. It halves
+the frozen base, which on a 24 GB card is enough to keep the classic full-depth component
+windows resident instead of depth-splitting and streaming them: **4 windows instead of 8** — a
+full pass over every weight in 4 epochs rather than 8 — at roughly **3× the step speed**
+(measured ~1.0 s/it against ~3.0 s/it for the fp8 base, same dataset, same 24 GB budget). On
+16 GB it is the only base that fits at all.
+
+The trade is that the *frozen* part of the model is held more coarsely while the trainable
+window learns against it. Your saved checkpoint is unaffected either way — it's written in
+bf16 from a master copy that never passes through a quantiser. If you want the more accurate
+frozen context and have the VRAM, pick **fp8** under Base precision and it will be used.
 
 **Component is the best mode — and Auto now stays in it at every depth.** Every window spans the
 model's full depth — attention across all 28 blocks, then each MLP matrix in turn — so a concept
@@ -393,12 +399,11 @@ extraction is nearly free. (Details and the experiments behind it: **[docs/FINET
 
 Being straight about the trade-offs, because they're real:
 
-- **VRAM tiers itself**: 32 GB runs the classic full-depth component cycle at full speed, and
-  **24 GB** stays in component mode with depth-split windows — still full speed, both families.
-  **16 GB** adds frozen-block streaming from RAM at ~1.5× the step time, on both families —
-  though on Krea 2 it needs **Base precision → 4-bit NF4**, which halves the frozen base;
-  leave it on Auto or fp8 and a 16 GB card won't fit. The console prints each run's plan; too
-  little VRAM refuses cleanly instead of OOMing.
+- **VRAM tiers itself**: on the default 4-bit NF4 base, **24 GB** runs the classic full-depth
+  component cycle at full speed, and **16 GB** adds frozen-block streaming from RAM at ~1.5×
+  the step time — both families. (Picking the fp8 base instead costs a 24 GB card depth-split,
+  streamed windows at ~3× the step time, and doesn't fit 16 GB at all.) The console prints
+  each run's plan; too little VRAM refuses cleanly instead of OOMing.
 - **System RAM** for the bf16 master copy, on top of VRAM: ~24 GB on Krea 2, ~23–38 GB on H3
   (H3's spills to disk automatically when RAM is tight).
 - **Disk.** Every save is a full checkpoint — ~26 GB on Krea 2, ~21 GB on H3. Saving once per
@@ -464,10 +469,9 @@ Fizgig ships as a ready-made cloud image — the **whole app in a browser tab**,
 - **Python** — 3.10 – 3.13.
 - **Disk** — ~10 GB for the venv, plus ~40 GB for model files.
 - **Full fine-tuning** (experimental, Krea 2 & MiniMax H3) asks for more than the above, and
-  tiers itself to your card: **32 GB** runs the classic full-depth component cycle at full
-  speed and **24 GB** depth-splits the windows (still full speed) on both families; **16 GB**
-  streams the frozen blocks from RAM at ~1.5× the step time, also on both — on Krea 2 set
-  **Base precision → 4-bit NF4** for it to fit. Add the bf16 master in RAM (spilled to disk
+  tiers itself to your card: on the default 4-bit NF4 base, **24 GB** runs the full-depth
+  component cycle at full speed and **16 GB** streams the frozen blocks from RAM at ~1.5× the
+  step time, both families. Add the bf16 master in RAM (spilled to disk
   automatically on H3), and disk for saves — **~26 GB per Krea 2 checkpoint, ~21 GB per
   H3 one**. Each
   family fine-tunes its normal training base — Krea 2 the RAW bf16 model, H3 the pruned int8

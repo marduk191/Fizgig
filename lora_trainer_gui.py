@@ -26472,6 +26472,17 @@ class LoRATrainerGUI:
             cmd += ["--finetune_rotation", str(max(1, nblocks)),
                     "--finetune_rotation_mode", mode,
                     "--finetune_rotate_every", str(max(1, every))]
+            # Base precision under FINE-TUNE: NF4 is the trainer's default now, so an
+            # explicit fp8 pick needs saying out loud. At the CLI an fp8 choice emits NO
+            # flag (fp8_scaled = not --no_fp8, true by default), which is indistinguishable
+            # from "Auto" — without this the dropdown's fp8 entry would silently produce
+            # NF4 and the control would be lying. LoRA runs are untouched: this sits inside
+            # the fine-tune branch.
+            try:
+                if self._base_precision() == "fp8":
+                    cmd.append("--ft_base_fp8")
+            except Exception:
+                pass
             if _fr:
                 # Continuation: pick the rotation cycle back up where the pause left it
                 # (from the checkpoint's metadata) instead of restarting at window 0.

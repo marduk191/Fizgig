@@ -69,6 +69,11 @@ def setup_parser() -> argparse.ArgumentParser:
     p.add_argument("--no_fp8", action="store_true", help="Train the base in bf16 instead of dynamic fp8")
     p.add_argument("--quantize_4bit", action="store_true",
                    help="QLoRA-style 4-bit (NF4) frozen base — ~5.6 GB DiT, fits 10-12 GB cards (no block swap)")
+    p.add_argument("--ft_base_fp8", action="store_true",
+                   help="FINE-TUNE ONLY: use an fp8 frozen trunk instead of the 4-bit NF4 "
+                        "default. NF4 is faster (measured ~3x at 24 GB, where it keeps "
+                        "full-depth windows resident) and is the only base that fits 16 GB; "
+                        "fp8 gives the trainable window a more accurate frozen context.")
     p.add_argument("--quant_int8", default="", choices=["", "bf16", "int8"],
                    help="EXPERIMENTAL INT8 W8A8 frozen base. 'bf16' = int8 forward with exact "
                         "bf16 gradients; 'int8' = both quantised (faster, lossier)")
@@ -237,6 +242,7 @@ def main():
         save_state=args.save_state, save_state_on_train_end=args.save_state_on_train_end,
         keep_last_n_states=args.keep_last_n_states,
         quant_4bit=args.quantize_4bit, quant_int8=args.quant_int8,
+        ft_base_fp8=args.ft_base_fp8,
         blocks_to_swap=args.blocks_to_swap, shift=args.discrete_flow_shift, seed=args.seed,
         min_timestep=args.min_timestep, max_timestep=args.max_timestep,
         motion_weighted_loss=args.motion_weighted_loss,

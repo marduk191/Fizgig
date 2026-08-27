@@ -41,7 +41,25 @@ caps (`FIZGIG_SIM_VRAM_GB`), likeness config on H3:
     Implication for the parked Auto question: NF4 is now the better pick on BOTH measured
     tiers, and Auto's INT8→fp8 coercion lands a 24 GB card on the slowest of the three.
     The speed and cycle wins are measured; the quality cost of the coarser frozen context
-    is NOT — that trade remains Peter's call.
+    is NOT.
+  * **DECIDED — NF4 IS NOW THE FINE-TUNE DEFAULT** (Peter, 27 Aug: "lets make FT default to
+    NF4"). Resolved trainer-side so CLI runs get it too, inside `if ft_rotation:` — the LoRA
+    recommender is untouched. Verified on a real run with NO precision flags: 4 full-depth
+    windows, 15.8 GB peak, i.e. the good plan arrives by default.
+    **Two traps that would have made the naive change a no-op or a lie:**
+    1. `fp8_scaled` arrives as `not args.no_fp8`, i.e. **True unless the user asked for
+       bf16** — so "wants fp8" and "said nothing" are the SAME value. A default keyed on it
+       never fires, and FT would have quietly kept using fp8 while the log claimed
+       otherwise.
+    2. At the CLI an **fp8 pick emits no flag at all**, so it is indistinguishable from
+       Auto. Defaulting without an explicit signal would have made the GUI's fp8 entry
+       produce NF4 — a lying control, the same class as the two logs fixed earlier today.
+    Hence `--ft_base_fp8` (FT-only), which the GUI emits for an explicit fp8 pick under
+    Fine-tune. Resolution: nothing specified → NF4; INT8 (Auto's usual pick) → NF4; explicit
+    4-bit → NF4; explicit fp8 → fp8, honoured. The NF4 banner also moved to AFTER resolution
+    — it sat before the branches that now enable NF4, so a defaulted run took the new path
+    in silence. 14 pins in tests/test_krea2_ft_base_default.py, including that Fine-tune OFF
+    never leaks the flag into a LoRA run.
   * **Previews on an NF4 trunk — PASS, first exercise of that path.** Every prior NF4 run
     had previews off, so the deactivate → re-encode-to-4-bit → fresh-Turbo-LoRA → render →
     restore bracket had never run on 4-bit. It renders clean 512² images at both 16 GB
