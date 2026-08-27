@@ -2716,6 +2716,9 @@ def train_krea2(
                     # Component specs translate to their resident block set.
                     dit.offloader.set_resident(_ft_resident_blocks(want))
                 rotator.rotate_to(want)
+                if torch.cuda.is_available():
+                    # Per-window peak measurement starts here (logged at epoch end).
+                    torch.cuda.reset_peak_memory_stats()
                 _new_params = rotator.trainable_params()
                 if fused_backward:
                     # Hooks and per-parameter optimizers belong to the OLD window's tensors —
@@ -2861,6 +2864,14 @@ def train_krea2(
         logger.info(f"epoch {epoch + 1}/{max_train_epochs}  avr_loss={loss_recorder.moving_average:.4f}  step={global_step}"
                     + _rate
                     + (f"  lr={optimizer.param_groups[0]['lr']:.3e}" if (scheduler is not None and optimizer is not None) else ""))
+        if rotator is not None and torch.cuda.is_available():
+            # Per-window peak, reset at each rotation — the H3 twin of this line is what
+            # calibrated that family's window planner, and _K2FT_OVERHEAD_GB here is still
+            # a DERIVED guess with no field measurement behind it. GB (1e9), never GiB:
+            # the planner constants are GB, and mixing the two cost H3 a full GB of
+            # headroom before it was caught (27 Aug).
+            logger.info("[ft-rotation] window peak VRAM: %.1f GB",
+                        torch.cuda.max_memory_allocated() / 1e9)
 
         # Attention backend: cuDNN's kernel is ~6% faster per step but costs ~1.3 s per distinct
         # sequence shape to plan, so it only wins on runs long enough to amortize that. After a

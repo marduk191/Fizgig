@@ -4785,10 +4785,12 @@ def train_minimax(
         loss = batch = None
         logger.info(f"epoch {epoch + 1}/{max_train_epochs} done — avr_loss {loss_recorder.moving_average:.4f}")
         if rotator is not None and torch.cuda.is_available():
-            # Per-window peak, reset at each rotation — the measured record the auto-tier
-            # work reads from.
+            # Per-window peak, reset at each rotation — the measured record the window
+            # planner's constants are calibrated from. GB (1e9), NOT GiB: this line used
+            # to divide by 2**30 while every planner constant was in GB, and the 7% gap
+            # silently put _FT_OVERHEAD_GB a full GB too low (found 27 Aug, field gate).
             logger.info("[h3-ft] window peak VRAM: %.1f GB",
-                        torch.cuda.max_memory_allocated() / 2 ** 30)
+                        torch.cuda.max_memory_allocated() / 1e9)
         if rotator is not None and _epoch_trained == 0:
             if finetune_scope == "photo":
                 raise RuntimeError(

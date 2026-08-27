@@ -221,13 +221,22 @@ H3_COMPONENT_PREFIXES = ("attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2")
 H3_COMPONENT_GB_PER_BLOCK = {"attn.qkv_proj": 0.174, "attn.out_proj": 0.058,
                              "mlp.fc1": 0.308, "mlp.fc2": 0.154}
 
-# Component-FT VRAM model (DESIGN_component_ft_24gb.md), calibrated against the measured
-# full-model per-window peaks (5090, 0.25 MP, batch 1, fused backward, checkpointing):
-# qkv 21.6 / out 16.2 / fc1 24.7 / fc2 18.8 GB. peak - window came out 12.9/13.3/9.3/11.1;
-# the MAX anchors the overhead constant so every prediction errs on the safe side (out_proj
-# lands exactly, fc1 over-predicts by ~4 GB — conservative, never optimistic). The trainer
-# logs real per-window peaks every run; refine these from field data, not theory.
-_FT_OVERHEAD_GB = 13.3          # non-window peak with the full NF4 trunk resident
+# Component-FT VRAM model (DESIGN_component_ft_24gb.md). The design table's per-window
+# peaks (qkv 21.6 / out 16.2 / fc1 24.7 / fc2 18.8) are GiB, and the first cut of this
+# model subtracted them as if they were GB — a ~7% systematic underestimate that put the
+# overhead at 13.3. Two independent field measurements on the 5090 (27 Aug, 496px stills,
+# batch 1, fused backward, checkpointing) both put it at 14.3: a 25-block qkv window
+# (4.35 GB) peaked 17.4 GiB, and a full-depth qkv window (8.7 GB) peaked 21.4 GiB —
+# 22.98 - 8.7 = 14.28. Rounded UP to 14.5 so predictions err safe.
+#
+# Deliberately NOT modelled: the design note's "minus the active component's freed NF4
+# share" term. Without it the fat windows over-predict (fc1/fc2 imply an overhead nearer
+# 11-12), which over-splits them — conservative, never optimistic. Add it only with clip
+# measurements in hand (see the full-model evaluation).
+#
+# CALIBRATED ON STILLS. A clip's activations are ~30x the tokens, so these do NOT
+# transfer to video datasets; the trainer logs real per-window peaks every run.
+_FT_OVERHEAD_GB = 14.5          # non-window peak with the full NF4 trunk resident
 _FT_NF4_GB_PER_BLOCK = 0.21     # trunk share reclaimed per streamed block (10.5 / 50)
 _FT_STREAM_SLOTS_GB = 2.0       # ring slots + copy-stream headroom when streaming
 _FT_MAX_SANE_WINDOWS = 12       # past this, a full-speed cycle is slower than streaming
