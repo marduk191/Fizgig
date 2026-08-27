@@ -342,6 +342,29 @@ def format_block_spec(indices):
     return ",".join(str(a) if a == b else f"{a}-{b}" for a, b in runs)
 
 
+def snap_ft_stop(n, cycle, offset, local_max):
+    """The effective (cumulative) FT retirement epoch: (value, kind).
+
+    Stop epochs are CUMULATIVE across pause/resume, exactly like checkpoint numbering —
+    on a continuation the flag means the same calendar epoch it meant in the original
+    run, so "pause at 12, set the stop to 12, resume" gives an audio-only continuation
+    instead of 12 more epochs of photos. Cycle-snapping happens in LOCAL space (each
+    process's rotation windows are what must see the identical data mix), then converts
+    back to cumulative. kind: "off" (0/disabled), "past" (already retired when this run
+    starts — value returned verbatim), "snapped"/"exact" (fires mid-run), "never"
+    (at or past this run's end). Pure so the table is pinnable without a training run."""
+    n = max(0, int(n or 0))
+    if not n:
+        return 0, "off"
+    local = n - int(offset or 0)
+    if local <= 0:
+        return n, "past"
+    snapped = ((local + cycle - 1) // cycle) * cycle
+    if snapped >= local_max:
+        return snapped + int(offset or 0), "never"
+    return snapped + int(offset or 0), ("snapped" if snapped != local else "exact")
+
+
 def plan_ft_modality_routing(n_blocks, photo_blocks, audio_blocks,
                              n_photo, n_voice, n_clip, explicit_subset=None):
     """The fine-tune's modality-routing plan, as pure data: (cycle_subset, routes).
@@ -2935,21 +2958,25 @@ def train_minimax(
         # Category retirement lands at cycle boundaries only: every window must see the
         # identical data mix for equal passes before the mix changes, or late-cycle
         # windows train on different data than early ones. Snapped UP, never down —
-        # the user asked for at least that much training.
+        # the user asked for at least that much training. Cumulative across pause/resume
+        # (snap_ft_stop): a stop at-or-below the continuation's start epoch means that
+        # category is retired for this whole run — "pause, set the stop to the current
+        # epoch, resume" IS the supported way to finish a mixed run audio- or visual-only.
         def _snap_stop(_n, _label):
-            _n = max(0, int(_n or 0))
-            if not _n:
-                return 0
-            _snapped = ((_n + _cyc - 1) // _cyc) * _cyc
-            if _snapped != _n:
+            _v, _kind = snap_ft_stop(_n, _cyc, ft_epoch_offset, max_train_epochs)
+            if _kind == "past":
+                logger.info("[h3-ft] %s retirement at epoch %d is already behind this run "
+                            "(continuing from epoch %d) — retired from the start.",
+                            _label, _v, ft_epoch_offset)
+            elif _kind == "snapped":
                 logger.info("[h3-ft] %s retirement lands at rotation-cycle boundaries — "
                             "epoch %d snaps to %d (%d-epoch cycle).",
-                            _label, _n, _snapped, _cyc)
-            if _snapped >= max_train_epochs:
+                            _label, int(_n or 0), _v, _cyc)
+            elif _kind == "never":
                 logger.warning("[h3-ft] %s retirement at epoch %d is at or past the run's "
-                               "%d epochs — it will never fire.",
-                               _label, _snapped, max_train_epochs)
-            return _snapped
+                               "end (epoch %d) — it will never fire.",
+                               _label, _v, max_train_epochs + ft_epoch_offset)
+            return _v
         visual_stop_epoch = _snap_stop(visual_stop_epoch, "photos & clips")
         audio_stop_epoch = _snap_stop(audio_stop_epoch, "voice")
         if train_blocks:
@@ -4476,8 +4503,11 @@ def train_minimax(
             # Per-category retirement: past its stop epoch a category is either ANCHORED
             # (trains on at ANCHOR_LR_SCALE — rehearsal against drift on the shared adapters,
             # ledger stays live) or STOPPED (skipped outright — faster epochs, blind).
-            _retired = ((not _is_voice and _vis_stop and (epoch + 1) > _vis_stop)
-                        or (_is_voice and _aud_stop and (epoch + 1) > _aud_stop))
+            # The comparison is CUMULATIVE: ft_epoch_offset re-bases a continuation's local
+            # epochs onto the original run's calendar (0 everywhere else, incl. LoRA resume,
+            # whose restored numbering is already cumulative).
+            _retired = ((not _is_voice and _vis_stop and (epoch + 1 + ft_epoch_offset) > _vis_stop)
+                        or (_is_voice and _aud_stop and (epoch + 1 + ft_epoch_offset) > _aud_stop))
             _ret_mode = audio_stop_mode if _is_voice else visual_stop_mode
             if _retired and _ret_mode != "anchor":
                 # No forward, no loss, no record — but a boundary landing here still owes any

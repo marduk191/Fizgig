@@ -175,6 +175,9 @@ on valid checkpoints:
   the run trains only the epochs that remain of the original total, and checkpoint
   numbering continues where it left off (nothing gets overwritten). The same works by
   hand with the printed `--dit <checkpoint> --finetune_start_window N` command.
+  Category-retirement epochs count on the same calendar: pause a mixed run, set the
+  stop epoch to the current epoch (or lower), and Resume to finish it voice-only or
+  visual-only.
 
 ---
 
