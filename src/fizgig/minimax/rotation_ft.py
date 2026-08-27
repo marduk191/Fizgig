@@ -338,6 +338,24 @@ class H3NF4Rotator(BlockRotator):
             self.master[key] = trained.to("cpu", dtype=torch.bfloat16).clone()
             lin.weight = self._nf4(trained, self.device)
             lin.__class__ = self._orig_class.pop(id(lin))
+            # RELEASE THE ORPHAN. Rebinding lin.weight is not enough: something C++-side
+            # (autograd's AccumulateGrad, invisible to gc.get_referrers) keeps the old
+            # bf16 storage alive, so the whole outgoing window survived into the NEXT
+            # epoch — measured at the boundary that failed full-model FT on a 24 GB
+            # budget (22.03 GiB LIVE of a 22.24 GiB cap, only 207 MiB stranded, i.e. not
+            # fragmentation). Neither gc nor the park/restore defrag can reach it, because
+            # by now it is no longer a module parameter for the walk to find.
+            # resize_(0) frees the bytes under every tensor sharing the storage and
+            # leaves phantom holders a zero-byte husk — the same trick, and the same
+            # justification, as park_dit_partial. Safe here because the value is already
+            # saved to the master above and _nf4 re-encodes from its own CPU copy, so
+            # nothing legitimate reads this storage again.
+            _orphan = trained.untyped_storage()
+            del trained
+            try:
+                _orphan.resize_(0)
+            except Exception:
+                pass
             n += 1
         return n
 

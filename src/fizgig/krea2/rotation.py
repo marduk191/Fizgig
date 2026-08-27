@@ -386,6 +386,19 @@ class BlockRotator:
                 def _fwd(self_, x, _p=fp8_linear_forward_patch):
                     return _p(self_, x, False, None)
                 lin.forward = _fwd.__get__(lin, type(lin))
+            # RELEASE THE ORPHAN — see the H3 twin in rotation_ft.py for the measurement.
+            # Rebinding lin.weight above does not free the old bf16: a C++-side autograd
+            # referrer keeps its storage alive and the whole outgoing window survives into
+            # the next epoch, so a rotation costs two windows instead of one. Nothing
+            # legitimate reads it again — the master holds a CPU clone and the fp8
+            # re-quantize took its own float copy — and resize_(0) leaves any phantom
+            # holder a zero-byte husk, exactly as park_dit_partial does.
+            _orphan = trained.untyped_storage()
+            del trained
+            try:
+                _orphan.resize_(0)
+            except Exception:
+                pass
             n += 1
         return n
 
