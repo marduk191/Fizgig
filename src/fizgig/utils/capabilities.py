@@ -256,16 +256,32 @@ class MemoryStrategy:
 #   component            27.67 GB   every window spans all 28 blocks (quality-preferred)
 #   block 8 + streaming  20.71 GB
 #   block 4 + streaming  18.70 GB
-#   block 2 + streaming  17.62 GB   the floor of this architecture
+#   block 2 + streaming  17.62 GB
 #
-# Streaming is deliberately absent from the component row: it cannot help there, because
-# every block holds a trainable slice so there is nothing to stream out.
+# HISTORY (27 Aug): this table used to drive the auto pick, and its component row
+# excluded streaming on the reasoning that every block holds a trainable slice.
+# Depth-split component windows (the small-card tiers) dissolved that premise — an
+# out-of-window block is fully frozen and streamable — so auto now stays in component
+# mode at every depth (see recommend_ft_rotation) and the trainer's window planner
+# does the exact sizing at launch. The block rows remain for the explicit Window
+# dropdown choice, quality-untested as ever.
 FT_ROTATION_TIERS = [
     # (min_free_gb, mode,        blocks, stream, measured_peak_gb)
     (29.5, "component", 14, False, 27.67),
     (22.5, "block",      8, True,  20.71),
     (20.5, "block",      4, True,  18.70),
     (19.5, "block",      2, True,  17.62),
+]
+
+# Component-mode auto ladder: (min_free_gb, stream, narrative). The window planner in
+# the trainer does the exact split arithmetic from the model's own Linear sizes; these
+# thresholds only decide the MODE and set expectations in the console.
+FT_COMPONENT_LADDER = [
+    (29.5, False, "full-depth component windows (the classic 4-window cycle)"),
+    (18.5, False, "component mode with depth-split windows — fat windows train in "
+                  "slices, still full speed"),
+    (12.5, True,  "component mode with depth-split windows + frozen-block streaming "
+                  "from RAM — steps slower for the PCIe trips"),
 ]
 
 
@@ -296,27 +312,19 @@ def recommend_ft_rotation(free_gb: Optional[float] = None):
     except Exception:
         pass
 
-    for min_free, mode, blocks, stream, peak in FT_ROTATION_TIERS:
+    # Component mode at every depth (27 Aug): depth-split windows made every card tier
+    # a component tier — block mode remains an explicit Window-dropdown choice only.
+    for min_free, stream, narrative in FT_COMPONENT_LADDER:
         if free_gb >= min_free:
-            why = [f"{free_gb:.1f} GB free -> "
-                   + (f"component mode" if mode == "component"
-                      else f"block mode, {blocks} blocks per window"
-                           + (" + frozen-block streaming" if stream else ""))
-                   + f"  (measured peak {peak:.1f} GB)"]
-            if mode != "component":
-                why.append("component mode needs ~29.5 GB free and does not fit here. Component "
-                           "trains a slice of EVERY block each window; block mode trains "
-                           "contiguous depth slices, so each window sees only part of the model.")
-                why.append("Block mode is not yet quality-tested — the good results so far are "
-                           "from component runs. Judge your checkpoints.")
-            return (mode, blocks, stream, why)
+            return ("component", 14, stream,
+                    [f"{free_gb:.1f} GB free -> {narrative}; the window planner sizes "
+                     "the exact splits at launch and prints them"])
 
-    lo = FT_ROTATION_TIERS[-1]
-    return (lo[1], lo[2], lo[3],
-            [f"{free_gb:.1f} GB free is below the ~{lo[0]:.1f} GB this needs even at its "
-             f"smallest window — trying {lo[1]} mode with {lo[2]} blocks anyway "
-             f"(measured peak {lo[4]:.1f} GB). Expect an out-of-memory error.",
-             "Rotating fine-tune cannot reach 16 GB cards in any configuration."])
+    lo = FT_COMPONENT_LADDER[-1]
+    return ("component", 14, True,
+            [f"{free_gb:.1f} GB free is below the ~{lo[0]:.1f} GB the smallest streamed "
+             "component plan was budgeted for — trying anyway; the window planner will "
+             "refuse cleanly if it truly cannot fit."])
 
 
 def _nvidia_smi_used_gb() -> Optional[float]:

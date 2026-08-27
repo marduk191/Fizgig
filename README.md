@@ -239,10 +239,10 @@ bottleneck — on a single consumer GPU. Tick **⚗ Fine-tune the BASE MODEL ins
 LoRA** on the Training tab.
 
 > **Note on VRAM:** the "trains on 8 GB" figures elsewhere in this README are for **LoRA**
-> training. Full fine-tuning is a different animal: on Krea 2, ~29.5 GB free for the recommended
-> component mode, down to ~19.5 GB in the smallest streamed block mode (MiniMax H3's figures are
-> in [its subsection below](#minimax-h3-fine-tuning)). The Window setting's Auto picks what your
-> card can do.
+> training. Full fine-tuning is a different animal — but it now **tiers itself to your card** on
+> both families: ~32 GB runs the classic full-depth windows at full speed, ~24 GB depth-splits
+> them (still full speed), and ~16 GB streams the frozen blocks from system RAM at a step-speed
+> cost. The planner prints the chosen plan at launch.
 
 **Which model files.** Fine-tuning uses the same training bases you already have — nothing new to
 download:
@@ -286,19 +286,18 @@ why. Measured Krea 2 peaks (RTX 5090, past a rotation boundary — which is wher
 | block, 4 per window + streaming | 18.7 GB | ~2–3× slower | **24 GB** |
 | block, 2 per window + streaming | 17.6 GB | ~2–3× slower | **24 GB** |
 
-**Component is the best mode, and it needs a 32 GB card.** Every window spans the model's full
-depth — attention across all 28 blocks, then each MLP matrix in turn — so a concept is learned by
-every layer at once rather than one depth slice at a time. The text-fusion stack stays trainable
-throughout: rotation would never reach it, and it's where prompt-to-concept binding happens.
+**Component is the best mode — and Auto now stays in it at every depth.** Every window spans the
+model's full depth — attention across all 28 blocks, then each MLP matrix in turn — so a concept
+is learned by every layer at once rather than one depth slice at a time. The text-fusion stack
+stays trainable throughout: rotation would never reach it, and it's where prompt-to-concept
+binding happens. Where the budget used to force a mode change, the planner now **depth-splits**
+the windows instead (a fat window trains in slices — more windows per cycle, still full speed),
+and below that the frozen out-of-window blocks **stream from system RAM** — slower steps, but
+still component-mode learning. The console prints the chosen plan and why.
 
-**On a 24 GB card it drops to block mode**, which trains contiguous depth slices instead and
-streams the frozen blocks from system RAM. That fits comfortably, but be clear about the two
-costs: steps run roughly **2–3× slower** because of the PCIe transfers, and block mode is **not
-yet quality-tested** — every good result so far came from component runs. The console says so when
-it picks it.
-
-**16 GB cards can't run it** in any configuration. The floor is 17.6 GB with the smallest window
-and streaming already on, and the model alone occupies ~18 GB before training starts.
+**Block mode remains an explicit Window-dropdown choice** — contiguous depth slices with frozen
+blocks streamed (the measured table above). It's **not yet quality-tested**; every good result so
+far came from component runs.
 
 ### MiniMax H3 fine-tuning
 
@@ -379,10 +378,10 @@ extraction is nearly free. (Details and the experiments behind it: **[docs/FINET
 
 Being straight about the trade-offs, because they're real:
 
-- **A 32 GB card** for Krea 2's good mode — 24 GB works but drops to block mode with streaming
-  (~2–3× slower per step, and a learning shape that hasn't been quality-tested yet); 16 GB can't
-  run it. MiniMax H3 tiers itself: 32 GB full speed, **24 GB** with depth-split windows (still
-  full speed), **16 GB** with streamed frozen blocks (slower steps).
+- **VRAM tiers itself, both families**: 32 GB runs the classic full-depth component cycle at
+  full speed; **24 GB** stays in component mode with depth-split windows (still full speed);
+  **16 GB** adds frozen-block streaming from RAM (slower steps). The console prints each run's
+  plan; too little VRAM refuses cleanly instead of OOMing.
 - **System RAM** for the bf16 master copy, on top of VRAM: ~24 GB on Krea 2, ~23–38 GB on H3
   (H3's spills to disk automatically when RAM is tight).
 - **Disk.** Every save is a full checkpoint — ~26 GB on Krea 2, ~21 GB on H3. Saving once per
@@ -447,12 +446,12 @@ Fizgig ships as a ready-made cloud image — the **whole app in a browser tab**,
 - **OS** — Windows 10 / 11 or Linux. macOS handles captioning and image prep, but training needs CUDA or ROCm.
 - **Python** — 3.10 – 3.13.
 - **Disk** — ~10 GB for the venv, plus ~40 GB for model files.
-- **Full fine-tuning** (experimental, Krea 2 & MiniMax H3) asks for more than the above.
-  **Krea 2**: a **32 GB card** for the best mode — 24 GB works at ~2–3× slower steps, 16 GB not
-  at all — plus ~24 GB of free system RAM and **~26 GB of disk per saved checkpoint**.
-  **MiniMax H3**: 32 GB at full speed, **24 GB** with depth-split windows (still full speed),
-  or **16 GB** with the frozen blocks streamed from RAM (slower steps) — plus the bf16 master
-  in RAM or spilled to disk automatically, and **~21 GB per checkpoint**. Each
+- **Full fine-tuning** (experimental, Krea 2 & MiniMax H3) asks for more than the above, and
+  tiers itself to your card on both families: **32 GB** runs the classic full-depth component
+  cycle at full speed, **24 GB** depth-splits the windows (still full speed), and **16 GB**
+  streams the frozen blocks from system RAM (slower steps). Add the bf16 master in RAM (spilled
+  to disk automatically on H3), and disk for saves — **~26 GB per Krea 2 checkpoint, ~21 GB per
+  H3 one**. Each
   family fine-tunes its normal training base — Krea 2 the RAW bf16 model, H3 the pruned int8
   checkpoint (H3's ~66 GB bf16 file works for LoRA training only, not fine-tuning).
 - **Visual Studio Build Tools** (Windows only) — for InsightFace and the torch.compile speedup: **[aka.ms/vs/17/release/vs_BuildTools.exe](https://aka.ms/vs/17/release/vs_BuildTools.exe)**, tick **"Desktop development with C++"**. Without it everything still works minus the compile speedup.

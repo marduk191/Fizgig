@@ -2000,18 +2000,86 @@ def train_krea2(
                                quantization_mode="tensor" if fast_ft else "block")
         if getattr(dit, "txtfusion", None) is not None:
             rotator.activate_always("txtfusion", dit.txtfusion)
+        # Component-window plan (the small-card tiers, mirrors H3): read free VRAM, add
+        # back the fp8 trunk already resident, and let the shared planner decide how many
+        # depth-splits the budget forces — and whether the frozen out-of-window blocks
+        # must stream. Window sizes come from the model's own Linears, not a table.
+        _k2_windows = None
+        if str(finetune_rotation_mode).startswith("comp"):
+            from fizgig.krea2.rotation import (component_gb_per_block,
+                                               plan_krea2_ft_windows,
+                                               K2FT_COMPONENT_PREFIXES,
+                                               _K2FT_FP8_GB_PER_BLOCK)
+            _comp_gb = component_gb_per_block(dit.blocks[0], K2FT_COMPONENT_PREFIXES)
+            try:
+                from fizgig.utils.device import plannable_free_vram as _pfv0
+                _usable = _pfv0() + _K2FT_FP8_GB_PER_BLOCK * len(dit.blocks) - 1.5
+            except Exception:
+                _usable = 99.0
+            _k2_windows, _k2_stream, _plan_why = plan_krea2_ft_windows(
+                _usable, _comp_gb, n_blocks=len(dit.blocks),
+                allow_stream=os.environ.get("FIZGIG_NO_FT_STREAM") != "1")
+            for _line in _plan_why:
+                logger.info("[ft-rotation] %s", _line)
+            if _k2_windows is None:
+                raise RuntimeError(
+                    f"[ft-rotation] ~{_usable:.1f} GB of usable VRAM is below what the "
+                    "fine-tune needs even with depth-split windows and streamed frozen "
+                    "blocks. Close other GPU apps, or train a LoRA instead.")
+            if _k2_stream:
+                # The planner's verdict outranks how streaming was (or wasn't) requested:
+                # split windows leave the out-of-window blocks fully frozen, so the
+                # rotation-aware streamer carries them regardless of the swap box.
+                ft_stream_frozen = True
         rot_schedule = RotationSchedule(len(dit.blocks), active=ft_rotation,
                                         rotate_every=finetune_rotate_every,
                                         mode=finetune_rotation_mode,
+                                        components=(_k2_windows if _k2_windows
+                                                    else ("attn", "mlp.gate",
+                                                          "mlp.up", "mlp.down")),
                                         start_window=finetune_start_window)
         if finetune_start_window:
             logger.info(f"[ft-rotation] resuming mid-cycle: schedule starts at window "
                         f"{rot_schedule.window_at(0)} of {rot_schedule.n_windows}")
-        if rot_schedule.mode == "component" and ft_stream_frozen:
-            # Every block holds trainable Linears in component mode, so nothing can be
-            # streamed out — there is no frozen block left to evict.
-            logger.info("[ft-rotation] component mode trains part of every block — "
-                        "block streaming disabled.")
+        # Continuation across a different card/plan: the stamped window index only lines
+        # up when the window COUNT matches (mirrors H3).
+        if ft_epoch_offset:
+            try:
+                from safetensors import safe_open as _so_w
+                with _so_w(raw_path, framework="pt") as _fw:
+                    _prev_nw = int((_fw.metadata() or {}).get("fizgig_ft_n_windows", 0))
+            except Exception:
+                _prev_nw = 0
+            if _prev_nw and _prev_nw != rot_schedule.n_windows:
+                logger.warning("[ft-rotation] this card's plan has %d windows; the "
+                               "checkpoint was trained with %d — the rotation cycle "
+                               "cannot line up exactly across the change, so expect one "
+                               "cycle of mild imbalance while it settles.",
+                               rot_schedule.n_windows, _prev_nw)
+
+        def _ft_resident_blocks(spec):
+            """Blocks holding trainable Linears under `spec` — block-index specs pass
+            through; component entries translate (bare prefix = every block, a depth
+            slice = its range). The streamer's resident set, per window."""
+            from fizgig.krea2.rotation import is_component_spec
+            if not is_component_spec(spec):
+                return set(int(b) for b in spec)
+            res = set()
+            for _e in spec:
+                if isinstance(_e, str):
+                    res |= set(range(len(dit.blocks)))
+                else:
+                    _p, _lo, _hi = _e
+                    res |= set(range(max(0, _lo), min(len(dit.blocks), _hi + 1)))
+            return res
+
+        _split_windows = any(isinstance(c, tuple) for c in rot_schedule.components)
+        if rot_schedule.mode == "component" and ft_stream_frozen and not _split_windows:
+            # Every block holds trainable Linears when component windows span full depth,
+            # so nothing can be streamed out. (Depth-SPLIT windows are different — the
+            # out-of-window blocks are fully frozen, which is the whole 16 GB tier.)
+            logger.info("[ft-rotation] full-depth component windows train part of every "
+                        "block — block streaming disabled.")
             ft_stream_frozen = False
         if ft_stream_frozen:
             from fizgig.krea2.rotation import RotationOffloader
@@ -2020,7 +2088,7 @@ def train_krea2(
             # Window 0 here; the epoch loop re-pins to the correct window on the first
             # iteration (and on resume, since want != rotator.active triggers a rotation).
             dit.offloader = RotationOffloader(dit.blocks, torch.device(device),
-                                              rot_schedule.active_at(0))
+                                              _ft_resident_blocks(rot_schedule.active_at(0)))
             dit.blocks_to_swap = 1
             logger.info("[ft-rotation] streaming frozen blocks from CPU — only the trainable "
                         "window stays resident.")
@@ -2621,10 +2689,32 @@ def train_krea2(
                 # New window: swap the blocks, then rebuild the optimizer. The old optimizer's
                 # state refers to tensors that no longer require grad, and Adam moments for the
                 # outgoing window are meaningless to the incoming one.
+                #
+                # Release the optimizer's grip BEFORE the swap (H3 field lesson): the old
+                # optimizer/hooks/scheduler are keyed on the outgoing window's Parameters,
+                # so without this every rotation transiently held BOTH windows at once —
+                # the measured 27.7 GB component peak IS that boundary, ~7 GB over steady
+                # state. Stash the schedule position first; the rebuild below re-attaches.
+                _sched_pos_now = (scheduler.last_epoch
+                                  if (scheduler is not None and not fused_backward)
+                                  else _ft_sched_pos["pos"])
+                params = None
+                if fused_backward:
+                    for _h in _fused["handles"]:
+                        _h.remove()
+                    _fused["handles"].clear()
+                    _fused["opts"].clear()
+                else:
+                    optimizer = None
+                    scheduler = None
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 if ft_stream_frozen:
                     # Pin the incoming window BEFORE the weight swap: activate() reads from the
                     # master onto the GPU, and the outgoing window must rejoin the stream pool.
-                    dit.offloader.set_resident(want)
+                    # Component specs translate to their resident block set.
+                    dit.offloader.set_resident(_ft_resident_blocks(want))
                 rotator.rotate_to(want)
                 _new_params = rotator.trainable_params()
                 if fused_backward:
@@ -2634,14 +2724,10 @@ def train_krea2(
                 else:
                     optimizer = _make_optimizer(_new_params)
                 params = _new_params
-                if scheduler is not None and not fused_backward:
-                    # Re-attach the schedule to the new optimizer at the current position.
-                    _pos = scheduler.last_epoch
-                    scheduler = _rebuild_scheduler(optimizer, _pos)
-                elif not fused_backward and _ft_sched_pos["pos"] is not None:
-                    # The preview bracket dropped the scheduler (it pins the old window's
-                    # optimizer, which pins the window) — rebuild at the stashed position.
-                    scheduler = _rebuild_scheduler(optimizer, _ft_sched_pos["pos"])
+                if not fused_backward and _sched_pos_now is not None:
+                    # Re-attach the schedule to the new optimizer at the stashed position
+                    # (covers both the rotation drop above and the preview bracket's).
+                    scheduler = _rebuild_scheduler(optimizer, _sched_pos_now)
                     _ft_sched_pos["pos"] = None
                 logger.info("[ft-rotation] epoch %d: training blocks %s", epoch + 1, want)
         for i, batch in enumerate(loader):
@@ -2829,6 +2915,7 @@ def train_krea2(
                 _next_w = rot_schedule.window_at(epoch + 1)
                 _save_full_checkpoint(rotator, raw_path, _ck, extra_metadata={
                     "fizgig_next_start_window": str(_next_w),
+                    "fizgig_ft_n_windows": str(rot_schedule.n_windows),
                     "fizgig_ft_epochs_done": str(epoch + 1 + ft_epoch_offset)})
                 ft_ckpt_saved_this_epoch = True
                 logger.info("[ft-rotation] to continue from this checkpoint: --dit %s "
@@ -3035,6 +3122,7 @@ def train_krea2(
                     try:
                         _save_full_checkpoint(rotator, raw_path, _pp, extra_metadata={
                             "fizgig_next_start_window": str(_next_w),
+                            "fizgig_ft_n_windows": str(rot_schedule.n_windows),
                             "fizgig_ft_epochs_done": str(epoch + 1 + ft_epoch_offset)})
                         logger.info("[ft-rotation] paused. Continue with: --dit %s "
                                     "--finetune_start_window %d", os.path.basename(_pp), _next_w)
@@ -3107,6 +3195,7 @@ def train_krea2(
         # Fine-tune mode: the training lives in the base weights, not the (inert) LoRA.
         _next_w = rot_schedule.window_at(max_train_epochs)
         extra.update({"fizgig_next_start_window": str(_next_w),
+                      "fizgig_ft_n_windows": str(rot_schedule.n_windows),
                       "fizgig_ft_epochs_done": str(max_train_epochs + ft_epoch_offset)})
         _save_full_checkpoint(rotator, raw_path, out, extra_metadata=extra)
         logger.info(f"saved fine-tuned checkpoint -> {out}")

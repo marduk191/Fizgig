@@ -102,6 +102,125 @@ class RotationSchedule:
                 f"{self.cycle_epochs} epochs per full cycle")
 
 
+def component_gb_per_block(block: nn.Module, prefixes) -> dict:
+    """Exact bf16 GB per block for each component prefix, measured from the model itself.
+
+    Sums Linear weight numel x 2 bytes under each prefix — no architecture guessing, so
+    the window planner's sizes are exact for whatever checkpoint actually loaded."""
+    out = {p: 0.0 for p in prefixes}
+    for name, m in block.named_modules():
+        if not isinstance(m, nn.Linear):
+            continue
+        for p in prefixes:
+            if name.startswith(p):
+                out[p] += m.weight.numel() * 2 / 1e9
+                break
+    return out
+
+
+def plan_component_windows(usable_gb, span, n_blocks, comp_gb, overhead_gb,
+                           trunk_gb_per_block, slots_gb, allow_stream=True,
+                           max_sane_windows=12):
+    """The family-agnostic component-window plan: (windows, stream, reasons).
+
+    comp_gb: ordered (prefix -> bf16 GB per block). windows: RotationSchedule component
+    entries — bare prefixes where the full span fits, (prefix, lo, hi) depth-splits where
+    it doesn't. stream: True when the frozen out-of-window blocks must stream from CPU to
+    fit. Returns (None, stream, reasons) when the budget can't run FT at all.
+
+    Depth-splitting trades the full-depth-per-window geometry (what makes component mode
+    learn fast) for fit; streaming further trades step speed (PCIe) for residency. Both
+    families feed their own calibrated constants; the trainer's per-window peak logs are
+    what refine them. Pure so the tier tables are pinnable without a card."""
+    span = sorted(int(b) for b in span)
+    usable = float(usable_gb)
+    prefixes = list(comp_gb)
+    fattest = max(comp_gb.values())
+    reasons = []
+
+    def _chunk(prefix, max_gb):
+        """Even depth-chunks of `span` whose bf16 window fits max_gb, or None."""
+        g = comp_gb[prefix]
+        max_len = int(max_gb / g)
+        if max_len < 1:
+            return None
+        k = (len(span) + max_len - 1) // max_len
+        per = (len(span) + k - 1) // k
+        chunks = [span[i:i + per] for i in range(0, len(span), per)]
+        if k == 1:
+            return [prefix]                       # full span — bare prefix, full depth
+        return [(prefix, c[0], c[-1]) for c in chunks]
+
+    # Full-speed plan: everything resident, split only what the budget forces. Viable
+    # only when at least a 1-block window of the fattest component fits the cap.
+    cap = usable - overhead_gb
+    plain = []
+    if cap >= fattest:
+        for prefix in prefixes:
+            _c = _chunk(prefix, cap)
+            if _c is None:
+                plain = []
+                break
+            plain.extend(_c)
+    if plain and len(plain) <= max_sane_windows:
+        for prefix in prefixes:
+            need = overhead_gb + len(span) * comp_gb[prefix]
+            if need > usable:
+                reasons.append(f"{prefix} across {len(span)} block(s) would peak "
+                               f"~{need:.1f} GB vs {usable:.1f} usable — depth-split")
+        return plain, False, reasons
+
+    if not allow_stream:
+        reasons.append(f"{usable:.1f} GB usable cannot hold the frozen trunk + a component "
+                       f"window at full residency, and streaming is disabled")
+        return (plain or None), False, reasons
+
+    # Streaming plan: only the active chunk's blocks stay resident; every other block's
+    # frozen weights ring in from CPU. Per-chunk peak ≈ overhead − reclaimed + slots + window.
+    base = overhead_gb - trunk_gb_per_block * int(n_blocks) + slots_gb
+    stream_windows = []
+    for prefix in prefixes:
+        g = comp_gb[prefix]
+        per_block = g + trunk_gb_per_block         # window bf16 + the block's own frozen share
+        max_gb = (usable - base) / per_block * g   # expressed back in window GB
+        chunks = _chunk(prefix, max_gb) if max_gb > 0 else None
+        if chunks is None:
+            reasons.append(f"{usable:.1f} GB usable cannot fit even a 1-block {prefix} "
+                           f"window with streaming (~{base + per_block:.1f} GB needed)")
+            return None, True, reasons
+        stream_windows.extend(chunks)
+    reasons.append(f"{usable:.1f} GB usable is below the resident plan — frozen "
+                   f"out-of-window blocks stream from CPU "
+                   f"(~{trunk_gb_per_block * n_blocks:.1f} GB staged in RAM, "
+                   f"steps slower for the PCIe trips)")
+    return stream_windows, True, reasons
+
+
+# Krea 2 component-FT VRAM model. One measured anchor exists: 27.67 GB peak on the 5090
+# for classic full-depth component windows — but that peak IS the rotation boundary,
+# where the pre-fix rotation transiently held BOTH windows (~7 GB over steady state).
+# With the boundary ref-drop fix (ported from H3) the steady model is fp8 trunk ~13 GB
+# + activations + margin. Conservative until the trainer's per-window peak logs
+# calibrate: OVERHEAD 16.0 (trunk 13 + act ~1.5 + margin), fp8 reclaimed per streamed
+# block 13/28, JIT-streamer in-flight allowance 1.5 (RotationOffloader prefetches one
+# block, no flat ring slots).
+K2FT_COMPONENT_PREFIXES = ("attn", "mlp.gate", "mlp.up", "mlp.down")
+_K2FT_OVERHEAD_GB = 16.0
+_K2FT_FP8_GB_PER_BLOCK = 0.464
+_K2FT_STREAM_SLOTS_GB = 1.5
+
+
+def plan_krea2_ft_windows(usable_gb, comp_gb, n_blocks=28, allow_stream=True):
+    """The Krea 2 component-window plan: (windows, stream, reasons).
+
+    comp_gb comes from component_gb_per_block on a real block (exact, no architecture
+    guessing); the constants above are the calibration. Same contract as the H3 twin."""
+    return plan_component_windows(
+        usable_gb, range(int(n_blocks)), n_blocks, dict(comp_gb),
+        overhead_gb=_K2FT_OVERHEAD_GB, trunk_gb_per_block=_K2FT_FP8_GB_PER_BLOCK,
+        slots_gb=_K2FT_STREAM_SLOTS_GB, allow_stream=allow_stream)
+
+
 def is_component_spec(spec) -> bool:
     """True when a rotation spec lists component windows rather than block indices.
 

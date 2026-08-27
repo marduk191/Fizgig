@@ -234,73 +234,21 @@ _FT_MAX_SANE_WINDOWS = 12       # past this, a full-speed cycle is slower than s
 
 
 def plan_h3_ft_windows(usable_gb, subset=None, n_blocks=50, allow_stream=True):
-    """The component-window plan for a VRAM budget: (windows, stream, reasons).
+    """The H3 component-window plan for a VRAM budget: (windows, stream, reasons).
 
-    windows: RotationSchedule component entries — bare prefixes where the full span fits,
-    (prefix, lo, hi) depth-splits where it doesn't. stream: True when the frozen
-    out-of-window blocks must ring-stream from CPU to fit (the 16 GB tier). reasons:
-    console lines explaining the arithmetic. Returns (None, False, reasons) when the
-    budget can't run FT at all.
-
-    Depth-splitting trades the full-depth-per-window geometry (what makes component mode
-    learn fast) for fit — attention/fc2 usually keep full depth and only fc1 splits, so
-    most of the win survives. Streaming further trades step speed (PCIe) for residency.
-    Pure so the tier table is pinnable without a card."""
-    span = sorted(int(b) for b in subset) if subset else list(range(int(n_blocks)))
-    usable = float(usable_gb)
-    reasons = []
-
-    def _chunk(prefix, max_gb):
-        """Even depth-chunks of `span` whose bf16 window fits max_gb, or None."""
-        g = H3_COMPONENT_GB_PER_BLOCK[prefix]
-        max_len = int(max_gb / g)
-        if max_len < 1:
-            return None
-        k = (len(span) + max_len - 1) // max_len
-        per = (len(span) + k - 1) // k
-        chunks = [span[i:i + per] for i in range(0, len(span), per)]
-        if k == 1:
-            return [prefix]                       # full span — bare prefix, full depth
-        return [(prefix, c[0], c[-1]) for c in chunks]
-
-    # Full-speed plan: everything resident, split only what the budget forces.
-    cap = usable - _FT_OVERHEAD_GB
-    plain = []
-    if cap >= H3_COMPONENT_GB_PER_BLOCK["mlp.fc1"]:      # at least a 1-block fc1 window
-        for prefix in H3_COMPONENT_PREFIXES:
-            plain.extend(_chunk(prefix, cap) or [])
-    if plain and len(plain) <= _FT_MAX_SANE_WINDOWS:
-        for prefix in H3_COMPONENT_PREFIXES:
-            need = _FT_OVERHEAD_GB + len(span) * H3_COMPONENT_GB_PER_BLOCK[prefix]
-            if need > usable:
-                reasons.append(f"{prefix} across {len(span)} block(s) would peak "
-                               f"~{need:.1f} GB vs {usable:.1f} usable — depth-split")
-        return plain, False, reasons
-
-    if not allow_stream:
-        reasons.append(f"{usable:.1f} GB usable cannot hold the NF4 trunk + a component "
-                       f"window at full residency, and streaming is disabled")
-        return (plain or None), False, reasons
-
-    # Streaming plan: only the active chunk's blocks stay resident; every other block's
-    # NF4 rings in from CPU. Per-chunk peak ≈ overhead − reclaimed + slots + window.
-    base = _FT_OVERHEAD_GB - _FT_NF4_GB_PER_BLOCK * int(n_blocks) + _FT_STREAM_SLOTS_GB
-    stream_windows = []
-    for prefix in H3_COMPONENT_PREFIXES:
-        g = H3_COMPONENT_GB_PER_BLOCK[prefix]
-        per_block = g + _FT_NF4_GB_PER_BLOCK          # window bf16 + the block's own NF4
-        max_gb = (usable - base) / per_block * g       # expressed back in window GB
-        chunks = _chunk(prefix, max_gb) if max_gb > 0 else None
-        if chunks is None:
-            reasons.append(f"{usable:.1f} GB usable cannot fit even a 1-block {prefix} "
-                           f"window with streaming (~{base + per_block:.1f} GB needed)")
-            return None, True, reasons
-        stream_windows.extend(chunks)
-    reasons.append(f"{usable:.1f} GB usable < ~{_FT_OVERHEAD_GB + 2.0:.0f} GB the resident "
-                   f"plan needs — frozen out-of-window blocks stream from CPU "
-                   f"(~{_FT_NF4_GB_PER_BLOCK * n_blocks:.1f} GB staged in RAM, "
-                   f"steps slower for the PCIe trips)")
-    return stream_windows, True, reasons
+    A thin wrapper over the family-agnostic plan_component_windows with H3's calibrated
+    constants — windows are bare prefixes where the full span fits, (prefix, lo, hi)
+    depth-splits where it doesn't, and stream=True is the 16 GB tier (frozen
+    out-of-window blocks ring in from CPU). Returns (None, ..., reasons) when the budget
+    can't run FT at all. Pure so the tier table is pinnable without a card."""
+    from fizgig.krea2.rotation import plan_component_windows
+    span = sorted(int(b) for b in subset) if subset else range(int(n_blocks))
+    return plan_component_windows(
+        usable_gb, span, n_blocks,
+        {p: H3_COMPONENT_GB_PER_BLOCK[p] for p in H3_COMPONENT_PREFIXES},
+        overhead_gb=_FT_OVERHEAD_GB, trunk_gb_per_block=_FT_NF4_GB_PER_BLOCK,
+        slots_gb=_FT_STREAM_SLOTS_GB, allow_stream=allow_stream,
+        max_sane_windows=_FT_MAX_SANE_WINDOWS)
 
 
 class H3NF4Rotator(BlockRotator):
