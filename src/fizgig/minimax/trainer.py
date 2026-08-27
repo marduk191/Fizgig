@@ -3002,28 +3002,81 @@ def train_minimax(
             streamed set first is what makes room for the incoming bf16 window — the
             other order OOMs at setup on the 16 GB tier. Every resident block is pushed
             to the GPU through bind_block_packed_to (idempotent for blocks already
-            there), so this is also the restore path after an override-encode park."""
+            there), so this is also the restore path after an override-encode park.
+
+            On a rotation it also DEFRAGS (see below) — on a 16 GB budget the rebuild's
+            allocations otherwise strand ~3.6 GB of unusable segments per boundary.
+
+            ORDER IS LOAD-BEARING, both ways (field, 27 Aug, a 16 GB-sim OOM):
+              * the outgoing residents are unbound to CPU by the new ring's prepare()
+                BEFORE the incoming ones are bound to the GPU. The other order holds
+                BOTH packed sets (~3 GB each at 15 blocks) on the card at once, and that
+                transient is what tips a Windows allocator with no expandable_segments
+                over the edge — it died with only 8.65 GiB live but 5.88 GiB stranded in
+                fragments.
+              * `old` is dropped BEFORE the new ring is built. Releasing the old ring
+                frees its GPU slots but NOT its CPU staging dict, so a lingering local
+                reference doubles the pinned staging (~7 GB -> ~14 GB here) straight
+                through construction. enable_block_swap solved exactly this in
+                model.py; this is the same hazard on the rotation path."""
             if not ft_stream:
                 return
             from fizgig.minimax.h3_nf4_h2d_offload import (H3NF4H2DOffloader,
                                                            bind_block_packed_to)
             old = _ft_ring["ring"]
             if old is not None:
+                # RING-AWARE DEFRAG. Ordering fixes alone did not save the 16 GB tier:
+                # it still died at the epoch-2 boundary with only ~8.9 GiB LIVE (exactly
+                # what the window plan predicts) but ~5.5 GiB stranded in segments the
+                # allocator could not reuse. Windows has no expandable_segments, so the
+                # rebuild's fresh allocations never fit the holes the old ones left and
+                # `reserved` climbed ~3.6 GB per rotation until it hit the cap.
+                #
+                # The cure is the one the non-streaming path already uses, expressed
+                # THROUGH the ring instead of around it: park everything first, so for
+                # one moment no block tensor is live and empty_cache can hand whole
+                # segments back, then let the rebuild land contiguously. park_dit_partial
+                # is safe against a live ring by design — it calls unbind_to_cpu() before
+                # its walk, so the streamed blocks' ring VIEWS are never resize_(0)'d
+                # (the sticky 'invalid argument' that once killed step 0). It must
+                # therefore run BEFORE the offloader refs are cleared, or that guard
+                # cannot fire.
+                park_dit_to_cpu(dit)
                 old.release()
                 _ft_ring["ring"] = None
                 dit._h2d_offloader = None
                 for _blk in dit.blocks:
                     _blk._h2d_offloader = None
+                # Each block's weight still views its old CPU flat until it rebinds
+                # below, so the staging peak stays ~one window's worth instead of two.
+                old = None
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                # The park took the non-block modules (token refiner, embeddings, final
+                # layer) down with it; the blocks come back below, but these have no
+                # other restore path. The refiner is always-on TRAINABLE, and .to() only
+                # repoints .data — Parameter identity and requires_grad survive, and the
+                # optimizer is rebuilt after activate() regardless.
+                for _cname, _child in dit.named_children():
+                    if _cname != "blocks":
+                        _child.to(device)
             resident = _ft_resident_blocks(spec)
             streamed = [i for i in range(len(dit.blocks)) if i not in resident]
+            ring = H3NF4H2DOffloader(dit.blocks, streamed, torch.device(device))
+            ring.move_static_weights_to_gpu()
+            # prepare() stages every streamed block into a CPU flat and rebinds it —
+            # which is what releases the OUTGOING residents' GPU packed weights.
+            ring.prepare()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            # ...only now pull the incoming window's blocks onto the card.
             for i in sorted(resident):
                 bind_block_packed_to(dit.blocks[i], device)
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            ring = H3NF4H2DOffloader(dit.blocks, streamed, torch.device(device))
-            ring.move_static_weights_to_gpu()
-            ring.prepare()
             dit._h2d_offloader = ring
             for _blk in dit.blocks:
                 _blk._h2d_offloader = ring
