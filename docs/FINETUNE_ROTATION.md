@@ -433,7 +433,8 @@ fine-tune it was meant to replace. Recorded here so it is not re-derived.
 
    Structural note that does hold: **16 GB is unreachable without streaming.** The frozen base
    alone is ~11.3 GB of fp8 blocks plus ~0.6 GB of bf16 norms/embeddings/IO before any trainable
-   weight or activation exists.
+   weight or activation exists. (Still true as stated, but read it as a statement about **fp8**:
+   an NF4 trunk is 6.08 GB, and 16 GB was reached that way on 27 Aug 2026 — see below.)
 
 </details>
 
@@ -451,6 +452,14 @@ fine-tune it was meant to replace. Recorded here so it is not re-derived.
    - **24 GB cards: yes, comfortably.** Block mode with streaming has room to spare.
    - **16 GB: no, in any configuration.** The floor is 17.62 GB with the most aggressive window
      and streaming already on. That leaves the txtfusion-only mode below as the only route.
+     **SUPERSEDED (27 Aug 2026) — 16 GB is reached, and the escape was the assumption rather
+     than the arithmetic.** Every figure in this table is an **fp8** base, which was the only
+     frozen trunk Krea 2 FT allowed (4-bit was refused outright). An **NF4** trunk is 6.08 GB
+     packed against fp8's ~13, which moves the whole table down: component mode with streaming
+     now measures **8.4–11.0 GB peak** across 12 depth-split windows under a hard 15.9 GB cap,
+     ~2.8 s/it, with pause/resume verified across a rotation. The "structural note that does
+     hold" above holds only for its own precision — it reasoned from an 11.3 GB fp8 base as if
+     the base size were fixed. See docs/DESIGN_component_ft_24gb.md for the current tiers.
    - **The peak is TRAINING, not load**, in both modes (load is 18-19.5 GB either way). So
      changing how the model is brought in -- e.g. sourcing frozen blocks from a pre-quantised
      fp8 file rather than quantising RAW -- cannot help. The lever is the trainable window and
