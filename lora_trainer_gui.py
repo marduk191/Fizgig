@@ -5078,7 +5078,9 @@ class LoRATrainerGUI:
                       "2.0× per step on INT8 (0.59 → 0.29 s/step, matching OneTrainer) and 1.28× on "
                       "NF4 (0.71 → 0.56) — but costs a ~90 s compile pause first, so a short run is SLOWER "
                       "overall. Break-even is around 600 steps on INT8, 1200 on NF4. NF4 + compile still fits a 16 GB "
-                      "card (verified under a 13.5 GB cap); INT8 + compile needs ~24 GB. Requires Triton and, on "
+                      "card (verified under a 13.5 GB cap). INT8 + compile fits from ~22 GB free: at high resolution "
+                      "the checkpoint automatically moves outside the compiled region, which keeps memory at eager "
+                      "levels (~18 GB at 1024px, measured ~27% faster than uncompiled). Requires Triton and, on "
                       "Windows, a C++ compiler (VS Build Tools) — both located automatically. Never used with "
                       "Blocks Swap, since swapping moves weights and compiled graphs assume they stay put.",
                  font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
@@ -26297,7 +26299,10 @@ class LoRATrainerGUI:
         if _opt_args:
             cmd += ["--optimizer_args", _opt_args]
         _cb = str(self.settings.get("COMPILE_BLOCKS", "auto") or "auto").lower()
-        if _cb in ("auto", "on", "off"):
+        # "outside" is a hand-set power value (settings JSON only — the dropdown offers
+        # Auto/On/Off): the high-res compile boundary (#99). Passing it through beats
+        # silently downgrading a stated choice to auto.
+        if _cb in ("auto", "on", "off", "outside"):
             cmd += ["--compile_blocks", _cb]
         # torch.compile and block swap are mutually exclusive — compiled graphs assume their
         # weights stay put, and swap moves them every step, so the trainer ignores compile

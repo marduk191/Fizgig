@@ -28,7 +28,7 @@ set "ROCM_INDEX=https://rocm.nightlies.amd.com/whl-multi-arch/"
 if not defined TORCH_PIN set "TORCH_PIN=2.12.0+rocm7.15.0a20260728"
 if not defined TORCHVISION_PIN set "TORCHVISION_PIN=0.27.0+rocm7.15.0a20260728"
 if not defined ROCM_SDK_DEVEL_PIN set "ROCM_SDK_DEVEL_PIN=7.15.0a20260728"
-set "BNB_WHEEL=https://github.com/0xDELUXA/bitsandbytes_win_rocm/releases/download/0.50.0.dev0-py3.12-rocm7.15-win_amd64_all/bitsandbytes-0.50.0.dev0-cp312-cp312-win_amd64.whl"
+set "BNB_WHEEL=https://github.com/0xDELUXA/bitsandbytes_win_rocm/releases/download/0.50.2.dev0-py3.12-rocm7.16-win_amd64_all/bitsandbytes-0.50.2.dev0-cp312-cp312-win_amd64.whl"
 
 echo ============================================================
 echo   Fizgig Installer - AMD ROCm (Windows)

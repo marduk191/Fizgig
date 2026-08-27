@@ -593,6 +593,40 @@ _NF4_COMPILE_PEAK_GB = 13.0
 # activations are bf16 either way, so the slope shouldn't depend on the weight format) — being
 # wrong here declines compile and the run proceeds uncompiled, which costs speed, never the run.
 _COMPILE_GB_PER_MP = 15.0
+# The OUTSIDE boundary (#99): checkpoint kept OUTSIDE the compiled region, so inductor's
+# partitioner stashes only what eager checkpointing stashes — recompute reruns the compiled
+# graph. Measured (Krea 2 INT8, 46 imgs @ 1.05 MP, rank 32, RTX 5090): peak ~18.7 GB net vs
+# eager's ~18.0, steady 2.4 s/step vs eager 3.30 (~27% faster), warm-up ~25 s (the per-block
+# graph is reused across Krea 2's 28 identical blocks). The constant is the measured need at
+# 1.05 MP; below that it is mildly conservative, which never matters — inside is preferred
+# wherever IT fits, and it fits everywhere small. Beyond 1.05 MP the inside slope is borrowed
+# as a deliberately-too-steep bound: over-declining runs eager (slower), never OOMs.
+_INT8_COMPILE_OUTSIDE_PEAK_GB = 19.0
+_COMPILE_OUTSIDE_ANCHOR_MP = 1.05
+
+
+def compile_boundary(quant_4bit: bool, quant_int8: str, vram_gb=None, caps=None,
+                     mp: float = 0.25, batch: int = 1) -> str:
+    """'inside' | 'outside' — where the gradient checkpoint sits for an EXPLICIT
+    Compile=On (#99). Never declines (On means on); it only places the boundary where
+    it fits: inside-the-graph is 1.19x faster per block but its stashes scale hard with
+    tokens (measured >32 GB at 1 MP on INT8), outside stays at eager-level stashes.
+    When inside doesn't fit, outside is the strictly safer gamble even near the edge."""
+    kind = "nf4" if quant_4bit else ("int8" if quant_int8 else None)
+    if kind != "int8":
+        return "inside"          # NF4/other: outside unmeasured — behave as before
+    caps = caps or detect()
+    vram = vram_gb if vram_gb is not None else (caps.vram_free_gb or caps.vram_gb)
+    if not vram:
+        # None OR the detect() default of 0.0 (no readable GPU): no basis to pick, and
+        # 0.0 falling through would read as "inside doesn't fit -> outside", which is a
+        # decision dressed as a default. Inside = today's behaviour.
+        return "inside"
+    _step_mp = float(mp) * max(1, int(batch))
+    _res_gb = _COMPILE_GB_PER_MP * max(0.0, _step_mp - 0.25)
+    if vram < _INT8_COMPILE_PEAK_GB + _res_gb + _HEADROOM_GB:
+        return "outside"
+    return "inside"
 
 
 def should_compile(total_steps: int, quant_4bit: bool, quant_int8: str,
@@ -635,10 +669,27 @@ def should_compile(total_steps: int, quant_4bit: bool, quant_int8: str,
     _res_gb = _COMPILE_GB_PER_MP * max(0.0, _step_mp - 0.25)
     _shape = (f" at {mp:.2f} MP" + (f" x batch {batch}" if batch > 1 else "")) if _res_gb else ""
     _fix = (" (lower Target Megapixels or batch size to compile)" if _res_gb else "")
+    _boundary = "inside"
     if kind == "int8" and vram < _INT8_COMPILE_PEAK_GB + _res_gb + _HEADROOM_GB:
-        return False, (f"INT8 + compile peaks near {_INT8_COMPILE_PEAK_GB + _res_gb:.0f} GB{_shape} "
-                       f"and only {vram:.1f} GB is free — INT8 alone still fits, compile does not"
-                       + _fix)
+        # Inside-the-graph doesn't fit at this token load — try the OUTSIDE boundary
+        # (#99): same fused kernels, eager-level stashes, measured ~27% faster than
+        # eager at 1 MP. Only falls to uncompiled when even that can't fit.
+        # Batch is charged at the measured EAGER term, not laundered through the step-MP
+        # slope (which only starts at the anchor): the outside boundary's stashes ARE
+        # eager-checkpointing stashes, and this module's own history says batch is the
+        # single biggest term and the classic blind spot ("batch 2 sailed through the
+        # check and OOM'd"). Resolution above the anchor keeps the deliberately-too-steep
+        # inside slope, on mp alone.
+        _out_need = (_INT8_COMPILE_OUTSIDE_PEAK_GB
+                     + _COMPILE_GB_PER_MP * max(0.0, float(mp) - _COMPILE_OUTSIDE_ANCHOR_MP)
+                     + _BATCH_GB_PER_IMAGE * max(0, int(batch) - 1))
+        if vram >= _out_need + _HEADROOM_GB:
+            _boundary = "outside"
+        else:
+            return False, (f"INT8 + compile peaks near {_INT8_COMPILE_PEAK_GB + _res_gb:.0f} "
+                           f"GB{_shape} (checkpoint-outside still ~{_out_need:.0f} GB) and only "
+                           f"{vram:.1f} GB is free — INT8 alone still fits, compile does not"
+                           + _fix)
     if kind == "nf4" and _res_gb and vram < _NF4_COMPILE_PEAK_GB + _res_gb + _HEADROOM_GB:
         return False, (f"NF4 + compile peaks near {_NF4_COMPILE_PEAK_GB + _res_gb:.0f} GB{_shape} "
                        f"and only {vram:.1f} GB is free — NF4 alone still fits, compile does not"
@@ -648,5 +699,11 @@ def should_compile(total_steps: int, quant_4bit: bool, quant_int8: str,
     if total_steps < needed:
         return False, (f"{total_steps} steps is too short — compiling costs ~{_COMPILE_WARMUP_S:.0f} s "
                        f"up front and needs ~{needed} steps on the {kind.upper()} path to pay back")
+    if _boundary == "outside":
+        # Truthy like True, so bool-minded callers keep working; boundary-aware callers
+        # (the Krea 2 trainer) pass it through to _compile_blocks.
+        return "outside", (f"{total_steps} steps on the {kind.upper()} path — inside-the-graph "
+                           f"doesn't fit{_shape}, compiling with the checkpoint OUTSIDE the "
+                           f"region instead (measured ~27% faster than eager at 1 MP)")
     return True, (f"{total_steps} steps on the {kind.upper()} path — compile pays back within "
                   f"~{needed} steps and this run is longer")

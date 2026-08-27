@@ -73,21 +73,30 @@ if TRITON_AVAILABLE:
         pid_n = (pid % num_pid_in_group) // group_size_m
 
         offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+        # rintic-13's v2 "large M" hardening (#89): the row offsets go int64 in the X and
+        # O pointer math. int32 wraps at M x stride_xm > 2^31 (M > ~150k tokens at
+        # K=14336) — silent corruption, no error. Below that the addresses are identical,
+        # so the kernel is bit-for-bit unchanged for every reachable shape (pinned by the
+        # old-vs-new parity check that shipped this). The k-side stays int32, verbatim
+        # from their file: K never exceeds ~14k.
+        offs_m_i64 = offs_m.to(tl.int64)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         mask_m = offs_m < M
         mask_n = offs_n < N
 
         accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-        for k0 in range(0, K, BLOCK_K):
-            offs_k = k0 + tl.arange(0, BLOCK_K)
-            mask_k = offs_k < K
+        offs_k = tl.arange(0, BLOCK_K)
+        for k_idx in range(0, tl.cdiv(K, BLOCK_K)):
+            mask_k = offs_k < K - k_idx * BLOCK_K
 
-            x_ptrs = X_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+            x_ptrs = (X_ptr + offs_m_i64[:, None] * stride_xm
+                      + (offs_k[None, :] + k_idx * BLOCK_K) * stride_xk)
             x = tl.load(x_ptrs, mask=(mask_m[:, None] & mask_k[None, :]), other=0.0)
             x = x.to(tl.bfloat16)
 
-            w_ptrs = W_ptr + offs_n[:, None] * stride_wm + offs_k[None, :] * stride_wk
+            w_ptrs = (W_ptr + offs_n[:, None] * stride_wm
+                      + (offs_k[None, :] + k_idx * BLOCK_K) * stride_wk)
             w_int8 = tl.load(w_ptrs, mask=(mask_n[:, None] & mask_k[None, :]), other=0)
             w = w_int8.to(tl.bfloat16)
 
@@ -104,7 +113,7 @@ if TRITON_AVAILABLE:
             bias = tl.load(B_ptr + offs_n, mask=mask_n, other=0.0).to(tl.float32)
             out += bias[None, :]
 
-        out_ptrs = O_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+        out_ptrs = O_ptr + offs_m_i64[:, None] * stride_om + offs_n[None, :] * stride_on
         tl.store(out_ptrs, out.to(tl.bfloat16), mask=(mask_m[:, None] & mask_n[None, :]))
 
     def fused_w8a16_gemm(x, qdata, wscale, bias):
