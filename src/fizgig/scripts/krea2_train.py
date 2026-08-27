@@ -211,6 +211,13 @@ def setup_parser() -> argparse.ArgumentParser:
 
 
 def main():
+    # FIZGIG_SIM_VRAM_GB: behave like a smaller card. minimax_train.py has always done
+    # this; krea2_train.py never did, so the simulator only ever fooled the PLANNER here
+    # while the allocator kept the real card's headroom — a Krea 2 "16 GB" run could
+    # quietly spill past 16 GB and still look like a pass (field, 27 Aug: a sim-16 run
+    # peaked 16.7 GB against a 15.9 GB budget and completed). No-op without the env var.
+    from fizgig.utils.device import apply_sim_vram_cap
+    apply_sim_vram_cap()
     args = setup_parser().parse_args()
     prompts = None
     if args.sample_prompts and os.path.exists(args.sample_prompts):
