@@ -333,7 +333,8 @@ one, overriding the Samples tab's "every N epochs" (prompts, resolution, seed an
 sample override still come from the Samples tab and status bar as usual — every sample in the
 gallery maps to a file you can deploy). Checkpoints are numbered by epoch (`-000004`,
 `-000008`, …) and the numbering continues across Pause/Resume, so a resumed run never overwrites
-an earlier save.
+an earlier save. Krea 2 fine-tunes behave exactly the same way — saves snap to the cycle,
+previews ride them (rendered on the training DiT with the Turbo LoRA), numbering carries over.
 
 The output is a normal H3 checkpoint: load it in ComfyUI directly, or run **Checkpoint to LoRA**
 on it (the extractor decodes the int8 format natively) for a shareable LoRA.
@@ -383,9 +384,10 @@ Being straight about the trade-offs, because they're real:
   (anything as high as 1e-4) will destroy a fine-tune.
 - **Run at least one full cycle** (4 epochs in component mode) or some weights never train at all.
   The console warns you.
-- **Adaptive LR is off** — rotation boundaries would read as instability to it. Krea 2 also runs
-  **without in-training previews** (H3 renders one per saved checkpoint). Judge the saved
-  checkpoints in ComfyUI, or extract a LoRA and scrub the epochs in LoRA Royale.
+- **Adaptive LR is off** — rotation boundaries would read as instability to it. Previews render
+  **once per saved checkpoint** on both families (every sample is the rehearsal of a file you can
+  deploy); judge those, evaluate checkpoints in ComfyUI, or extract a LoRA and scrub the epochs
+  in LoRA Royale.
 
 Experimental, and on this branch only — master is untouched.
 

@@ -1919,12 +1919,15 @@ def train_krea2(
     do_previews = bool((sample_every_n_epochs or sample_at_first)
                        and sample_prompts and (turbo_path or turbo_lora_path)
                        and vae_path and te_path)
-    # Skipped entirely under a full fine-tune: previews apply a LoRA (turbo or checkpoint) and
-    # there is no trainable LoRA here, so loading the encoder and VAE would be pure waste.
-    # MUST stay after every other do_previews decision — the FT kill wins.
-    if do_previews and ft_rotation:
-        logger.info("[ft-rotation] in-training previews are disabled — evaluate saved "
-                    "checkpoints in ComfyUI instead.")
+    # Under a full fine-tune the trained weights live in the BASE, so the standalone Turbo
+    # checkpoint (a different model) cannot show them — the only faithful preview renders on
+    # the training DiT itself with the Turbo LoRA applied fresh inside a deactivate/reactivate
+    # bracket (the H3 pattern). Without the Turbo LoRA, previews stay off.
+    # MUST stay after every other do_previews decision — the FT gate wins.
+    if do_previews and ft_rotation and not turbo_lora_path:
+        logger.info("[ft-rotation] in-training previews need the Turbo LoRA (the standalone "
+                    "Turbo checkpoint can't show fine-tuned weights) and none is configured — "
+                    "previews off. Evaluate saved checkpoints in ComfyUI instead.")
         do_previews = False
     encoded_prompts = sample_ae = sample_dir = None
     encoded_negative = None
@@ -1968,7 +1971,11 @@ def train_krea2(
         fp8_scaled=fp8_scaled, quant_4bit=quant_4bit, quant_int8=quant_int8,
         blocks_to_swap=blocks_to_swap, compile_blocks=_do_compile, fp8_fast=fast_ft,
         context_lora_path=context_lora_path, context_lora_strength=context_lora_strength,
-        turbo_lora_path=(turbo_lora_path if do_previews else None),
+        # Under FT the Turbo LoRA is NOT staged at load: the rotation bracket applies it
+        # FRESH against the deactivated model at each preview and restores every wrapped
+        # forward exactly afterwards — a load-time wrap would end up stashed inside the
+        # rotator's forward snapshots and double-applied.
+        turbo_lora_path=(turbo_lora_path if (do_previews and not ft_rotation) else None),
         device=device, dtype=dtype)
     if turbo_net is not None:
         logger.info("[preview] turbo-LoRA mode: previews render on the resident training DiT "
@@ -2023,6 +2030,24 @@ def train_krea2(
                            "blocks after window %d will NEVER train this run.",
                            rot_schedule.cycle_epochs, max_train_epochs,
                            max_train_epochs // finetune_rotate_every)
+        # Checkpoints (and the previews that ride them) land at rotation-cycle boundaries
+        # only — mirrors H3: every window must see the identical data mix for equal passes
+        # before the mix changes, or checkpoints compare unlike-for-unlike. Snapped UP,
+        # never down — the user asked for at least that much training between saves.
+        _cyc = rot_schedule.cycle_epochs
+        if save_every_n_epochs and save_every_n_epochs % _cyc:
+            _snapped_save = ((save_every_n_epochs + _cyc - 1) // _cyc) * _cyc
+            logger.info("[ft-rotation] checkpoint saves land at rotation-cycle boundaries — "
+                        "save-every %d snaps to %d (%d-epoch cycle).",
+                        save_every_n_epochs, _snapped_save, _cyc)
+            save_every_n_epochs = _snapped_save
+        if do_previews:
+            logger.info("[ft-rotation] previews follow CHECKPOINT SAVES (every %d epoch(s), "
+                        "plus the final one), overriding Sample-every-N — each sample is the "
+                        "rehearsal of a checkpoint you can deploy, rendered on the training "
+                        "DiT via a deactivate/reactivate bracket with the Turbo LoRA applied "
+                        "fresh each time.",
+                        save_every_n_epochs if save_every_n_epochs else max_train_epochs)
         if adaptive_lr:
             # The watcher reads epoch-to-epoch loss movement as signal. Rotation changes which
             # weights are trainable at the boundary, so every rotation looks like a step change
@@ -2403,9 +2428,99 @@ def train_krea2(
             except Exception:
                 pass
             loss_watch.resume_from_jsonl(up_to_epoch=start_epoch, resets=_resets)
+    # The preview bracket's scheduler hand-off: dropping the scheduler unpins the old
+    # window's optimizer, and the next rotation rebuilds it here from the stashed position.
+    _ft_sched_pos = {"pos": None}
+
+    def _ft_bracket_preview(epoch1):
+        """Fine-tune preview (the field-proven H3 bracket, krea2-shaped): deactivate the
+        whole window so the model is a consistent all-fp8 checkpoint (the master holds
+        every trained weight), apply the Turbo LoRA FRESH against it, render on the
+        resident training DiT, then put every wrapped forward back exactly. The model is
+        left DEACTIVATED on purpose: the next epoch's rotation check sees active=[] !=
+        wanted and reactivates + rebuilds the optimizer through the one normal path — and
+        on a failed render, only after the exception's tensors are gone (re-activating
+        inside the exception's lifetime OOM'd in H3's field runs). Returns the last
+        rendered prompt (for the status line) or None."""
+        nonlocal optimizer, scheduler, params
+        _act = list(rotator.active)
+        if _act:
+            rotator.deactivate(_act)
+            # Drop every reference to the window's now-orphaned bf16 Parameters — the
+            # fused per-parameter optimizers are KEYED on them, a plain optimizer's state
+            # pins them just as hard, and the scheduler pins the optimizer.
+            params = None
+            if fused_backward:
+                for _h in _fused["handles"]:
+                    _h.remove()
+                _fused["handles"].clear()
+                _fused["opts"].clear()
+            else:
+                if scheduler is not None:
+                    _ft_sched_pos["pos"] = scheduler.last_epoch
+                optimizer = None
+                scheduler = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        _t_net = _t_diffb = None
+        try:
+            # Override read + TE encode AFTER the deactivate, when the window's VRAM is
+            # back — the ~8 GB Qwen3-VL is the render's one real memory risk.
+            ov = _read_sample_override(output_dir)
+            if ov:
+                logger.info(f"[sample override] active — '{ov['prompt'][:60]}' "
+                            f"seed={ov['seed']} {ov['width']}x{ov['height']}"
+                            f"{' +ref' if ov.get('ref_image') else ''}")
+                _enc = encode_sample_prompts(te_path, [ov["prompt"]],
+                                             ref_image=ov.get("ref_image") or None, device=device)
+                _w, _h, _seed, _prompts = ov["width"], ov["height"], ov["seed"], [ov["prompt"]]
+            else:
+                _enc, _w, _h, _seed = encoded_prompts, sample_width, sample_height, sample_seed
+                _prompts = sample_prompts
+            if _seed == 0:
+                _seed = random.randint(1, 2**31 - 1)
+                logger.info(f"[sample] seed 0 -> random {_seed}")
+            _t_net, _t_diffb = _apply_turbo_lora(dit, turbo_lora_path, device=device, dtype=dtype)
+            _, _lp = sample_previews_on_dit(dit, _t_net, _t_diffb, sample_ae, _enc,
+                                            sample_dir, epoch1, output_name=output_name,
+                                            steps=sample_steps, cfg_scale=sample_cfg_scale,
+                                            neg=encoded_negative, width=_w, height=_h,
+                                            seed=_seed, blocks_to_swap=blocks_to_swap,
+                                            device=device, prompts=_prompts)
+            return _lp
+        finally:
+            if _t_net is not None:
+                # Exact un-apply. The pre-Turbo forward here is an INSTANCE chain (the fp8
+                # patch + the inert trainable wrap), so popping down to the class forward —
+                # H3's move — would destroy it. Each LoRAInfModule kept the target module in
+                # org_module_ref, so the captured bound forward is restored verbatim.
+                for _l in _t_net.unet_loras:
+                    _m = (_l.org_module_ref[0]
+                          if getattr(_l, "org_module_ref", None) else None)
+                    if _m is not None and getattr(_l, "org_forward", None) is not None:
+                        _m.forward = _l.org_forward
+                _t_net.to("cpu")
+            _t_net = _t_diffb = None
+            dit.train()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
     # Sample at Start: an epoch-0 preview (base model + zero-init LoRA) so the run's
     # starting point is on record. Fresh runs only — a resume already has samples.
-    if sample_at_first and do_previews and start_epoch == 0 and turbo_net is not None:
+    if sample_at_first and do_previews and start_epoch == 0 and rotator is not None:
+        # Fine-tune: the bracket renders the untouched base (nothing trained yet) on the
+        # training DiT; the epoch-0 rotation check re-activates the first window after.
+        logger.info("rendering epoch-0 preview (Sample at Start, fine-tune bracket)...")
+        try:
+            _last_p = _ft_bracket_preview(ft_epoch_offset)
+            if _last_p:
+                _last_sample_prompt = _last_p
+        except Exception as _e0:
+            logger.warning(f"[preview] Sample at Start failed ({type(_e0).__name__}) — training "
+                           f"continues; per-epoch previews will still be attempted.")
+    elif sample_at_first and do_previews and start_epoch == 0 and turbo_net is not None:
         # Turbo-LoRA mode: render on the resident training DiT (live network — no save/reload,
         # no parking). sample_previews_on_dit reverts everything in its finally.
         logger.info("rendering epoch-0 preview (Sample at Start, on training DiT)...")
@@ -2523,6 +2638,11 @@ def train_krea2(
                     # Re-attach the schedule to the new optimizer at the current position.
                     _pos = scheduler.last_epoch
                     scheduler = _rebuild_scheduler(optimizer, _pos)
+                elif not fused_backward and _ft_sched_pos["pos"] is not None:
+                    # The preview bracket dropped the scheduler (it pins the old window's
+                    # optimizer, which pins the window) — rebuild at the stashed position.
+                    scheduler = _rebuild_scheduler(optimizer, _ft_sched_pos["pos"])
+                    _ft_sched_pos["pos"] = None
                 logger.info("[ft-rotation] epoch %d: training blocks %s", epoch + 1, want)
         for i, batch in enumerate(loader):
             if epoch < 2:
@@ -2746,7 +2866,28 @@ def train_krea2(
                                      "already saved.", type(_se).__name__, _se)
                     prune_state_dirs(output_dir, output_name, keep_last_n_states)
 
-        if (do_previews and sample_every_n_epochs and (epoch + 1) % sample_every_n_epochs == 0
+        if (rotator is not None and do_previews
+                and (ft_ckpt_saved_this_epoch or (epoch + 1) == max_train_epochs)):
+            # Fine-tune: previews ride the checkpoint saves (plus the final epoch) — each
+            # sample is the rehearsal of a file you can deploy. Clear the last step's
+            # loss/batch refs first: the loss tensor's graph metadata holds the window's
+            # Parameters (H3 field lesson, ab04379) and would pin them through the render.
+            loss = batch = None
+            logger.info(f"rendering previews (epoch {epoch + 1 + ft_epoch_offset}) via the "
+                        "fine-tune bracket (training DiT + fresh Turbo LoRA)...")
+            try:
+                _lp = _ft_bracket_preview(epoch + 1 + ft_epoch_offset)
+                if _lp:
+                    _last_sample_prompt = _lp
+            except Exception as _prev_err:
+                _oom = "out of memory" in str(_prev_err).lower()
+                logger.warning(
+                    f"[preview] epoch {epoch + 1 + ft_epoch_offset} preview failed "
+                    f"({'CUDA OOM' if _oom else type(_prev_err).__name__}); "
+                    f"disabling previews for the rest of the run. Training continues and "
+                    f"checkpoints still save normally.")
+                do_previews = False
+        elif (do_previews and sample_every_n_epochs and (epoch + 1) % sample_every_n_epochs == 0
                 and turbo_net is not None):
             # Turbo-LoRA mode: live network, resident DiT, no parking. The override TE encode
             # is the one VRAM risk (the ~8 GB Qwen3-VL loads alongside the resident trainer,
@@ -2786,7 +2927,8 @@ def train_krea2(
                 )
                 do_previews = False
             network.train()
-        elif do_previews and sample_every_n_epochs and (epoch + 1) % sample_every_n_epochs == 0:
+        elif (do_previews and sample_every_n_epochs and rotator is None
+                and (epoch + 1) % sample_every_n_epochs == 0):
             from safetensors.torch import load_file
             tmp = os.path.join(output_dir, "_sample_lora.safetensors")
             _save_lora(network, tmp, network_dim, network_alpha, dtype)

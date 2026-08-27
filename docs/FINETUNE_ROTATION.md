@@ -224,8 +224,13 @@ ignored; in block mode it's the blocks per window.
 backward, upstream of where fused backward consumes gradients), auto-recaption, look-outlier
 warm-up. Verified: 36/36 images tracked with real verdicts under a component-mode run.
 
-**Auto-disabled, with a log line:** in-training previews (they apply a LoRA to the Turbo; there is
-no LoRA here), adaptive LR, block swap unless explicitly asked for, 4-bit.
+**Auto-disabled, with a log line:** adaptive LR, block swap unless explicitly asked for, 4-bit.
+In-training previews RUN under the fine-tune (27 Aug, both families): the save cadence snaps to
+rotation-cycle boundaries and previews follow the checkpoint saves, rendered on the training DiT
+via a deactivate/reactivate bracket with the Turbo LoRA applied fresh each time — the same
+pattern H3 field-proved. Krea 2 needs the Turbo LoRA configured (the standalone Turbo checkpoint
+is a different model and cannot show fine-tuned weights); without it previews stay off with a
+log line saying why.
 
 **Caveat on the loss watch.** It was designed against a model of constant capacity. Under rotation
 the trainable set changes every epoch, so loss carries a 4-epoch periodic component — an

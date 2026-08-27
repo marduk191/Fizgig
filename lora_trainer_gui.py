@@ -26562,7 +26562,11 @@ class LoRATrainerGUI:
                 # with the Turbo LoRA @1.0 — no Turbo checkpoint load, no CPU parking. The
                 # trainer prefers --turbo_lora over --turbo_dit when both are given, and falls
                 # back to the Turbo checkpoint by itself if the LoRA file has gone missing.
-                if self._krea2_preview_engine() == "raw_lora":
+                # Under a fine-tune the Turbo LoRA is REQUIRED for previews (the trained
+                # weights live in the base, which the standalone Turbo can't show), so the
+                # engine preference is overridden and the LoRA travels regardless.
+                if (self._krea2_preview_engine() == "raw_lora"
+                        or bool(self.krea2_finetune_var.get())):
                     _tlora = self._krea2_pref("krea2_turbo_lora")
                     if not _tlora or not os.path.isfile(_tlora):
                         # First use after an update: fetch it now (~470 MB, idempotent — the
