@@ -169,6 +169,12 @@ on valid checkpoints:
   ~21 GB int8 checkpoints, cadence snapped to the cycle (so previews keep the
   equal-training honesty); rendered via a deactivate/reactivate bracket; continuation is
   `--dit <checkpoint> --finetune_start_window N` (printed at every save).
+- **Pause / Resume** (GUI, both families): Pause saves a full checkpoint at the epoch
+  boundary — even between save-cadence epochs — and exits to free the GPU. Resume
+  relaunches from that checkpoint: the rotation cycle picks up at its stamped window,
+  the run trains only the epochs that remain of the original total, and checkpoint
+  numbering continues where it left off (nothing gets overwritten). The same works by
+  hand with the printed `--dit <checkpoint> --finetune_start_window N` command.
 
 ---
 

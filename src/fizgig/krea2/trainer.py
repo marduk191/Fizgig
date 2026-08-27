@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import random
+import re
 import sys
 import time
 from multiprocessing import Value
@@ -1740,7 +1741,8 @@ def train_krea2(
         raise RuntimeError(
             "--resume is not supported in fine-tune mode: state dirs hold the (inert) LoRA, "
             "not the base weights. To continue a fine-tune, point --dit at your last saved "
-            "checkpoint — it is structurally identical to the RAW base.")
+            "checkpoint (structurally identical to the RAW base) and set "
+            "--finetune_start_window to the value printed at that save.")
 
     # Auto window mode: size the rotation window to the free VRAM. Resolved here rather than
     # in the GUI so headless runs get it too, and so it reads the VRAM actually available at
@@ -1754,6 +1756,30 @@ def train_krea2(
             blocks_to_swap = 12      # any positive value switches on rotation-aware streaming
         for _line in _why:
             logger.info("[ft-auto] %s", _line)
+
+    # Continuation numbering: a fine-tune continued from a saved checkpoint is a fresh
+    # process whose local epochs restart at 1, so `<name>-000001.safetensors` would silently
+    # OVERWRITE the original run's first checkpoint. The --dit file IS the previous
+    # checkpoint, and its trailing epoch number is the true count of epochs already trained —
+    # offset every checkpoint filename by it. A renamed file just starts numbering at 1.
+    ft_epoch_offset = 0
+    if ft_rotation:
+        _m = re.search(r"-(\d{6})\.safetensors$", os.path.basename(raw_path or ""))
+        if _m:
+            ft_epoch_offset = int(_m.group(1))
+        else:
+            # The FINAL checkpoint carries no epoch number in its name — its cumulative
+            # count rides in the metadata instead (stamped at every FT save below).
+            try:
+                from safetensors import safe_open
+                with safe_open(raw_path, framework="pt") as _f:
+                    _md = _f.metadata() or {}
+                ft_epoch_offset = int(_md.get("fizgig_ft_epochs_done", 0))
+            except Exception:
+                ft_epoch_offset = 0
+        if ft_epoch_offset:
+            logger.info("[ft-rotation] continuing from %s — checkpoint numbering starts at "
+                        "epoch %d", os.path.basename(raw_path), ft_epoch_offset + 1)
 
     # --- Regularisation set (fine-tune only) ---------------------------------------------
     # Images from a dataset block marked `is_reg = true` — a PRIOR ANCHOR, not a subject.
@@ -2670,14 +2696,23 @@ def train_krea2(
                                recaption_instruction_detailed=recaption_instruction_detailed)
 
         state_saved_this_epoch = False
+        ft_ckpt_saved_this_epoch = False
         if save_every_n_epochs and (epoch + 1) % save_every_n_epochs == 0 and (epoch + 1) < max_train_epochs:
             if rotator is not None:
                 # The full checkpoint IS the resumable state under fine-tuning: the LoRA is
                 # inert and the optimizer may be None (fused backward), so a state dir would
                 # snapshot nothing real. To continue a fine-tune, point --dit at the saved
-                # checkpoint (structurally identical to the RAW base).
-                _save_full_checkpoint(rotator, raw_path,
-                                      os.path.join(output_dir, f"{output_name}-{epoch + 1:06d}.safetensors"))
+                # checkpoint (structurally identical to the RAW base). The next start window
+                # rides in the metadata so the GUI's Resume can pick it up without the console.
+                _ck = os.path.join(output_dir,
+                                   f"{output_name}-{epoch + 1 + ft_epoch_offset:06d}.safetensors")
+                _next_w = rot_schedule.window_at(epoch + 1)
+                _save_full_checkpoint(rotator, raw_path, _ck, extra_metadata={
+                    "fizgig_next_start_window": str(_next_w),
+                    "fizgig_ft_epochs_done": str(epoch + 1 + ft_epoch_offset)})
+                ft_ckpt_saved_this_epoch = True
+                logger.info("[ft-rotation] to continue from this checkpoint: --dit %s "
+                            "--finetune_start_window %d", os.path.basename(_ck), _next_w)
                 if save_state:
                     logger.info("[ft-rotation] state dirs are skipped — the full checkpoint "
                                 "is the state; swap the base to continue training.")
@@ -2839,7 +2874,34 @@ def train_krea2(
             # so a crash during the rewrite would destroy the very state we're pausing to keep.
             # The flag (not os.path.isdir) is the right check — a stale dir left by an earlier
             # run with the same name would wrongly suppress a real pause save.
-            if state_saved_this_epoch:
+            if rotator is not None:
+                # Under fine-tuning the full checkpoint IS the state — a state dir would hold
+                # only the inert LoRA (and the optimizer may be None under fused backward),
+                # and worse, an off-cadence pause used to save NOTHING at all: every epoch of
+                # dense training since the last cadence checkpoint silently vanished on exit.
+                if ft_ckpt_saved_this_epoch:
+                    logger.info(f"[pause] requested — epoch {epoch + 1 + ft_epoch_offset} checkpoint "
+                                "already saved this epoch; exiting cleanly")
+                    logger.info("[ft-rotation] paused. Continue with: --dit %s "
+                                "--finetune_start_window %d",
+                                f"{output_name}-{epoch + 1 + ft_epoch_offset:06d}.safetensors",
+                                rot_schedule.window_at(epoch + 1))
+                else:
+                    _pp = os.path.join(output_dir,
+                                       f"{output_name}-{epoch + 1 + ft_epoch_offset:06d}.safetensors")
+                    _next_w = rot_schedule.window_at(epoch + 1)
+                    try:
+                        _save_full_checkpoint(rotator, raw_path, _pp, extra_metadata={
+                            "fizgig_next_start_window": str(_next_w),
+                            "fizgig_ft_epochs_done": str(epoch + 1 + ft_epoch_offset)})
+                        logger.info("[ft-rotation] paused. Continue with: --dit %s "
+                                    "--finetune_start_window %d", os.path.basename(_pp), _next_w)
+                    except Exception as _se:
+                        logger.error("[pause] checkpoint save FAILED (%s: %s) — there is NO new "
+                                     "continuation point for this pause. Free disk space and "
+                                     "continue from the previous saved checkpoint.",
+                                     type(_se).__name__, _se)
+            elif state_saved_this_epoch:
                 logger.info(f"[pause] requested — state for epoch {epoch + 1} already saved; exiting cleanly")
             else:
                 logger.info(f"[pause] requested — saving state at epoch {epoch + 1} and exiting cleanly")
@@ -2901,8 +2963,13 @@ def train_krea2(
     extra.update(_sai_metadata())
     if rotator is not None:
         # Fine-tune mode: the training lives in the base weights, not the (inert) LoRA.
+        _next_w = rot_schedule.window_at(max_train_epochs)
+        extra.update({"fizgig_next_start_window": str(_next_w),
+                      "fizgig_ft_epochs_done": str(max_train_epochs + ft_epoch_offset)})
         _save_full_checkpoint(rotator, raw_path, out, extra_metadata=extra)
         logger.info(f"saved fine-tuned checkpoint -> {out}")
+        logger.info("[ft-rotation] to train it further: --dit %s --finetune_start_window %d",
+                    os.path.basename(out), _next_w)
         return out
     _save_lora(network, out, network_dim, network_alpha, dtype, extra_metadata=extra,
                comfy_format=True)

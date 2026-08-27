@@ -672,6 +672,30 @@ def minimax_train_base(raw):
     return "ref2va" if "ref2va" in str(raw or "").lower() else "fl2va"
 
 
+def ft_checkpoint_continuation(path):
+    """(next_window, epochs_done) for a rotation fine-tune checkpoint.
+
+    A fine-tune's continuation point is the full checkpoint itself, not a state dir. The
+    trainers stamp `fizgig_next_start_window` (where the rotation cycle picks back up) and
+    `fizgig_ft_epochs_done` (cumulative epochs trained) into every FT save; the epoch count
+    also lives in the filename's -NNNNNN, which wins when present (the un-numbered FINAL
+    artifact has only the metadata). Anything missing reads as 0 — a continuation that
+    restarts the cycle at window 0 is degraded, not wrong."""
+    next_window, epochs_done = 0, 0
+    try:
+        from safetensors import safe_open
+        with safe_open(path, framework="pt") as f:
+            md = f.metadata() or {}
+        next_window = int(md.get("fizgig_next_start_window", 0))
+        epochs_done = int(md.get("fizgig_ft_epochs_done", 0))
+    except Exception:
+        pass
+    m = re.search(r"-(\d{6})\.safetensors$", os.path.basename(path or ""))
+    if m:
+        epochs_done = int(m.group(1))
+    return next_window, epochs_done
+
+
 # Built-in presets — always available in the Load Preset dropdown, prefixed with ✨ to distinguish
 # from user-saved presets. Defined in code so they ship with the app and can't be deleted accidentally.
 # Tune these as empirical findings accumulate.
@@ -25391,7 +25415,9 @@ class LoRATrainerGUI:
         # built and we skip re-caching, so wiping it would leave the resumed run with no latents
         # /text. Read the resume path from the entry (the live source of truth at this point).
         _resume_entry = self.entries.get("RESUME_TRAINING")
-        _is_resuming_clear = bool(_resume_entry and _resume_entry.get().strip())
+        # An armed FT continuation is a resume too — same cache, same frozen dataset.
+        _is_resuming_clear = bool((_resume_entry and _resume_entry.get().strip())
+                                  or self._ft_resume_active())
         cache_dir = self.dataset_cache_dir_var.get().strip()
         if cache_dir and os.path.isdir(cache_dir) and not _is_resuming_clear:
             try:
@@ -25611,8 +25637,10 @@ class LoRATrainerGUI:
             """Called when training finishes - cleanup watchers"""
             self.stop_samples_watcher()
 
-        # On resume, skip cache preparation entirely — the cache is already built from the original launch.
-        is_resuming = bool(self.settings.get("RESUME_TRAINING", "").strip())
+        # On resume, skip cache preparation entirely — the cache is already built from the
+        # original launch. An armed FT continuation counts: it is the same run continuing.
+        is_resuming = bool(self.settings.get("RESUME_TRAINING", "").strip()
+                           or self._ft_resume_active())
         if self.enable_cache_var.get() and not is_resuming:
             self.update_console(f"Starting cache preparation for {arch}...\n")
 
@@ -25716,9 +25744,17 @@ class LoRATrainerGUI:
 
     def build_training_command(self, config):
         """Build the training command based on architecture configuration"""
+        # Stamp whether THIS launch is a rotation fine-tune (and which family), for the
+        # pause exit-handler: an FT pause leaves a full checkpoint rather than a state dir,
+        # and the Tk checkbox can be flipped mid-run, so the truth is recorded at launch.
+        self._launched_ft_family = None
         if config.get("is_krea2"):
+            if bool(getattr(self, "krea2_finetune_var", None) and self.krea2_finetune_var.get()):
+                self._launched_ft_family = "krea2"
             return self._build_krea2_train_command()
         if config.get("is_minimax"):
+            if bool(getattr(self, "minimax_finetune_var", None) and self.minimax_finetune_var.get()):
+                self._launched_ft_family = "minimax"
             return self._build_minimax_train_command()
         arch = self.settings["ARCHITECTURE"]
         # Same reasoning as _venv_python: fall back to whatever is on PATH when the bundled venv
@@ -26218,17 +26254,33 @@ class LoRATrainerGUI:
         Model paths come from Preferences (krea2_*); rank/alpha/lr/epochs/save/seed and the
         auto-resolved Blocks Swap come from the shared Training-tab knobs; sample resolution +
         frequency come from the Samples tab (same source Klein uses)."""
+        # Armed fine-tune continuation (Resume after an FT pause): --dit becomes the pause
+        # checkpoint — a one-run override, the preference is never touched — and the epoch
+        # count is what's left of the original total. No --resume: FT has no state dirs.
+        _fr = self._ft_resume_active()
+        if getattr(self, "_ft_resume", None) and not _fr:
+            self.update_console("[resume] armed fine-tune continuation IGNORED — the run being "
+                                "launched is a different name or not a fine-tune.\n")
+        _dit = _fr["checkpoint"] if _fr else self._krea2_pref("krea2_raw_dit")
+        try:
+            _epochs = int(str(self.settings["MAX_TRAIN_EPOCHS"]))
+        except (KeyError, ValueError, TypeError):
+            _epochs = 1
+        if _fr:
+            _epochs = max(1, _epochs - int(_fr.get("epochs_done", 0)))
+            self.update_console(f"[resume] continuing fine-tune from "
+                                f"{os.path.basename(_dit)} — {_epochs} epoch(s) to run\n")
         cmd = [
             self._venv_python(),
             self._krea2_script("krea2_train.py"),
-            "--dit", self._krea2_pref("krea2_raw_dit"),
+            "--dit", _dit,
             "--dataset_config", self.settings["DATASET_CONFIG"],
             "--output_dir", self.settings["LORA_OUTPUT_DIR"],
             "--output_name", self.settings["LORA_NAME"],
             "--network_dim", str(self.settings["NETWORK_DIM"]),
             "--network_alpha", str(self.settings["NETWORK_ALPHA"]),
             "--learning_rate", str(self.settings["LEARNING_RATE"]),
-            "--max_train_epochs", str(self.settings["MAX_TRAIN_EPOCHS"]),
+            "--max_train_epochs", str(_epochs),
             "--save_every_n_epochs", str(self.settings["SAVE_EVERY_N_EPOCHS"]),
             "--blocks_to_swap", str(self.settings["BLOCKS_SWAP"]),
             "--seed", str(self.settings["SEED"]),
@@ -26417,6 +26469,10 @@ class LoRATrainerGUI:
             cmd += ["--finetune_rotation", str(max(1, nblocks)),
                     "--finetune_rotation_mode", mode,
                     "--finetune_rotate_every", str(max(1, every))]
+            if _fr:
+                # Continuation: pick the rotation cycle back up where the pause left it
+                # (from the checkpoint's metadata) instead of restarting at window 0.
+                cmd += ["--finetune_start_window", str(int(_fr.get("next_window", 0)))]
             if bool(self.krea2_ft_fused_var.get()):
                 cmd.append("--finetune_fused_backward")
             if bool(self.krea2_fast_ft_var.get()):
@@ -26562,24 +26618,41 @@ class LoRATrainerGUI:
         NF4-quantized frozen base. No samples, no block swap, no context LoRA, no LoKR, no
         per-image loss watch: just the core knobs (rank/alpha/lr/epochs/save/seed/optimizer) plus
         adaptive LR and output metadata. Model paths come from Preferences (minimax_*)."""
+        # Armed fine-tune continuation (Resume after an FT pause): --dit becomes the pause
+        # checkpoint — a one-run override that outranks the distill/ref2va choice too — and
+        # the epoch count is what's left of the original total. No --resume under FT.
+        _fr = self._ft_resume_active()
+        if getattr(self, "_ft_resume", None) and not _fr:
+            self.update_console("[resume] armed fine-tune continuation IGNORED — the run being "
+                                "launched is a different name or not a fine-tune.\n")
+        _dit = (_fr["checkpoint"] if _fr
+                else (self._krea2_pref("minimax_ref_dit")
+                      if ((self.settings.get("MINIMAX_DISTILL")
+                           or self.settings.get("MINIMAX_TRAIN_BASE") == "ref2va")
+                          and self._krea2_pref("minimax_ref_dit"))
+                      else self._krea2_pref("minimax_dit")))
+        try:
+            _epochs = int(str(self.settings["MAX_TRAIN_EPOCHS"]))
+        except (KeyError, ValueError, TypeError):
+            _epochs = 1
+        if _fr:
+            _epochs = max(1, _epochs - int(_fr.get("epochs_done", 0)))
+            self.update_console(f"[resume] continuing fine-tune from "
+                                f"{os.path.basename(_dit)} — {_epochs} epoch(s) to run\n")
         cmd = [
             self._venv_python(),
             self._krea2_script("minimax_train.py"),
             # Distillation trains against ref2va — the teacher only exists on that model.
             # Otherwise the Training Base dropdown decides: ref2va when the user deploys on
             # the r2v workflow, the ordinary fl2va base by default.
-            "--dit", (self._krea2_pref("minimax_ref_dit")
-                      if ((self.settings.get("MINIMAX_DISTILL")
-                           or self.settings.get("MINIMAX_TRAIN_BASE") == "ref2va")
-                          and self._krea2_pref("minimax_ref_dit"))
-                      else self._krea2_pref("minimax_dit")),
+            "--dit", _dit,
             "--dataset_config", self.settings["DATASET_CONFIG"],
             "--output_dir", self.settings["LORA_OUTPUT_DIR"],
             "--output_name", self.settings["LORA_NAME"],
             "--network_dim", str(self.settings["NETWORK_DIM"]),
             "--network_alpha", str(self.settings["NETWORK_ALPHA"]),
             "--learning_rate", str(self.settings["LEARNING_RATE"]),
-            "--max_train_epochs", str(self.settings["MAX_TRAIN_EPOCHS"]),
+            "--max_train_epochs", str(_epochs),
             "--save_every_n_epochs", str(self.settings["SAVE_EVERY_N_EPOCHS"]),
             "--seed", str(self.settings["SEED"]),
         ]
@@ -26706,6 +26779,10 @@ class LoRATrainerGUI:
             cmd += ["--finetune_rotation", "1", "--finetune_rotation_mode", "component"]
             _mfte = str(self.minimax_ft_every_var.get()).strip()
             cmd += ["--finetune_rotate_every", _mfte if _mfte.isdigit() else "1"]
+            if _fr:
+                # Continuation: pick the rotation cycle back up where the pause left it
+                # (from the checkpoint's metadata) instead of restarting at window 0.
+                cmd += ["--finetune_start_window", str(int(_fr.get("next_window", 0)))]
             if str(self.minimax_ft_scope_var.get()).startswith("Photos"):
                 cmd += ["--finetune_scope", "photo"]
             _mftspec = str(self.minimax_ft_blockspec_var.get()).strip()
@@ -26954,6 +27031,51 @@ class LoRATrainerGUI:
         candidates.sort(reverse=True)
         return os.path.join(out_dir, candidates[0][1])
 
+    def _detect_latest_ft_checkpoint(self):
+        """The FT twin of _detect_latest_state_dir: highest-numbered
+        <output_name>-NNNNNN.safetensors in the output dir. Fine-tunes leave full
+        checkpoints, never state dirs — the checkpoint IS the continuation point."""
+        import re as _re
+        out_dir = self.settings.get("LORA_OUTPUT_DIR", "") or "."
+        out_name = self.settings.get("LORA_NAME", "") or ""
+        if not out_name or not os.path.isdir(out_dir):
+            return None
+        pattern = _re.compile(rf"^{_re.escape(out_name)}-(\d{{6}})\.safetensors$")
+        candidates = []
+        try:
+            for entry in os.listdir(out_dir):
+                m = pattern.match(entry)
+                if m and os.path.isfile(os.path.join(out_dir, entry)):
+                    candidates.append((int(m.group(1)), entry))
+        except Exception:
+            return None
+        if not candidates:
+            return None
+        candidates.sort(reverse=True)
+        return os.path.join(out_dir, candidates[0][1])
+
+    def _ft_resume_active(self):
+        """The armed fine-tune continuation for THIS launch, or None.
+
+        Guarded twice: the run being launched must still be a fine-tune of the same family
+        (unticking the FT box means the user wants something else), and its output name must
+        match the paused run's — a queued job launched via 'Start next now' while an FT
+        continuation is armed must not consume another run's checkpoint."""
+        _fr = getattr(self, "_ft_resume", None)
+        if not _fr:
+            return None
+        if self._is_krea2_arch():
+            _on = bool(getattr(self, "krea2_finetune_var", None) and self.krea2_finetune_var.get())
+        elif self._is_minimax_arch():
+            _on = bool(getattr(self, "minimax_finetune_var", None) and self.minimax_finetune_var.get())
+        else:
+            _on = False
+        if not _on:
+            return None
+        if str(self.settings.get("LORA_NAME", "")) != str(_fr.get("output_name", "")):
+            return None
+        return _fr
+
     POD_STOP_COUNTDOWN = 120   # seconds
 
     def _maybe_stop_pod_after_training(self):
@@ -27111,18 +27233,29 @@ class LoRATrainerGUI:
                     f"Start Training to retry it), or open the queue (📋, bottom right) and "
                     f"'Start next now' to skip to the next job.\n")
         if getattr(self, "training_state", "idle") == "pausing" and return_code == 0:
-            # Successful graceful exit — record paused state
-            state_dir = self._detect_latest_state_dir()
+            # Successful graceful exit — record paused state. A fine-tune leaves a full
+            # checkpoint rather than a state dir (state dirs would hold only the inert
+            # LoRA), so the paused artifact is detected per the launch's stamped mode.
+            _ft_pause = bool(getattr(self, "_launched_ft_family", None))
+            if _ft_pause:
+                state_dir = self._detect_latest_ft_checkpoint()
+            else:
+                state_dir = self._detect_latest_state_dir()
             if state_dir is None:
-                self.update_console("[pause] WARN: no state directory found after pause exit. Treating as idle.\n")
+                self.update_console(
+                    "[pause] WARN: no fine-tune checkpoint found after pause exit. Treating as idle.\n"
+                    if _ft_pause else
+                    "[pause] WARN: no state directory found after pause exit. Treating as idle.\n")
                 self.training_state = "idle"
             else:
                 self.paused_state_path = state_dir
+                self.paused_mode = "ft" if _ft_pause else "state"
                 # Persist sidecar so paused state survives GUI restart
                 try:
                     import json as _json
                     out_dir = self.settings.get("LORA_OUTPUT_DIR", "") or "."
                     sidecar = {
+                        "mode": self.paused_mode,
                         "state_path": state_dir,
                         "output_name": self.settings.get("LORA_NAME", ""),
                         "dataset_config": self.settings.get("DATASET_CONFIG", ""),
@@ -27136,6 +27269,9 @@ class LoRATrainerGUI:
                     self.update_console(f"[pause] WARN: failed to write sidecar: {e}\n")
                 self.training_state = "paused"
                 self.update_console(
+                    f"\n=== PAUSED — fine-tune checkpoint saved at {os.path.basename(state_dir)}. "
+                    f"Click Resume Training to continue. ===\n\n"
+                    if _ft_pause else
                     f"\n=== PAUSED — state saved at {state_dir}. Click Resume Training to continue. ===\n\n"
                 )
         else:
@@ -27151,27 +27287,64 @@ class LoRATrainerGUI:
             self.settings["RESUME_TRAINING"] = ""
         except Exception:
             pass
+        # Same hygiene for the FT twin: the armed continuation lives until its run ends
+        # (it must survive the async caption-worker launch path), then dies here.
+        self._ft_resume = None
         self._refresh_training_buttons()
 
     def _resume_training(self):
-        """Re-launch training from the latest paused state directory."""
+        """Re-launch training from the latest paused state (state dir, or FT checkpoint).
+
+        A LoRA pause resumes via --resume <state dir>. A rotation fine-tune has no state
+        dirs — its continuation is a fresh run whose --dit is the pause checkpoint, whose
+        rotation cycle picks up at the window stamped in that checkpoint's metadata, and
+        whose epoch count is what's left of the original total. The optimizer's second
+        moments reset across that hop — the same reset every rotation boundary already
+        performs, so it costs what one rotation costs."""
         if getattr(self, "training_state", "idle") != "paused":
             messagebox.showinfo("Not Paused", "No paused training to resume.")
             return
         state_path = getattr(self, "paused_state_path", None)
-        if not state_path or not os.path.isdir(state_path):
-            messagebox.showerror("Error", f"Paused state directory not found:\n{state_path}")
-            return
-        # Inject resume path into settings + entry field, then reuse the standard start_training flow
-        self.settings["RESUME_TRAINING"] = state_path
-        try:
-            entry = self.entries.get("RESUME_TRAINING")
-            if entry is not None:
-                entry.delete(0, tk.END)
-                entry.insert(0, state_path)
-        except Exception:
-            pass
-        self.update_console(f"\n=== RESUMING from {state_path} ===\n\n")
+        if getattr(self, "paused_mode", "state") == "ft":
+            if not state_path or not os.path.isfile(state_path):
+                messagebox.showerror("Error", f"Paused fine-tune checkpoint not found:\n{state_path}")
+                return
+            next_window, epochs_done = ft_checkpoint_continuation(state_path)
+            try:
+                total = int(str(self.entries["MAX_TRAIN_EPOCHS"].get()).strip() or 0)
+            except (KeyError, ValueError, TypeError):
+                total = 0
+            if total - epochs_done <= 0:
+                messagebox.showinfo(
+                    "Nothing left to train",
+                    f"This fine-tune has already trained {epochs_done} epoch(s) — at or past "
+                    f"Max Train Epochs ({total}).\n\n"
+                    f"{os.path.basename(state_path)} IS the finished model — deploy it as-is.\n\n"
+                    f"To train it further, raise Max Train Epochs above {epochs_done} and click "
+                    "Resume Training again.")
+                return
+            # Arm the one-shot continuation. The command builders consume it (guarded by
+            # family + output name); the exit handler clears it when the run ends.
+            self._ft_resume = {"checkpoint": state_path, "next_window": next_window,
+                               "epochs_done": epochs_done,
+                               "output_name": self.settings.get("LORA_NAME", "")}
+            self.update_console(
+                f"\n=== RESUMING fine-tune from {os.path.basename(state_path)} — "
+                f"{total - epochs_done} epoch(s) remaining, rotation window {next_window} ===\n\n")
+        else:
+            if not state_path or not os.path.isdir(state_path):
+                messagebox.showerror("Error", f"Paused state directory not found:\n{state_path}")
+                return
+            # Inject resume path into settings + entry field, then reuse the standard start_training flow
+            self.settings["RESUME_TRAINING"] = state_path
+            try:
+                entry = self.entries.get("RESUME_TRAINING")
+                if entry is not None:
+                    entry.delete(0, tk.END)
+                    entry.insert(0, state_path)
+            except Exception:
+                pass
+            self.update_console(f"\n=== RESUMING from {state_path} ===\n\n")
         self.start_training()
         # Only a start that actually LAUNCHED consumes the pause. start_training can decline
         # (validation, disk headroom, epochs-left) — destroying the sidecar and flipping the
@@ -27200,8 +27373,14 @@ class LoRATrainerGUI:
             with open(sidecar, "r") as f:
                 meta = _json.load(f)
             state_path = meta.get("state_path", "")
-            if state_path and os.path.isdir(state_path):
+            # "ft" pauses point at a full checkpoint FILE (fine-tunes have no state dirs);
+            # LoRA pauses point at a state DIRECTORY. Validate whichever this one is.
+            _mode = str(meta.get("mode", "state") or "state")
+            _ok = bool(state_path) and (os.path.isfile(state_path) if _mode == "ft"
+                                        else os.path.isdir(state_path))
+            if _ok:
                 self.paused_state_path = state_path
+                self.paused_mode = _mode
                 # Restore the paused run's frozen dataset config (#98) so a cross-restart
                 # resume trains the dataset it started with — the resume launch keeps an
                 # existing snapshot instead of re-freezing whatever the Start tab shows.
@@ -27212,8 +27391,9 @@ class LoRATrainerGUI:
                 self.training_state = "paused"
                 self._refresh_training_buttons()
                 self.update_console(
-                    f"=== Paused training detected: {meta.get('output_name','?')} "
-                    f"at state {os.path.basename(state_path)}. Click Resume Training to continue. ===\n"
+                    f"=== Paused {'fine-tune' if _mode == 'ft' else 'training'} detected: "
+                    f"{meta.get('output_name','?')} "
+                    f"at {os.path.basename(state_path)}. Click Resume Training to continue. ===\n"
                 )
         except Exception:
             pass

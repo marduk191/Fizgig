@@ -2303,6 +2303,7 @@ def train_minimax(
     ft_rotation = max(0, int(finetune_rotation or 0))
     rotator = None
     ft_subset = None
+    ft_epoch_offset = 0
     if ft_rotation:
         from fizgig.utils.capabilities import wait_for_gpu_handoff, wait_for_ram_recovery
         # Before OUR first CUDA call (the recommender's free-VRAM read inits the context):
@@ -2333,6 +2334,25 @@ def train_minimax(
                                f"got {finetune_scope!r}")
         if finetune_blocks:
             parse_block_spec(finetune_blocks)   # early typo check; bounds after the load
+        # Continuation numbering (mirrors krea2): a fine-tune continued from a saved
+        # checkpoint restarts local epochs at 1, so `<name>-000001.safetensors` would
+        # silently OVERWRITE the original run's first checkpoint. The --dit file IS the
+        # previous checkpoint — offset every checkpoint filename by its trailing epoch
+        # number (the FINAL file has no number; its count rides in fizgig_ft_epochs_done).
+        _m = re.search(r"-(\d{6})\.safetensors$", os.path.basename(dit_path or ""))
+        if _m:
+            ft_epoch_offset = int(_m.group(1))
+        else:
+            try:
+                from safetensors import safe_open
+                with safe_open(dit_path, framework="pt") as _f:
+                    _md = _f.metadata() or {}
+                ft_epoch_offset = int(_md.get("fizgig_ft_epochs_done", 0))
+            except Exception:
+                ft_epoch_offset = 0
+        if ft_epoch_offset:
+            logger.info("[h3-ft] continuing from %s — checkpoint numbering starts at "
+                        "epoch %d", os.path.basename(dit_path), ft_epoch_offset + 1)
         # Structural disarms (each mirrors a Krea FT coercion):
         blocks_to_swap = 0          # the H2D offloader would fight the rotator for qdata
         # Component windows only coexist with an NF4 trunk: one matmul across every block
@@ -4660,15 +4680,20 @@ def train_minimax(
             logger.info(ramp.epoch_report())
         if adaptive is not None:
             adaptive.epoch_boundary(epoch, loss_recorder.moving_average, network, optimizer)
+        ft_ckpt_saved_this_epoch = False
         if save_every_n_epochs and (epoch + 1) % save_every_n_epochs == 0 and (epoch + 1) < max_train_epochs:
             ckpt = os.path.join(output_dir, f"{output_name}-{epoch + 1:06d}.safetensors")
             if rotator is not None:
                 # The full checkpoint IS the resumable state under FT (the continuation is
                 # --dit <this file> + the printed start_window). ~21 GB per save.
                 from fizgig.minimax.rotation_ft import save_full_checkpoint_h3
+                ckpt = os.path.join(output_dir,
+                                    f"{output_name}-{epoch + 1 + ft_epoch_offset:06d}.safetensors")
                 _next_w = rot_schedule.window_at(epoch + 1)
                 save_full_checkpoint_h3(rotator, dit_path, ckpt, extra_metadata={
-                    **_meta(), "fizgig_next_start_window": str(_next_w)})
+                    **_meta(), "fizgig_next_start_window": str(_next_w),
+                    "fizgig_ft_epochs_done": str(epoch + 1 + ft_epoch_offset)})
+                ft_ckpt_saved_this_epoch = True
                 logger.info("[h3-ft] to continue from this checkpoint: --dit %s "
                             "--finetune_start_window %d", os.path.basename(ckpt), _next_w)
             else:
@@ -4759,11 +4784,17 @@ def train_minimax(
             # optimizer may be per-tensor hooks).
             if rotator is not None:
                 from fizgig.minimax.rotation_ft import save_full_checkpoint_h3
-                _pp = os.path.join(output_dir, f"{output_name}-{epoch + 1:06d}.safetensors")
+                _pp = os.path.join(output_dir,
+                                   f"{output_name}-{epoch + 1 + ft_epoch_offset:06d}.safetensors")
                 _next_w = rot_schedule.window_at(epoch + 1)
                 try:
-                    save_full_checkpoint_h3(rotator, dit_path, _pp, extra_metadata={
-                        **_meta(), "fizgig_next_start_window": str(_next_w)})
+                    # ~21 GB and minutes per save: if the cadence just wrote this epoch's
+                    # checkpoint above, don't rewrite the identical file — same dedupe as the
+                    # LoRA path's state_saved_this_epoch.
+                    if not ft_ckpt_saved_this_epoch:
+                        save_full_checkpoint_h3(rotator, dit_path, _pp, extra_metadata={
+                            **_meta(), "fizgig_next_start_window": str(_next_w),
+                            "fizgig_ft_epochs_done": str(epoch + 1 + ft_epoch_offset)})
                     logger.info("[h3-ft] paused. Continue with: --dit %s "
                                 "--finetune_start_window %d", os.path.basename(_pp), _next_w)
                     # The checkpoint now carries everything — the scratch is superseded.
@@ -4797,7 +4828,8 @@ def train_minimax(
         from fizgig.minimax.rotation_ft import save_full_checkpoint_h3
         _next_w = rot_schedule.window_at(max_train_epochs)
         save_full_checkpoint_h3(rotator, dit_path, final, extra_metadata={
-            **_meta(), "fizgig_next_start_window": str(_next_w)})
+            **_meta(), "fizgig_next_start_window": str(_next_w),
+            "fizgig_ft_epochs_done": str(max_train_epochs + ft_epoch_offset)})
         logger.info("[h3-ft] saved final fine-tuned checkpoint: %s — test it in ComfyUI as a "
                     "normal H3 model, or distil it to a LoRA with Checkpoint to LoRA. To train "
                     "it further: --dit %s --finetune_start_window %d",
