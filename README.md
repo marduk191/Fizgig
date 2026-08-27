@@ -314,11 +314,26 @@ the model's full depth from the very first epoch.
 - **System RAM:** the bf16 master copy is ~23 GB (likeness) to ~38 GB (full model), and spills
   to disk automatically when RAM is tight — full-model fine-tuning runs on a 64 GB box.
 - **Disk:** each save is a full **~21 GB** int8 checkpoint.
+- **Learning rate: 3e-5** — the tested fast-and-reliable rate for H3 fine-tuning. Anything as
+  high as 1e-4 will destroy a fine-tune.
+- **Use unique trigger tokens** — strongly recommended: an invented token gives the fine-tune
+  somewhere clean to bind, where a common word drags its existing meaning along with it.
+- **Budget steps for big datasets.** Large datasets are where fine-tuning shines, and they can
+  easily take **~30× the steps** you're used to from LoRA runs to converge — plan run length
+  (and disk) accordingly.
 - **Voice and mixed datasets train too** — voice stays confined to its measured blocks (34–49),
   photos to theirs, and the per-category **stop epoch** counts across Pause/Resume: pause a
   mixed run, set the stop to the current epoch, Resume, and it finishes voice-only.
-- **Previews stay on**, rendered once per saved checkpoint — every sample in the gallery maps to
-  a file you can deploy.
+
+**Saves, previews and numbering run on the rotation cycle, not the Samples tab.** The save
+cadence snaps to cycle boundaries — the Save-every box follows the FT controls live in the GUI,
+and the trainer snaps it again at launch — so every checkpoint compares like-for-like, with each
+window trained equally. Previews ride the saves: one render per saved checkpoint plus the final
+one, overriding the Samples tab's "every N epochs" (prompts, resolution, seed and the live
+sample override still come from the Samples tab and status bar as usual — every sample in the
+gallery maps to a file you can deploy). Checkpoints are numbered by epoch (`-000004`,
+`-000008`, …) and the numbering continues across Pause/Resume, so a resumed run never overwrites
+an earlier save.
 
 The output is a normal H3 checkpoint: load it in ComfyUI directly, or run **Checkpoint to LoRA**
 on it (the extractor decodes the int8 format natively) for a shareable LoRA.
@@ -364,7 +379,8 @@ Being straight about the trade-offs, because they're real:
   (H3's spills to disk automatically when RAM is tight).
 - **Disk.** Every save is a full checkpoint — ~26 GB on Krea 2, ~21 GB on H3. Saving once per
   4-epoch cycle is ~260 GB over a 40-epoch run. Point the Output Directory somewhere with room.
-- **A low learning rate — 1e-5 or below.** LoRA learning rates will wreck a base model.
+- **A low learning rate** — 1e-5 on Krea 2; **3e-5** is the tested rate on H3. LoRA-style rates
+  (anything as high as 1e-4) will destroy a fine-tune.
 - **Run at least one full cycle** (4 epochs in component mode) or some weights never train at all.
   The console warns you.
 - **Adaptive LR is off** — rotation boundaries would read as instability to it. Krea 2 also runs
