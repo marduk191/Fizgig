@@ -3113,13 +3113,23 @@ def train_minimax(
                         "~21 GB checkpoint, and previews ride along with saves).",
                         save_every_n_epochs, _cyc, _snapped_save)
             save_every_n_epochs = _snapped_save
-        if sample_prompts and te_path:
+        # Gate on do_previews, not on prompts+TE. Previews ALSO need a cadence
+        # (sample_every_n_epochs or sample_at_first), so a run with prompts and a TE but
+        # neither flag renders nothing — and this line used to announce previews anyway,
+        # for a whole run. Same class as the vision-rung streaming lie and the compile-"On"
+        # lie: a log that describes intent rather than what was decided. Say which it is.
+        if do_previews:
             logger.info("[h3-ft] previews follow CHECKPOINT SAVES (every %d epoch(s), plus "
                         "the final one) — each sample is the rehearsal of a checkpoint you "
                         "can deploy, overriding Sample-every-N. Rendered via a "
                         "deactivate/reactivate bracket with the Turbo applied fresh each "
                         "time.",
                         save_every_n_epochs if save_every_n_epochs else max_train_epochs)
+        elif sample_prompts and te_path:
+            logger.warning("[h3-ft] previews are OFF for this run: prompts and a text "
+                           "encoder are set, but no sample cadence — set Sample every N "
+                           "epochs (--sample_every_n_epochs), or sample-at-first, and "
+                           "previews will ride the checkpoint saves.")
 
         # Category retirement lands at cycle boundaries only: every window must see the
         # identical data mix for equal passes before the mix changes, or late-cycle
