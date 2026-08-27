@@ -30,6 +30,28 @@ caps (`FIZGIG_SIM_VRAM_GB`), likeness config on H3:
     never chosen automatically. The user must pin Base precision to 4-bit NF4. The trainer
     now warns when it lands on fp8 below ~20 GB free; changing the Auto policy is Peter's
     call, not done.
+  * **Krea 2 24 GB on NF4 — PASS, and it changes the plan SHAPE, not just the fit.** The
+    24 GB tier had only ever been run on fp8, where it depth-split into 8 windows AND
+    streamed. With the NF4 trunk the same budget keeps the **classic full-depth component
+    windows resident**: 4 windows `['attn', 'mlp.gate', 'mlp.up', 'mlp.down']`, no
+    streaming, peaks **15.8 / 15.7 / 16.0 GB**, **~1.02 s/it against fp8's ~3.0 s/it** on
+    the same dataset and cap. So NF4 halves the cycle (4 epochs per full pass, not 8) and
+    roughly triples step speed. The "full-depth component on 24 GB" outcome predicted for
+    fp8 and measured as impossible there IS reachable — it just needed the smaller trunk.
+    Implication for the parked Auto question: NF4 is now the better pick on BOTH measured
+    tiers, and Auto's INT8→fp8 coercion lands a 24 GB card on the slowest of the three.
+    The speed and cycle wins are measured; the quality cost of the coarser frozen context
+    is NOT — that trade remains Peter's call.
+  * **Previews on an NF4 trunk — PASS, first exercise of that path.** Every prior NF4 run
+    had previews off, so the deactivate → re-encode-to-4-bit → fresh-Turbo-LoRA → render →
+    restore bracket had never run on 4-bit. It renders clean 512² images at both 16 GB
+    (peaks 8.6/8.6/7.7) and 24 GB, checked by eye, not just by "a file appeared".
+  * **H3 full-model previews and pause/resume — PASS, both previously unrun.** Previews at
+    16 GB full-model render with the ring live (peaks 11.6/9.8/9.8, ring rescoping
+    [0-12]→[13-25]→[26-38] per rotation). Pause/resume at 24 GB full-model paused at the
+    epoch-3 boundary, resumed into window 3 of the 8-window cycle (peaks 18.4/18.5), wrote
+    its 20.97 GB checkpoint and pointed at window 5. A separate full 4-epoch full-model
+    run reproduced the post-fix peaks exactly: 18.7 / 18.7 / 17.3 / 18.4 GB.
   * Constant corrected: `_FT_OVERHEAD_GB` 13.3 → **14.5**. The per-window table below is
     in **GiB** and was being subtracted as GB — a ~7% systematic underestimate. Krea 2's
     fp8 `_K2FT_OVERHEAD_GB = 16.0` is conservative but was left alone; it cannot be

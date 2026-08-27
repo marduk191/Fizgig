@@ -287,7 +287,14 @@ why. Measured Krea 2 peaks (RTX 5090, past a rotation boundary — which is wher
 | block, 8 per window + streaming | 20.7 GB | ~2–3× slower | **24 GB** |
 | block, 4 per window + streaming | 18.7 GB | ~2–3× slower | **24 GB** |
 | block, 2 per window + streaming | 17.6 GB | ~2–3× slower | **24 GB** |
+| component + **4-bit NF4** base, full-depth windows | 16.0 GB | ~1.0 s/it | **24 GB** |
 | component + **4-bit NF4** base + streaming | 11.0 GB | ~2.8 s/it | **16 GB** |
+
+On a 24 GB card the **4-bit NF4** base is the one to pick: it halves the frozen base, which is
+enough to keep the classic full-depth component windows resident instead of depth-splitting and
+streaming them. That is **4 windows instead of 8** — a full pass over every weight in 4 epochs
+rather than 8 — at roughly **3× the step speed** (measured ~1.0 s/it against ~3.0 s/it for the
+fp8 base on the same dataset and the same 24 GB budget). Auto does not choose it for you.
 
 **Component is the best mode — and Auto now stays in it at every depth.** Every window spans the
 model's full depth — attention across all 28 blocks, then each MLP matrix in turn — so a concept
