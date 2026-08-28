@@ -58,26 +58,105 @@ def check_python_version():
     return True
 
 
+def venv_health(venv_dir=None):
+    """Why an existing venv can't be trusted, as one plain sentence — or None when it's fine.
+
+    A venv silently outlives the Python it was built from: uninstall or swap that Python and
+    venv\\Scripts\\python.exe is still there, so "Using existing venv" looks reasonable — and
+    the install then fails three steps later inside uv's interpreter probe with a 40-line
+    CPython init dump that points everywhere except the cause (#111: a venv from an original
+    3.10 install, retried against 3.10-3.13, reused every time because the recreate prompt
+    defaults to No; a leftover 32-bit Python 3.7 then booted in the probe and died at
+    'No module named encodings'). Three checks, cheapest first: the venv's python.exe exists;
+    its pyvenv.cfg still points at a Python that exists and matches the one running this
+    installer; and it can actually boot in isolated mode — '-I' — because that is how uv
+    queries it, and #111's venv passed a plain spawn while failing exactly that one."""
+    venv_dir = Path(venv_dir) if venv_dir else VENV_DIR
+    python_path = venv_dir / ("Scripts/python.exe" if platform.system() == "Windows"
+                              else "bin/python")
+    if not python_path.exists():
+        return "its Python executable is missing"
+
+    cfg = venv_dir / "pyvenv.cfg"
+    if cfg.exists():
+        home = version = None
+        try:
+            for line in cfg.read_text(encoding="utf-8", errors="replace").splitlines():
+                key, _, value = line.partition("=")
+                key, value = key.strip().lower(), value.strip()
+                if key == "home":
+                    home = value
+                elif key in ("version", "version_info"):
+                    version = value
+        except OSError:
+            pass
+        if home and not Path(home).exists():
+            # Only the whole home directory vanishing counts — probing for a specific
+            # executable name inside it would false-positive on Unix layouts where the
+            # binary is python3, and a wrongly-condemned venv is worse than a missed one.
+            return f"it was built from a Python that is no longer installed ({home})"
+        if version:
+            built = ".".join(version.split(".")[:2])
+            running = f"{sys.version_info[0]}.{sys.version_info[1]}"
+            if built != running:
+                return (f"it was built from Python {built}, but this installer is "
+                        f"running Python {running}")
+
+    try:
+        result = subprocess.run(
+            [str(python_path), "-I", "-c", "import encodings"],
+            capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            return ("its Python cannot start in isolated mode — the way the package "
+                    "installer runs it — usually because another Python installation "
+                    "is interfering")
+    except (OSError, subprocess.TimeoutExpired):
+        return "its Python cannot be started at all"
+    return None
+
+
 def create_venv():
     """Create virtual environment"""
     if VENV_DIR.exists():
         print(f"Virtual environment already exists at: {VENV_DIR}")
-        response = input("Delete and recreate? (y/N): ").strip().lower()
-        if response == 'y':
-            print("Removing existing venv...")
+        problem = venv_health()
+        if problem:
+            # A broken venv must not be the default choice — the y/N prompt below kept
+            # #111's dead venv alive through every retry the user made.
+            print(f"But {problem}.")
+            print("Reusing it would fail during dependency install, so it needs recreating.")
+            response = input("Delete and recreate it now? (Y/n): ").strip().lower()
+            if response == 'n':
+                print("Cannot continue with this venv. Delete the folder manually "
+                      "(or answer Y here) and run the installer again.")
+                return False
+            print("Removing venv...")
             shutil.rmtree(VENV_DIR)
         else:
-            print("Using existing venv.")
-            return True
+            response = input("Delete and recreate? (y/N): ").strip().lower()
+            if response == 'y':
+                print("Removing existing venv...")
+                shutil.rmtree(VENV_DIR)
+            else:
+                print("Using existing venv.")
+                return True
 
     print(f"Creating virtual environment at: {VENV_DIR}")
     try:
         subprocess.run([sys.executable, "-m", "venv", str(VENV_DIR)], check=True)
-        print("Virtual environment created successfully.")
-        return True
     except subprocess.CalledProcessError as e:
         print(f"Error creating venv: {e}")
         return False
+    problem = venv_health()
+    if problem:
+        print(f"The new virtual environment was created, but {problem}.")
+        print("This usually means a stray older Python is getting in the way — check "
+              "for old installations (especially 32-bit ones, e.g. in "
+              "'C:\\Program Files (x86)') and uninstall them or remove them from PATH, "
+              "then run this installer again from a new terminal.")
+        return False
+    print("Virtual environment created successfully.")
+    return True
 
 
 def get_pip_path():
