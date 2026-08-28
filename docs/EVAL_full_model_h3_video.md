@@ -72,22 +72,50 @@ ranges vs full 50, judged by eye. If a clip zone exists it shrinks the cycle, th
 master, and the VRAM simultaneously, and every question below gets smaller. **Nothing to
 build; it needs Peter's video material and GPU time, not engineering.**
 
-## Q2 — the VRAM model is calibrated on stills and will not transfer (the gating unknown)
+*Status after the 28 Aug Q2 session: still open, deliberately.* The Q2 measurement
+dataset is 8 identical copies of ONE clip — overfit-one shaped, so a quality A/B on it
+would say nothing about generalisation. Needs a real multi-clip dataset. Note for that
+session: on a 5090 the resident full-model plan only fits ≤22-frame clips (Q2), so
+either run the A/B at 22 frames or wait for the planner activation term to land.
 
-Every constant above came from 496 px still runs. A 22-frame clip is on the order of 30×
-the tokens, and **activations, not window bf16, will dominate** — which means the
-overhead term stops being a constant and becomes resolution- and frame-count dependent.
-The FT planner has no activation term at all; the LoRA-side planner does (`_ACT_GB_CKPT ×
-mp/0.25`), and the FT side would need an analogue.
+## Q2 — MEASURED (28 Aug 2026): the activation term is real, linear, and plan-independent
 
-**This is unmeasured and I did not measure it.** No clip dataset is cached on this box
-(`h3_mixed.toml` is stills + voice), so it needs Peter's source video and a cache pass —
-not a cheap measurement, and not one worth faking with a synthetic clip.
+Measured on a real Gizmo-spec clip (2144×3808 portrait, 24 fps, with sound), duplicated
+8× and cut to grid lengths, at 0.25 MP (latent 24×40 spatial, audio targets cached).
+Full-model FT, `--finetune_rotation 1`, one full window cycle per run, on the 5090 —
+no-sim for the 32 GB tier, `FIZGIG_SIM_VRAM_GB` (allocator-capped) for 24/16.
+Runs + logs: `Desktop/fizgig-ft-runs/clipq2/` (RESULTS.md there has the full tables).
 
-**Consequence for the table above: the full-model rows are stills numbers.** They say the
-50-block cycle fits 24 GB and 16 GB *for stills*; they do **not** license a "video fine-tunes
-on 16 GB" claim, and the README should not make one until a clip run is measured. Take
-per-window peaks on a real clip dataset before any clip tier is stated publicly.
+**The activation term: ~0.145 GB per latent frame** (grid `latent = 5n+2`, frames
+`= 17n+5`), i.e. **~0.9 GB per second of 24 fps clip at 0.25 MP**. Linear across the
+measured range (7 → 17 latent frames, extrapolates cleanly to the 37-frame failures),
+consistent across windows, and **plan-independent**: it is per-step activation memory,
+so splitting or streaming windows does not reduce it (proved by the sim-24 124-frame
+run dying in the *forward* at 19.1 GiB live with small split windows). The spike lives
+in the checkpoint-segment recompute during backward for the resident plans, and in the
+forward itself once windows are small.
+
+**The measured tier map (full-model, 0.25 MP, audio on):**
+
+| tier | plan | 22 fr (0.9 s) | 56 fr (2.3 s) | 124 fr (5.2 s) |
+|---|---|---|---|---|
+| 32 GB resident | 4 windows | **PASS** (peaks 23.4/17.3/28.5/20.8) | FAIL (fc1, e3) | FAIL (qkv, e1 backward) |
+| 24 GB | 8-window split | *predicted pass* | **PASS** (max 21.2 / 23.88) | FAIL (step 0, forward) |
+| 16 GB | streamed, 16 windows | **PASS** (max 11.6 / 15.9 — identical to stills) | *predicted ~13.1* | *predicted ~16.0, at the line* |
+
+Loss fell normally in every passing run (1.15 → 0.50 over a cycle); the a23a325
+orphan-release fix and the ring-aware defrag both hold on clips (no boundary
+retention, all rescopes clean). Clip cost at passing lengths is **time, not VRAM**:
+~2.1–3.2 s/it at 22 frames, ~5.4–5.9 s/it at 56, vs ~0.7–1.5 s/it stills.
+
+**Product consequence (the actionable one):** the FT planner has no activation term,
+so a 32 GB card with >22-frame clips gets the resident plan and OOMs — and
+`FIZGIG_SIM_VRAM_GB` is not a workaround, because it caps the allocator along with the
+planner. **At 0.25 MP there is currently no configuration that full-model-trains 5 s
+clips on ≤32 GB.** The fix is exactly the Q4 bundle below: give `plan_component_windows`
+an activation term (`~0.145 GB × latent_frames × mp/0.25`, from the largest cached item)
+so it downshifts to split/streamed plans — and refuses honestly when even streaming
+cannot fit. Not built — Peter's call, per this doc's own rule.
 
 ## Q4 — the freed-NF4-share term is unmodelled (cheap, worth doing with Q2)
 
@@ -110,15 +138,17 @@ is that **the GUI still estimates the cycle from a 32 GB 4-window baseline**, wh
 under-report badly on a small card. The trainer's own snap is authoritative and prints the
 real plan; the GUI estimate should either follow it or say it is a 32 GB figure.
 
-## Recommendation
+## Recommendation (updated 28 Aug after the Q2 session)
 
-1. **Run the Q1 block-zone experiment first.** Zero build cost, and a positive result
-   shrinks every other problem here. It is the only item where an afternoon of GPU time
-   could remove the need for engineering entirely.
-2. **Then measure Q2 on a real clip dataset** before claiming any video VRAM tier. Until
-   that exists, treat the full-model rows above as stills-only and say so.
-3. **Then do Q4 + the Q2 activation term together**, as one budgeting change with one
-   recalibration.
+1. **Q2 is measured.** The activation term is ~0.145 GB/latent-frame at 0.25 MP,
+   plan-independent, and the tier map above is real. The headline: 22-frame clips fit
+   every tier down to 16 GB; 2.3 s clips fit 24 GB; 5 s clips fit nothing ≤32 GB today.
+2. **The Q4 + activation-term planner change is now the gating item** — without it, a
+   32 GB card with normal-length clips picks a plan measured to OOM. One budgeting
+   change, calibrated by this session's numbers. Needs Peter's go-ahead.
+3. **Q1 (block zones for clips) stays next after that**, and needs a real multi-clip
+   dataset — the Q2 duplicate-clip set is overfit-one shaped and can't judge quality.
 4. **Q3 is closed.** Q5 needs only the GUI estimate corrected, which is cosmetic.
 
-Nothing above is blocked on code. The gating input is Peter's video material.
+The gating input is no longer measurement — it is the planner decision (2) and more
+source video for (3).
