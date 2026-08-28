@@ -101,7 +101,7 @@ forward itself once windows are small.
 |---|---|---|---|---|
 | 32 GB resident | 4 windows | **PASS** (peaks 23.4/17.3/28.5/20.8) | FAIL (fc1, e3) | FAIL (qkv, e1 backward) |
 | 24 GB | 8-window split | *predicted pass* | **PASS** (max 21.2 / 23.88) | FAIL (step 0, forward) |
-| 16 GB | streamed, 16 windows | **PASS** (max 11.6 / 15.9 — identical to stills) | *predicted ~13.1* | *predicted ~16.0, at the line* |
+| 16 GB | streamed, 16 windows | **PASS** (max 11.6 / 15.9 — identical to stills) | **PASS** (steady 10.1–11.1) | *predicted ~16.0, at the line* |
 
 Loss fell normally in every passing run (1.15 → 0.50 over a cycle); the a23a325
 orphan-release fix and the ring-aware defrag both hold on clips (no boundary
