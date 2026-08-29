@@ -7,7 +7,7 @@
        in-house, audited); the two community-REPORTED fixes carried from master are
        credited in Also-in-this-release (JohnSiris #111, ritonV #94/#95/#110) -->
 
-Fine-tune the base model itself — on the card you already have.
+Fine-tune the MiniMax H3 and Krea 2 base models on consumer GPU hardware — down to 16 GB.
 
 ## Full fine-tuning graduates
 
