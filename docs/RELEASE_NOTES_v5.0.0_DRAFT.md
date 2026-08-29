@@ -2,7 +2,7 @@
 
 <!-- DRAFT STATUS: builds as the FT release firms up. Before publishing:
      - NF4-vs-fp8 quality A/B result folds into the "default" paragraph
-     - 32 GB Krea 2 smoke of the NF4 default
+     - DONE 29 Aug: 32 GB Krea 2 smoke green (NF4 default resolves flagless; 4 resident windows, peaks 22.6/20.8/20.8/20.8, ~1.0 s/it, bracket preview rendered, exit 0)
      - contributor credits for the cycle get added in the usual style -->
 
 Fine-tune the base model itself — on the card you already have.
