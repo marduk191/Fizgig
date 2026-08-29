@@ -116,4 +116,4 @@ necessary to make it happen. — Peter
 
 <!-- sections to add as the release firms up: intelligent-trainer features on FT
      (problem images, adaptive throttle), likeness-mode recommendation, RAM/disk
-     requirements, upgrade notes, credits. -->
+     requirements, upgrade notes. -->
