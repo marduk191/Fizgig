@@ -4092,6 +4092,13 @@ def train_minimax(
             f"judge an epoch in ComfyUI, then Resume.")
 
     def _render_previews(epoch):
+        # Cumulative numbering, matching the checkpoints: a continuation run passes its
+        # LOCAL epoch here, but the sample tag and the console must carry the run-total
+        # epoch — the gallery's per-epoch tools (visualiser scrub, likeness trend) sort
+        # by this tag, so a resumed leg re-tagging from e000000 collides with the first
+        # leg's samples in the same folder (field, 29 Aug). Rebased once, here, because
+        # everything below uses `epoch` for display and the filename only.
+        epoch = epoch + ft_epoch_offset
         """Render one still per prompt on the RESIDENT training DiT and write them where the
         samples gallery looks. The filename format is the gallery/likeness/Visualiser contract
         (parse_sample_filename in the GUI) — do not change it casually.
@@ -4977,7 +4984,11 @@ def train_minimax(
         # under rotation FT that pins the entire deactivated window (~6 GB of orphaned bf16
         # at 8 blocks, census-confirmed) straight through the bracket preview.
         loss = batch = None
-        logger.info(f"epoch {epoch + 1}/{max_train_epochs} done — avr_loss {loss_recorder.moving_average:.4f}")
+        # Cumulative across pause/resume, matching checkpoint numbering — a resumed run
+        # logging "epoch 1/95" beside checkpoints named -000006 read as a numbering bug
+        # (field, 29 Aug). Offset is 0 on a fresh run, so nothing changes there.
+        logger.info(f"epoch {epoch + 1 + ft_epoch_offset}/{max_train_epochs + ft_epoch_offset} "
+                    f"done — avr_loss {loss_recorder.moving_average:.4f}")
         if rotator is not None and torch.cuda.is_available():
             # Per-window peak, reset at each rotation — the measured record the window
             # planner's constants are calibrated from. GB (1e9), NOT GiB: this line used

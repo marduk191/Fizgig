@@ -3018,7 +3018,9 @@ def train_krea2(
                 _rate += f" ({_drift:.2f}x vs last epoch)"
         if _ep_steps > 0:
             _epoch_rate_prev = _ep_secs / _ep_steps
-        logger.info(f"epoch {epoch + 1}/{max_train_epochs}  avr_loss={loss_recorder.moving_average:.4f}  step={global_step}"
+        # Cumulative across FT pause/resume, matching checkpoint numbering (H3 twin; the
+        # offset is 0 on fresh and LoRA runs, so nothing changes there).
+        logger.info(f"epoch {epoch + 1 + ft_epoch_offset}/{max_train_epochs + ft_epoch_offset}  avr_loss={loss_recorder.moving_average:.4f}  step={global_step}"
                     + _rate
                     + (f"  lr={optimizer.param_groups[0]['lr']:.3e}" if (scheduler is not None and optimizer is not None) else ""))
         if rotator is not None and torch.cuda.is_available():
