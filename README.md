@@ -29,6 +29,7 @@
 </p>
 
 > ### 📰 Latest news
+> - **🧪 NEW — Full fine-tuning: train the Krea 2 base model itself, on one consumer GPU.** No adapter, no rank bottleneck — full-rank updates that change how the model *represents* a concept instead of filtering its output. One checkbox (**⚗ Fine-tune the BASE MODEL** on the Training tab) applies the whole recommended recipe; the **Window** setting's Auto sizes the rotating trainable slice to your card (32 GB runs the full-quality component mode; 24 GB runs streamed block mode). The trainer's intelligence — problem-image detection and live per-image throttling — runs on the fine-tune too (auto-recaptioning stays a LoRA-run feature for now). When you're done, the built-in **Checkpoint to LoRA** utility diffs your fine-tune against the base and extracts an ordinary, shareable LoRA at any rank — the quality of a full fine-tune, in a file ComfyUI already knows how to use. Experimental. [Details ↓](#full-fine-tuning-krea-2--minimax-h3--experimental)
 > - **Fizgig 4.3.1 — 12 GB cards confirmed training MiniMax H3** — a community field report on an RTX 5070 proved H3 LoRA training runs stable at 12 GB, and the two crashes in its way are fixed: checkpoint saves no longer die on low memory, and previews no longer fragment VRAM into a next-step OOM. Also in this maintenance release: **captioning no longer slows down your next training run** (it runs in its own process now — built by **[@scryptio](https://github.com/scryptio)**). [Release notes](docs/RELEASE_NOTES_v4.3.1.md)
 > - **Fizgig 4.3 — AMD Radeon support arrives** — Fizgig now trains on AMD with ROCm (RDNA1 through RDNA4, Strix Point / Halo, Instinct). **Windows** is the supported path with its own one-click installer; **Linux** is experimental. Built by **[@scryptio](https://github.com/scryptio)** and tested in the open by the community. Also in the release: **identity distillation now fits 16 GB cards** — the 32B text encoder streams layer by layer, contributed by **[@rintic-13](https://github.com/rintic-13)** — the Repair Studio gains a **side-by-side compare view with likeness and quality metrics**, and Fizgig **speaks Korean** via a community add-on by **[@ssain3d-lgtm](https://github.com/ssain3d-lgtm/Fizgig-Korean-Translated-Ver)**. [Details ↓](#install) · [Release notes](docs/RELEASE_NOTES_v4.3.0.md)
 > - **Fizgig 4.2 — the workbench opens to MiniMax H3, and what it found ships as features** — all five post-training tools now work on H3 LoRAs, with previews rendered as 22-frame clips judged by their middle frame. Using those tools on real LoRAs produced the first **H3 block map** — and its biggest finding is now **Optimised Likeness Learning**, a default-on checkbox that trains photos on the identity blocks only: sharper, more prompt-responsive, better sound, fewer epochs. Plus a **✨ MiniMax H3 Style** preset, an **Append Transcription** button that Whispers a clip's speech into its caption, and fully offline transcription. [Details ↓](#minimax-h3--third-model-family) · [Release notes](docs/RELEASE_NOTES_v4.2.0.md)
@@ -46,6 +47,7 @@ Every trainer makes LoRAs. Fizgig is built around what you do with them **afterw
 - **Find** the best LoRA by eye — **LoRA Royale** renders every epoch of a run (or any folder of LoRAs) on one seed; crossfade to the one that *feels* right.
 - **Share** what you made — LoRA Royale exports the epoch morph, or travels a single LoRA through seeds, prompts, or strength, as a looping MP4/GIF made to share.
 - **Profile** exactly which blocks carry identity, style, and detail — so you know what to touch before you touch it.
+- **Train beyond LoRAs.** Standard LoRA, **LoKR**, or the **full base model itself** — pick per run. A fine-tune comes back as a normal checkpoint, and **Checkpoint to LoRA** distils it into a shareable LoRA at any rank.
 
 Under the workbench sits a fast, light trainer tuned to **fit your GPU**: a full **Klein 9B** LoRA trains on **16 GB**, the 12.9B **Krea 2** on **8 GB**, and the 33B **MiniMax H3** on **16 GB** — block swap, quantisation and previews all size themselves to your VRAM automatically, and if a preview can't fit, training keeps running and saving. It loads kohya / PEFT / OneTrainer / AI-Toolkit / LyCORIS LoRAs, auto-converted, and saves kohya `.safetensors` that drop straight into ComfyUI.
 
@@ -204,7 +206,7 @@ Each has a **Download link on its row in Preferences**:
 
 | Model | Size | Notes |
 |---|---|---|
-| DiT — pruned int8 | ~21 GB | The training base — `minimax_h3_fl2va_pruned_int8_convrot.safetensors`, the same file ComfyUI runs. (The ~66 GB bf16 file also works, NF4 at load) |
+| DiT — pruned int8 | ~21 GB | The training base — `minimax_h3_fl2va_pruned_int8_convrot.safetensors`, the same file ComfyUI runs. (The ~66 GB bf16 file also works for LoRA training, NF4 at load — but full fine-tuning needs this int8 file) |
 | Qwen3-VL-32B text encoder | ~15.7 GB | The **nvfp4** file — same one ComfyUI uses. Loaded once for caching, then freed |
 | Video VAE | ~4.9 GB | Caching and preview decode |
 | Audio VAE *(optional)* | ~605 MB | Sound training and previews with sound |
@@ -227,6 +229,284 @@ Every control has a hint in the app; the highlights:
 - **Using the Turbo LoRA in ComfyUI? Skip its custom sampler** — current ComfyUI samples H3 audio cleanly with stock Euler; community consensus is 8 steps, with `minimax_h3_turbo_v4_step600_ema` the strongest checkpoint.
 
 Settings are read at launch; Pause → Resume relaunches with your current settings, so a pause is the moment to change them mid-run.
+
+---
+
+## Full fine-tuning (Krea 2 & MiniMax H3) — experimental
+
+Everything above trains a **LoRA**. This trains the **base model itself** — no adapter, no rank
+bottleneck — on a single consumer GPU. Tick **⚗ Fine-tune the BASE MODEL instead of training a
+LoRA** on the Training tab.
+
+> **A note on where this is at.** I first got fine-tuning working on Krea 2 shortly after
+> its release, and I've been deliberately cautious about shipping it — first proving it to
+> myself, then refining it through the MiniMax H3 work. This is the point where it needs
+> the community to develop further. I don't expect every scenario to work perfectly yet —
+> but it works, the numbers below are measured, and there's a solid foundation here to
+> build on. Field reports genuinely shape what gets built next. I'm also aware this
+> technique is model-agnostic at heart — it opens the door to fine-tuning other models,
+> and I'm open to going there. But for that to happen it needs practical community
+> support around those models — code, PRs, testing, that kind of thing — so I have the
+> time necessary to make it happen. — Peter
+
+New to fine-tuning? The extended **["How do I…?" guide](docs/FINETUNE_HOWDOI.md)** answers
+everything this section can't fit — including **five-minute recipes for both families**:
+tick Fine-tune, let the settings switch themselves, and change almost nothing.
+
+> **One idea makes everything else here make sense: an "epoch" trains one slice of the
+> model.** The trainable window rotates each epoch, so it takes a full cycle — typically
+> **4 epochs** — for every part of the model to train once. Rule of thumb: **4 fine-tune
+> epochs ≈ 1 true epoch of the whole model.** That's why the epoch defaults look high,
+> and why saves land on cycle boundaries — each saved checkpoint is a whole, evenly
+> trained model.
+
+> **Note on VRAM:** the "trains on 8 GB" figures elsewhere in this README are for **LoRA**
+> training. Full fine-tuning is a different animal — but it now **tiers itself to your card**,
+> and fine-tuning defaults to a **4-bit NF4** frozen base that halves the model held on the
+> card: on **32 GB and 24 GB** the classic full-depth windows stay resident at full speed, and
+> on **16 GB** the frozen blocks stream from system RAM — slower steps, but the same
+> component-mode learning. The planner measures your
+> free VRAM at launch and prints the plan it chose.
+
+**What can my card fine-tune?** The short answer, at the default training resolution:
+
+| Your card | Krea 2 — photos | MiniMax H3 — photos | H3 — voice | H3 — video, confirmed | H3 — video on likeness blocks, expected |
+|---|---|---|---|---|---|
+| **16 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** | up to **3.8 s** |
+| **24 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** | up to **5.2 s** |
+| **32 GB** | ✅ | ✅ | ✅ | ✅ up to **3.8 s** | up to **5.2 s** |
+
+A few things worth knowing about that table: clip lengths follow Gizmo's grid, so **2.3 s
+means the 56-frame slot** — cut your clips there and everything fits, **confirmed by
+measured runs on every tier**. On **32 GB, 3.8 s is also confirmed**, even with video
+training the whole model. Beyond that, the **Restrict video to likeness blocks** tickbox
+(on by default with Optimised Likeness Learning — in our tests it trains video just as
+well, and it makes clips far lighter) extends the *expected* range: **up to 5.2 s on
+24 GB and 32 GB, and 3.8 s on 16 GB** — conservative arithmetic from the measured
+constants, not yet individually measured, so treat those as expected rather than
+promised. Whole-model 5.2 s clips need more than 32 GB (measured). With the restriction
+unticked, one clip anywhere in your folder trains the **whole** model, so a mixed
+photos + clips dataset uses the clip column. And 12 GB cards train **LoRAs**, not
+fine-tunes — 16 GB is the fine-tune floor.
+
+> **"A full fine-tune of a 12.9B–33B model on 16 GB" sounds like a trick, so here's the
+> arithmetic.** Only one slice of the model is ever trainable at a time — the trainable
+> window rotates each epoch, so gradients and optimizer state exist for that slice alone.
+> The frozen rest is held **4-bit (NF4)** at half size and, on 16 GB, streamed from system
+> RAM. The bf16 master copy lives in CPU RAM, never on the card. Those three together are
+> the whole magic, and the numbers are measured, not projected: **8.8–12.3 GB peaks on a
+> 16 GB card for H3**, **8.4–11.0 GB for Krea 2** — and the console prints your own run's
+> peak every epoch, so you can watch the claim hold live. Mechanism, tiers and every
+> "how do I" in the extended guide: **[docs/FINETUNE_HOWDOI.md](docs/FINETUNE_HOWDOI.md)**.
+
+**Which model files.** Fine-tuning uses the same training bases you already have — nothing new to
+download:
+
+- **Krea 2** fine-tunes the **RAW bf16 model** (`krea2_raw_bf16.safetensors`, ~26 GB), the same
+  file LoRA training uses. The fp8 Turbo is the preview model and can't be fine-tuned.
+- **MiniMax H3** fine-tunes the **pruned int8 checkpoint**
+  (`minimax_h3_fl2va_pruned_int8_convrot.safetensors`, ~21 GB) — again the same file the LoRA
+  path trains against and ComfyUI runs. The ~66 GB bf16 file, which LoRA training accepts, does
+  **not** work for fine-tuning; the trainer refuses it with a clear message.
+
+A finished fine-tune checkpoint is itself a valid base for either family — point the model path
+at it to train further (the console prints the exact continuation settings at every save). And
+**Pause / Resume works on a fine-tune**: Pause saves a full checkpoint even between the regular
+save epochs, and Resume continues it — rotation window, checkpoint numbering and the remaining
+epoch count all carry over.
+
+**Why bother.** A LoRA constrains every update to a low-rank subspace, so concepts compete for the
+same handful of directions. That's why LoRAs tend to drag pose, framing and lighting toward the
+training set along with the likeness — they behave a bit like a filter over the model's output. A
+full-rank update can change how the model *represents* a concept, so it composes with what the
+model already knows. **In our own tests, multi-character and concept teaching seemed to land at
+a much deeper level than LoRA training, with much better results** — and the built-in
+**Checkpoint to LoRA** converter turns the result into a shareable file, and works very well.
+Beyond that, we're deliberately letting the community find the ceiling.
+
+**How it fits.** A naive full fine-tune of Krea 2 (12.9B) needs roughly **78 GB** — bf16 weights,
+gradients and optimizer state at once. Rotating windows make only part of the model trainable at a
+time, advancing each epoch, so gradients and optimizer state only ever exist for the active slice.
+Over a full cycle every weight trains. Around that sit three decisions that do the heavy lifting: a
+**CPU-resident bf16 master copy** is the source of truth, so training never round-trips through fp8
+and quantisation can't erase the small updates being learned; **optimizer-in-backward** consumes
+and frees each gradient the moment it lands (worth 5.2 GB); and **Adafactor**'s factored state is
+~10× smaller than AdamW's.
+
+**It sizes itself to your card.** Leave **Window** on **Auto (by VRAM)** and Fizgig measures the
+memory actually free at launch, picks the largest window that fits, and prints what it chose and
+why. Measured Krea 2 peaks (RTX 5090):
+
+| Window mode | Peak VRAM | Speed | Fits |
+|---|---|---|---|
+| **component + 4-bit NF4 (the default)** — full-depth windows, resident | ~16 GB (24 GB budget) / ~21–23 GB (32 GB, more headroom held) | ~1.0 s/it | **24 GB and up** |
+| component + **4-bit NF4** + streaming | 8.4–11.0 GB | ~2.8 s/it | **16 GB** |
+| component on the **fp8 base** (explicit Base-precision pick) — depth-split + streamed | 15.6–17.6 GB | ~3.0 s/it | 24 GB |
+
+**4-bit NF4 is the fine-tune default**, and you don't have to do anything to get it. It halves
+the frozen base, which on a 24 GB card is enough to keep the classic full-depth component
+windows resident instead of depth-splitting and streaming them: **4 windows instead of 8** — a
+full pass over every weight in 4 epochs rather than 8 — at roughly **3× the step speed**
+(measured ~1.0 s/it against ~3.0 s/it for the fp8 base, same dataset, same 24 GB budget). On
+16 GB it is the only base that fits at all.
+
+The trade is that the *frozen* part of the model is held more coarsely while the trainable
+window learns against it. Your saved checkpoint is unaffected either way — it's written in
+bf16 from a master copy that never passes through a quantiser. If you want the more accurate
+frozen context and have the VRAM, pick **fp8** under Base precision and it will be used.
+
+**Component is the best mode — and Auto now stays in it at every depth.** Every window spans the
+model's full depth — attention across all 28 blocks, then each MLP matrix in turn — so a concept
+is learned by every layer at once rather than one depth slice at a time. The text-fusion stack
+stays trainable throughout: rotation would never reach it, and it's where prompt-to-concept
+binding happens. Where the budget used to force a mode change, the planner now **depth-splits**
+the windows instead (a fat window trains in slices — more windows per cycle, still full speed),
+and below that the frozen out-of-window blocks **stream from system RAM** — slower steps, but
+still component-mode learning. The console prints the chosen plan and why.
+
+**Block mode remains an explicit Window-dropdown choice** — contiguous depth slices with frozen
+blocks streamed, slower than component at every budget. It's **not yet quality-tested**; every good result so
+far came from component runs.
+
+### MiniMax H3 fine-tuning
+
+The same checkbox under the MiniMax H3 family fine-tunes the 33B model, with the recipe adapted
+to it: **component windows only** — each window trains one attention or MLP matrix across all 50
+blocks (4 windows per cycle), with the token refiner trainable throughout, so every window spans
+the model's full depth from the very first epoch.
+
+- **VRAM — it sizes itself to your card.** Measured with **Optimised Likeness Learning** on,
+  which is the recommendation on every tier (matched runs came out clearly better on both look
+  and prompt adherence than full-model fine-tuning — and it shrinks the windows, so the tiers
+  below assume it). On 32 GB the classic 4-window cycle runs at full speed. On **24 GB** the
+  planner **depth-splits the fat windows** — `mlp.fc1` trains in two slices, a 5-window cycle,
+  still full speed, no offloading; measured peaks 19.1–21.5 GB. On **16 GB** the frozen
+  out-of-window blocks also **stream from system RAM** (~7 GB staged, a 9-window cycle):
+  measured peaks 8.8–12.3 GB at **~1.5× the step time** — a full fine-tune of a 33B video model
+  on a 16 GB card. The console prints the chosen plan and why.
+- **Full-model fine-tuning (likeness off, or any dataset with video clips) plans itself too.**
+  On stills it fits right down the range — measured peaks 17.3–18.7 GB on a 24 GB budget and
+  8.8–11.6 GB streamed on 16 GB. Clip datasets additionally reserve activation memory before
+  the windows are sized (clips cost VRAM per frame of length), which is what the card table
+  above reflects — and when clips are too long for your card, the trainer says so up front,
+  with the fix (cut to the 2.3 s Gizmo slot, or lower Target Megapixels), instead of failing
+  mid-run.
+- **System RAM:** the bf16 master copy is ~23 GB (likeness) to ~38 GB (full model), and spills
+  to disk automatically when RAM is tight — full-model fine-tuning runs on a 64 GB box.
+- **Disk:** each save is a full **~21 GB** int8 checkpoint — set the Training tab's **Output
+  Directory** to a drive with room *before* the run, or you'll be moving 20 GB files by hand after.
+- **Learning rate: 3e-5** — the tested fast-and-reliable rate for H3 fine-tuning. Anything as
+  high as 1e-4 will destroy a fine-tune.
+- **Use unique trigger tokens** — strongly recommended: an invented token gives the fine-tune
+  somewhere clean to bind, where a common word drags its existing meaning along with it.
+- **Run length: there's no standard number.** It depends on learning rate, dataset size and
+  what you're teaching. The 100-epoch default is a generous scrub-range for a typical small
+  dataset — **a large dataset probably needs far fewer epochs** (each epoch is more steps).
+  Save once per cycle and compare checkpoints to find where yours peaks; Max epochs and
+  Save-every both snap to cycle boundaries so every save ends evenly trained. Total *steps*
+  still run well past LoRA habits (only one component trains at a time — a full pass of
+  learning costs a full cycle, not an epoch), so budget wall-clock and disk accordingly.
+- **Voice and mixed datasets train too** — voice stays confined to its measured blocks (34–49),
+  photos to theirs, and the per-category **stop epoch** counts across Pause/Resume: pause a
+  mixed run, set the stop to the current epoch, Resume, and it finishes voice-only.
+
+**Saves, previews and numbering run on the rotation cycle, not the Samples tab.** The save
+cadence snaps to cycle boundaries — the Save-every box follows the FT controls live in the GUI,
+and the trainer snaps it again at launch — so every checkpoint compares like-for-like, with each
+window trained equally. Previews ride the saves: one render per saved checkpoint plus the final
+one, overriding the Samples tab's "every N epochs" (prompts, resolution, seed and the live
+sample override still come from the Samples tab and status bar as usual — every sample in the
+gallery maps to a file you can deploy). Checkpoints are numbered by epoch (`-000004`,
+`-000008`, …) and the numbering continues across Pause/Resume, so a resumed run never overwrites
+an earlier save. Krea 2 fine-tunes behave exactly the same way — saves snap to the cycle,
+previews ride them (rendered on the training DiT with the Turbo LoRA), numbering carries over.
+
+The output is a normal H3 checkpoint: load it in ComfyUI directly, or run **Checkpoint to LoRA**
+on it (the extractor decodes the int8 format natively) for a shareable LoRA.
+
+### Learning rates — lower than you're used to
+
+If you're coming from LoRA training, recalibrate before anything else: **fine-tuning wants
+much lower learning rates than LoRAs**. A LoRA nudges a small adapter riding on a frozen
+model; a fine-tune moves the model's own weights, so the rates you're used to typing land
+very differently here — what's a normal LoRA rate can wreck a fine-tune outright.
+
+- **MiniMax H3: use 3e-5.** It's the tested fast-and-reliable rate; **1e-4 will destroy an
+  H3 fine-tune** — that one is measured, not folklore.
+- **Krea 2: you're welcome to start at 1e-4** — it trains — but realistically the best
+  results are found lower. Treat 1e-4 as the top of the experiment range, not the recipe:
+  when a run looks almost right but slightly overcooked, the next move is a lower rate,
+  not fewer epochs.
+- **The regularisation LR × multiplier is part of the same tuning space** (next section).
+  It sets how hard the anchor pulls relative to your subject, and it's genuinely worth
+  experimenting with per dataset — 0.1–0.3 keeps it a tether, higher trains the reg set
+  more like real data.
+
+### Optional: regularisation images
+
+Full fine-tuning moves every weight, so a long run on a handful of subjects drifts the model's
+whole notion of people — there's no low-rank bound to limit it the way there is with a LoRA. Point
+**Regularisation images** at a folder of ordinary photos of the broader class and they train at a
+reduced learning rate (**LR ×**, default 0.2) as an anchor rather than a lesson. That
+multiplier is a real dial, not a set-and-forget: **0.1–0.3** tethers the model's prior while
+your subject trains; push it toward **1.0** and the reg set trains like a second subject set —
+class-balanced training rather than a light anchor, which is a different (valid) thing. If a
+fine-tune drifts the broader class, raise it a step; if the subject learns too slowly, lower
+it. Worth a little experimentation per dataset.
+
+Use **real photos, not model output** — anchoring a fine-tune to its own samples distils its
+artifacts back in, and there's nothing bounding that drift. Caption them normally: anything you
+leave unsaid gets attributed to the class word itself. Leave the folder empty to train without
+one.
+
+### Then turn it back into a LoRA
+
+A fine-tune produces a **~26 GB checkpoint**, which is not what anyone wants to share. The
+**Checkpoint to LoRA** utility (`run_diff_to_lora.bat`, its own small window) takes the base model
+you started from and the checkpoint you produced, and extracts the difference as an ordinary
+kohya `.safetensors` — at several ranks at once, since one SVD per layer serves them all.
+
+This turned out to work far better than expected: **rank 64 was perceptually
+indistinguishable from the full 26 GB checkpoint** at ~0.5 GB, and quality degrades smoothly
+at lower ranks rather than falling off a cliff.
+
+The result worth knowing: in our testing, a LoRA **extracted** from a fine-tune came out
+better than a LoRA **trained directly** at the same or higher rank on the same dataset. A
+low-rank file can *hold* a solution that low-rank training struggles to *find* — so
+fine-tune-then-extract isn't a workaround; the full-rank phase is the mechanism, and the
+extraction is nearly free. (Details and the experiments behind it: **[docs/FINETUNE_ROTATION.md](docs/FINETUNE_ROTATION.md)**.)
+
+### What it costs you
+
+Being straight about the trade-offs, because they're real:
+
+- **VRAM tiers itself**: on the default 4-bit NF4 base, **24 GB** runs the classic full-depth
+  component cycle at full speed, and **16 GB** adds frozen-block streaming from RAM at ~1.5×
+  the step time — both families. (Picking the fp8 base instead costs a 24 GB card depth-split,
+  streamed windows at ~3× the step time, and doesn't fit 16 GB at all.) The console prints
+  each run's plan; too little VRAM refuses cleanly instead of OOMing.
+- **System RAM** for the bf16 master copy, on top of VRAM: ~24 GB on Krea 2, ~23–38 GB on H3.
+  H3's spills to disk automatically; **Krea 2's does not, so Krea 2 fine-tuning realistically
+  wants 48 GB+ of system RAM** — the trainer warns at launch when RAM looks tight.
+- **NVIDIA only, for now.** Fine-tuning is untested on AMD/ROCm — every measured tier is
+  NVIDIA, and the NF4 default leans on bitsandbytes 4-bit, the least-travelled part of the
+  ROCm stack. Reports welcome either way.
+- **Disk — set your save location BEFORE the run.** Every save is a full checkpoint — ~26 GB
+  on Krea 2, ~21 GB on H3 — and saving once per 4-epoch cycle is ~260 GB over a 40-epoch run.
+  The **Output Directory** on the Training tab defaults to the same folder your LoRAs go to,
+  which is often not the drive you want holding a stack of 20+ GB files: change it to a roomy
+  drive before you press Start, because afterwards the only fix is moving huge files by hand.
+  (A Pause also writes a full checkpoint, on top of the regular cadence.)
+- **A low learning rate** — 1e-5 on Krea 2; **3e-5** is the tested rate on H3. LoRA-style rates
+  (anything as high as 1e-4) will destroy a fine-tune.
+- **Run at least one full cycle** (4 epochs in component mode) or some weights never train at all.
+  The console warns you.
+- **Adaptive LR is off** — rotation boundaries would read as instability to it. Previews render
+  **once per saved checkpoint** on both families (every sample is the rehearsal of a file you can
+  deploy); judge those, evaluate checkpoints in ComfyUI, or extract a LoRA and scrub the epochs
+  in LoRA Royale.
+
+Experimental, and on this branch only — master is untouched.
 
 ---
 
@@ -278,6 +558,14 @@ Fizgig ships as a ready-made cloud image — the **whole app in a browser tab**,
 - **Python** — 3.10 – 3.13.
 - **System RAM** — 32 GB recommended; 16 GB is workable for **Klein 9B** and **Krea 2**. **MiniMax H3 is the outlier**: its text encoder is a 15.7 GB file that streams from system RAM while captions are cached, and INT8 block streaming stages a similar amount again during training — so 32 GB is comfortable, and 24 GB works only with other apps closed. Worth knowing: when system RAM runs short, the failure arrives dressed as **"CUDA error: out of memory"** even though the GPU is nearly empty. Close what else is running and retry the caching step before suspecting VRAM.
 - **Disk** — ~10 GB for the venv, plus ~40 GB for model files.
+- **Full fine-tuning** (experimental, Krea 2 & MiniMax H3) asks for more than the above, and
+  tiers itself to your card: on the default 4-bit NF4 base, **24 GB** runs the full-depth
+  component cycle at full speed and **16 GB** streams the frozen blocks from RAM at ~1.5–3× the
+  step time, both families. Add the bf16 master in RAM (spilled to disk
+  automatically on H3), and disk for saves — **~26 GB per Krea 2 checkpoint, ~21 GB per
+  H3 one**. Each
+  family fine-tunes its normal training base — Krea 2 the RAW bf16 model, H3 the pruned int8
+  checkpoint (H3's ~66 GB bf16 file works for LoRA training only, not fine-tuning).
 - **Visual Studio Build Tools** (Windows only) — for InsightFace and the torch.compile speedup: **[aka.ms/vs/17/release/vs_BuildTools.exe](https://aka.ms/vs/17/release/vs_BuildTools.exe)**, tick **"Desktop development with C++"**. Without it everything still works minus the compile speedup.
 
 ---
@@ -459,6 +747,11 @@ Launch Fizgig and work left-to-right through the numbered tabs:
 5. **Training** — pick a preset, click **Start Training**.
 
 The unnumbered tabs are the post-training workbench: **Profiler**, **Repair Studio**, **LoRA the Explorer**, **LoRA Royale**, **Extract**, and **Preferences**.
+
+One tool lives outside the main window: **Checkpoint to LoRA** (`run_diff_to_lora.bat`, or
+`python diff_to_lora_gui.py`) — point it at a base model and a fine-tuned checkpoint and it writes
+an ordinary LoRA at whichever ranks you tick. Only needed if you use the experimental full
+fine-tune above.
 
 **Headless?** Everything the trainer does is also available from the command line — see **[docs/CLI.md](docs/CLI.md)**.
 

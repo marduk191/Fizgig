@@ -12,6 +12,8 @@ from tqdm import tqdm
 
 from fizgig.krea2.safetensors_utils import MemoryEfficientSafeOpen, TensorWeightAdapter, WeightTransformHooks
 
+from fizgig.modules.fp8 import _try_fp8_scaled_mm_train
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -377,6 +379,17 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
     Returns:
         torch.Tensor: Result of linear transformation
     """
+    # Fast FT: try the _scaled_mm path Klein already trains on. Opt-in per module via
+    # _fp8_fast (set by apply_fp8_monkey_patch), and only ever a fast path — it returns
+    # None whenever it can't run (unsupported card, non-per-tensor scale, ragged K/N,
+    # or a _scaled_mm RuntimeError) and we fall through to the dequant below, which is
+    # the shipped behaviour. Reused rather than reimplemented: that helper carries the
+    # block-swap scale-device fixup and the checkpoint-safe ctx stashing.
+    if getattr(self, "_fp8_fast", False):
+        out = _try_fp8_scaled_mm_train(self, x)
+        if out is not None:
+            return out
+
     if use_scaled_mm:
         # **not tested**
         # _scaled_mm only works for per-tensor scale for now (per-channel scale does not work in certain cases)
@@ -437,7 +450,7 @@ def fp8_linear_forward_patch(self: nn.Linear, x, use_scaled_mm=False, max_value=
         return output
 
 
-def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False):
+def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False, fast=False):
     """
     Apply monkey patching to a model using FP8 optimized state dict.
 
@@ -476,10 +489,28 @@ def apply_fp8_monkey_patch(model, optimized_state_dict, use_scaled_mm=False):
 
         # Apply patch if it's a Linear layer with FP8 scale
         if isinstance(module, nn.Linear) and has_scale:
-            # register the scale_weight as a buffer to load the state_dict
-            # module.register_buffer("scale_weight", torch.tensor(1.0, dtype=module.weight.dtype))
+            # Register scale_weight as a buffer for load_state_dict to fill.
+            #
+            # Create it on the weight's DEVICE and in a COMPUTE dtype, not the weight's
+            # own dtype: by this point module.weight is already fp8, and the dequant
+            # forward does `weight.to(scale_weight.dtype) * scale_weight`. Inheriting the
+            # fp8 dtype makes that multiply fp8*fp8 ("mul_cuda not implemented for
+            # Float8_e4m3fn"), and defaulting to CPU makes it a cross-device multiply.
+            # The usual flow hides both because load_state_dict(assign=True) replaces the
+            # buffer wholesale — but any path that patches without a subsequent assigning
+            # load (e.g. re-freezing a block after fine-tuning it) would hit them.
             scale_shape = scale_shape_info[name]
-            module.register_buffer("scale_weight", torch.ones(scale_shape, dtype=module.weight.dtype))
+            scale_dtype = module.weight.dtype
+            if scale_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                scale_dtype = torch.bfloat16
+            module.register_buffer(
+                "scale_weight",
+                torch.ones(scale_shape, dtype=scale_dtype, device=module.weight.device),
+            )
+
+            # Fast FT opt-in. Per-module rather than global so a rotation window that
+            # re-freezes a Linear keeps the same behaviour without re-plumbing.
+            module._fp8_fast = bool(fast)
 
             # Create a new forward method with the patched version.
             def new_forward(self, x):

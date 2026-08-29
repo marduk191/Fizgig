@@ -16,11 +16,13 @@ So the training target for the model's output is `x0 - noise`.
 import argparse
 import contextlib
 import gc
+import hashlib
 import logging
 import math
 import os
 import random
 import re
+import shutil
 import sys
 import time
 from multiprocessing import Value
@@ -338,6 +340,78 @@ def format_block_spec(indices):
         start = prev = i
     runs.append((start, prev))
     return ",".join(str(a) if a == b else f"{a}-{b}" for a, b in runs)
+
+
+def snap_ft_stop(n, cycle, offset, local_max):
+    """The effective (cumulative) FT retirement epoch: (value, kind).
+
+    Stop epochs are CUMULATIVE across pause/resume, exactly like checkpoint numbering —
+    on a continuation the flag means the same calendar epoch it meant in the original
+    run, so "pause at 12, set the stop to 12, resume" gives an audio-only continuation
+    instead of 12 more epochs of photos. Cycle-snapping happens in LOCAL space (each
+    process's rotation windows are what must see the identical data mix), then converts
+    back to cumulative. kind: "off" (0/disabled), "past" (already retired when this run
+    starts — value returned verbatim), "snapped"/"exact" (fires mid-run), "never"
+    (at or past this run's end). Pure so the table is pinnable without a training run."""
+    n = max(0, int(n or 0))
+    if not n:
+        return 0, "off"
+    local = n - int(offset or 0)
+    if local <= 0:
+        return n, "past"
+    snapped = ((local + cycle - 1) // cycle) * cycle
+    if snapped >= local_max:
+        return snapped + int(offset or 0), "never"
+    return snapped + int(offset or 0), ("snapped" if snapped != local else "exact")
+
+
+def plan_ft_modality_routing(n_blocks, photo_blocks, audio_blocks,
+                             n_photo, n_voice, n_clip, explicit_subset=None,
+                             clip_blocks=None):
+    """The fine-tune's modality-routing plan, as pure data: (cycle_subset, routes).
+
+    cycle_subset: sorted block list the rotation cycle should span, or None for the full
+    model — the UNION of what each modality present in the dataset needs (photos -> the
+    likeness set when given, voice -> the audio zone, clips -> clip_blocks when given,
+    full model otherwise). clip_blocks landed 29 Aug from a field result: an overnight
+    video run confined to the likeness blocks worked, so "clips -> full model" is now the
+    fallback, not the law — the GUI's "Restrict video to likeness blocks" tickbox passes
+    the likeness set here, and unticking it (or CLI runs without --clip_blocks) keeps the
+    whole-model behaviour.
+    routes: {"photo": set|None, "voice": set|None, "clip": set|None} — the per-batch
+    confinement set for each modality, or None when that modality may train the whole
+    span (absent from the dataset, no set configured, or the span already sits inside
+    its set — the caller's freeze list then comes out empty anyway; None here keeps the
+    intent legible in logs).
+
+    An explicit --finetune_blocks subset wins: it is returned verbatim and all routes are
+    None (the validated manual workflow — the A/B that produced the 34-49 rule was run
+    exactly this way). Kept as a module-level pure function so the truth table is pinnable
+    without a training run."""
+    routes = {"photo": None, "voice": None, "clip": None}
+    if explicit_subset is not None:
+        return sorted(explicit_subset), routes
+    pb = set(parse_block_spec(photo_blocks, n_blocks)) if photo_blocks else None
+    aud = set(parse_block_spec(audio_blocks, n_blocks)) if audio_blocks else None
+    cb = set(parse_block_spec(clip_blocks, n_blocks)) if clip_blocks else None
+    full = set(range(n_blocks))
+    union = set()
+    if n_photo:
+        union |= (pb if pb else full)
+    if n_voice:
+        union |= (aud if aud else full)
+    if n_clip:
+        union |= (cb if cb else full)
+    if not union:
+        union = full
+    span = union
+    if pb is not None and n_photo and not span.issubset(pb):
+        routes["photo"] = pb
+    if aud is not None and n_voice and not span.issubset(aud):
+        routes["voice"] = aud
+    if cb is not None and n_clip and not span.issubset(cb):
+        routes["clip"] = cb
+    return (sorted(union) if union != full else None), routes
 
 
 def restrict_patterns_to_blocks(patterns, block_spec, num_blocks: int = None):
@@ -660,6 +734,66 @@ def _max_effective_mp(group):
             except Exception:
                 continue                      # unreadable cache: the caching pass will say so
     return best_mp, best_t
+
+
+def _max_clip_act_item(group):
+    """The dataset's heaviest CLIP, as (latent_t, spatial_mp) — (1, 0.0) when it has none.
+
+    Feeds the FT planner's clip activation term (ft_clip_activation_gb) and nothing else —
+    _max_effective_mp stays untouched because it feeds the LoRA-side plan_vram. Same
+    header-only scan and stale-stem filter as _max_effective_mp, with two differences:
+
+    * A CLIP is identified by its cache HEADER, never by filename: a 3-dim latent key
+      (`latent_{T}x{H}x{W}`) in a file with no `audio_only` key. Cache filenames strip the
+      source extension, so an extension test would need the source directory listing — and
+      that listing is optional here (missing dir just disables the staleness filter), which
+      would silently zero the activation term and reintroduce the exact OOM it prevents.
+    * VOICE items are excluded even though their placeholder latents are 3-dim and their
+      video frames genuinely forward: their spatial grid is 8x8 latent, so their own
+      activation cost tops out ~0.35 GB — inside the stills overhead's round-up, and
+      field-proven at every tier. What the exclusion actually protects is the flat
+      fragmentation MARGIN, which gates on T>1 and would tax every voice-only dataset
+      ~2.4 GB for nothing. The `audio_only` header key is the guarantee.
+
+    Heaviest = argmax of the per-item (T-1) x spatial_mp product (one step's peak belongs
+    to one item; two separate maxima would re-create the trap documented above)."""
+    from safetensors import safe_open
+    best_score, best_t, best_mp = 0.0, 1, 0.0
+    seen = set()
+    for ds in getattr(group, "datasets", []):
+        cache_dir = getattr(ds, "cache_directory", None)
+        if not cache_dir or cache_dir in seen or not os.path.isdir(cache_dir):
+            continue
+        seen.add(cache_dir)
+        _stems = None
+        _img_dir = getattr(ds, "image_directory", None)
+        if _img_dir and os.path.isdir(_img_dir):
+            _stems = {os.path.splitext(f)[0] for f in os.listdir(_img_dir)}
+        for name in os.listdir(cache_dir):
+            if not name.endswith(".safetensors"):
+                continue
+            if _stems is not None:
+                _stem = "_".join(name.split("_")[:-2])       # {basename}_{WxH}_{arch}
+                if _stem and _stem not in _stems:
+                    continue
+            try:
+                with safe_open(os.path.join(cache_dir, name), framework="pt") as f:
+                    keys = list(f.keys())
+                    if "audio_only" in keys:
+                        continue                              # voice item — see docstring
+                    for k in keys:
+                        if k.startswith("latent_") and not k.startswith("latent_control_"):
+                            dims = [int(d) for d in k[len("latent_"):].split("x")]
+                            if len(dims) != 3:
+                                continue                      # a still — no activation term
+                            t, h, w = dims
+                            spatial_mp = (h * 16) * (w * 16) / 1e6
+                            score = (t - 1) * spatial_mp
+                            if score > best_score:
+                                best_score, best_t, best_mp = score, t, spatial_mp
+            except Exception:
+                continue                      # unreadable cache: the caching pass will say so
+    return best_t, best_mp
 
 
 # The 0.5 GB / 0.25 MP checkpointed-activation anchor was MEASURED at 0.25 MP; everything
@@ -2092,6 +2226,22 @@ def _save_lora(network, path, network_dim, network_alpha, dtype, extra_metadata=
     network.save_weights(path, dtype, metadata)
 
 
+def _reg_subject_keys(datasets):
+    """(reg item_keys, subject item_keys) across the dataset group — bare stems, the same
+    strings the collate puts in batch['item_keys']. Split out of train_minimax so the
+    collision handling is pinnable without a full trainer boot."""
+    reg, subj = set(), set()
+    for _ds in datasets:
+        _bm = getattr(_ds, "batch_manager", None)
+        if _bm is None:
+            continue
+        _tgt = reg if getattr(_ds, "is_reg", False) else subj
+        for _bucket in _bm.buckets.values():
+            for _it in _bucket:
+                _tgt.add(str(_it.item_key))
+    return reg, subj
+
+
 def train_minimax(
     dataset_config: str,
     output_dir: str,
@@ -2128,6 +2278,16 @@ def train_minimax(
                                      # The 20-49 recipe: photo gradients into the front trunk are
                                      # pure prior damage (deformed previews, eroded prompt
                                      # following) while identity lives in the back 30 blocks.
+    clip_blocks: str = None,         # FT only: confine CLIP steps to these blocks too (the GUI's
+                                     # "Restrict video to likeness blocks" tickbox passes the
+                                     # likeness set). Field result 29 Aug: an overnight video run
+                                     # confined this way trained perfectly well. Unset = clips
+                                     # train the whole model, the original behaviour.
+    audio_blocks: str = None,        # Voice routing: audio-only steps update only these blocks
+                                     # (+refiners). The 34-49 recipe (voice core 38-48 + shoulder,
+                                     # RESEARCH_h3_block_map.md): audio gradients outside it
+                                     # measurably corrupt the visual blocks (A/B, 24 Aug —
+                                     # audio-only @34-49 clean, @20-49 damaged visuals).
     train_adaln: bool = True,        # False = drop adaln_proj from the targets (pruned only)
     distill: bool = False,           # reference distillation (references come from the dataset)
     distill_weight: float = 0.8,     # teacher share of the loss; the rest is the real photo
@@ -2191,6 +2351,24 @@ def train_minimax(
     metadata_license: str = None,
     metadata_tags: str = None,
     metadata_trigger_phrase: str = None,
+    # Rotation full fine-tune (trains the BASE, not a LoRA). finetune_rotation > 0 is the
+    # master switch. COMPONENT windows only (24 Aug: block/numeric modes removed — component
+    # on the NF4 base is the mode that actually works): each window is one matmul
+    # (qkv/out/fc1/fc2) across every block, 4 windows per cycle. Scope "photo" skips
+    # clip/audio batches; finetune_blocks restricts the rotation cycle to a block subset
+    # (the likeness recipe is "20-49"). Continuation = point --dit at the last saved
+    # checkpoint and set --finetune_start_window (printed at every save); state-dir resume
+    # is refused.
+    finetune_rotation: int = 0,
+    finetune_rotate_every: int = 1,
+    finetune_rotation_mode: str = "component",
+    finetune_start_window: int = 0,
+    finetune_fused_backward: bool = True,
+    finetune_scope: str = "all",            # "all" | "photo"
+    finetune_blocks: str = None,
+    finetune_master: str = "auto",          # "auto" | "ram" | "disk" — see the mode select
+    finetune_scratch_dir: str = None,       # disk mode's spill dir; default: beside the caches
+    reg_lr_multiplier: float = 0.2,         # FT only: LR nudge for `is_reg` dataset blocks
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
 ):
@@ -2216,6 +2394,126 @@ def train_minimax(
     if train_blocks:
         parse_block_spec(train_blocks)
     validate_output_name(output_name)          # same reason, one epoch later otherwise (#70)
+
+    # ---- rotation full fine-tune: resolve the config and disarm what can't coexist ----
+    # Mirrors krea2/trainer.py's FT coercion block. Everything forced here is forced for a
+    # structural reason, not taste — each line names it.
+    ft_rotation = max(0, int(finetune_rotation or 0))
+    rotator = None
+    ft_subset = None
+    ft_epoch_offset = 0
+    # FT streaming state — defined unconditionally so closures shared with LoRA mode
+    # (e.g. _encode_override) can test it without tripping a NameError.
+    ft_stream = False
+    _ft_ring = {"ring": None}
+    if ft_rotation:
+        from fizgig.utils.capabilities import wait_for_gpu_handoff, wait_for_ram_recovery
+        # Before OUR first CUDA call (the recommender's free-VRAM read inits the context):
+        # a back-to-back fine-tune can start while the previous trainer process is still
+        # tearing down, and the resulting WDDM demotion is sticky — see the guards' docstrings.
+        # Two legs: VRAM (driver view) and RAM (a finished FT hands back ~120 GB of commit).
+        wait_for_gpu_handoff()
+        wait_for_ram_recovery()
+        if resume_state_dir:
+            raise RuntimeError(
+                "[h3-ft] --resume with a state dir is not supported under rotation fine-tune: "
+                "state dirs hold the (inert) LoRA, not base weights. To continue a fine-tune, "
+                "point --dit at the last saved checkpoint and set --finetune_start_window to "
+                "the value printed at that save.")
+        if distill:
+            raise RuntimeError(
+                "[h3-ft] reference distillation is LoRA-only: the teacher pass assumes an "
+                "adapter it can switch off (lora_disabled), which a fine-tune doesn't have. "
+                "Turn one of the two off.")
+        # Component is THE mode (24 Aug): block/numeric windows are gone — they never
+        # matched component's likeness speed and their int8-residency path is dead weight.
+        if not str(finetune_rotation_mode).startswith("comp"):
+            raise RuntimeError(
+                f"[h3-ft] rotation mode {finetune_rotation_mode!r} was removed — component "
+                "is the only H3 fine-tune mode (one matmul across every block per window).")
+        if finetune_scope not in ("all", "photo"):
+            raise RuntimeError(f"[h3-ft] finetune_scope must be 'all' or 'photo', "
+                               f"got {finetune_scope!r}")
+        if finetune_blocks:
+            parse_block_spec(finetune_blocks)   # early typo check; bounds after the load
+        # Continuation numbering (mirrors krea2): a fine-tune continued from a saved
+        # checkpoint restarts local epochs at 1, so `<name>-000001.safetensors` would
+        # silently OVERWRITE the original run's first checkpoint. The --dit file IS the
+        # previous checkpoint — offset every checkpoint filename by its trailing epoch
+        # number (the FINAL file has no number; its count rides in fizgig_ft_epochs_done).
+        _m = re.search(r"-(\d{6})\.safetensors$", os.path.basename(dit_path or ""))
+        if _m:
+            ft_epoch_offset = int(_m.group(1))
+        else:
+            try:
+                from safetensors import safe_open
+                with safe_open(dit_path, framework="pt") as _f:
+                    _md = _f.metadata() or {}
+                ft_epoch_offset = int(_md.get("fizgig_ft_epochs_done", 0))
+            except Exception:
+                ft_epoch_offset = 0
+        if ft_epoch_offset:
+            logger.info("[h3-ft] continuing from %s — checkpoint numbering starts at "
+                        "epoch %d", os.path.basename(dit_path), ft_epoch_offset + 1)
+        # Structural disarms (each mirrors a Krea FT coercion):
+        blocks_to_swap = 0          # the H2D offloader would fight the rotator for qdata
+        # Component windows only coexist with an NF4 trunk: one matmul across every block
+        # is up to 15.4 GB of bf16, which fits beside a ~10.5 GB NF4 base, not the ~21 GB
+        # int8 one. The trunk's ~9.5% NF4 error is training-time only; the SAVED checkpoint
+        # still writes bf16-master -> int8 ConvRot. (The master always dequantizes from the
+        # int8 FILE, so residency never affects its fidelity.)
+        base_quant = "nf4"
+        adaptive_lr = False         # rotation boundaries read as instability to the watcher
+        # photo_blocks is KEPT under FT: it is the likeness intent, honoured with the same
+        # semantics as LoRA mode — photos feed the identity blocks, clips/voice the full
+        # model. Resolution (cycle-tighten vs per-window gating) happens after the dataset
+        # is known, in the rotator construction block.
+        network_type = "lora"       # the network is built inert; LoKR keys would just churn
+        block_limit = 0.0           # movement governors measure LoRA movement
+        adapter_ramp = 0.0
+        ema_decay = 0.0
+        lr_warmup_epochs = 0.0
+        slow_blocks = None
+        # The band multiplier and retirement ANCHORS both work by rewriting the optimizer's
+        # param-group LR at boundary steps — machinery FT doesn't have (fused: no optimizer
+        # object at all; non-fused: rotation rebuilds discard the stashed base LR). Left
+        # armed they crash, not degrade. So: the band multiplier is coerced off, and
+        # retirement is kept but in STOP form only — the skip path owns no optimizer state,
+        # and the stop epochs are snapped to rotation-cycle boundaries below (once the
+        # schedule exists) so every window sees the identical data mix for equal passes
+        # before the mix changes.
+        if abs(float(highnoise_lr_scale or 1.0) - 1.0) > 1e-9:
+            logger.info("[h3-ft] Medium to High LR is a LoRA-mode knob — the fine-tune "
+                        "trains every noise level at the configured rate.")
+        highnoise_lr_scale = 1.0
+        if ((int(visual_stop_epoch or 0) and visual_stop_mode == "anchor")
+                or (int(audio_stop_epoch or 0) and audio_stop_mode == "anchor")):
+            logger.info("[h3-ft] the 'anchor at 10% LR' retirement mode is LoRA-mode "
+                        "machinery — under the fine-tune a retired category stops entirely.")
+        visual_stop_mode = "stop"
+        audio_stop_mode = "stop"
+        # Previews stay ON under FT, but at CYCLE cadence only: they render when every block
+        # has had the same number of passes, via a deactivate-all -> standard preview ->
+        # reactivate bracket (the Sample-every-N box is overridden with a log line below).
+        if finetune_fused_backward:
+            max_grad_norm = 0.0             # grads are consumed per-tensor as they land
+            gradient_accumulation_steps = 1  # nothing left to accumulate
+        logger.info("[h3-ft] ROTATION FINE-TUNE: component windows on an NF4 base — each "
+                    "window is one matmul (qkv/out/fc1/fc2) across every block, so a "
+                    "concept trains at full model depth each epoch. The frozen trunk "
+                    "carries NF4's ~9.5%% error during training (the saved checkpoint "
+                    "is still exact int8, written from the bf16 master). Scope=%s%s%s.",
+                    finetune_scope,
+                    f", blocks {finetune_blocks}" if finetune_blocks else "",
+                    ", fused backward" if finetune_fused_backward else "")
+        # FT has never been run on AMD/ROCm — every measured tier is NVIDIA, and the NF4
+        # rotator leans on bitsandbytes 4-bit, the least-travelled part of the ROCm stack.
+        # Log-only: a power user gets the facts, not a gate. (Twin of the Krea 2 warning.)
+        if getattr(torch.version, "hip", None):
+            logger.warning("[h3-ft] heads-up: fine-tuning is UNTESTED on AMD/ROCm — every "
+                           "measured tier is NVIDIA. The NF4 rotator depends on bitsandbytes "
+                           "4-bit, the least-tested part of the ROCm stack. It may work; if "
+                           "it does (or doesn't), a report on GitHub genuinely helps.")
 
     # ---- dataset (built from the caches the two cache scripts wrote) ----
     shared_epoch = Value("i", 0)
@@ -2443,6 +2741,23 @@ def train_minimax(
         logger.info("[vram] block swap needs gradient checkpointing (autograd would pin swapped "
                     "weights through backward) — forcing it on.")
         use_ckpt = True
+    if ft_rotation:
+        # FT plans its own VRAM: no swap, NF4 base, and
+        # checkpointing ON — the window budget was sized against checkpointed activations.
+        # The int8 file is a hard requirement: the master dequantizes from its codes.
+        if not is_pruned_checkpoint(dit_path):
+            raise RuntimeError(
+                "[h3-ft] rotation fine-tune needs the pre-quantized int8 checkpoint "
+                "(minimax_h3_*_pruned_int8_convrot.safetensors) — this file has no ConvRot "
+                "codes to build the master from.")
+        use_ckpt = True
+        logger.info("[h3-ft] budget: ~10.5 GB NF4 resident + one component of bf16 "
+                    "(worst window fc1, ~%.1f GB); bf16 CPU master ~%.1f GB RAM%s",
+                    (len(parse_block_spec(finetune_blocks, 50)) if finetune_blocks
+                     else 50) * 0.308,
+                    (len(parse_block_spec(finetune_blocks, 50)) if finetune_blocks
+                     else 50) * 0.771,
+                    f" (blocks {finetune_blocks} only)" if finetune_blocks else "")
 
     # ---- previews: encode the prompts BEFORE the DiT loads ----
     # Order matters more here than anywhere else in Fizgig: the Qwen3-VL-32B text encoder is
@@ -2546,6 +2861,434 @@ def train_minimax(
     if use_ckpt:
         dit.enable_gradient_checkpointing()
         logger.info("[vram] gradient checkpointing ON")
+    if ft_rotation:
+        # ---- rotation FT: master + rotator + schedule ----
+        # No LoRA network is built or applied under FT. This is deliberate and H3-specific:
+        # LoRA's apply_to captures each module's BOUND forward at apply time, and the
+        # rotator's class-swap would leave that captured ConvRot forward pointing at freed
+        # int8 codes. Krea builds its network inert; H3 cannot even do that.
+        from fizgig.krea2.rotation import RotationSchedule
+        from fizgig.minimax.rotation_ft import build_bf16_master_h3
+        # The LoRA-path ring (enable_block_swap) must not be armed here — it spans a tail
+        # that includes trainable blocks and would fight the rotator for qdata. FT's OWN
+        # ring (built below when the plan streams) is different: scoped to fully-frozen
+        # out-of-window blocks only, rebuilt at every rotation.
+        assert getattr(dit, "_h2d_offloader", None) is None, \
+            "[h3-ft] H2D offloader present under FT — it would fight the rotator for qdata"
+        _n_blocks = len(dit.blocks)
+        if finetune_blocks:
+            ft_subset = sorted(parse_block_spec(finetune_blocks, _n_blocks))
+            if not ft_subset:
+                raise RuntimeError(f"[h3-ft] finetune_blocks {finetune_blocks!r} selects "
+                                   "no blocks")
+        # Modality routing. Each modality trains only where it belongs: photos -> the
+        # likeness set when ticked (photo gradients into the front trunk are pure prior
+        # damage), voice -> the audio zone (audio gradients OUTSIDE 34-49 measurably
+        # corrupt the visual blocks — A/B, 24 Aug), clips -> full model for now. Two
+        # mechanisms compose:
+        #   cycle tighten — the rotation cycle spans the UNION of what the modalities
+        #       present in the dataset need, so a photos+voice dataset never spends an
+        #       epoch on the front trunk and an audio-only dataset tightens to 34-49
+        #       automatically (the validated A/B config, no Blocks typing required);
+        #   per-batch freeze — a modality whose set is narrower than the span keeps its
+        #       hands off the rest via requires_grad, rebuilt per window in
+        #       _ft_rebind_optimizer (component windows span every block, so a window
+        #       skip cannot express partial confinement — a parameter freeze can, and
+        #       the fused per-tensor hooks simply never fire for a no-grad param).
+        # An explicit --finetune_blocks range wins and disables all routing.
+        try:
+            from fizgig.dataset.image_dataset import VIDEO_EXTENSIONS, is_audio_path
+            _vexts = {e.lower() for e in VIDEO_EXTENSIONS}
+            _mr_paths = [p for ds in group.datasets
+                         for p in getattr(getattr(ds, "datasource", None),
+                                          "image_paths", []) or []]
+            _n_voice_items = sum(1 for p in _mr_paths if is_audio_path(p))
+            _n_clip_items = sum(1 for p in _mr_paths
+                                if os.path.splitext(p)[1].lower() in _vexts)
+            _n_photo_items = len(_mr_paths) - _n_voice_items - _n_clip_items
+        except Exception:
+            # Composition unreadable: assume the widest mix so the cycle never under-spans.
+            _n_voice_items, _n_clip_items, _n_photo_items = 1, (1 if _clip_t > 1 else 0), 1
+        if finetune_scope == "photo":
+            # 'Train on: Photos only' is a dataset FILTER — clips and voice never train,
+            # so they place no demand on the cycle span.
+            _n_voice_items = _n_clip_items = 0
+        if ft_subset is not None and ((photo_blocks and _n_photo_items)
+                                      or (audio_blocks and _n_voice_items)):
+            logger.info("[h3-ft] Blocks is set explicitly (%s) — the explicit range "
+                        "wins over photo/voice routing.", finetune_blocks)
+        _plan_subset, _ft_route = plan_ft_modality_routing(
+            _n_blocks, photo_blocks, audio_blocks,
+            _n_photo_items, _n_voice_items, _n_clip_items, explicit_subset=ft_subset,
+            clip_blocks=clip_blocks)
+        if ft_subset is None and _plan_subset is not None:
+            ft_subset = _plan_subset
+            logger.info("[h3-ft] the cycle tightens to blocks %s — the union of what "
+                        "this dataset actually trains (%s).",
+                        format_block_spec(ft_subset),
+                        ", ".join(filter(None, [
+                            (f"photos -> {photo_blocks}" if photo_blocks
+                             else "photos -> full model") if _n_photo_items else None,
+                            (f"voice -> {audio_blocks}" if audio_blocks
+                             else "voice -> full model") if _n_voice_items else None,
+                            ((f"clips -> {clip_blocks} (restricted)" if clip_blocks
+                              else "clips -> full model")
+                             if _n_clip_items else None)])))
+        if _ft_route["photo"] is not None:
+            logger.info("[h3-ft] Optimised Likeness Learning on a mixed dataset: photo "
+                        "batches freeze every block outside %s — the same photos-"
+                        "protect-the-trunk behaviour as LoRA mode, per parameter.",
+                        photo_blocks)
+        if _ft_route["voice"] is not None:
+            logger.info("[h3-ft] voice routing: audio batches freeze every block "
+                        "outside %s (the voice zone — audio gradients beyond it "
+                        "corrupt the visual blocks).", audio_blocks)
+        if _ft_route["clip"] is not None:
+            logger.info("[h3-ft] video routing: clip batches freeze every block "
+                        "outside %s (Restrict video to likeness blocks).", clip_blocks)
+        # RAM vs disk-backed master. The in-RAM dict is only irreplaceable for TRAINED
+        # tensors; MasterStore reads untouched ones lazily from the int8 file and spills
+        # trained bf16 to scratch — master RAM drops from whole-model to ~one tensor, which
+        # is what fits full-model FT on 64 GB boxes. Auto: disk when the estimated master
+        # would eat >40% of available RAM (so a 128 GB box keeps the field-proven RAM path
+        # for the likeness-sized masters and flips only where it matters).
+        _inc = ("token_refiner",)
+        _n_master_blocks = len(ft_subset) if ft_subset else _n_blocks
+        _est_master_gb = _n_master_blocks * 0.771 + 0.4
+        _mmode = str(finetune_master or "auto").lower()
+        if _mmode == "auto":
+            try:
+                from fizgig.utils.capabilities import _available_ram_gb
+                _avail_ram, _ = _available_ram_gb()
+            except Exception:
+                _avail_ram = None
+            _mmode = ("disk" if (_avail_ram is not None
+                                 and _est_master_gb > 0.40 * _avail_ram) else "ram")
+            logger.info("[ft-master] auto -> %s (master ~%.1f GB vs %.0f GB RAM available)",
+                        _mmode, _est_master_gb,
+                        _avail_ram if _avail_ram is not None else -1)
+        if _mmode == "disk":
+            from fizgig.minimax.rotation_ft import MasterStore
+            _scratch = finetune_scratch_dir
+            if not _scratch:
+                # Default beside the dataset caches — the cache pref lives on a fast local
+                # drive; the OUTPUT dir must not be assumed fast (checkpoints often land on
+                # a big slow volume).
+                _cd = next((getattr(d, "cache_directory", None) for d in group.datasets
+                            if getattr(d, "cache_directory", None)), None)
+                _base = (os.path.dirname(str(_cd).rstrip("/\\")) if _cd else output_dir)
+                _scratch = os.path.join(
+                    _base, f"ft-scratch-{hashlib.sha1(output_name.encode()).hexdigest()[:8]}")
+            # Fresh run = fresh training state: this run's own stale scratch is wiped
+            # (continuation runs carry state via --dit <checkpoint>, never via scratch),
+            # and crashed siblings older than a week are swept.
+            if os.path.isdir(_scratch):
+                shutil.rmtree(_scratch, ignore_errors=True)
+            try:
+                import glob as _glob
+                import time as _time
+                for _old in _glob.glob(os.path.join(os.path.dirname(_scratch),
+                                                    "ft-scratch-*")):
+                    if (os.path.isdir(_old) and _old != _scratch
+                            and _time.time() - os.path.getmtime(_old) > 7 * 86400):
+                        shutil.rmtree(_old, ignore_errors=True)
+            except Exception:
+                pass
+            master = MasterStore(dit_path, _scratch, block_subset=ft_subset,
+                                 include_prefixes=_inc)
+        else:
+            master = build_bf16_master_h3(dit_path, block_subset=ft_subset,
+                                          include_prefixes=_inc)
+        from fizgig.minimax.rotation_ft import (H3NF4Rotator, H3_COMPONENT_PREFIXES,
+                                                H3_COMPONENT_GB_PER_BLOCK,
+                                                plan_h3_ft_windows)
+        # Window plan: how many depth-splits (and whether the frozen out-of-window blocks
+        # must stream from CPU) this card's budget forces. Measured AFTER the NF4 base
+        # loaded, so the trunk it already holds is added back — the plan's model counts
+        # the whole process footprint. FIZGIG_NO_FT_STREAM=1 is the debug kill-switch to
+        # the resident-only plan (the streaming tier then refuses rather than OOMs).
+        #
+        # Clip datasets reserve their activation term BEFORE window sizing: the stills-
+        # calibrated overhead has no idea a 56-frame clip adds ~2.3 GB per step, and the
+        # measured consequence was a 32 GB card picking the resident 4-window plan and
+        # dying at fc1 while the 16/24 GB tiers (forced onto split/streamed plans) passed
+        # the same dataset. The term is per-STEP and plan-independent, so subtracting it
+        # from usable is exact for both the resident cap and the streaming budget.
+        # Gated on _n_clip_items — already zeroed above for finetune_scope == "photo",
+        # whose clip batches `continue` before any forward and so never spike.
+        from fizgig.minimax.rotation_ft import ft_clip_activation_gb
+        _act_gb = _act_margin_gb = 0.0
+        if _n_clip_items:
+            _clip_lt, _clip_smp = _max_clip_act_item(group)
+            _act_gb, _act_margin_gb = ft_clip_activation_gb(_clip_lt, _clip_smp)
+            if _act_gb > 0:
+                logger.info("[h3-ft] clip activations ~%.1f GB + %.1f GB fragmentation "
+                            "margin (%d-latent-frame clips at %.2f MP) reserved before "
+                            "window sizing", _act_gb, _act_margin_gb, _clip_lt, _clip_smp)
+        try:
+            from fizgig.utils.device import plannable_free_vram as _pfv0
+            _usable = _pfv0() + 0.21 * _n_blocks - 1.5      # + resident trunk − reserve
+        except Exception:
+            _usable = 99.0
+        _usable -= _act_gb + _act_margin_gb
+        _windows, ft_stream, _plan_why = plan_h3_ft_windows(
+            _usable, subset=ft_subset, n_blocks=_n_blocks,
+            allow_stream=os.environ.get("FIZGIG_NO_FT_STREAM") != "1")
+        for _line in _plan_why:
+            logger.info("[h3-ft] %s", _line)
+        if _windows is None:
+            _clip_advice = (
+                f" This dataset's clips are the driver (~{_act_gb + _act_margin_gb:.1f} GB "
+                "of the budget is reserved for their activations, which is why the figure "
+                "above reads lower than your card's free VRAM): cutting the clips to the "
+                "56-frame / 2.3 s Gizmo slot, or lowering Target Megapixels, shrinks what "
+                "the plan needs." if _act_gb > 0 else "")
+            raise RuntimeError(
+                f"[h3-ft] ~{_usable:.1f} GB of usable VRAM is below what the rotation "
+                "fine-tune needs even with depth-split windows and streamed frozen blocks. "
+                f"Close other GPU apps, or train a LoRA instead.{_clip_advice}")
+        rotator = H3NF4Rotator(dit.blocks, master, key_prefix="blocks", device=device,
+                               block_subset=ft_subset)
+        _refiner = getattr(dit, "token_refiner", None)
+        if _refiner is not None:
+            # The always-on analogue of Krea's txtfusion: small, text-side, unquantized in
+            # the int8 checkpoint (the NF4 rotator swaps its Params4bit Linears in from the
+            # master; small dense Linears just unfreeze).
+            rotator.activate_always("token_refiner", _refiner)
+        _cycle_n = len(ft_subset) if ft_subset else _n_blocks
+        rot_schedule = RotationSchedule(_cycle_n, active=ft_rotation,
+                                        rotate_every=max(1, int(finetune_rotate_every or 1)),
+                                        mode="component",
+                                        components=_windows,
+                                        start_window=int(finetune_start_window or 0))
+        # Continuation across a different card/plan: the stamped window index only lines
+        # up when the window COUNT matches. A mismatch is survivable (the cycle re-walks
+        # from an approximate position) but must not be silent.
+        if ft_epoch_offset:
+            try:
+                from safetensors import safe_open as _so_w
+                with _so_w(dit_path, framework="pt") as _fw:
+                    _prev_nw = int((_fw.metadata() or {}).get("fizgig_ft_n_windows", 0))
+            except Exception:
+                _prev_nw = 0
+            if _prev_nw and _prev_nw != rot_schedule.n_windows:
+                logger.warning("[h3-ft] this card's plan has %d windows; the checkpoint "
+                               "was trained with %d — the rotation cycle cannot line up "
+                               "exactly across the change, so expect one cycle of mild "
+                               "imbalance while it settles.",
+                               rot_schedule.n_windows, _prev_nw)
+
+        def _ft_want(_epoch):
+            """The rotation spec for an epoch: component window entries, verbatim."""
+            return list(rot_schedule.active_at(_epoch))
+
+        def _ft_window_gb(spec):
+            """Projected bf16 size of a window spec (bare prefixes and depth-splits)."""
+            _span_l = ft_subset if ft_subset else range(_n_blocks)
+            total = 0.0
+            for _e in spec:
+                if isinstance(_e, str):
+                    total += H3_COMPONENT_GB_PER_BLOCK.get(_e, 0.31) * len(list(_span_l))
+                else:
+                    _p, _lo, _hi = _e
+                    _nb = sum(1 for b in _span_l if _lo <= b <= _hi)
+                    total += H3_COMPONENT_GB_PER_BLOCK.get(_p, 0.31) * _nb
+            return total
+
+        _ft_span_set = set(ft_subset) if ft_subset else set(range(_n_blocks))
+
+        def _ft_resident_blocks(spec):
+            """Blocks holding trainable Linears under `spec` — the set that must stay
+            GPU-resident when the frozen remainder streams."""
+            res = set()
+            for _e in spec:
+                if isinstance(_e, str):
+                    res |= _ft_span_set
+                else:
+                    _p, _lo, _hi = _e
+                    res |= {b for b in _ft_span_set if _lo <= b <= _hi}
+            return res
+
+        def _ft_rebuild_ring(spec):
+            """(Re)scope the NF4 H2D ring to the frozen out-of-window blocks.
+
+            Called BEFORE each window activates (setup and every rotation): evicting the
+            streamed set first is what makes room for the incoming bf16 window — the
+            other order OOMs at setup on the 16 GB tier. Every resident block is pushed
+            to the GPU through bind_block_packed_to (idempotent for blocks already
+            there), so this is also the restore path after an override-encode park.
+
+            On a rotation it also DEFRAGS (see below) — on a 16 GB budget the rebuild's
+            allocations otherwise strand ~3.6 GB of unusable segments per boundary.
+
+            ORDER IS LOAD-BEARING, both ways (field, 27 Aug, a 16 GB-sim OOM):
+              * the outgoing residents are unbound to CPU by the new ring's prepare()
+                BEFORE the incoming ones are bound to the GPU. The other order holds
+                BOTH packed sets (~3 GB each at 15 blocks) on the card at once, and that
+                transient is what tips a Windows allocator with no expandable_segments
+                over the edge — it died with only 8.65 GiB live but 5.88 GiB stranded in
+                fragments.
+              * `old` is dropped BEFORE the new ring is built. Releasing the old ring
+                frees its GPU slots but NOT its CPU staging dict, so a lingering local
+                reference doubles the pinned staging (~7 GB -> ~14 GB here) straight
+                through construction. enable_block_swap solved exactly this in
+                model.py; this is the same hazard on the rotation path."""
+            if not ft_stream:
+                return
+            from fizgig.minimax.h3_nf4_h2d_offload import (H3NF4H2DOffloader,
+                                                           bind_block_packed_to)
+            old = _ft_ring["ring"]
+            if old is not None:
+                # RING-AWARE DEFRAG. Ordering fixes alone did not save the 16 GB tier:
+                # it still died at the epoch-2 boundary with only ~8.9 GiB LIVE (exactly
+                # what the window plan predicts) but ~5.5 GiB stranded in segments the
+                # allocator could not reuse. Windows has no expandable_segments, so the
+                # rebuild's fresh allocations never fit the holes the old ones left and
+                # `reserved` climbed ~3.6 GB per rotation until it hit the cap.
+                #
+                # The cure is the one the non-streaming path already uses, expressed
+                # THROUGH the ring instead of around it: park everything first, so for
+                # one moment no block tensor is live and empty_cache can hand whole
+                # segments back, then let the rebuild land contiguously. park_dit_partial
+                # is safe against a live ring by design — it calls unbind_to_cpu() before
+                # its walk, so the streamed blocks' ring VIEWS are never resize_(0)'d
+                # (the sticky 'invalid argument' that once killed step 0). It must
+                # therefore run BEFORE the offloader refs are cleared, or that guard
+                # cannot fire.
+                park_dit_to_cpu(dit)
+                old.release()
+                _ft_ring["ring"] = None
+                dit._h2d_offloader = None
+                for _blk in dit.blocks:
+                    _blk._h2d_offloader = None
+                # Each block's weight still views its old CPU flat until it rebinds
+                # below, so the staging peak stays ~one window's worth instead of two.
+                old = None
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                # The park took the non-block modules (token refiner, embeddings, final
+                # layer) down with it; the blocks come back below, but these have no
+                # other restore path. The refiner is always-on TRAINABLE, and .to() only
+                # repoints .data — Parameter identity and requires_grad survive, and the
+                # optimizer is rebuilt after activate() regardless.
+                for _cname, _child in dit.named_children():
+                    if _cname != "blocks":
+                        _child.to(device)
+            resident = _ft_resident_blocks(spec)
+            streamed = [i for i in range(len(dit.blocks)) if i not in resident]
+            ring = H3NF4H2DOffloader(dit.blocks, streamed, torch.device(device))
+            ring.move_static_weights_to_gpu()
+            # prepare() stages every streamed block into a CPU flat and rebinds it —
+            # which is what releases the OUTGOING residents' GPU packed weights.
+            ring.prepare()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            # ...only now pull the incoming window's blocks onto the card.
+            for i in sorted(resident):
+                bind_block_packed_to(dit.blocks[i], device)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            dit._h2d_offloader = ring
+            for _blk in dit.blocks:
+                _blk._h2d_offloader = ring
+            dit._swap_from = 0      # every block consults the ring; residents no-op inside it
+            _ft_ring["ring"] = ring
+            logger.info("[h3-ft] streaming ring rescoped: %d resident block(s) [%s], "
+                        "%d streamed (~%.1f GB staged in RAM)", len(resident),
+                        format_block_spec(sorted(resident)), len(streamed), ring.staged_gb)
+
+        if rot_schedule.cycle_epochs > max_train_epochs:
+            logger.warning("[h3-ft] a full rotation cycle is %d epochs but the run is only "
+                           "%d — some blocks will never train. Raise Max Epochs to at least "
+                           "the cycle length.", rot_schedule.cycle_epochs, max_train_epochs)
+
+        _first = _ft_want(0)
+        _ft_rebuild_ring(_first)      # evict the streamed set BEFORE the window allocates
+        rotator.activate(_first)
+        logger.info("[h3-ft] cycle: %d component windows %s across %d block(s), "
+                    "%d epoch(s) per cycle; first window -> %s",
+                    rot_schedule.n_windows, list(rot_schedule.components),
+                    _cycle_n, rot_schedule.cycle_epochs, _first)
+        # Save cadence snaps to the cycle too — each save is a full ~21 GB checkpoint, and
+        # per-cycle saves compare like-for-like (every block equally trained). A multiple
+        # of the cycle is respected; anything else snaps UP to the next multiple — the
+        # typed number expressed how SPARSE the user wants 20 GB saves (and, since
+        # previews follow saves, previews), so rounding down to one-per-cycle would give
+        # 2.5x the saves they asked for (field: 10 on a 4-cycle silently became 4).
+        # 0 = final only.
+        _cyc = rot_schedule.cycle_epochs
+        # Max epochs snaps UP to end on a cycle boundary too — an off-cycle total leaves
+        # the FINAL checkpoint (the one people keep) with some components trained one
+        # more pass than others. Start-aware, so a resumed leg still lands on the
+        # original total when that total was cycle-aligned.
+        from fizgig.krea2.rotation import snap_ft_epochs as _snap_ep
+        _snapped_ep = _snap_ep(max_train_epochs, _cyc,
+                               start_window=int(finetune_start_window or 0),
+                               rotate_every=max(1, int(finetune_rotate_every or 1)))
+        if _snapped_ep != max_train_epochs:
+            logger.info("[h3-ft] Max epochs %d would end mid-cycle (%d-epoch cycle) — "
+                        "snapping to %d so the final checkpoint ends with every "
+                        "component evenly trained.",
+                        max_train_epochs, _cyc, _snapped_ep)
+            max_train_epochs = _snapped_ep
+        if save_every_n_epochs and save_every_n_epochs % _cyc != 0:
+            _snapped_save = ((save_every_n_epochs + _cyc - 1) // _cyc) * _cyc
+            logger.info("[h3-ft] Save every %d epoch(s) doesn't line up with the %d-epoch "
+                        "cycle — snapping to %d, the next multiple (each save is a full "
+                        "~21 GB checkpoint, and previews ride along with saves).",
+                        save_every_n_epochs, _cyc, _snapped_save)
+            save_every_n_epochs = _snapped_save
+        # Gate on do_previews, not on prompts+TE. Previews ALSO need a cadence
+        # (sample_every_n_epochs or sample_at_first), so a run with prompts and a TE but
+        # neither flag renders nothing — and this line used to announce previews anyway,
+        # for a whole run. Same class as the vision-rung streaming lie and the compile-"On"
+        # lie: a log that describes intent rather than what was decided. Say which it is.
+        if do_previews:
+            logger.info("[h3-ft] previews follow CHECKPOINT SAVES (every %d epoch(s), plus "
+                        "the final one) — each sample is the rehearsal of a checkpoint you "
+                        "can deploy, overriding Sample-every-N. Rendered via a "
+                        "deactivate/reactivate bracket with the Turbo applied fresh each "
+                        "time.",
+                        save_every_n_epochs if save_every_n_epochs else max_train_epochs)
+        elif sample_prompts and te_path:
+            logger.warning("[h3-ft] previews are OFF for this run: prompts and a text "
+                           "encoder are set, but no sample cadence — set Sample every N "
+                           "epochs (--sample_every_n_epochs), or sample-at-first, and "
+                           "previews will ride the checkpoint saves.")
+
+        # Category retirement lands at cycle boundaries only: every window must see the
+        # identical data mix for equal passes before the mix changes, or late-cycle
+        # windows train on different data than early ones. Snapped UP, never down —
+        # the user asked for at least that much training. Cumulative across pause/resume
+        # (snap_ft_stop): a stop at-or-below the continuation's start epoch means that
+        # category is retired for this whole run — "pause, set the stop to the current
+        # epoch, resume" IS the supported way to finish a mixed run audio- or visual-only.
+        def _snap_stop(_n, _label):
+            _v, _kind = snap_ft_stop(_n, _cyc, ft_epoch_offset, max_train_epochs)
+            if _kind == "past":
+                logger.info("[h3-ft] %s retirement at epoch %d is already behind this run "
+                            "(continuing from epoch %d) — retired from the start.",
+                            _label, _v, ft_epoch_offset)
+            elif _kind == "snapped":
+                logger.info("[h3-ft] %s retirement lands at rotation-cycle boundaries — "
+                            "epoch %d snaps to %d (%d-epoch cycle).",
+                            _label, int(_n or 0), _v, _cyc)
+            elif _kind == "never":
+                logger.warning("[h3-ft] %s retirement at epoch %d is at or past the run's "
+                               "end (epoch %d) — it will never fire.",
+                               _label, _v, max_train_epochs + ft_epoch_offset)
+            return _v
+        visual_stop_epoch = _snap_stop(visual_stop_epoch, "photos & clips")
+        audio_stop_epoch = _snap_stop(audio_stop_epoch, "voice")
+        if train_blocks:
+            logger.info("[h3-ft] Blocks to Train (%s) is LoRA machinery and does nothing "
+                        "under fine-tune — use the FT card's Blocks field "
+                        "(--finetune_blocks) to restrict the rotation cycle instead.",
+                        train_blocks)
+            train_blocks = None
     # AdaLN targeting is per-checkpoint — see the pattern note at the top of this file.
     include_patterns = user_include_patterns or (
         PRUNED_INCLUDE_PATTERNS if dit.pruned_adaln else DEFAULT_INCLUDE_PATTERNS)
@@ -2592,7 +3335,15 @@ def train_minimax(
                                  network_alpha, lokr_factor)
         for _n in _rs_notes:
             logger.warning(f"[resume] {_n} — a resume continues the run it resumes")
-    if network_type == "lokr":
+    if rotator is not None:
+        # Rotation FT: no adapter at all. LoRA's apply_to captures each wrapped module's
+        # BOUND forward, which the rotator's class-swap would orphan — a wrapped window
+        # would call the old ConvRot forward against freed codes. network stays None and
+        # every downstream network consumer branches on the rotator.
+        network = None
+        _n_targeted = 0
+        logger.info("[h3-ft] no LoRA network — the base model's own weights train")
+    elif network_type == "lokr":
         # LoKR (Kronecker) — same mechanism as Krea 2's: module_class swaps the parametrization
         # inside the identical scan/wrap machinery, so include_patterns (adaln exclusion) and the
         # NF4/Linear4bit base compose unchanged. dim/alpha are ignored; factor is the dial.
@@ -2605,45 +3356,57 @@ def train_minimax(
     else:
         network = create_network(None, "lora_unet", 1.0, network_dim, network_alpha, None, [], dit,
                                  include_patterns=include_patterns)
-    network.apply_to(text_encoders=None, unet=dit, apply_text_encoder=False, apply_unet=True)
-    network.requires_grad_(True)
-    network.to(device=device, dtype=dtype)
-    network._network_type = network_type
-    network._lokr_factor = int(lokr_factor)
-    # Dotted module paths for the LyCORIS-standard save (diffusion_model.<path>.lokr_*) — built
-    # from the DiT itself with the same flattening create_modules used, so the reverse mapping is
-    # exact even where module names contain underscores. isinstance covers bnb Linear4bit (an
-    # nn.Linear subclass).
-    network._dotted_names = {
-        f"lora_unet_{name.replace('.', '_')}": name
-        for name, m in dit.named_modules() if isinstance(m, torch.nn.Linear)
-    }
-    _n_targeted = len(network.unet_loras)
-    if network_type == "lokr":
-        logger.info(f"LoKR: {len(network.unet_loras)} modules wrapped (factor {lokr_factor})")
-    else:
-        logger.info(f"LoRA: {len(network.unet_loras)} modules wrapped (dim {network_dim}, alpha {network_alpha})")
+    if network is not None:
+        network.apply_to(text_encoders=None, unet=dit, apply_text_encoder=False, apply_unet=True)
+        network.requires_grad_(True)
+        network.to(device=device, dtype=dtype)
+        network._network_type = network_type
+        network._lokr_factor = int(lokr_factor)
+    if network is not None:
+        # Dotted module paths for the LyCORIS-standard save (diffusion_model.<path>.lokr_*) — built
+        # from the DiT itself with the same flattening create_modules used, so the reverse mapping
+        # is exact even where module names contain underscores. isinstance covers bnb Linear4bit
+        # (an nn.Linear subclass).
+        network._dotted_names = {
+            f"lora_unet_{name.replace('.', '_')}": name
+            for name, m in dit.named_modules() if isinstance(m, torch.nn.Linear)
+        }
+        _n_targeted = len(network.unet_loras)
+        if network_type == "lokr":
+            logger.info(f"LoKR: {len(network.unet_loras)} modules wrapped (factor {lokr_factor})")
+        else:
+            logger.info(f"LoRA: {len(network.unet_loras)} modules wrapped (dim {network_dim}, alpha {network_alpha})")
 
-    # How many Linears did the include_patterns actually TARGET? create_modules matches by class
-    # NAME, so a quantized Linear stand-in that is not on that list is skipped in silence — which
-    # once shipped a run training 58 of 258 modules with no error anywhere. Compare and refuse.
-    import re as _re
-    _targeted = [n for n, m in dit.named_modules()
-                 if isinstance(m, torch.nn.Linear)
-                 and any(_re.search(p, n) for p in include_patterns)]
-    if len(network.unet_loras) < len(_targeted):
-        _kinds = sorted({type(dit.get_submodule(n)).__name__ for n in _targeted})
-        raise RuntimeError(
-            f"only {len(network.unet_loras)} of {len(_targeted)} targeted Linears were wrapped — "
-            f"the network builder matches by class name and one of {_kinds} is not on its list "
-            f"(networks/lora.py, create_modules). Training now would silently learn a fraction "
-            f"of the model.")
-    _n_targeted = len(_targeted)
-    logger.info(f"[network] {len(network.unet_loras)}/{_n_targeted} targeted Linears wrapped")
+        # How many Linears did the include_patterns actually TARGET? create_modules matches by
+        # class NAME, so a quantized Linear stand-in that is not on that list is skipped in
+        # silence — which once shipped a run training 58 of 258 modules with no error anywhere.
+        import re as _re
+        _targeted = [n for n, m in dit.named_modules()
+                     if isinstance(m, torch.nn.Linear)
+                     and any(_re.search(p, n) for p in include_patterns)]
+        if len(network.unet_loras) < len(_targeted):
+            _kinds = sorted({type(dit.get_submodule(n)).__name__ for n in _targeted})
+            raise RuntimeError(
+                f"only {len(network.unet_loras)} of {len(_targeted)} targeted Linears were wrapped — "
+                f"the network builder matches by class name and one of {_kinds} is not on its list "
+                f"(networks/lora.py, create_modules). Training now would silently learn a fraction "
+                f"of the model.")
+        _n_targeted = len(_targeted)
+        logger.info(f"[network] {len(network.unet_loras)}/{_n_targeted} targeted Linears wrapped")
 
     # The preview Turbo LoRA — a nicety, never a run-killer: any failure logs and trains on.
     turbo_net = None
     turbo_adaln = []
+    _ft_turbo_path = None
+    if turbo_lora_path and rotator is not None:
+        # The Turbo must NOT be applied at setup under FT: apply_to captures bound forwards
+        # that the rotator's class-swap would orphan. It is instead applied FRESH at each
+        # cycle-boundary preview (against the fully-deactivated, all-ConvRot model) and
+        # cleanly un-applied before the next window activates.
+        _ft_turbo_path = turbo_lora_path
+        turbo_lora_path = None
+        logger.info("[h3-ft] preview Turbo LoRA deferred — applied per preview, inside the "
+                    "deactivate/reactivate bracket")
     if turbo_lora_path:
         if not os.path.isfile(turbo_lora_path):
             logger.warning(f"[turbo] file not found — previews render without it: "
@@ -2694,7 +3457,35 @@ def train_minimax(
                            f"({type(_ae).__name__}: {_ae}) — samples render silent")
         return _audio_dec_state["dec"]
 
-    params = list(network.get_trainable_params())
+    params = rotator.trainable_params() if rotator is not None \
+        else list(network.get_trainable_params())
+
+    # Per-modality confinement under FT (the routing decided in the rotator block): the
+    # active window's Parameters that each modality must NOT touch, rebuilt per window.
+    # Applied as a per-batch requires_grad freeze around the forward/backward — the fused
+    # per-tensor hooks never fire for a no-grad param, and the non-fused path simply
+    # accumulates nothing. The always-on refiner is never in these lists (its Linears are
+    # not block-indexed): it trains on every modality, matching the validated 34-49 run.
+    _ft_freeze = {"photo": [], "voice": [], "clip": []}
+
+    def _ft_rebuild_freeze():
+        _ft_freeze["photo"] = []
+        _ft_freeze["voice"] = []
+        _ft_freeze["clip"] = []
+        if rotator is None or not (_ft_route["photo"] or _ft_route["voice"]
+                                   or _ft_route["clip"]):
+            return
+        for _k, _lin in rotator._targets(list(rotator.active)):
+            _bi = int(_k.split(".")[1])
+            for _cat, _allowed in _ft_route.items():
+                if _allowed is not None and _bi not in _allowed:
+                    _ft_freeze[_cat].append(_lin.weight)
+        for _cat, _label in (("photo", "photo"), ("voice", "audio"), ("clip", "video")):
+            if _ft_freeze[_cat]:
+                logger.info("[h3-ft] this window: %d of %d tensors frozen on %s batches",
+                            len(_ft_freeze[_cat]), len(params), _label)
+
+    _ft_rebuild_freeze()
 
     # Adaptive LR ignores the Learning Rate box: it starts at the GEOMETRIC MIDPOINT of Min/Max
     # and the watcher owns the LR from there (matches Klein/Krea 2). Two knobs, not three.
@@ -2754,7 +3545,9 @@ def train_minimax(
     # deltas stay ACTIVE in the forward; they just don't learn from photos. Refiners and non-block
     # modules always train (same rule as restrict_patterns_to_blocks — text-side, held constant).
     _photo_mask_params, _photo_used = [], ""
-    if photo_blocks:
+    # LoRA-only: under FT there is no network — the likeness intent was already resolved in
+    # the rotator block (cycle-tighten or per-window gating).
+    if photo_blocks and rotator is None:
         _pb_allowed = set(parse_block_spec(photo_blocks, len(dit.blocks)))
         _mask_ids = set()
         for _lora in network.unet_loras:
@@ -2773,14 +3566,93 @@ def train_minimax(
         else:
             logger.info("[likeness] photo_blocks %s covers every trained block — nothing to "
                         "mask (Blocks to Train already inside it?)", _photo_used)
+    # Voice routing, LoRA mode: audio-only steps update only audio_blocks (the measured
+    # voice zone — audio gradients outside it corrupt the visual blocks). Same mechanism
+    # as the photo mask, keyed on voice-only optimizer windows.
+    _audio_mask_params = []
+    if audio_blocks and rotator is None:
+        _ab_allowed = set(parse_block_spec(audio_blocks, len(dit.blocks)))
+        _amask_ids = set()
+        for _lora in network.unet_loras:
+            _nm = _lora.lora_name
+            if "token_refiner" in _nm:
+                continue
+            _m = re.search(r"blocks_(\d+)_", _nm)
+            if _m and int(_m.group(1)) not in _ab_allowed:
+                _amask_ids.update(id(p) for p in _lora.parameters())
+        _audio_mask_params = [p for p in params if id(p) in _amask_ids]
+        if _audio_mask_params:
+            logger.info("[likeness] voice routing ON — audio steps train blocks %s "
+                        "(+refiners, %d of %d tensors frozen on voice)",
+                        format_block_spec(sorted(_ab_allowed)),
+                        len(_audio_mask_params), len(params))
 
-    # eps_floor_8bit: H3-only. The 8-bit second moment underflows on this model's most structured
-    # tensors and the update degrades to lr*m/eps — measured at ~100x the configured LR, which
-    # presented as melted anatomy at epoch 1. The floor caps that. It is passed here and nowhere
-    # else: Krea 2 has never shown the failure and keeps the library default.
-    optimizer, optimizer_label = create_optimizer(optimizer_type, opt_params, learning_rate,
-                                                  optimizer_args, eps_floor_8bit=True)
-    logger.info(f"optimizer: {optimizer_label} @ lr={learning_rate:.3e}")
+    # FT ignores the Optimizer Type box (Krea parity): Adafactor's factored state is ~10x
+    # smaller than Adam's, which is part of what keeps a window inside 32 GB. Optionally
+    # fused into backward — one single-parameter optimizer per tensor, stepped from a
+    # post-accumulate hook so a gradient is consumed the moment it lands and the whole
+    # window's gradients never coexist.
+    _fused = {"on": False, "opts": {}, "handles": []}
+
+    def _make_ft_optimizer(_params):
+        try:
+            from transformers.optimization import Adafactor
+            return (Adafactor(_params, lr=learning_rate, scale_parameter=False,
+                              relative_step=False, warmup_init=False),
+                    "adafactor (rotation)")
+        except Exception:
+            try:
+                import bitsandbytes as bnb
+                return bnb.optim.AdamW8bit(_params, lr=learning_rate), "adamw8bit (rotation)"
+            except Exception:
+                return torch.optim.AdamW(_params, lr=learning_rate), "adamw (rotation)"
+
+    def _detach_fused():
+        for h in _fused["handles"]:
+            h.remove()
+        _fused["handles"].clear()
+        _fused["opts"].clear()
+        _fused["on"] = False
+
+    def _attach_fused(_params):
+        for h in _fused["handles"]:
+            h.remove()
+        _fused["handles"].clear()
+        _fused["opts"].clear()
+        for p in _params:
+            opt1, _ = _make_ft_optimizer([p])
+            _fused["opts"][p] = opt1
+
+            def _hook(param, _o=None):
+                o = _fused["opts"].get(param)
+                if o is not None:
+                    o.step()
+                    o.zero_grad(set_to_none=True)
+            _fused["handles"].append(p.register_post_accumulate_grad_hook(_hook))
+        _fused["on"] = True
+
+    if rotator is not None:
+        # opt_params is the non-FT path's alias of the FIRST window's param list — under FT
+        # it would pin generation-1 params (3+ GB of bf16) for the whole run after the first
+        # rotation deactivates them (field: peak 23.9 -> 26.8 GB at rotation one, and the
+        # next ~0.6 GB of creep crossed the WDDM spill line at ~9 s/it).
+        opt_params = None
+        if finetune_fused_backward:
+            _attach_fused(params)
+            optimizer, optimizer_label = None, "adafactor (rotation, fused backward)"
+            logger.info("[h3-ft] optimizer-in-backward: each gradient is consumed and freed "
+                        "as it lands (grad clipping and accumulation are off)")
+        else:
+            optimizer, optimizer_label = _make_ft_optimizer(params)
+        logger.info(f"optimizer: {optimizer_label} @ lr={learning_rate:.3e}")
+    else:
+        # eps_floor_8bit: H3-only. The 8-bit second moment underflows on this model's most
+        # structured tensors and the update degrades to lr*m/eps — measured at ~100x the
+        # configured LR, which presented as melted anatomy at epoch 1. The floor caps that. It
+        # is passed here and nowhere else: Krea 2 has never shown the failure.
+        optimizer, optimizer_label = create_optimizer(optimizer_type, opt_params, learning_rate,
+                                                      optimizer_args, eps_floor_8bit=True)
+        logger.info(f"optimizer: {optimizer_label} @ lr={learning_rate:.3e}")
 
     limiter = None
     if block_limit and float(block_limit) > 0:
@@ -2843,6 +3715,55 @@ def train_minimax(
                     "References come from the dataset itself (each image paired with others by "
                     "the caching pass); no image is ever its own reference.",
                     distill_weight, 1.0 - distill_weight)
+
+    # Regularisation images (`is_reg = true` dataset blocks) — a PRIOR ANCHOR, not a subject
+    # (same doctrine as Krea 2 FT): a full fine-tune moves the base weights with no low-rank
+    # bound, so a handful of subjects drifts the model's whole notion of people. Reg stills
+    # pull back, and only work as a fixed reduced-LR nudge. Their lifecycle rides the visual
+    # category for free: they are stills, so likeness routing confines them to the photo
+    # window and 'Finish photos & clips early' stops them with the photos (by design —
+    # once subject-visual pressure stops, the counter-pressure must stop too). LoRA runs
+    # ignore them with a warning: the update is rank-bounded, the problem doesn't exist.
+    reg_keys = set()
+    reg_mult = float(reg_lr_multiplier)
+    if rotator is not None:
+        reg_keys, _subj_keys = _reg_subject_keys(group.datasets)
+        # item_keys are bare image stems — a subject and a reg image sharing a filename
+        # would silently throttle the SUBJECT to reg LR for the whole run. Never punish
+        # the subject: colliding stems leave the reg set (that reg image then trains
+        # unthrottled, which the warning says out loud).
+        _clash = reg_keys & _subj_keys
+        if _clash:
+            reg_keys -= _clash
+            logger.warning(
+                f"[reg] {len(_clash)} filename(s) appear in BOTH the subject and the "
+                f"regularisation folders ({', '.join(sorted(_clash)[:5])}"
+                f"{'...' if len(_clash) > 5 else ''}) — those items train as ordinary "
+                "subjects at full LR. Rename the regularisation copies to re-anchor them.")
+        if reg_keys:
+            logger.info(f"[reg] {len(reg_keys)} regularisation image(s) at x{reg_mult:g} LR "
+                        f"({group.num_train_items - len(reg_keys)} subject items). They follow "
+                        "the photo routing and the visual category's stop epoch.")
+            if len(reg_keys) >= group.num_train_items - len(reg_keys):
+                logger.warning("[reg] regularisation images are at least half the training "
+                               "set — keep them the minority or the multiplier stops reading "
+                               "as a nudge.")
+            if not finetune_fused_backward and max_grad_norm and max_grad_norm > 0:
+                # The boundary clip renormalises the whole gradient to max_grad_norm —
+                # a x0.2 reg gradient and a full subject gradient both land at the SAME
+                # norm, so the multiplier is erased. Fused FT is immune (grad clipping
+                # is structurally off there).
+                logger.warning(
+                    "[reg] gradient clipping is ON (non-fused fine-tune, max_grad_norm="
+                    f"{max_grad_norm:g}) — it renormalises every step to the same norm, "
+                    "which CANCELS the regularisation multiplier. Re-tick 'Free each "
+                    "gradient as it lands' or pass --max_grad_norm 0 for the anchor to "
+                    "work.")
+    elif any(getattr(_ds, "is_reg", False) for _ds in group.datasets):
+        logger.warning("[reg] the dataset config has a regularisation block, but this is a "
+                       "LoRA run — regularisation images are a fine-tune feature and are "
+                       "IGNORED here. They will train as ordinary images at full LR; remove "
+                       "the `is_reg` block from the TOML if that is not what you want.")
 
     collator = _Collator(shared_epoch, group)
     loader = DataLoader(group, batch_size=1, shuffle=True, collate_fn=collator, num_workers=0)
@@ -2958,7 +3879,10 @@ def train_minimax(
     _vis_stop = max(0, int(visual_stop_epoch or 0))
     _aud_stop = max(0, int(audio_stop_epoch or 0))
     _cat_acc = []                        # this window's per-category multipliers
-    _retire_active = bool(_vis_stop or _aud_stop)
+    # Under FT retirement is pure batch-skipping (mode is coerced to "stop" and the epochs
+    # snap to cycle boundaries) — it must NOT arm the LR-composition machinery below, which
+    # rewrites optimizer param groups FT doesn't have (fused: no optimizer object at all).
+    _retire_active = bool(_vis_stop or _aud_stop) and rotator is None
     if _vis_stop:
         logger.info(f"[retire] photos & clips after epoch {_vis_stop}: "
                     + (f"anchored at {ANCHOR_LR_SCALE * 100:.0f}% LR (drift guard, ledger "
@@ -3016,7 +3940,8 @@ def train_minimax(
         return {
             "ss_base_checkpoint": os.path.basename(dit_path),
             "ss_base_quant": _base_mode,
-            "ss_lora_modules": str(len(network.unet_loras)),
+            "ss_lora_modules": (str(len(network.unet_loras)) if network is not None
+                                else "0 (rotation fine-tune)"),
             "ss_targeted_modules": str(_n_targeted),
             "ss_steps": str(global_step),
             "ss_epochs": str(max_train_epochs),
@@ -3091,16 +4016,33 @@ def train_minimax(
         from fizgig.utils.device import plannable_free_vram
         _free = plannable_free_vram() if torch.cuda.is_available() else 0.0
         _park = torch.cuda.is_available() and _free < 17.0     # TE + headroom
+        _ring_was_live = _ft_ring["ring"] is not None
         if _park:
             logger.info(f"[sample override] parking the base on CPU to fit the text encoder "
                         f"({_free:.1f} GB free) — one-off for this prompt")
+            if _ring_was_live:
+                # The ring's GPU slots go too, and its CPU-bound flats must never ride a
+                # dit.to(device) restore (that would materialize the whole base) — so the
+                # ring is torn down here and rebuilt below through its one normal path.
+                _ft_ring["ring"].release()
+                _ft_ring["ring"] = None
+                dit._h2d_offloader = None
+                for _blk in dit.blocks:
+                    _blk._h2d_offloader = None
             park_dit_to_cpu(dit)
             gc.collect()
             torch.cuda.empty_cache()
         try:
             return encode_sample_prompts(te_path, [prompt], device=device, quantize=quantize)
         finally:
-            if _park:
+            if _park and _ring_was_live:
+                for _cname, _child in dit.named_children():
+                    if _cname != "blocks":
+                        _child.to(device)
+                _ft_rebuild_ring(list(rotator.active))   # residents back up, ring re-armed
+                gc.collect()
+                torch.cuda.empty_cache()
+            elif _park:
                 restore_parked_dit(dit, device, n_swap)   # swap-aware: never the whole base
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -3150,6 +4092,13 @@ def train_minimax(
             f"judge an epoch in ComfyUI, then Resume.")
 
     def _render_previews(epoch):
+        # Cumulative numbering, matching the checkpoints: a continuation run passes its
+        # LOCAL epoch here, but the sample tag and the console must carry the run-total
+        # epoch — the gallery's per-epoch tools (visualiser scrub, likeness trend) sort
+        # by this tag, so a resumed leg re-tagging from e000000 collides with the first
+        # leg's samples in the same folder (field, 29 Aug). Rebased once, here, because
+        # everything below uses `epoch` for display and the filename only.
+        epoch = epoch + ft_epoch_offset
         """Render one still per prompt on the RESIDENT training DiT and write them where the
         samples gallery looks. The filename format is the gallery/likeness/Visualiser contract
         (parse_sample_filename in the GUI) — do not change it casually.
@@ -3264,11 +4213,14 @@ def train_minimax(
             # is ~2.5 GB of dead weight during a no-grad preview: park it on CPU for the
             # sampling phase. Costs about a second each way, once per preview epoch.
             if _frames > 1 and torch.cuda.is_available():
-                for _st in optimizer.state.values():
-                    for _k, _v in list(_st.items()):
-                        if torch.is_tensor(_v) and _v.is_cuda:
-                            _st[_k] = _v.to('cpu')
-                            _opt_parked.append((_st, _k))
+                # optimizer is None under FT's fused backward (per-tensor Adafactor whose
+                # factored state is a rounding error) — nothing to park there.
+                if optimizer is not None:
+                    for _st in optimizer.state.values():
+                        for _k, _v in list(_st.items()):
+                            if torch.is_tensor(_v) and _v.is_cuda:
+                                _st[_k] = _v.to('cpu')
+                                _opt_parked.append((_st, _k))
                 if ema is not None:
                     # The fp32 shadow (~1.25 GB at LoKR factor 8) is dead weight during a
                     # no-grad preview — the EMA weights are already swapped INTO the live
@@ -3551,7 +4503,7 @@ def train_minimax(
                     _free_after = _pfv2()
                 except Exception:
                     _free_after = 99.0
-                if _free_after < 4.0:
+                if _free_after < 4.0 and _ft_ring["ring"] is None:
                     logger.info(f"[preview] {_free_after:.1f} GB free after the preview — "
                                 "defragmenting via a full park/restore round-trip so the "
                                 "next training step doesn't fight the fragments.")
@@ -3562,13 +4514,148 @@ def train_minimax(
                     gc.collect()
                     torch.cuda.empty_cache()
                     vram_line("post-defrag")
+                elif _free_after < 4.0:
+                    logger.info(f"[preview] {_free_after:.1f} GB free after the preview — "
+                                "the park/restore defrag is unavailable while the FT "
+                                "streaming ring is live; the next rotation's ring rebuild "
+                                "re-lands the resident set instead.")
             vram_line("finally-done")
+
+    def _ft_rebind_optimizer():
+        """Rebuild the optimizer wiring for the CURRENT window params. Must run after ANY
+        re-activation — rotation or preview bracket — because activation creates fresh
+        Parameter objects: per-tensor fused optimizers keyed on the old objects would keep
+        3+ GB of zombie weights alive while the new params accumulate un-stepped, un-freed
+        gradients (field bug: 29.5 GB peak on a 24 GB window, and the window silently not
+        training after an epoch-0 preview)."""
+        nonlocal params, optimizer
+        params = rotator.trainable_params()
+        if finetune_fused_backward:
+            _attach_fused(params)
+        else:
+            optimizer, _ = _make_ft_optimizer(params)
+        # Fresh Parameter objects -> the modality freeze lists must be rebuilt too, or
+        # they'd freeze the deactivated window's orphans and leave the live one open.
+        _ft_rebuild_freeze()
+
+    def _ft_render_previews(n):
+        """Cycle-boundary preview under rotation FT: deactivate the whole window so the model
+        is a consistent all-ConvRot checkpoint (the master holds every trained weight —
+        reactivation-exactness is test-pinned), apply the Turbo FRESH against it, run the
+        bog-standard preview, then un-apply the Turbo completely and reactivate. The un-apply
+        pops each wrapped module's instance `forward` — apply_to deleted the module ref but
+        the bound org_forward's __self__ IS the module, and the pre-Turbo forward here is
+        always the class-level one, so popping restores it exactly."""
+        nonlocal turbo_net, turbo_adaln, params, optimizer
+        import gc as _gc
+        _act = list(rotator.active)
+        if _act:
+            rotator.deactivate(_act)
+            # Drop every optimizer reference to the window's now-orphaned bf16 Parameters —
+            # the fused opts dict is KEYED on them, so without this they stay VRAM-resident
+            # (~6 GB at 8 blocks) through the whole preview. Measured: the bracket saw
+            # 3.7-4.2 GB free on an otherwise-clean card with them pinned. The next epoch's
+            # rotation activates + rebinds through the one normal path, exactly as it does
+            # for the deferred re-activation below.
+            params = None
+            if _fused["on"]:
+                _detach_fused()
+            else:
+                optimizer = None
+            _gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        try:
+            # Windows has no expandable_segments, so the activate/deactivate churn (worst at
+            # 8-block windows) fragments the allocator — a bracket preview measured 3.9 GB
+            # free and spilled to 50 s/step. A PARTIAL park can't help: sampling runs the
+            # DiT, so parked blocks crash the render (field, RuntimeError at 56 and 22
+            # frames). The real cure is a full defrag round-trip: park the ENTIRE base to
+            # the CPU arena, hand every emptied segment back to the driver, then restore —
+            # the re-upload lands contiguously. Seconds per preview, both halves are the
+            # long-proven park machinery.
+            try:
+                from fizgig.utils.device import plannable_free_vram
+                _free_now = plannable_free_vram()
+            except Exception:
+                _free_now = 99.0
+            if _free_now < 8.0 and _ft_ring["ring"] is not None:
+                # Never park/restore over a live ring: the restore's dit.to(device) would
+                # push the streamed CPU flats up and materialize the whole base. The ring
+                # itself keeps residency low; the render proceeds with what's free.
+                logger.info("[h3-ft] %.1f GB free before the bracket preview — the "
+                            "park/restore defrag is unavailable while the streaming ring "
+                            "is live; rendering with what's free.", _free_now)
+            elif _free_now < 8.0:
+                logger.info("[h3-ft] %.1f GB free before the bracket preview — defragmenting "
+                            "via a full park/restore round-trip.", _free_now)
+                import gc as _gc3
+                park_dit_to_cpu(dit)
+                _gc3.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                restore_parked_dit(dit, device, 0)
+                _gc3.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                try:
+                    _free_now = plannable_free_vram()
+                    logger.info("[h3-ft] post-defrag: %.1f GB free", _free_now)
+                except Exception:
+                    pass
+            # Still tight after the defrag = the shortage is TOTAL VRAM (usually other apps
+            # holding the card), not fragmentation. Spilling turns a 5 s preview step into
+            # 60 s — degrade THIS render to a shorter clip instead, and say so. Temporary:
+            # unlike the crash ladder, the next preview tries the full length again.
+            # Threshold from measured runs: 5.7 GB free rendered full-length fast; 4.1 GB
+            # spilled to 61 s/step. 5.0 splits them.
+            _frames_held = None
+            if _free_now < 5.0 and int(_clip_state.get("frames", 1) or 1) > 22:
+                _frames_held = _clip_state["frames"]
+                _clip_state["frames"] = 22
+                logger.info("[h3-ft] %.1f GB free is not enough for a %d-frame preview "
+                            "without spilling — rendering 22 frames this time. Full length "
+                            "returns automatically when more VRAM is free (closing other "
+                            "GPU apps can help).", _free_now, _frames_held)
+            if _ft_turbo_path:
+                turbo_net, turbo_adaln = load_preview_turbo(dit, _ft_turbo_path,
+                                                            turbo_lora_strength)
+            try:
+                _render_previews(n)
+            finally:
+                if _frames_held is not None:
+                    _clip_state["frames"] = _frames_held
+                if turbo_net is not None:
+                    for _l in turbo_net.unet_loras:
+                        _m = getattr(getattr(_l, "org_forward", None), "__self__", None)
+                        if _m is not None:
+                            _m.__dict__.pop("forward", None)
+                    turbo_net.to("cpu")
+                turbo_net, turbo_adaln = None, []
+                _gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        finally:
+            # Deliberately NO re-activation here. The model stays deactivated (fully
+            # consistent — the master holds everything) and the NEXT epoch's rotation
+            # check sees active=[] != wanted and activates + rebinds through the normal
+            # path. Two wins: one activation code path, and on a FAILED preview the
+            # activation happens only after the exception (whose traceback pins the
+            # render's tensors) has been fully released — re-activating inside the
+            # exception's lifetime OOM'd in the field (30.1 GB at the activate).
+            import gc as _gc2
+            _gc2.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     # ---- epoch loop ----
     loss_recorder = LossRecorder()
     if do_previews and sample_at_first and start_epoch == 0:
         try:
-            _render_previews(0)
+            if rotator is not None:
+                _ft_render_previews(0)
+            else:
+                _render_previews(0)
         except Exception as _e0:
             if _clip_state["frames"] > 1:
                 _was = _clip_state["frames"]
@@ -3595,6 +4682,7 @@ def train_minimax(
 
     _pending = [0]                       # backwards accumulated since the last optimizer step
     _window_photo_only = [True]          # likeness mask: does this window hold ONLY photo steps?
+    _window_voice_only = [True]          # voice-routing mask: ONLY audio steps in this window?
 
     def _boundary_step():
         """The optimizer step at a window boundary — shared by live iterations and by the
@@ -3621,6 +4709,12 @@ def train_minimax(
             for _p in _photo_mask_params:
                 _p.grad = None
         _window_photo_only[0] = True
+        # Voice routing, same rule: a voice-only window drops the out-of-zone params' grads
+        # (mixed windows mask nothing — conservative, exact at the default accumulation of 1).
+        if _audio_mask_params and _window_voice_only[0]:
+            for _p in _audio_mask_params:
+                _p.grad = None
+        _window_voice_only[0] = True
         if max_grad_norm and max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
         _bm = (sum(_band_acc) / len(_band_acc)) if _band_acc else 1.0
@@ -3637,8 +4731,9 @@ def train_minimax(
                 _g["lr"] = _g["_warmup_base_lr"] * _wf * _rm * _phase_lr * _bm * _cm
         if limiter is not None:
             limiter.pre_step()           # snapshot BEFORE the optimizer moves anything
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+        if optimizer is not None:        # None under FT's fused backward (per-tensor hooks)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
         if limiter is not None:
             limiter.step()
         if ramp is not None:
@@ -3649,7 +4744,82 @@ def train_minimax(
 
     for epoch in range(start_epoch, max_train_epochs):
         shared_epoch.value = epoch + 1
-        network.train()
+        if network is not None:
+            network.train()
+        if rotator is not None:
+            # Rotate BEFORE the epoch's first step. The optimizer (or the fused per-tensor
+            # set) is rebuilt from scratch each window — the outgoing window's Adafactor
+            # state is meaningless to the incoming one — and `params` is REASSIGNED so
+            # clip_grad_norm_ and the boundary step see the live window, not the old one.
+            _want = _ft_want(epoch)
+            if _want != list(rotator.active):
+                # Decomposed rotate_to (deactivate -> activate is exactly what it does) so a
+                # defrag can run at the one moment it helps: after the old window frees,
+                # before the new one allocates. Windows torch has no expandable_segments, and
+                # the ~6 GB in/out churn of every rotation fragments the reserve a little
+                # each epoch — empty_cache only returns fully-EMPTY segments — until driver
+                # memory hits the WDDM ceiling and steps silently crawl (field: a clean
+                # first run pinned at 32.0/32.6 GB by epochs 6-7). The full park/restore
+                # round-trip re-lands everything contiguously; seconds, and only when the
+                # post-deactivate free is too tight for the incoming window.
+                _act_now = list(rotator.active)
+                if _act_now:
+                    # Release the optimizer's grip BEFORE deactivating — the fused opts are
+                    # KEYED on the outgoing window's Parameters, and _ft_rebind_optimizer
+                    # only runs after the next window activates, so without this every
+                    # rotation held BOTH windows at once. Block mode squeaked under the
+                    # ceiling; full-model component mode did not (field: fc1's 15.4 GB
+                    # stayed pinned — orphaned params are invisible to the park, so the
+                    # defrag read 3.4 GB free and fc2's activation OOMed).
+                    params = None
+                    if _fused["on"]:
+                        _detach_fused()
+                    else:
+                        optimizer = None
+                    rotator.deactivate(_act_now)
+                    import gc as _gcr
+                    _gcr.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                try:
+                    from fizgig.utils.device import plannable_free_vram as _pfv
+                    _free_r = _pfv()
+                except Exception:
+                    _free_r = 99.0
+                # Component window: projected bf16 size of the incoming spec — depth-split
+                # entries count only their slice, so a 17-block fc1 chunk no longer reads
+                # as the full-depth 15.4 GB.
+                _need_r = _ft_window_gb(_want) + 2.0
+                if _free_r < _need_r and not ft_stream:
+                    logger.info("[h3-ft] %.1f GB free before activating the next window "
+                                "(needs ~%.1f) — defragmenting via a full park/restore "
+                                "round-trip.", _free_r, _need_r)
+                    park_dit_to_cpu(dit)
+                    import gc as _gcr2
+                    _gcr2.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    restore_parked_dit(dit, device, 0)
+                    try:
+                        logger.info("[h3-ft] post-defrag: %.1f GB free", _pfv())
+                    except Exception:
+                        pass
+                elif _free_r < _need_r:
+                    # Streaming: the ring rebuild below evicts the streamed set before the
+                    # window allocates — that IS the defrag here. A park/restore round-trip
+                    # would push the ring's CPU-bound flats through dit.to(device) and
+                    # materialize the whole base, so it never runs while the ring is live.
+                    logger.info("[h3-ft] %.1f GB free before the next window (needs ~%.1f) "
+                                "— the streaming ring rebuild reclaims the streamed set "
+                                "first.", _free_r, _need_r)
+                _ft_rebuild_ring(_want)   # evict the outgoing/streamed set, then activate
+                rotator.activate(_want)
+                if torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats()   # per-window peak (logged per epoch)
+                _ft_rebind_optimizer()
+                logger.info("[h3-ft] epoch %d: window -> %s (%d trainable tensors)",
+                            epoch + 1, _want, len(params))
+        _epoch_trained = 0
         _distill_acc[:] = [0.0, 0.0, 0]
         # Identity-first: teacher-only while inside phase 1, photos-only after. Phase 2 takes the
         # ORDINARY loss path, so it never runs the teacher forward at all — half the compute of a
@@ -3678,11 +4848,16 @@ def train_minimax(
             _is_voice = bool(batch.get("audio_only") is not None and batch["audio_only"].any())
             if not _is_photo or _is_voice:
                 _window_photo_only[0] = False
+            if not _is_voice:
+                _window_voice_only[0] = False
             # Per-category retirement: past its stop epoch a category is either ANCHORED
             # (trains on at ANCHOR_LR_SCALE — rehearsal against drift on the shared adapters,
             # ledger stays live) or STOPPED (skipped outright — faster epochs, blind).
-            _retired = ((not _is_voice and _vis_stop and (epoch + 1) > _vis_stop)
-                        or (_is_voice and _aud_stop and (epoch + 1) > _aud_stop))
+            # The comparison is CUMULATIVE: ft_epoch_offset re-bases a continuation's local
+            # epochs onto the original run's calendar (0 everywhere else, incl. LoRA resume,
+            # whose restored numbering is already cumulative).
+            _retired = ((not _is_voice and _vis_stop and (epoch + 1 + ft_epoch_offset) > _vis_stop)
+                        or (_is_voice and _aud_stop and (epoch + 1 + ft_epoch_offset) > _aud_stop))
             _ret_mode = audio_stop_mode if _is_voice else visual_stop_mode
             if _retired and _ret_mode != "anchor":
                 # No forward, no loss, no record — but a boundary landing here still owes any
@@ -3692,6 +4867,29 @@ def train_minimax(
                 global_step += 1
                 progress_bar.update(1)
                 continue
+            if rotator is not None and finetune_scope == "photo" and (not _is_photo or _is_voice):
+                # Photo-scope FT: clip/voice batches are skipped outright (same shape as the
+                # retirement skip — a full clip forward at 4.5k tokens would be pure waste).
+                # Fairness holds across the cycle: windows advance per epoch and every epoch
+                # sees the identical photo subset.
+                if (i + 1) % _accum_n == 0 or (i + 1) >= steps_per_epoch:
+                    _boundary_step()
+                global_step += 1
+                progress_bar.update(1)
+                continue
+            # Modality routing (FT): freeze the blocks this batch's modality must not touch
+            # for the span of its forward+backward — a component window spans every block,
+            # so this per-parameter freeze is the only way to express "photos stay inside
+            # 20-49, voice stays inside 34-49, clips inside clip_blocks when restricted".
+            # The fused per-tensor hooks never fire for a no-grad param; restored right
+            # after the backward (any exception here is fatal to the run anyway).
+            _frz = []
+            if rotator is not None:
+                _frz = (_ft_freeze["voice"] if _is_voice
+                        else (_ft_freeze["photo"] if _is_photo
+                              else _ft_freeze["clip"]))
+                for _p in _frz:
+                    _p.requires_grad_(False)
             if (distill and (_teacher_phase or not _p1_epochs) and "ref_hidden_states" in batch
                     and not _is_voice):
                 # `not _is_voice`: compute_distill_loss packs still-sized audio noise (4 rows)
@@ -3748,38 +4946,87 @@ def train_minimax(
             # Appended for EVERY executed backward (distill path included — a retired visual
             # category's distillation steps anchor exactly like its plain ones).
             _cat_acc.append(ANCHOR_LR_SCALE if _retired else 1.0)
+            # Regularisation images (FT): scale THIS step's gradient down to the nudge —
+            # loss scaling, because the fused per-tensor update has no optimizer object
+            # whose LR could be rewritten. The RAW loss is what the ledgers record below,
+            # so avr_loss and the drift lines see unscaled numbers (Krea 2 FT parity).
+            #
+            # Honesty note (review, 26 Aug — and the exception to _boundary_step's
+            # "never the loss" doctrine): Adafactor's second-moment normalisation
+            # partially cancels a constant gradient scale, so x0.2 realises as roughly
+            # x0.2-0.25 ONLY while reg steps are the minority feeding each tensor's EMA
+            # (the [reg] majority warning above is that condition). The very first step
+            # after each rotation rebind is fully UNthrottled (fresh state: beta2t=0
+            # makes the update scale-invariant) — ~one stray full-LR reg step per
+            # rotation at typical reg ratios. Krea 2 FT has identical behaviour; the
+            # doctrine comment stays right for everything that CAN ride param-group LR.
+            _bk = loss
+            if reg_keys and any(str(k) in reg_keys for k in (batch.get("item_keys") or ())):
+                _bk = loss * reg_mult
             # Divide so the accumulated gradient is the MEAN over the window, not the sum —
             # otherwise the effective LR scales with the accumulation count.
-            (loss / _accum_n if _accum_n > 1 else loss).backward()
+            (_bk / _accum_n if _accum_n > 1 else _bk).backward()
+            for _p in _frz:
+                _p.requires_grad_(True)
             _pending[0] += 1
             # Step on the window boundary, and always on the last batch of the epoch so a
             # partial tail window is never silently discarded.
             if (i + 1) % _accum_n == 0 or (i + 1) >= steps_per_epoch:
                 _boundary_step()
             global_step += 1
+            _epoch_trained += 1
             loss_recorder.add(epoch=epoch, step=i, loss=loss.item())
             progress_bar.set_postfix(avr_loss=f"{loss_recorder.moving_average:.4f}", refresh=False)
             progress_bar.update(1)
 
-        logger.info(f"epoch {epoch + 1}/{max_train_epochs} done — avr_loss {loss_recorder.moving_average:.4f}")
+        # The last step's `loss` keeps its whole autograd graph alive across the epoch
+        # boundary, and each leaf AccumulateGrad node holds a STRONG ref to its Parameter —
+        # under rotation FT that pins the entire deactivated window (~6 GB of orphaned bf16
+        # at 8 blocks, census-confirmed) straight through the bracket preview.
+        loss = batch = None
+        # Cumulative across pause/resume, matching checkpoint numbering — a resumed run
+        # logging "epoch 1/95" beside checkpoints named -000006 read as a numbering bug
+        # (field, 29 Aug). Offset is 0 on a fresh run, so nothing changes there.
+        logger.info(f"epoch {epoch + 1 + ft_epoch_offset}/{max_train_epochs + ft_epoch_offset} "
+                    f"done — avr_loss {loss_recorder.moving_average:.4f}")
+        if rotator is not None and torch.cuda.is_available():
+            # Per-window peak, reset at each rotation — the measured record the window
+            # planner's constants are calibrated from. GB (1e9), NOT GiB: this line used
+            # to divide by 2**30 while every planner constant was in GB, and the 7% gap
+            # silently put _FT_OVERHEAD_GB a full GB too low (found 27 Aug, field gate).
+            logger.info("[h3-ft] window peak VRAM: %.1f GB",
+                        torch.cuda.max_memory_allocated() / 1e9)
+        if rotator is not None and _epoch_trained == 0:
+            if finetune_scope == "photo":
+                raise RuntimeError(
+                    "[h3-ft] photo-scope fine-tune trained ZERO steps this epoch — the "
+                    "dataset has no photos (clips/voice only). Use --finetune_scope all, "
+                    "or add photos.")
+            if _vis_stop or _aud_stop:
+                raise RuntimeError(
+                    "[h3-ft] category retirement left this epoch with nothing to train — "
+                    "every batch belongs to a retired category. Lower the stop epoch, or "
+                    "end the run at it with Max Epochs.")
         # Optimizer sanity: lora_up starts at zero and an Adam-family step is bounded by ~lr, so
         # after N steps no element can honestly exceed ~3*N*lr. When the 8-bit second moment
         # misbehaves (v quantized to zero -> update degrades to lr*m/eps) the drift blows through
         # that bound by orders of magnitude — caught here per epoch instead of per melted preview.
-        try:
-            _lr_now = optimizer.param_groups[0]["lr"]
-            _drift = max((float(l.lora_up.weight.detach().abs().max())
-                          for l in network.unet_loras if hasattr(l, "lora_up")), default=0.0)
-            _bound = 3.0 * global_step * _lr_now
-            if _drift > _bound:
-                logger.warning(f"[drift] max|lora_up|={_drift:.4f} EXCEEDS the Adam bound "
-                               f"~{_bound:.4f} ({global_step} steps @ lr={_lr_now:.1e}) — the "
-                               f"optimizer is stepping far beyond the configured LR (8-bit "
-                               f"state underflow?). Expect degraded samples.")
-            else:
-                logger.info(f"[drift] max|lora_up|={_drift:.4f} (bound ~{_bound:.4f} — healthy)")
-        except Exception:
-            pass
+        # LoRA-specific by construction — FT's movement signal is the per-window write-back log.
+        if rotator is None:
+            try:
+                _lr_now = optimizer.param_groups[0]["lr"]
+                _drift = max((float(l.lora_up.weight.detach().abs().max())
+                              for l in network.unet_loras if hasattr(l, "lora_up")), default=0.0)
+                _bound = 3.0 * global_step * _lr_now
+                if _drift > _bound:
+                    logger.warning(f"[drift] max|lora_up|={_drift:.4f} EXCEEDS the Adam bound "
+                                   f"~{_bound:.4f} ({global_step} steps @ lr={_lr_now:.1e}) — the "
+                                   f"optimizer is stepping far beyond the configured LR (8-bit "
+                                   f"state underflow?). Expect degraded samples.")
+                else:
+                    logger.info(f"[drift] max|lora_up|={_drift:.4f} (bound ~{_bound:.4f} — healthy)")
+            except Exception:
+                pass
         if _p1_epochs and not _teacher_phase and distill:
             logger.info(f"[distill] photos only (identity-first phase 2) — the teacher was "
                         f"dropped after epoch {_p1_epochs}.")
@@ -3820,17 +5067,36 @@ def train_minimax(
             logger.info(ramp.epoch_report())
         if adaptive is not None:
             adaptive.epoch_boundary(epoch, loss_recorder.moving_average, network, optimizer)
+        ft_ckpt_saved_this_epoch = False
         if save_every_n_epochs and (epoch + 1) % save_every_n_epochs == 0 and (epoch + 1) < max_train_epochs:
             ckpt = os.path.join(output_dir, f"{output_name}-{epoch + 1:06d}.safetensors")
-            if ema is not None:
-                ema.swap_in()
-            try:
-                _save_lora(network, ckpt, network_dim, network_alpha, dtype, _meta())
-            finally:
+            if rotator is not None:
+                # The full checkpoint IS the resumable state under FT (the continuation is
+                # --dit <this file> + the printed start_window). ~21 GB per save.
+                from fizgig.minimax.rotation_ft import save_full_checkpoint_h3
+                ckpt = os.path.join(output_dir,
+                                    f"{output_name}-{epoch + 1 + ft_epoch_offset:06d}.safetensors")
+                _next_w = rot_schedule.window_at(epoch + 1)
+                save_full_checkpoint_h3(rotator, dit_path, ckpt, extra_metadata={
+                    **_meta(), "fizgig_next_start_window": str(_next_w),
+                    "fizgig_ft_n_windows": str(rot_schedule.n_windows),
+                    "fizgig_ft_epochs_done": str(epoch + 1 + ft_epoch_offset)})
+                ft_ckpt_saved_this_epoch = True
+                logger.info("[h3-ft] to continue from this checkpoint: --dit %s "
+                            "--finetune_start_window %d", os.path.basename(ckpt), _next_w)
+            else:
                 if ema is not None:
-                    ema.swap_out()
+                    ema.swap_in()
+                try:
+                    _save_lora(network, ckpt, network_dim, network_alpha, dtype, _meta())
+                finally:
+                    if ema is not None:
+                        ema.swap_out()
             logger.info(f"saved {ckpt}")
-            if save_state:
+            if save_state and rotator is not None:
+                logger.info("[h3-ft] state dirs are skipped — the full checkpoint is the "
+                            "state; continue with --dit + --finetune_start_window.")
+            if save_state and rotator is None:
                 # Non-fatal (see the krea2 twin): a failed convenience save must never kill a
                 # run whose checkpoint already wrote. Truly-full disks fail the next epoch
                 # CHECKPOINT, and that one is rightly fatal.
@@ -3845,14 +5111,31 @@ def train_minimax(
                                  "dashboard). Training continues; this epoch has no resume "
                                  "point. The epoch checkpoint itself already saved.",
                                  type(_se).__name__, _se)
-        if do_previews and sample_every_n_epochs and (epoch + 1) % sample_every_n_epochs == 0:
+        # Under FT previews FOLLOW CHECKPOINT SAVES (Peter, 24 Aug): one preview per saved
+        # checkpoint, so the sample gallery maps 1:1 onto files you can actually deploy.
+        # Saves only land on cycle boundaries, so the old per-cycle equal-training honesty
+        # is preserved; a sparser save cadence (a multiple of the cycle) now previews
+        # sparser too, and Save-every 0 (final only) previews only at the end. The final
+        # epoch always previews — its checkpoint is the final save after the loop.
+        # Sample-every-N still doesn't apply; the Samples tab still gates previews on/off.
+        _ft_saved_this_epoch = bool(save_every_n_epochs
+                                    and (epoch + 1) % save_every_n_epochs == 0
+                                    and (epoch + 1) < max_train_epochs)
+        _prev_due = ((_ft_saved_this_epoch or (epoch + 1) >= max_train_epochs)
+                     if rotator is not None
+                     else bool(sample_every_n_epochs
+                               and (epoch + 1) % sample_every_n_epochs == 0))
+        if do_previews and _prev_due:
             try:
                 # Previews render on the EMA weights when EMA is on — a preview must show what
                 # the saved checkpoint will look like, not the raw zigzag the EMA exists to hide.
                 if ema is not None:
                     ema.swap_in()
                 try:
-                    _render_previews(epoch + 1)
+                    if rotator is not None:
+                        _ft_render_previews(epoch + 1)
+                    else:
+                        _render_previews(epoch + 1)
                     vram_line("post-preview")
                 finally:
                     if ema is not None:
@@ -3878,19 +5161,48 @@ def train_minimax(
                         f"({'CUDA OOM' if _oom else type(_pe).__name__}); disabling previews for "
                         f"the rest of the run. Training continues and LoRAs still save normally.")
                     do_previews = False
-            network.train()
+            if network is not None:
+                network.train()
         if os.path.exists(pause_flag):
             # Pause = graceful epoch-end exit with FULL state (regardless of the save-state
             # toggles), so Resume continues exactly here — matching Klein/Krea 2. The final
             # LoRA is deliberately NOT written; Resume (or the natural run end) writes it.
-            try:
-                _save_training_state(output_dir, output_name, network, optimizer,
-                                     epoch=epoch + 1, global_step=global_step,
-                                     dtype=dtype, extra=_state_extra(), ema=ema)
-            except Exception as _se:
-                logger.error("[pause] state save FAILED (%s: %s) — there is NO new resume point "
-                             "for this pause. Free disk space (RunPod: dashboard quota) and "
-                             "resume from the previous saved state.", type(_se).__name__, _se)
+            # Under FT the "state" is a full checkpoint + the printed continuation command
+            # (state-dir resume is structurally impossible — the LoRA is absent and the
+            # optimizer may be per-tensor hooks).
+            if rotator is not None:
+                from fizgig.minimax.rotation_ft import save_full_checkpoint_h3
+                _pp = os.path.join(output_dir,
+                                   f"{output_name}-{epoch + 1 + ft_epoch_offset:06d}.safetensors")
+                _next_w = rot_schedule.window_at(epoch + 1)
+                try:
+                    # ~21 GB and minutes per save: if the cadence just wrote this epoch's
+                    # checkpoint above, don't rewrite the identical file — same dedupe as the
+                    # LoRA path's state_saved_this_epoch.
+                    if not ft_ckpt_saved_this_epoch:
+                        save_full_checkpoint_h3(rotator, dit_path, _pp, extra_metadata={
+                            **_meta(), "fizgig_next_start_window": str(_next_w),
+                            "fizgig_ft_n_windows": str(rot_schedule.n_windows),
+                            "fizgig_ft_epochs_done": str(epoch + 1 + ft_epoch_offset)})
+                    logger.info("[h3-ft] paused. Continue with: --dit %s "
+                                "--finetune_start_window %d", os.path.basename(_pp), _next_w)
+                    # The checkpoint now carries everything — the scratch is superseded.
+                    from fizgig.minimax.rotation_ft import MasterStore as _MS
+                    if isinstance(rotator.master, _MS):
+                        rotator.master.cleanup()
+                except Exception as _se:
+                    logger.error("[pause] checkpoint save FAILED (%s: %s) — there is NO new "
+                                 "continuation point for this pause.", type(_se).__name__, _se)
+            else:
+                try:
+                    _save_training_state(output_dir, output_name, network, optimizer,
+                                         epoch=epoch + 1, global_step=global_step,
+                                         dtype=dtype, extra=_state_extra(), ema=ema)
+                except Exception as _se:
+                    logger.error("[pause] state save FAILED (%s: %s) — there is NO new resume "
+                                 "point for this pause. Free disk space (RunPod: dashboard "
+                                 "quota) and resume from the previous saved state.",
+                                 type(_se).__name__, _se)
             try:
                 os.remove(pause_flag)
             except OSError:
@@ -3901,6 +5213,26 @@ def train_minimax(
 
     progress_bar.close()
     final = os.path.join(output_dir, f"{output_name}.safetensors")
+    if rotator is not None:
+        from fizgig.minimax.rotation_ft import save_full_checkpoint_h3
+        _next_w = rot_schedule.window_at(max_train_epochs)
+        save_full_checkpoint_h3(rotator, dit_path, final, extra_metadata={
+            **_meta(), "fizgig_next_start_window": str(_next_w),
+            "fizgig_ft_n_windows": str(rot_schedule.n_windows),
+            "fizgig_ft_epochs_done": str(max_train_epochs + ft_epoch_offset)})
+        logger.info("[h3-ft] saved final fine-tuned checkpoint: %s — test it in ComfyUI as a "
+                    "normal H3 model, or distil it to a LoRA with Checkpoint to LoRA. To train "
+                    "it further: --dit %s --finetune_start_window %d",
+                    final, os.path.basename(final), _next_w)
+        # The final checkpoint supersedes the scratch — reclaim the disk.
+        from fizgig.minimax.rotation_ft import MasterStore as _MS
+        if isinstance(rotator.master, _MS):
+            rotator.master.cleanup()
+        try:
+            os.remove(pause_flag)
+        except OSError:
+            pass
+        return final
     if ema is not None:
         ema.swap_in()
     try:

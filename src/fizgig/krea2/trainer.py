@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import random
+import re
 import sys
 import time
 from multiprocessing import Value
@@ -58,6 +59,19 @@ def _apply_context_lora(target, path, strength, *, device, dtype):
     net.to(device=device, dtype=dtype).eval()
     net.requires_grad_(False)
     return net
+
+
+def _batch_is_reg(item_keys, reg_keys) -> bool:
+    """True when EVERY item in the batch is a regularisation image.
+
+    Batches are drawn from a single dataset's BucketBatchManager, so in practice a batch is
+    wholly reg or wholly not (and FT runs at batch size 1 regardless). `all` rather than `any`
+    is the safe reading of a mixed batch: throttling a subject image by mistake costs training
+    signal, while missing a throttle on a reg image costs only a slightly firmer anchor.
+    """
+    if not item_keys or not reg_keys:
+        return False
+    return all(str(k) in reg_keys for k in item_keys)
 
 
 def _apply_turbo_lora(dit, path, *, device, dtype):
@@ -130,6 +144,7 @@ def load_dit_for_training(
     turbo_lora_path: str = None,    # Turbo distillation LoRA — staged disabled, for on-DiT previews
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
+    fp8_fast: bool = False,
 ):
     """Load the RAW DiT (frozen base, optionally fp8) and apply a trainable full-model LoRA.
     An optional frozen Context LoRA is applied to the base first, so the new LoRA learns to
@@ -154,7 +169,7 @@ def load_dit_for_training(
     else:
         loading_device = "cpu" if blocks_to_swap > 0 else device
     dit = load_krea2_dit(raw_path, device=device, dtype=dtype, fp8_scaled=fp8_scaled,
-                         loading_device=loading_device)
+                         loading_device=loading_device, fp8_fast=fp8_fast)
     dit.requires_grad_(False)  # frozen base (QLoRA-style)
     if quant_int8:
         from fizgig.krea2.utils import KREA2_FP8_OPTIMIZATION_TARGET_KEYS, KREA2_FP8_OPTIMIZATION_EXCLUDE_KEYS
@@ -435,7 +450,8 @@ def _get_lin_function(x1, y1, x2, y2):
 _KREA2_MU = _get_lin_function(256, 0.5, 6400, 1.15)
 
 
-def sample_krea2_timesteps(bsize: int, num_img_tokens: int, device, sigmoid_scale: float = 1.0) -> torch.Tensor:
+def sample_krea2_timesteps(bsize: int, num_img_tokens: int, device, sigmoid_scale: float = 1.0,
+                           min_timestep: float = 0.0, max_timestep: float = 1.0) -> torch.Tensor:
     """Krea 2 'krea2_shift' timestep sampling — a faithful port of the musubi krea2_train recipe.
 
     The base t is **logit-normal** (sigmoid of a standard normal), so timesteps concentrate near the
@@ -450,16 +466,36 @@ def sample_krea2_timesteps(bsize: int, num_img_tokens: int, device, sigmoid_scal
     mu = _KREA2_MU(num_img_tokens)
     shift = math.exp(mu)
     t = (torch.randn(bsize, device=device) * sigmoid_scale).sigmoid()
-    return (t * shift) / (1.0 + (shift - 1.0) * t)
+    t = (t * shift) / (1.0 + (shift - 1.0) * t)
+    # Optional timestep window (0-1 scale; t near 1 = high noise / structure, near 0 = detail).
+    # Rescale INTO the window rather than clamp — clamping piles probability mass onto the two
+    # endpoints, which trains those exact t values disproportionately.
+    if min_timestep > 0.0 or max_timestep < 1.0:
+        lo, hi = max(0.0, float(min_timestep)), min(1.0, float(max_timestep))
+        t = lo + t * max(hi - lo, 1e-6)
+    return t
 
 
 def compute_loss(dit, latent, hidden_states, attention_mask, *, shift=2.5, dtype=torch.bfloat16,
-                 device=None):
+                 device=None, control_latent=None,
+                 min_timestep=0.0, max_timestep=1.0, motion_weight=0.0,
+                 diff_ref_latent=None, diff_weight=0.0):
     """Flow-matching training loss for Krea 2.
 
     latent:        (B, 16, h, w)         — cached Qwen-Image VAE latent
     hidden_states: (B, seq, layers, dim) — cached Qwen3-VL multi-layer stack
     attention_mask:(B, seq) bool         — cached validity mask
+    control_latent: optional (B, 16, h, w) — a CLEAN in-context reference (paired-image
+        training, e.g. the source frame of a temporal-displacement pair). Injected as extra
+        image tokens at RoPE frame=1 — the krea2_edit ecosystem's convention: the model tells
+        source from target purely by that axis. Never noised; loss on target tokens only; the
+        mu schedule stays on the target token count. Klein's control path is the template.
+    motion_weight: 0..1 (paired path only) — upweight target tokens where the CLEAN pair
+        actually differs (|x0 - source| per token). Uniform MSE rewards copying the source:
+        most of a frame is static, so the copy shortcut wins the gradient. At m the per-token
+        weight is (1-m) + m * diff/mean(diff), capped at 8x and renormalized to per-sample
+        mean 1 — a fully static pair degrades to uniform weights and avr_loss stays on the
+        same scale either way. 0 (default) = exact previous behaviour.
 
     `shift` is kept for signature compatibility but no longer used: krea2_shift derives the flow
     shift from the image resolution (see sample_krea2_timesteps), matching the musubi reference.
@@ -478,19 +514,69 @@ def compute_loss(dit, latent, hidden_states, attention_mask, *, shift=2.5, dtype
     # (latent grid // patch). Replaces the old uniform-u sampler that over-weighted high-noise t
     # and inflated the loss.
     num_img_tokens = (latent.shape[-2] // patch) * (latent.shape[-1] // patch)
-    t = sample_krea2_timesteps(B, num_img_tokens, device)
+    t = sample_krea2_timesteps(B, num_img_tokens, device,
+                               min_timestep=min_timestep, max_timestep=max_timestep)
     t_ = t.view(B, 1, 1, 1).to(dtype)
     noised = (1.0 - t_) * latent + t_ * noise
     target = noise - latent  # flow-matching velocity
 
     txt, txtmask = gather_valid_text(hidden_states.to(device=device, dtype=dtype), attention_mask.to(device))
-    img_tokens, pos, mask = prepare(noised, txt.shape[1], patch, txtmask)
-    target_tokens, _, _ = prepare(target, txt.shape[1], patch, txtmask)
+
+    if control_latent is None:
+        img_tokens, pos, mask = prepare(noised, txt.shape[1], patch, txtmask)
+        target_tokens, _, _ = prepare(target, txt.shape[1], patch, txtmask)
+        n_tgt = None
+    else:
+        # Paired-image (edit-style) sequence: [noisy target @ frame 0 | clean source @ frame 1
+        # | text @ zeros]. Image tokens stay a contiguous all-valid prefix (the varlen
+        # invariant); imglen inside the DiT covers target+source, so its output includes source
+        # rows — sliced off below before the loss.
+        from fizgig.krea2.sampling import patchify_block
+        src = control_latent.to(device=device, dtype=dtype)
+        tgt_tokens, tgt_pos, tgt_mask = patchify_block(noised, patch, frame=0.0)
+        src_tokens, src_pos, src_mask = patchify_block(src, patch, frame=1.0)
+        txtpos = torch.zeros(B, txt.shape[1], 3, device=device)
+        img_tokens = torch.cat((tgt_tokens, src_tokens), dim=1)
+        pos = torch.cat((tgt_pos, src_pos, txtpos), dim=1)
+        mask = torch.cat((tgt_mask, src_mask, txtmask), dim=1)
+        target_tokens, _, _ = patchify_block(target, patch, frame=0.0)
+        n_tgt = tgt_tokens.shape[1]
 
     with torch.autocast(device_type=torch.device(device).type, dtype=dtype):
         pred = dit(img=img_tokens, context=txt, t=t.to(dtype), pos=pos, mask=mask)
+    if n_tgt is not None:
+        pred = pred[:, :n_tgt]  # loss on target tokens only — source rows carry no target
     # Return the mean drawn timestep alongside the loss so the passive per-image loss logger can
     # normalize for noise level (the caller ignores it when logging is off).
+    if control_latent is not None and motion_weight > 0.0:
+        # Motion comes from the CLEAN latents (x0 vs source) — the velocity target carries
+        # noise and would randomize the weights.
+        diff_tokens, _, _ = patchify_block((latent - src).abs(), patch, frame=0.0)
+        d = diff_tokens.float().mean(dim=-1)                                # (B, N)
+        dm = d.mean(dim=1, keepdim=True)
+        r = (d / dm.clamp_min(1e-8)).clamp(max=8.0)
+        w = (1.0 - float(motion_weight)) + float(motion_weight) * r
+        w = w / w.mean(dim=1, keepdim=True).clamp_min(1e-8)                 # per-sample mean 1
+        # A DEGENERATE pair (identical images) at weight 1.0 would zero every token's weight
+        # and silently train nothing — fall back to uniform for that sample instead.
+        w = torch.where(dm > 1e-6, w, torch.ones_like(w))
+        se = (pred.float() - target_tokens.float()).pow(2).mean(dim=-1)     # (B, N)
+        return (se * w).mean(), float(t.mean().item())
+    if diff_ref_latent is not None and diff_weight > 0.0:
+        # Slider training's disentanglement weight: identical formula to motion weighting,
+        # but on the PLAIN (unpaired) sequence — the reference is the pair's other image,
+        # never packed into the forward. The smile slider learns the mouth, not the haircut.
+        from fizgig.krea2.sampling import patchify_block
+        _ref = diff_ref_latent.to(device=device, dtype=dtype)
+        diff_tokens, _, _ = patchify_block((latent - _ref).abs(), patch, frame=0.0)
+        d = diff_tokens.float().mean(dim=-1)
+        dm = d.mean(dim=1, keepdim=True)
+        r = (d / dm.clamp_min(1e-8)).clamp(max=8.0)
+        w = (1.0 - float(diff_weight)) + float(diff_weight) * r
+        w = w / w.mean(dim=1, keepdim=True).clamp_min(1e-8)
+        w = torch.where(dm > 1e-6, w, torch.ones_like(w))   # same degenerate-pair guard
+        se = (pred.float() - target_tokens.float()).pow(2).mean(dim=-1)
+        return (se * w).mean(), float(t.mean().item())
     return F.mse_loss(pred.float(), target_tokens.float()), float(t.mean().item())
 
 
@@ -590,7 +676,8 @@ def _save_training_state(output_dir, output_name, network, optimizer, *, epoch, 
 def _write_state_files(state_dir, network, optimizer, *, epoch, global_step,
                        network_dim, network_alpha, dtype, extra=None):
     _save_lora(network, os.path.join(state_dir, "lora.safetensors"), network_dim, network_alpha, dtype)
-    torch.save(optimizer.state_dict(), os.path.join(state_dir, "optimizer.pt"))
+    if optimizer is not None:   # None under fused backward (per-parameter optimizers)
+        torch.save(optimizer.state_dict(), os.path.join(state_dir, "optimizer.pt"))
     rng = {"torch": torch.get_rng_state()}
     if torch.cuda.is_available():
         rng["cuda"] = torch.cuda.get_rng_state_all()
@@ -863,6 +950,96 @@ class AdaptiveLR:
         self._snapshot(network, optimizer)
 
 
+def _build_bf16_master(raw_path: str, dit) -> dict:
+    """CPU bf16 copy of every fp8-patched block Linear — the source of truth for rotation.
+
+    Read straight from the RAW file (which is bf16 on disk) rather than dequantizing the GPU
+    copy: the GPU weights have already been through fp8, so dequantizing them would bake the
+    quantization error into the master and we'd fine-tune a degraded model.
+    """
+    from safetensors.torch import load_file
+    from fizgig.krea2.rotation import is_rotatable_linear
+
+    # Discovery must match what the rotator will actually target — an NF4 base has no
+    # `scale_weight`, so an fp8-only test here would build an EMPTY master and the run
+    # would train nothing while looking healthy.
+    wanted = set()
+    for bi, block in enumerate(dit.blocks):
+        for name, m in block.named_modules():
+            if is_rotatable_linear(m):
+                wanted.add(f"blocks.{bi}.{name}.weight")
+    # txtfusion sits outside dit.blocks, so rotation never reaches it — but it's the stack
+    # that fuses the text embeddings, so it's held always-on rather than left frozen.
+    txtf = getattr(dit, "txtfusion", None)
+    if txtf is not None:
+        for name, m in txtf.named_modules():
+            if is_rotatable_linear(m):
+                wanted.add(f"txtfusion.{name}.weight")
+
+    sd = load_file(raw_path)          # mmap'd; we copy out only the keys we need
+    master, missing = {}, []
+    for key in sorted(wanted):
+        t = sd.get(key)
+        if t is None:
+            missing.append(key)
+            continue
+        master[key] = t.to("cpu", dtype=torch.bfloat16).clone()
+    del sd
+    gc.collect()
+    total_gb = sum(v.numel() * v.element_size() for v in master.values()) / 1e9
+    logger.info("[ft-rotation] bf16 master: %d tensors, %.1f GB in CPU RAM%s",
+                len(master), total_gb,
+                f" ({len(missing)} keys missing from the RAW file — those stay frozen)" if missing else "")
+    if missing:
+        logger.warning("[ft-rotation] missing master keys, e.g. %s", missing[:3])
+    return master
+
+
+def _save_full_checkpoint(rotator, raw_path: str, path: str, extra_metadata=None):
+    """Write the fine-tuned model: the RAW checkpoint with trained block weights replaced.
+
+    Everything the rotator never touches (norms, embeddings, txtfusion, I/O layers) is copied
+    through from the original, so the result is a complete, loadable Krea 2 checkpoint.
+    """
+    from safetensors.torch import load_file, save_file
+
+    sd = load_file(raw_path)
+    trained = rotator.master_state_dict()
+    replaced = 0
+    for k, v in trained.items():
+        if k in sd:
+            sd[k] = v.to(torch.bfloat16)
+            replaced += 1
+    meta = {"fizgig_finetune": "krea2-rotation", "fizgig_trained_tensors": str(replaced)}
+    if extra_metadata:
+        meta.update({str(k): str(v) for k, v in extra_metadata.items()})
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    # Write to a temp name and rename on completion. This file is ~24.5 GB and takes minutes;
+    # Stop (a hard kill) or a power cut partway through used to leave a TRUNCATED checkpoint
+    # sitting at the real filename — correct header, most of the tensors, and unloadable
+    # ("MetadataIncompleteBuffer"). It looked like a valid save until ComfyUI refused it, which
+    # could be days later. os.replace is atomic within a volume, so an interrupted write now
+    # leaves only a .tmp you can delete, and the previous checkpoint stays intact.
+    tmp = path + ".tmp"
+    try:
+        save_file(sd, tmp, metadata=meta)
+        os.replace(tmp, path)
+    except BaseException:
+        # BaseException, not Exception: KeyboardInterrupt/SystemExit are exactly the cases
+        # that produce a half-written file, and they must not leave the .tmp behind either.
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    size_gb = os.path.getsize(path) / 1e9
+    logger.info("[ft-rotation] saved full checkpoint (%d/%d tensors trained, %.1f GB) -> %s",
+                replaced, len(sd), size_gb, path)
+    del sd, trained
+    gc.collect()
+
+
 def _save_lora(network, path, network_dim, network_alpha, dtype, extra_metadata=None,
                comfy_format=False):
     """Save the trainable network. `comfy_format` (final artifact only) rewrites a LoKR's keys
@@ -978,7 +1155,8 @@ def _remove_claimed_queue(path: str) -> None:
 
 
 def _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_swap, loss_watch, epoch,
-                           *, auto_recaption=False, trigger_word=None, recaptioned=None,
+                           *, auto_recaption=False, trigger_word=None, trigger_position="start",
+                           recaptioned=None,
                            image_dir=None, caption_ext=".txt", recaption_instruction=None,
                            recaption_instruction_detailed=None):
     """Live caption repair (Problem Images window). Consume <output_dir>/loss_log/caption_updates.json
@@ -989,7 +1167,7 @@ def _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_sw
 
     auto_recaption: additionally re-caption CONFIRMED-STUCK images with the same Qwen3-VL (it's a
     full VLM with a real LM head — the captioner ships inside the training stack), appending
-    ", <trigger_word>" when one is set. Max TWO attempts per image per run (`recaptioned` is a
+    "<trigger_word>, " (leading) when one is set. Max TWO attempts per image per run (`recaptioned` is a
     {key: attempts} dict): attempt 1 = standard caption; if the image re-confirms stuck after its
     history reset (~5-6 epochs later, i.e. the first caption demonstrably failed), attempt 2 =
     exhaustive-detail caption; after that it's permanently human-review. A manual edit already
@@ -1090,10 +1268,13 @@ def _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_sw
         from fizgig.krea2.embedder import generate_caption
         encoder = load_krea2_text_encoder(te_path, dtype=torch.bfloat16, device=device)
 
-        # Auto-recaption: the SAME loaded VLM describes what's actually in the stuck image;
-        # trigger word (if any) is appended at the END — per the conditional-trigger doctrine,
-        # a trailing token is a far weaker identity claim than a leading one. Attempt 2 (the
-        # first caption demonstrably failed) goes exhaustive-detail.
+        # Auto-recaption: the SAME loaded VLM describes what's actually in the stuck image.
+        # The trigger goes FIRST by default, matching what the Captions tab writes — a dataset
+        # must not end up with the trigger leading on some images and trailing on others.
+        # Leading is also the right call when the trigger is a real name (base-model
+        # fine-tuning): the name is the subject, not an afterthought. trigger_position="end"
+        # restores the weaker trailing claim, which suits a conditional trigger on a LoRA.
+        # Attempt 2 (the first caption demonstrably failed) goes exhaustive-detail.
         if recaption_instruction or recaption_instruction_detailed:
             _which = " + ".join(
                 w for w, v in (("Training caption", recaption_instruction),
@@ -1109,7 +1290,8 @@ def _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_sw
                 cap = generate_caption(encoder, img_path, detailed=(attempt >= 2),
                                        instruction=_instr)
                 if trigger_word:
-                    cap = f"{cap}, {trigger_word}"
+                    cap = (f"{cap}, {trigger_word}" if str(trigger_position) == "end"
+                           else f"{trigger_word}, {cap}")
                 cap_path = os.path.join(image_dir, os.path.basename(k) + caption_ext)
                 try:
                     with open(cap_path, "w", encoding="utf-8") as f:
@@ -1375,10 +1557,35 @@ def train_krea2(
     save_state_on_train_end: bool = False,
     keep_last_n_states: int = 2,
     fp8_scaled: bool = True,
+    fast_ft: bool = False,
+    reg_lr_multiplier: float = 0.2,
     quant_4bit: bool = False,
     quant_int8: str = "",
+    # FINE-TUNE ONLY. NF4 is the fine-tune default; this is the escape hatch back to an fp8
+    # frozen trunk. It exists because at the CLI "fp8" and "said nothing" are the same thing
+    # (fp8_scaled = not --no_fp8, i.e. True by default), so without an explicit signal the
+    # new default would silently swallow a deliberate fp8 pick and turn the GUI's fp8 option
+    # into a lie. Ignored outside rotation.
+    ft_base_fp8: bool = False,
     blocks_to_swap: int = 0,
     shift: float = 2.5,
+    # Timestep window (0-1 scale): restrict training to a noise band. High-t-only training
+    # teaches structure/layout without touching the detail-rendering regime — the quality
+    # protection when training on low-res data (e.g. temporal-displacement pairs).
+    min_timestep: float = 0.0,
+    max_timestep: float = 1.0,
+    # Paired-image runs only: upweight target tokens where source and target actually differ
+    # (kills the copy shortcut on mostly-static pairs). 0 = off; ~0.7 is a strong setting.
+    motion_weighted_loss: float = 0.0,
+    # Image-pair slider training: the adapter learns a signed attribute direction from
+    # positive/negative image pairs (training image = positive, its control_directory match
+    # = negative). Strength is the dial at inference: +N pushes toward the positive pole,
+    # -N away. Captions must NOT name the attribute — the multiplier carries it.
+    slider_pairs: bool = False,
+    slider_diff_weight: float = 1.0,
+    # Rotation FT resume: 0-based window the schedule starts at. A resumed run is a fresh
+    # process, so without this it re-runs window 0 (attn) instead of the next unfinished one.
+    finetune_start_window: int = 0,
     max_grad_norm: float = 1.0,
     seed: int = 42,
     # Effective batch = batch_size (1) x this. Grads accumulate over N micro-batches, then one
@@ -1427,6 +1634,20 @@ def train_krea2(
     adaptive_lr: bool = False,
     adaptive_lr_min: float = 1e-5,
     adaptive_lr_max: float = 4e-4,
+    # Rotating-block FULL fine-tune (experimental). >0 trains that many DiT blocks at a
+    # time in bf16 while the rest stay fp8-frozen, rotating the window every N epochs.
+    # No LoRA is trained in this mode — the output is a full model checkpoint.
+    # Where the trigger word lands in auto-generated captions: "start" (matches the
+    # Captions tab, and right for a real-name trigger) or "end" (weaker claim).
+    trigger_position: str = "start",
+    finetune_rotation: int = 0,
+    finetune_rotate_every: int = 1,
+    # "block" = contiguous depth slices; "component" = attn across ALL blocks, then
+    # mlp — same VRAM, but every window spans the model's full depth.
+    finetune_rotation_mode: str = "block",
+    # Step each parameter's optimizer inside backward and free its grad immediately, so the
+    # whole active window's gradients never coexist. Saves roughly the gradient footprint.
+    finetune_fused_backward: bool = False,
     # Output metadata (Other Options → Metadata in the GUI) — recorded in the saved LoRA.
     metadata_title: str = None,
     metadata_author: str = None,
@@ -1481,6 +1702,216 @@ def train_krea2(
         raise RuntimeError("No training items — run the krea2 cache scripts first.")
     logger.info(f"Krea 2 training: {group.num_train_items} items, {max_train_epochs} epochs")
 
+    ft_rotation = max(0, int(finetune_rotation or 0))
+
+    if ft_rotation:
+        # Handoff guards, before our first CUDA call: a back-to-back fine-tune can start
+        # while the previous trainer process is still tearing down — VRAM (WDDM demotion is
+        # sticky) and RAM (the old process hands back a huge commit) both need to settle.
+        # See the guards' docstrings in capabilities.py.
+        from fizgig.utils.capabilities import wait_for_gpu_handoff, wait_for_ram_recovery
+        wait_for_gpu_handoff()
+        wait_for_ram_recovery()
+
+    if slider_pairs:
+        # Slider mode's structural coercions. FT and sliders are mutually exclusive (a slider
+        # IS an adapter; FT has none). The per-image loss watch and adaptive LR both assume
+        # one target per image — a slider step has two poles, so their signals would be
+        # meaningless noise. Motion weighting is the paired-EDIT path's knob; the slider owns
+        # its pairs and never packs them.
+        if ft_rotation:
+            raise RuntimeError("[slider] slider training and base-model fine-tuning are "
+                               "mutually exclusive — turn one off.")
+        if adaptive_lr:
+            logger.info("[slider] adaptive LR disabled — its plateau signals assume one "
+                        "target per image; a slider step has two poles.")
+            adaptive_lr = False
+        if log_per_image_loss or per_image_lr or auto_recaption or warmup_look_outliers:
+            logger.info("[slider] per-image loss watch disabled for the same reason.")
+            log_per_image_loss = per_image_lr = auto_recaption = warmup_look_outliers = False
+        motion_weighted_loss = 0.0
+        logger.info("[slider] IMAGE-PAIR SLIDER TRAINING: each step trains the adapter at "
+                    "+1 toward the training image and at -1 toward its paired control; "
+                    "diff-weight %.2f concentrates the loss where the pair differs. Keep "
+                    "captions neutral — the attribute must live in the multiplier, not the "
+                    "text.", float(slider_diff_weight))
+
+    # Fine-tune trains the BASE weights — the LoRA/LoKR network is built but inert, so a LoKR
+    # request would only burn VRAM on parameters that are never trained or saved. Coerce with a
+    # loud log (the GUI also hides the Network Type control under fine-tune).
+    if ft_rotation and network_type == "lokr":
+        logger.warning("[ft-rotation] --network_type lokr is ignored under base-model "
+                       "fine-tuning (the adapter is inert) — proceeding as standard.")
+        network_type = "lora"
+    # Resume restores an INERT LoRA + an optimizer that may not even exist under fused
+    # backward — it would silently restart the base from RAW while looking like a resume.
+    # The full checkpoints are the continuation point: swap --dit to the saved checkpoint.
+    if ft_rotation and resume_state_dir:
+        raise RuntimeError(
+            "--resume is not supported in fine-tune mode: state dirs hold the (inert) LoRA, "
+            "not the base weights. To continue a fine-tune, point --dit at your last saved "
+            "checkpoint (structurally identical to the RAW base) and set "
+            "--finetune_start_window to the value printed at that save.")
+
+    # Auto window mode: size the rotation window to the free VRAM. Resolved here rather than
+    # in the GUI so headless runs get it too, and so it reads the VRAM actually available at
+    # the moment training starts rather than whenever a dialog was last opened.
+    if ft_rotation and str(finetune_rotation_mode).lower().startswith("auto"):
+        from fizgig.utils.capabilities import recommend_ft_rotation
+        _mode, _blocks, _stream, _why = recommend_ft_rotation()
+        finetune_rotation_mode = _mode
+        ft_rotation = _blocks
+        if _stream and blocks_to_swap <= 0:
+            blocks_to_swap = 12      # any positive value switches on rotation-aware streaming
+        for _line in _why:
+            logger.info("[ft-auto] %s", _line)
+
+    # Continuation numbering: a fine-tune continued from a saved checkpoint is a fresh
+    # process whose local epochs restart at 1, so `<name>-000001.safetensors` would silently
+    # OVERWRITE the original run's first checkpoint. The --dit file IS the previous
+    # checkpoint, and its trailing epoch number is the true count of epochs already trained —
+    # offset every checkpoint filename by it. A renamed file just starts numbering at 1.
+    ft_epoch_offset = 0
+    if ft_rotation:
+        _m = re.search(r"-(\d{6})\.safetensors$", os.path.basename(raw_path or ""))
+        if _m:
+            ft_epoch_offset = int(_m.group(1))
+        else:
+            # The FINAL checkpoint carries no epoch number in its name — its cumulative
+            # count rides in the metadata instead (stamped at every FT save below).
+            try:
+                from safetensors import safe_open
+                with safe_open(raw_path, framework="pt") as _f:
+                    _md = _f.metadata() or {}
+                ft_epoch_offset = int(_md.get("fizgig_ft_epochs_done", 0))
+            except Exception:
+                ft_epoch_offset = 0
+        if ft_epoch_offset:
+            logger.info("[ft-rotation] continuing from %s — checkpoint numbering starts at "
+                        "epoch %d", os.path.basename(raw_path), ft_epoch_offset + 1)
+
+    # --- Regularisation set (fine-tune only) ---------------------------------------------
+    # Images from a dataset block marked `is_reg = true` — a PRIOR ANCHOR, not a subject.
+    # Full fine-tuning moves every weight, so 40 epochs on a handful of subjects drifts the
+    # model's whole notion of people, with no low-rank bound to limit it. Reg data pulls back,
+    # and it only works if it stays a nudge: a fixed reduced LR.
+    #
+    # LoRA training doesn't have that problem — the update is rank-bounded — so reg images are
+    # ignored outright rather than quietly trained as subjects at full LR.
+    reg_keys = set()
+    reg_mult = float(reg_lr_multiplier)
+    if ft_rotation:
+        for _ds in group.datasets:
+            if not getattr(_ds, "is_reg", False):
+                continue
+            _bm = getattr(_ds, "batch_manager", None)
+            if _bm is None:
+                continue
+            for _bucket in _bm.buckets.values():
+                for _it in _bucket:
+                    reg_keys.add(str(_it.item_key))
+        if reg_keys:
+            logger.info(f"[reg] {len(reg_keys)} regularisation image(s) at x{reg_mult:g} LR "
+                        f"({group.num_train_items - len(reg_keys)} subject items).")
+            if len(reg_keys) >= group.num_train_items - len(reg_keys):
+                logger.warning("[reg] regularisation images are at least half the training set — "
+                               "the multiplier only reads as an LR cut while they are the "
+                               "minority, since Adafactor normalises by a second moment the "
+                               "majority dominates.")
+    elif any(getattr(_ds, "is_reg", False) for _ds in group.datasets):
+        logger.warning("[reg] the dataset config has a regularisation block, but this is a LoRA "
+                       "run — regularisation images are a fine-tune feature and are IGNORED "
+                       "here. They will train as ordinary images at full LR; remove the "
+                       "`is_reg` block from the TOML if that is not what you want.")
+    ft_stream_frozen = False
+
+    if ft_rotation:
+        # Rotation owns the block weights: it swaps them between fp8-frozen and bf16-trainable
+        # in place. Block swap moves whole blocks to CPU behind the offloader's back, and 4-bit
+        # keeps weights packed in _nf4_packed — neither survives that swap, so both are off.
+        # Resolved here, with the other quantisation/swap interactions below, so everything
+        # downstream (compile decision, loader, offloader) reads settled values.
+        if blocks_to_swap > 0:
+            # Rotation brings its own swap policy (RotationOffloader): the trainable window is
+            # pinned and every other block streams. The stock offloader can't express that —
+            # it keeps a fixed contiguous prefix resident.
+            logger.info("[ft-rotation] using rotation-aware block swap instead of the "
+                        "fixed-prefix offloader (--blocks_to_swap value ignored).")
+            blocks_to_swap = 0
+            ft_stream_frozen = True
+        # NF4 IS THE FINE-TUNE DEFAULT (Peter, 27 Aug: "lets make FT default to NF4").
+        # Measured on the same dataset and the same budget, NF4 beats fp8 at BOTH tested
+        # tiers, and at 24 GB it changes the plan shape rather than merely fitting:
+        #   24 GB fp8 -> 8 windows, depth-split AND streamed, ~3.0 s/it
+        #   24 GB NF4 -> 4 FULL-DEPTH windows, resident, ~1.02 s/it (peaks 15.7-16.0 GB)
+        #   16 GB fp8 -> does not complete (allocator fragmentation)
+        #   16 GB NF4 -> completes, peaks 8.6-11.0 GB
+        # So it is ~3x the step speed AND half the cycle (4 epochs per full pass, not 8).
+        # This applies to the FINE-TUNE path only — the LoRA recommender is untouched, and
+        # is exactly why "Auto" could never reach 4-bit here: it is LoRA-shaped, has no
+        # fine-tune awareness, and prefers INT8 (which rotation cannot use at all).
+        # An EXPLICIT fp8 pin is still honoured; this only fills the gap where the user
+        # expressed no usable preference.
+        # NOTE ON WHY THIS IS NOT JUST `if not fp8_scaled`: fp8_scaled arrives as
+        # `not args.no_fp8`, i.e. TRUE unless the user asked for a bf16 base. So "the user
+        # wants fp8" and "the user said nothing" are the SAME value here, and a default
+        # keyed on it would never fire. The explicit signal is ft_base_fp8.
+        if quant_int8 and not ft_base_fp8:
+            # int8 keeps its own packed weights + scales, which the bf16-master round-trip
+            # would have to undo and redo every window. It is not a choice we can keep, so
+            # substitute the best base that rotation CAN use rather than the middle one.
+            logger.info("[ft-rotation] INT8 base is incompatible with rotation — using "
+                        "4-bit NF4 instead (the fastest base rotation supports: measured "
+                        "~3x fp8's step speed at 24 GB, and the only one that fits 16 GB).")
+            quant_int8 = ""
+            quant_4bit = True
+        elif quant_int8:
+            logger.info("[ft-rotation] INT8 base is incompatible with rotation — honouring "
+                        "the explicit fp8 request instead.")
+            quant_int8 = ""
+        if not quant_4bit and not ft_base_fp8:
+            logger.info("[ft-rotation] frozen base: 4-bit NF4 (the fine-tune default). It "
+                        "keeps full-depth component windows resident on a 24 GB card — 4 "
+                        "windows at ~3x fp8's step speed — and is what makes 16 GB "
+                        "possible at all. Choose fp8 in Base precision (CLI --ft_base_fp8) "
+                        "for the fp8 trunk instead.")
+            quant_4bit = True
+        elif ft_base_fp8 and not quant_4bit:
+            logger.info("[ft-rotation] frozen base: fp8, by explicit request (the "
+                        "fine-tune default is 4-bit NF4).")
+            fp8_scaled = True
+        if quant_4bit:
+            # Announced AFTER resolution, not before it: the branches above can turn 4-bit
+            # on, so a banner placed earlier would stay silent on exactly the runs that
+            # took the new default — the class of lie this file has been fixing all day.
+            # The rotator branches per module: activate reads the bf16 master and frees
+            # `_nf4_packed`; deactivate re-encodes with quantize_nf4 and restores the
+            # patched forward. The trade, as on H3: the frozen CONTEXT the active window
+            # trains against carries NF4's error. The saved checkpoint does not — it is
+            # written bf16 from the master, which never sees a quantizer.
+            fp8_scaled = False
+            logger.info("[ft-rotation] 4-bit base: the frozen trunk holds NF4 (~half the "
+                        "fp8 footprint) while the trainable window runs bf16 from the "
+                        "master. The window trains against a coarser frozen context; the "
+                        "saved checkpoint is unaffected (bf16, straight from the master).")
+        if fp8_scaled and not quant_4bit:
+            # Only reachable now by an EXPLICIT fp8 choice — the defaults above never land
+            # here. Measured bands, not guesses: the fp8 trunk (~13 GB) fine-tunes at 24 GB
+            # but runs out of usable memory below ~20; NF4 (6.08 GB packed) completes a
+            # 16 GB run with ~5 GB spare. Honour the pin, but say what it costs.
+            try:
+                from fizgig.utils.device import plannable_free_vram as _pfv_warn
+                _free_now = _pfv_warn()
+            except Exception:
+                _free_now = None
+            if _free_now is not None and _free_now < 20.0:
+                logger.warning(
+                    "[ft-rotation] fp8 frozen base was requested explicitly on a ~%.0f GB "
+                    "card: measured, fp8 fine-tunes at 24 GB but runs out of usable memory "
+                    "below ~20 GB. Drop the fp8 pick (or pass --quantize_4bit) to get the "
+                    "4-bit default back — half the trunk, and it completes a 16 GB run.",
+                    _free_now)
+
     # Resolve quantisation/swap interactions BEFORE anything reads blocks_to_swap —
     # should_compile used to be consulted with a swap value the NF4 branch zeroed a few
     # lines later, declining compile "because block swap is active" about a swap that no
@@ -1534,6 +1965,15 @@ def train_krea2(
         logger.info("[compile] auto: %s — %s",
                     ("ENABLED (checkpoint outside)" if _do_compile == "outside"
                      else ("ENABLED" if _do_compile else "off")), _why)
+    if _do_compile and ft_rotation:
+        # Rotation flips requires_grad and swaps weights between the bf16 master and the GPU
+        # every window, which is exactly the kind of state change a compiled graph bakes in.
+        # Untested together — take the safe side rather than debug it mid-run. Catches the
+        # "outside" boundary too (truthy), on purpose: the boundary changes where the
+        # checkpoint sits, not the fact that the compiled graph pins its weights.
+        logger.info("[compile] disabled under rotating fine-tune (the trainable set changes "
+                    "every window; compiled graphs assume it doesn't).")
+        _do_compile = False
 
     # Preview setup: pre-encode prompts (frees the 8GB encoder) + load the VAE BEFORE the RAW DiT,
     # so the encoder never coexists with the resident base.
@@ -1548,6 +1988,18 @@ def train_krea2(
     do_previews = bool((sample_every_n_epochs or sample_at_first)
                        and sample_prompts and (turbo_path or turbo_lora_path)
                        and vae_path and te_path)
+    # Under a full fine-tune the trained weights live in the BASE, so the standalone Turbo
+    # checkpoint (a different model) cannot show them — the only faithful preview renders on
+    # the training DiT itself with the Turbo LoRA applied fresh inside a deactivate/reactivate
+    # bracket (the H3 pattern). Without the Turbo LoRA, previews stay off.
+    # MUST stay after every other do_previews decision — the FT gate wins.
+    _ft_preview_gap_warned = False
+    if do_previews and ft_rotation and not turbo_lora_path:
+        logger.info("[ft-rotation] in-training previews need the Turbo LoRA (the standalone "
+                    "Turbo checkpoint can't show fine-tuned weights) and none is configured — "
+                    "previews off. Evaluate saved checkpoints in ComfyUI instead.")
+        do_previews = False
+        _ft_preview_gap_warned = True
     encoded_prompts = sample_ae = sample_dir = None
     encoded_negative = None
     if do_previews:
@@ -1564,13 +2016,37 @@ def train_krea2(
         sample_ae = load_vae(vae_path, input_channels=3, device="cpu", disable_mmap=True)
         sample_dir = os.path.join(output_dir, "sample")
 
+    if fast_ft:
+        # Fast FT only has meaning on the fp8 path (it swaps the block-64 scale layout for a
+        # per-tensor one so _scaled_mm can take it). Say so plainly rather than no-op quietly.
+        from fizgig.modules.fp8 import _train_scaled_mm_supported
+        if not fp8_scaled:
+            logger.warning("[fast-ft] requested, but the base is not fp8 "
+                           f"({'INT8' if quant_int8 else '4-bit' if quant_4bit else 'bf16'}) "
+                           "— Fast FT does nothing here and is ignored.")
+            fast_ft = False
+        elif not _train_scaled_mm_supported():
+            logger.warning("[fast-ft] requested, but this GPU has no fp8 _scaled_mm support "
+                           "(needs SM 8.9+) — falling back to the standard dequant path.")
+            fast_ft = False
+        else:
+            logger.info("[fast-ft] ON — per-tensor fp8 scales + _scaled_mm on the frozen base. "
+                        "Costs ~1.5x the per-Linear forward error of the default path "
+                        "(3.7e-02 vs 2.5e-02) — mostly from quantising activations to fp8, which "
+                        "the fp8 GEMM requires; the scale change alone is 1.10x. "
+                        "Set FIZGIG_FP8_DIAG=1 to see per-Linear SCALED/DEQUANT decisions.")
+
     dit, network, turbo_net, turbo_diffb = load_dit_for_training(
         raw_path, network_dim=network_dim, network_alpha=network_alpha,
         network_type=network_type, lokr_factor=lokr_factor,
         fp8_scaled=fp8_scaled, quant_4bit=quant_4bit, quant_int8=quant_int8,
-        blocks_to_swap=blocks_to_swap, compile_blocks=_do_compile,
+        blocks_to_swap=blocks_to_swap, compile_blocks=_do_compile, fp8_fast=fast_ft,
         context_lora_path=context_lora_path, context_lora_strength=context_lora_strength,
-        turbo_lora_path=(turbo_lora_path if do_previews else None),
+        # Under FT the Turbo LoRA is NOT staged at load: the rotation bracket applies it
+        # FRESH against the deactivated model at each preview and restores every wrapped
+        # forward exactly afterwards — a load-time wrap would end up stashed inside the
+        # rotator's forward snapshots and double-applied.
+        turbo_lora_path=(turbo_lora_path if (do_previews and not ft_rotation) else None),
         device=device, dtype=dtype)
     if turbo_net is not None:
         logger.info("[preview] turbo-LoRA mode: previews render on the resident training DiT "
@@ -1583,12 +2059,297 @@ def train_krea2(
         dit.switch_block_swap_for_training()
     dit.train()
     network.train()
-    network.requires_grad_(True)
 
-    params = list(network.get_trainable_params())
-    from fizgig.training.optimizers import create_optimizer
-    optimizer, optimizer_label = create_optimizer(
-        optimizer_type, params, learning_rate, optimizer_args)
+    rotator = rot_schedule = None
+    if ft_rotation:
+        from fizgig.krea2.rotation import RotationSchedule, BlockRotator
+        # The LoRA network stays created but frozen and zero-init, so it contributes nothing
+        # to the forward. We're training the base weights themselves.
+        network.requires_grad_(False)
+        master = _build_bf16_master(raw_path, dit)
+        rotator = BlockRotator(dit.blocks, master, key_prefix="blocks", device=device,
+                               quantization_mode="tensor" if fast_ft else "block")
+        if getattr(dit, "txtfusion", None) is not None:
+            rotator.activate_always("txtfusion", dit.txtfusion)
+        # Component-window plan (the small-card tiers, mirrors H3): read free VRAM, add
+        # back the fp8 trunk already resident, and let the shared planner decide how many
+        # depth-splits the budget forces — and whether the frozen out-of-window blocks
+        # must stream. Window sizes come from the model's own Linears, not a table.
+        _k2_windows = None
+        if str(finetune_rotation_mode).startswith("comp"):
+            from fizgig.krea2.rotation import (component_gb_per_block,
+                                               plan_krea2_ft_windows,
+                                               K2FT_COMPONENT_PREFIXES,
+                                               krea2_trunk_gb_per_block)
+            _comp_gb = component_gb_per_block(dit.blocks[0], K2FT_COMPONENT_PREFIXES)
+            _trunk_per_block = krea2_trunk_gb_per_block(bool(quant_4bit))
+            try:
+                from fizgig.utils.device import plannable_free_vram as _pfv0
+                _usable = _pfv0() + _trunk_per_block * len(dit.blocks) - 1.5
+            except Exception:
+                _usable = 99.0
+            _k2_windows, _k2_stream, _plan_why = plan_krea2_ft_windows(
+                _usable, _comp_gb, n_blocks=len(dit.blocks),
+                allow_stream=os.environ.get("FIZGIG_NO_FT_STREAM") != "1",
+                nf4=bool(quant_4bit))
+            for _line in _plan_why:
+                logger.info("[ft-rotation] %s", _line)
+            if _k2_windows is None:
+                raise RuntimeError(
+                    f"[ft-rotation] ~{_usable:.1f} GB of usable VRAM is below what the "
+                    "fine-tune needs even with depth-split windows and streamed frozen "
+                    "blocks. Close other GPU apps, or train a LoRA instead.")
+            if _k2_stream:
+                # The planner's verdict outranks how streaming was (or wasn't) requested:
+                # split windows leave the out-of-window blocks fully frozen, so the
+                # rotation-aware streamer carries them regardless of the swap box.
+                ft_stream_frozen = True
+        rot_schedule = RotationSchedule(len(dit.blocks), active=ft_rotation,
+                                        rotate_every=finetune_rotate_every,
+                                        mode=finetune_rotation_mode,
+                                        components=(_k2_windows if _k2_windows
+                                                    else ("attn", "mlp.gate",
+                                                          "mlp.up", "mlp.down")),
+                                        start_window=finetune_start_window)
+        if finetune_start_window:
+            logger.info(f"[ft-rotation] resuming mid-cycle: schedule starts at window "
+                        f"{rot_schedule.window_at(0)} of {rot_schedule.n_windows}")
+        # Continuation across a different card/plan: the stamped window index only lines
+        # up when the window COUNT matches (mirrors H3).
+        if ft_epoch_offset:
+            try:
+                from safetensors import safe_open as _so_w
+                with _so_w(raw_path, framework="pt") as _fw:
+                    _prev_nw = int((_fw.metadata() or {}).get("fizgig_ft_n_windows", 0))
+            except Exception:
+                _prev_nw = 0
+            if _prev_nw and _prev_nw != rot_schedule.n_windows:
+                logger.warning("[ft-rotation] this card's plan has %d windows; the "
+                               "checkpoint was trained with %d — the rotation cycle "
+                               "cannot line up exactly across the change, so expect one "
+                               "cycle of mild imbalance while it settles.",
+                               rot_schedule.n_windows, _prev_nw)
+
+        def _ft_resident_blocks(spec):
+            """Blocks holding trainable Linears under `spec` — block-index specs pass
+            through; component entries translate (bare prefix = every block, a depth
+            slice = its range). The streamer's resident set, per window."""
+            from fizgig.krea2.rotation import is_component_spec
+            if not is_component_spec(spec):
+                return set(int(b) for b in spec)
+            res = set()
+            for _e in spec:
+                if isinstance(_e, str):
+                    res |= set(range(len(dit.blocks)))
+                else:
+                    _p, _lo, _hi = _e
+                    res |= set(range(max(0, _lo), min(len(dit.blocks), _hi + 1)))
+            return res
+
+        _split_windows = any(isinstance(c, tuple) for c in rot_schedule.components)
+        if rot_schedule.mode == "component" and ft_stream_frozen and not _split_windows:
+            # Every block holds trainable Linears when component windows span full depth,
+            # so nothing can be streamed out. (Depth-SPLIT windows are different — the
+            # out-of-window blocks are fully frozen, which is the whole 16 GB tier.)
+            logger.info("[ft-rotation] full-depth component windows train part of every "
+                        "block — block streaming disabled.")
+            ft_stream_frozen = False
+        if ft_stream_frozen:
+            from fizgig.krea2.rotation import RotationOffloader
+            # Injected as the DiT's offloader: the forward already calls wait_for_block /
+            # submit_move_blocks_forward whenever blocks_to_swap is truthy, so no model change.
+            # Window 0 here; the epoch loop re-pins to the correct window on the first
+            # iteration (and on resume, since want != rotator.active triggers a rotation).
+            # Constructed claiming EVERYTHING is resident — which is the truth at this
+            # moment, the whole fp8 base is on the card — and then narrowed. The
+            # constructor only RECORDS the resident set; eviction is just-in-time during
+            # the forward, so building it with the target set directly would leave the
+            # full base resident until the first step. The window's bf16 then lands on
+            # top of it and a 16 GB card OOMs inside the very first `rotate_to` (field,
+            # 27 Aug: 14.30 GiB of a 14.83 GiB cap, before a single training step).
+            # set_resident() does the up-front eviction with the one proven call.
+            # H3 solves the same problem by rescoping its ring before activating.
+            dit.offloader = RotationOffloader(dit.blocks, torch.device(device),
+                                              range(len(dit.blocks)))
+            dit.offloader.set_resident(_ft_resident_blocks(rot_schedule.active_at(0)))
+            dit.blocks_to_swap = 1
+            logger.info("[ft-rotation] streaming frozen blocks from CPU — only the trainable "
+                        "window stays resident.")
+        logger.info("[ft-rotation] FULL FINE-TUNE — %s", rot_schedule.describe())
+        # Max epochs snaps UP to end on a cycle boundary — an off-cycle total leaves the
+        # FINAL checkpoint (the one people keep) with some components trained one more
+        # pass than others. Start-aware, so a resumed leg still lands on the original
+        # total when that total was cycle-aligned. Before the too-short warning below,
+        # which must judge the post-snap value. (H3's twin lives at its save-snap site.)
+        from fizgig.krea2.rotation import snap_ft_epochs as _snap_ep
+        _snapped_ep = _snap_ep(max_train_epochs, rot_schedule.cycle_epochs,
+                               start_window=int(finetune_start_window or 0),
+                               rotate_every=max(1, int(finetune_rotate_every or 1)))
+        if _snapped_ep != max_train_epochs:
+            logger.info("[ft-rotation] Max epochs %d would end mid-cycle (%d-epoch cycle) "
+                        "— snapping to %d so the final checkpoint ends with every "
+                        "component evenly trained.",
+                        max_train_epochs, rot_schedule.cycle_epochs, _snapped_ep)
+            max_train_epochs = _snapped_ep
+        # Two pre-flight honesty checks (log-only — a power user gets the facts, not a gate):
+        # (1) FT has never been run on AMD/ROCm, and the NF4 default leans on bitsandbytes
+        # Linear4bit, whose ROCm wheel is the least-travelled part of that stack. Say so up
+        # front rather than letting a default-config failure look like the user's fault.
+        if getattr(torch.version, "hip", None):
+            logger.warning("[ft-rotation] heads-up: fine-tuning is UNTESTED on AMD/ROCm — "
+                           "every measured tier is NVIDIA. The NF4 default depends on "
+                           "bitsandbytes 4-bit, the least-tested part of the ROCm stack. "
+                           "It may work; if it does (or doesn't), a report on GitHub "
+                           "genuinely helps.")
+        # (2) The Krea 2 bf16 master (~24 GB) lives in system RAM with no disk spill (H3's
+        # spills; Krea 2's does not). A short host leaves Windows paging, and paging
+        # surfaces as a misleading 'CUDA error: out of memory' with the GPU nearly empty
+        # (#94/#110's commit-charge trap). Warn while the user can still close things.
+        try:
+            import psutil as _ps
+            _avail = _ps.virtual_memory().available / 1e9
+            if _avail < 34.0:
+                logger.warning("[ft-rotation] system RAM is tight for a Krea 2 fine-tune: "
+                               "%.0f GB available, and the ~24 GB bf16 master plus staging "
+                               "wants ~34 GB free. Expect paging (slow steps), and know "
+                               "that running out surfaces as 'CUDA error: out of memory' "
+                               "with the GPU nearly empty. Close other apps, or use a "
+                               "machine with 48 GB+ of RAM for comfort.", _avail)
+        except Exception:
+            pass
+        if rot_schedule.cycle_epochs > max_train_epochs:
+            logger.warning("[ft-rotation] a full cycle needs %d epochs but max_train_epochs=%d — "
+                           "blocks after window %d will NEVER train this run.",
+                           rot_schedule.cycle_epochs, max_train_epochs,
+                           max_train_epochs // finetune_rotate_every)
+        # Checkpoints (and the previews that ride them) land at rotation-cycle boundaries
+        # only — mirrors H3: every window must see the identical data mix for equal passes
+        # before the mix changes, or checkpoints compare unlike-for-unlike. Snapped UP,
+        # never down — the user asked for at least that much training between saves.
+        _cyc = rot_schedule.cycle_epochs
+        if save_every_n_epochs and save_every_n_epochs % _cyc:
+            _snapped_save = ((save_every_n_epochs + _cyc - 1) // _cyc) * _cyc
+            logger.info("[ft-rotation] checkpoint saves land at rotation-cycle boundaries — "
+                        "save-every %d snaps to %d (%d-epoch cycle).",
+                        save_every_n_epochs, _snapped_save, _cyc)
+            save_every_n_epochs = _snapped_save
+        if do_previews:
+            logger.info("[ft-rotation] previews follow CHECKPOINT SAVES (every %d epoch(s), "
+                        "plus the final one), overriding Sample-every-N — each sample is the "
+                        "rehearsal of a checkpoint you can deploy, rendered on the training "
+                        "DiT via a deactivate/reactivate bracket with the Turbo LoRA applied "
+                        "fresh each time.",
+                        save_every_n_epochs if save_every_n_epochs else max_train_epochs)
+        elif sample_prompts and not _ft_preview_gap_warned:
+            # H3's 7377f2c twin: a prompts file is the clearest statement the user WANTS
+            # previews, so a silent off is the same class as the announce-then-never-render
+            # lie fixed there — say which ingredient is missing instead (the cadence flag
+            # is the one nobody guesses; a run with prompts but no cadence renders nothing).
+            # The FT turbo-lora gate above prints its own line; don't double up on it.
+            _missing = [m for m, ok in (
+                ("a sample cadence — set Sample every N epochs "
+                 "(--sample_every_n_epochs) or sample-at-first",
+                 bool(sample_every_n_epochs or sample_at_first)),
+                ("the Turbo LoRA", bool(turbo_lora_path)),
+                ("the VAE path", bool(vae_path)),
+                ("the text encoder path", bool(te_path))) if not ok]
+            if _missing:
+                logger.warning("[ft-rotation] previews are OFF for this run: a prompts "
+                               "file is set, but missing %s. With that in place previews "
+                               "ride the checkpoint saves.", "; ".join(_missing))
+        if adaptive_lr:
+            # The watcher reads epoch-to-epoch loss movement as signal. Rotation changes which
+            # weights are trainable at the boundary, so every rotation looks like a step change
+            # and would trigger spurious reductions/rollbacks. Off for now.
+            logger.info("[ft-rotation] adaptive LR disabled — rotation boundaries look like "
+                        "instability to the plateau watcher.")
+            adaptive_lr = False
+    else:
+        network.requires_grad_(True)
+
+    # Label recorded in the saved checkpoint's metadata (ss_optimizer).
+    _optlabel = {"v": optimizer_type}
+
+    def _make_optimizer(params_, quiet: bool = False):
+        """Rotation-mode optimizer. Adafactor first: its factored state is ~10x smaller than
+        Adam's, which is what keeps a full fine-tune inside 32 GB. (The LoRA path uses the
+        shared catalog instead — see create_optimizer below — so the user's Optimizer Type
+        choice applies there; here the memory constraint decides.)"""
+        try:
+            from transformers.optimization import Adafactor
+            opt = Adafactor(params_, lr=learning_rate, scale_parameter=False,
+                            relative_step=False, warmup_init=False)
+            if not quiet:
+                logger.info("optimizer: Adafactor (rotation)")
+            _optlabel["v"] = "adafactor (rotation)"
+            return opt
+        except Exception as e:
+            if not quiet:
+                logger.warning("Adafactor unavailable (%s) — falling back to AdamW8bit", e)
+        try:
+            import bitsandbytes as bnb
+            opt = bnb.optim.AdamW8bit(params_, lr=learning_rate)
+            if not quiet:
+                logger.info("optimizer: AdamW8bit")
+            _optlabel["v"] = "adamw8bit (rotation)"
+            return opt
+        except Exception:
+            if not quiet:
+                logger.info("optimizer: AdamW (bitsandbytes unavailable)")
+            _optlabel["v"] = "adamw (rotation)"
+            return torch.optim.AdamW(params_, lr=learning_rate)
+
+    # ---- optimizer-in-backward (fused) ----
+    # Normally every active parameter's gradient exists simultaneously at the peak of backward.
+    # With this on, each parameter's optimizer steps the moment its grad is ready and the grad
+    # is dropped, so only one parameter's gradient is live at a time.
+    fused_backward = bool(finetune_fused_backward and ft_rotation)
+    _fused = {"opts": {}, "handles": []}
+    if finetune_fused_backward and not ft_rotation:
+        logger.info("[fused-backward] only applies to rotation fine-tuning — ignored.")
+    if fused_backward:
+        if int(gradient_accumulation_steps or 1) > 1:
+            logger.info("[fused-backward] incompatible with gradient accumulation (grads are "
+                        "consumed and freed per parameter) — forcing accumulation to 1.")
+        if max_grad_norm > 0:
+            logger.info("[fused-backward] global grad-norm clipping needs all grads at once — "
+                        "clipping is disabled in this mode.")
+
+    def _attach_fused(params_):
+        """One single-parameter optimizer per tensor, stepped from its grad hook."""
+        for h in _fused["handles"]:
+            h.remove()
+        _fused["handles"].clear()
+        _fused["opts"].clear()
+        for p in params_:
+            _fused["opts"][p] = _make_optimizer([p], quiet=True)
+
+        def _hook(param):
+            opt = _fused["opts"].get(param)
+            if opt is not None:
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+
+        for p in params_:
+            _fused["handles"].append(p.register_post_accumulate_grad_hook(_hook))
+        logger.info("[fused-backward] %d per-parameter optimizers attached", len(params_))
+
+    if ft_rotation:
+        rotator.rotate_to(rot_schedule.active_at(0))
+        params = rotator.trainable_params()
+        if fused_backward:
+            _attach_fused(params)
+            optimizer = None        # stepping happens in the backward hooks
+        else:
+            optimizer = _make_optimizer(params)
+        optimizer_label = _optlabel["v"]
+    else:
+        # LoRA training: the shared catalog, so the Optimizer Type / Args the user picked
+        # applies (and its family-appropriate LR warnings fire).
+        params = list(network.get_trainable_params())
+        from fizgig.training.optimizers import create_optimizer
+        optimizer, optimizer_label = create_optimizer(
+            optimizer_type, params, learning_rate, optimizer_args)
 
     collator = _Krea2Collator(shared_epoch, group)
     # Bucket-grouped ordering (OFF by default — measured, and it buys nothing today).
@@ -1667,49 +2428,61 @@ def train_krea2(
     # Mutually exclusive with adaptive LR by design: both write optimizer.param_groups[*]["lr"],
     # so a live scheduler would stomp the watcher's epoch decisions every step. Adaptive wins
     # (same rule as Klein, whose GUI also forces "constant" when adaptive is on).
-    accum = max(1, int(gradient_accumulation_steps or 1))
+    accum_requested = max(1, int(gradient_accumulation_steps or 1))
+    # Fused backward consumes and frees each grad as it lands, so there is nothing
+    # left to accumulate across micro-batches.
+    accum = 1 if fused_backward else accum_requested
     if accum > 1:
         logger.info(f"[grad_accum] {accum} micro-batches per optimizer step "
                     f"(effective batch {accum}); ~{max(1, steps_per_epoch // accum)} updates/epoch")
+
+    _sched_total_steps = math.ceil(steps_per_epoch / accum) * max_train_epochs
+
+    def _sched_position(gstep: int) -> int:
+        """global_step counts MICRO-batches; a schedule's position is optimizer steps.
+
+        The loop flushes a PARTIAL accumulation group at every epoch boundary (the scheduler
+        steps there too), so updates/epoch = ceil(steps_per_epoch/accum) — a flat
+        `global_step // accum` ignores those flushes and winds the schedule short, leaving the
+        LR high for the whole remainder. Resume always lands on an epoch boundary; the
+        leftover term covers a hand-rolled mid-epoch state anyway."""
+        if gstep <= 0:
+            return 0
+        _epochs_done = gstep // steps_per_epoch
+        _leftover = gstep % steps_per_epoch
+        return _epochs_done * math.ceil(steps_per_epoch / accum) + _leftover // accum
+
+    def _rebuild_scheduler(opt, position: int):
+        """Build the configured schedule against `opt`, wound forward to `position`
+        optimizer-steps. Used at startup, on resume, and after every rotation (which
+        replaces the optimizer, so the old scheduler's parameter refs are dead)."""
+        if adaptive or not lr_scheduler or lr_scheduler == "constant":
+            return None
+        from diffusers.optimization import get_scheduler
+        kwargs = {}
+        if lr_scheduler == "cosine_with_restarts":
+            kwargs["num_cycles"] = int(lr_scheduler_num_cycles)
+        elif lr_scheduler == "polynomial":
+            kwargs["power"] = float(lr_scheduler_power)
+        s = get_scheduler(lr_scheduler, opt,
+                          num_warmup_steps=int(lr_warmup_steps or 0),
+                          num_training_steps=_sched_total_steps, **kwargs)
+        # These schedules are pure functions of the step count, so re-deriving the position
+        # is exact and needs no persisted state. Setting last_epoch then stepping once lands
+        # the LR exactly where `position` calls to step() would have.
+        if position > 0:
+            s.last_epoch = position - 1
+            s.step()
+        return s
 
     scheduler = None
     if adaptive:
         if lr_scheduler and lr_scheduler != "constant":
             logger.info(f"[lr_scheduler] '{lr_scheduler}' ignored — adaptive LR is enabled and owns the LR.")
     elif lr_scheduler and lr_scheduler != "constant":
-        from diffusers.optimization import get_scheduler
-        # Schedules count OPTIMIZER steps, not micro-batches.
-        total_steps = math.ceil(steps_per_epoch / accum) * max_train_epochs
-        kwargs = {}
-        if lr_scheduler == "cosine_with_restarts":
-            kwargs["num_cycles"] = int(lr_scheduler_num_cycles)
-        elif lr_scheduler == "polynomial":
-            kwargs["power"] = float(lr_scheduler_power)
-        scheduler = get_scheduler(
-            lr_scheduler, optimizer,
-            num_warmup_steps=int(lr_warmup_steps or 0),
-            num_training_steps=total_steps,
-            **kwargs,
-        )
-        # Resume: these schedulers are pure functions of the step count, and global_step is
-        # already restored from the state dir — so re-deriving the position is exact and needs
-        # no extra persisted state. Setting last_epoch then stepping once lands the LR exactly
-        # where global_step calls to step() would have.
-        if global_step > 0:
-            # global_step counts micro-batches; the schedule's position is optimizer steps.
-            # The loop flushes a PARTIAL accumulation group at every epoch boundary (the
-            # scheduler steps there too), so updates/epoch = ceil(steps_per_epoch/accum) —
-            # a flat `global_step // accum` ignored those flushes and restored the schedule
-            # early, leaving the LR high for the whole remainder. Resume always lands on an
-            # epoch boundary; the leftover term covers a hand-rolled mid-epoch state anyway.
-            _epochs_done = global_step // steps_per_epoch
-            _leftover = global_step % steps_per_epoch
-            done_updates = (_epochs_done * math.ceil(steps_per_epoch / accum)
-                            + _leftover // accum)
-            scheduler.last_epoch = done_updates - 1
-            scheduler.step()
+        scheduler = _rebuild_scheduler(optimizer, _sched_position(global_step))
         logger.info(f"[lr_scheduler] {lr_scheduler} — warmup {int(lr_warmup_steps or 0)} / "
-                    f"{total_steps} total steps, start lr={optimizer.param_groups[0]['lr']:.3e}"
+                    f"{_sched_total_steps} total steps, start lr={optimizer.param_groups[0]['lr']:.3e}"
                     + (f" (resumed at step {global_step})" if global_step > 0 else ""))
     elif lr_warmup_steps:
         logger.info("[lr_scheduler] warmup steps ignored — LR scheduler is 'constant'.")
@@ -1751,6 +2524,22 @@ def train_krea2(
     # Also used to load/store <image_dir>/fizgig_excluded.json (exclusions travel with the dataset).
     recaptioned = {}   # key -> AI recaption attempts used (max 2; 2nd is the detailed pass)
     ar_image_dir, ar_caption_ext = None, ".txt"
+    if auto_recaption and ft_rotation:
+        # The between-epoch recaption loads the VLM by moving the WHOLE DiT to CPU and
+        # restoring it through a blocks_to_swap-aware path that knows nothing about the FT
+        # rotation streamer — on the streamed tier the restore would hoist every streamed
+        # block back onto the card behind the offloader's bookkeeping. The GUI hides the
+        # checkbox under a fine-tune; this is the belt for CLI runs and stale configs.
+        # The OTHER watch features stay: their multipliers ride the same loss-scaling the
+        # FT regularisation path uses (fused backward consumes the scaled grads), and
+        # detection judges each image against the cohort at the same epoch, so rotation's
+        # boundary shifts cancel — unlike the global adaptive watcher, which reads
+        # absolute movement and is disabled under FT for exactly that reason.
+        logger.info("[ft-rotation] auto-recaption is not available under a base-model "
+                    "fine-tune yet — detection, per-image LR and look-outlier warmup all "
+                    "still run. Fix stuck captions from the Problem Images window instead; "
+                    "manual edits queued there still apply at epoch boundaries in LoRA runs.")
+        auto_recaption = False
     watch_enabled = (log_per_image_loss or per_image_lr or auto_recaption
                      or warmup_look_outliers or _loss_log_env())
     if watch_enabled:
@@ -1864,9 +2653,99 @@ def train_krea2(
             except Exception:
                 pass
             loss_watch.resume_from_jsonl(up_to_epoch=start_epoch, resets=_resets)
+    # The preview bracket's scheduler hand-off: dropping the scheduler unpins the old
+    # window's optimizer, and the next rotation rebuilds it here from the stashed position.
+    _ft_sched_pos = {"pos": None}
+
+    def _ft_bracket_preview(epoch1):
+        """Fine-tune preview (the field-proven H3 bracket, krea2-shaped): deactivate the
+        whole window so the model is a consistent all-fp8 checkpoint (the master holds
+        every trained weight), apply the Turbo LoRA FRESH against it, render on the
+        resident training DiT, then put every wrapped forward back exactly. The model is
+        left DEACTIVATED on purpose: the next epoch's rotation check sees active=[] !=
+        wanted and reactivates + rebuilds the optimizer through the one normal path — and
+        on a failed render, only after the exception's tensors are gone (re-activating
+        inside the exception's lifetime OOM'd in H3's field runs). Returns the last
+        rendered prompt (for the status line) or None."""
+        nonlocal optimizer, scheduler, params
+        _act = list(rotator.active)
+        if _act:
+            rotator.deactivate(_act)
+            # Drop every reference to the window's now-orphaned bf16 Parameters — the
+            # fused per-parameter optimizers are KEYED on them, a plain optimizer's state
+            # pins them just as hard, and the scheduler pins the optimizer.
+            params = None
+            if fused_backward:
+                for _h in _fused["handles"]:
+                    _h.remove()
+                _fused["handles"].clear()
+                _fused["opts"].clear()
+            else:
+                if scheduler is not None:
+                    _ft_sched_pos["pos"] = scheduler.last_epoch
+                optimizer = None
+                scheduler = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        _t_net = _t_diffb = None
+        try:
+            # Override read + TE encode AFTER the deactivate, when the window's VRAM is
+            # back — the ~8 GB Qwen3-VL is the render's one real memory risk.
+            ov = _read_sample_override(output_dir)
+            if ov:
+                logger.info(f"[sample override] active — '{ov['prompt'][:60]}' "
+                            f"seed={ov['seed']} {ov['width']}x{ov['height']}"
+                            f"{' +ref' if ov.get('ref_image') else ''}")
+                _enc = encode_sample_prompts(te_path, [ov["prompt"]],
+                                             ref_image=ov.get("ref_image") or None, device=device)
+                _w, _h, _seed, _prompts = ov["width"], ov["height"], ov["seed"], [ov["prompt"]]
+            else:
+                _enc, _w, _h, _seed = encoded_prompts, sample_width, sample_height, sample_seed
+                _prompts = sample_prompts
+            if _seed == 0:
+                _seed = random.randint(1, 2**31 - 1)
+                logger.info(f"[sample] seed 0 -> random {_seed}")
+            _t_net, _t_diffb = _apply_turbo_lora(dit, turbo_lora_path, device=device, dtype=dtype)
+            _, _lp = sample_previews_on_dit(dit, _t_net, _t_diffb, sample_ae, _enc,
+                                            sample_dir, epoch1, output_name=output_name,
+                                            steps=sample_steps, cfg_scale=sample_cfg_scale,
+                                            neg=encoded_negative, width=_w, height=_h,
+                                            seed=_seed, blocks_to_swap=blocks_to_swap,
+                                            device=device, prompts=_prompts)
+            return _lp
+        finally:
+            if _t_net is not None:
+                # Exact un-apply. The pre-Turbo forward here is an INSTANCE chain (the fp8
+                # patch + the inert trainable wrap), so popping down to the class forward —
+                # H3's move — would destroy it. Each LoRAInfModule kept the target module in
+                # org_module_ref, so the captured bound forward is restored verbatim.
+                for _l in _t_net.unet_loras:
+                    _m = (_l.org_module_ref[0]
+                          if getattr(_l, "org_module_ref", None) else None)
+                    if _m is not None and getattr(_l, "org_forward", None) is not None:
+                        _m.forward = _l.org_forward
+                _t_net.to("cpu")
+            _t_net = _t_diffb = None
+            dit.train()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
     # Sample at Start: an epoch-0 preview (base model + zero-init LoRA) so the run's
     # starting point is on record. Fresh runs only — a resume already has samples.
-    if sample_at_first and do_previews and start_epoch == 0 and turbo_net is not None:
+    if sample_at_first and do_previews and start_epoch == 0 and rotator is not None:
+        # Fine-tune: the bracket renders the untouched base (nothing trained yet) on the
+        # training DiT; the epoch-0 rotation check re-activates the first window after.
+        logger.info("rendering epoch-0 preview (Sample at Start, fine-tune bracket)...")
+        try:
+            _last_p = _ft_bracket_preview(ft_epoch_offset)
+            if _last_p:
+                _last_sample_prompt = _last_p
+        except Exception as _e0:
+            logger.warning(f"[preview] Sample at Start failed ({type(_e0).__name__}) — training "
+                           f"continues; per-epoch previews will still be attempted.")
+    elif sample_at_first and do_previews and start_epoch == 0 and turbo_net is not None:
         # Turbo-LoRA mode: render on the resident training DiT (live network — no save/reload,
         # no parking). sample_previews_on_dit reverts everything in its finally.
         logger.info("rendering epoch-0 preview (Sample at Start, on training DiT)...")
@@ -1932,6 +2811,16 @@ def train_krea2(
     gc.collect()
     torch.cuda.empty_cache()
 
+    # VRAM probe: capture what the load phase alone cost, then zero the high-water mark so the
+    # training figure is training's own. Answers "is the peak the model coming in, or the steps?"
+    # AFTER the cleanup above on purpose: the probe should read the settled figure, not the
+    # transients that were about to be freed anyway.
+    _probe_load_gb = 0.0
+    if int(os.environ.get("FIZGIG_VRAM_PROBE", "0") or 0) and torch.cuda.is_available():
+        torch.cuda.synchronize()
+        _probe_load_gb = torch.cuda.max_memory_reserved() / 1024**3
+        torch.cuda.reset_peak_memory_stats()
+
     progress_bar = tqdm(total=steps_per_epoch * max_train_epochs, initial=global_step,
                         desc="steps", smoothing=0)
     pending_accum = 0  # micro-batches backward'd since the last optimizer step
@@ -1940,10 +2829,67 @@ def train_krea2(
     # boundary re-plans every shape in epoch 2). Users watching a crawling bar assume a
     # hang, so repeat a gentle note every ~30 s while it lasts.
     _warmup_note_last = 0.0
+    # Per-epoch step rate. The progress bar runs with smoothing=0, so its it/s (and the ETA
+    # derived from it) are a CUMULATIVE average over the whole run — every second not spent
+    # iterating (checkpoint saves, the Qwen3-VL load at a recaption boundary, rotation window
+    # switches) is amortised in permanently and can only push it up. That makes "is it actually
+    # slowing down?" unanswerable from the bar. This measures each epoch on its own clock.
+    _epoch_rate_prev = None
     for epoch in range(start_epoch, max_train_epochs):
         shared_epoch.value = epoch + 1
+        _epoch_t0, _epoch_step0 = time.time(), global_step
         if _sampler is not None:
             _sampler.set_epoch(epoch)      # reshuffle within/across buckets each epoch
+        if rotator is not None:
+            want = rot_schedule.active_at(epoch)
+            if want != rotator.active:
+                # New window: swap the blocks, then rebuild the optimizer. The old optimizer's
+                # state refers to tensors that no longer require grad, and Adam moments for the
+                # outgoing window are meaningless to the incoming one.
+                #
+                # Release the optimizer's grip BEFORE the swap (H3 field lesson): the old
+                # optimizer/hooks/scheduler are keyed on the outgoing window's Parameters,
+                # so without this every rotation transiently held BOTH windows at once —
+                # the measured 27.7 GB component peak IS that boundary, ~7 GB over steady
+                # state. Stash the schedule position first; the rebuild below re-attaches.
+                _sched_pos_now = (scheduler.last_epoch
+                                  if (scheduler is not None and not fused_backward)
+                                  else _ft_sched_pos["pos"])
+                params = None
+                if fused_backward:
+                    for _h in _fused["handles"]:
+                        _h.remove()
+                    _fused["handles"].clear()
+                    _fused["opts"].clear()
+                else:
+                    optimizer = None
+                    scheduler = None
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if ft_stream_frozen:
+                    # Pin the incoming window BEFORE the weight swap: activate() reads from the
+                    # master onto the GPU, and the outgoing window must rejoin the stream pool.
+                    # Component specs translate to their resident block set.
+                    dit.offloader.set_resident(_ft_resident_blocks(want))
+                rotator.rotate_to(want)
+                if torch.cuda.is_available():
+                    # Per-window peak measurement starts here (logged at epoch end).
+                    torch.cuda.reset_peak_memory_stats()
+                _new_params = rotator.trainable_params()
+                if fused_backward:
+                    # Hooks and per-parameter optimizers belong to the OLD window's tensors —
+                    # rebuild them or the incoming blocks would never step.
+                    _attach_fused(_new_params)
+                else:
+                    optimizer = _make_optimizer(_new_params)
+                params = _new_params
+                if not fused_backward and _sched_pos_now is not None:
+                    # Re-attach the schedule to the new optimizer at the stashed position
+                    # (covers both the rotation drop above and the preview bracket's).
+                    scheduler = _rebuild_scheduler(optimizer, _sched_pos_now)
+                    _ft_sched_pos["pos"] = None
+                logger.info("[ft-rotation] epoch %d: training blocks %s", epoch + 1, want)
         for i, batch in enumerate(loader):
             if epoch < 2:
                 _now = time.time()
@@ -1960,19 +2906,57 @@ def train_krea2(
                 global_step += 1
                 progress_bar.update(1)
                 continue
-            loss, t_used = compute_loss(dit, batch["latents"], batch["hidden_states"], batch["attention_mask"],
-                                        device=device,
-                                        shift=shift, dtype=dtype)
+            if slider_pairs:
+                # Image-pair slider step: the training image is the POSITIVE pole, its control
+                # the NEGATIVE. The adapter trains at +1 toward the positive and at -1 toward
+                # the negative — the SAME weights learn a signed direction, which is what makes
+                # strength a dial at inference. The pair is never packed into one sequence
+                # (that's edit-style training); each pole is a plain forward, diff-weighted so
+                # the loss concentrates where the pair actually differs.
+                _neg = batch.get("latents_control_0")
+                if _neg is None:
+                    raise RuntimeError(
+                        "[slider] this item has no pair image. Slider training needs a "
+                        "control_directory with a negative-pole image for every training "
+                        "image (matched by filename stem).")
+                network.set_multiplier(1.0)
+                _l_pos, t_used = compute_loss(dit, batch["latents"], batch["hidden_states"],
+                                              batch["attention_mask"], device=device,
+                                              shift=shift, dtype=dtype,
+                                              min_timestep=min_timestep, max_timestep=max_timestep,
+                                              diff_ref_latent=_neg, diff_weight=slider_diff_weight)
+                network.set_multiplier(-1.0)
+                _l_neg, _ = compute_loss(dit, _neg, batch["hidden_states"],
+                                         batch["attention_mask"], device=device,
+                                         shift=shift, dtype=dtype,
+                                         min_timestep=min_timestep, max_timestep=max_timestep,
+                                         diff_ref_latent=batch["latents"],
+                                         diff_weight=slider_diff_weight)
+                network.set_multiplier(1.0)
+                loss = 0.5 * (_l_pos + _l_neg)
+            else:
+                loss, t_used = compute_loss(dit, batch["latents"], batch["hidden_states"], batch["attention_mask"],
+                                            device=device,
+                                            shift=shift, dtype=dtype,
+                                            control_latent=batch.get("latents_control_0"),
+                                            min_timestep=min_timestep, max_timestep=max_timestep,
+                                            motion_weight=motion_weighted_loss)
             # Per-image LR: scale THIS step's gradient by the image's multiplier (throttle stuck
             # images, boost healthy learned ones). Raw loss is still what gets recorded/averaged below,
             # so avr_loss and the global adaptive-LR watcher see unscaled numbers.
-            step_mult = loss_watch.multiplier(batch.get("item_keys")) if loss_watch is not None else 1.0
+            if reg_keys and _batch_is_reg(batch.get("item_keys"), reg_keys):
+                step_mult = reg_mult   # regularisation images: fixed nudge, never the watch's
+            else:
+                step_mult = loss_watch.multiplier(batch.get("item_keys")) if loss_watch is not None else 1.0
             # Divide by the accumulation count so N micro-batches AVERAGE into one update rather
             # than summing (which would scale the effective LR by N).
             _scaled = loss * step_mult if step_mult != 1.0 else loss
             (_scaled / accum if accum > 1 else _scaled).backward()
             pending_accum += 1
-            if pending_accum >= accum:
+            if fused_backward:
+                # The per-parameter hooks already stepped and freed each grad during backward.
+                pending_accum = 0
+            elif pending_accum >= accum:
                 # Gradient clipping to match the musubi reference (max_grad_norm default 1.0). 0 disables.
                 if max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
@@ -1991,10 +2975,31 @@ def train_krea2(
             # "187, 187, 188, 188" doubling). Training itself is one step per iteration.
             progress_bar.set_postfix(avr_loss=f"{loss_recorder.moving_average:.4f}", refresh=False)
             progress_bar.update(1)
+
+            # VRAM probe (FIZGIG_VRAM_PROBE=N): run N steps, report peak memory, exit. For
+            # answering "does this config fit card X" without a full run or a checkpoint write.
+            # `reserved` is the number to compare against a card's capacity — it is what torch
+            # holds from the driver; `allocated` is only what is live inside that. Neither
+            # includes the ~0.5-1 GB CUDA context, so nvidia-smi always reads a little higher.
+            _probe_n = int(os.environ.get("FIZGIG_VRAM_PROBE", "0") or 0)
+            if _probe_n and global_step >= _probe_n:
+                torch.cuda.synchronize()
+                _alloc = torch.cuda.max_memory_allocated() / 1024**3
+                _resv = torch.cuda.max_memory_reserved() / 1024**3
+                _tot = torch.cuda.get_device_properties(0).total_memory / 1024**3
+                _overall = max(_resv, _probe_load_gb)
+                logger.info("[vram-probe] steps=%d  load=%.2f GB  training=%.2f GB  overall=%.2f GB  "
+                            "(peak is %s)  allocated=%.2f GB  card=%.1f GB  alloc_conf=%s",
+                            global_step, _probe_load_gb, _resv, _overall,
+                            "LOAD" if _probe_load_gb >= _resv else "TRAINING",
+                            _alloc, _tot, os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "(default)"))
+                print(f"VRAM_PROBE_RESULT reserved={_overall:.3f} allocated={_alloc:.3f} "
+                      f"load={_probe_load_gb:.3f} train={_resv:.3f}", flush=True)
+                sys.exit(0)
         # Flush a partial accumulation group at the epoch boundary: the epoch-end work (adaptive
         # LR decisions, rollback snapshot, state save) must see a settled optimizer, and leftover
         # grads must not leak into the next epoch.
-        if pending_accum > 0:
+        if pending_accum > 0 and not fused_backward:
             if max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
             optimizer.step()
@@ -2002,8 +3007,30 @@ def train_krea2(
                 scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             pending_accum = 0
-        logger.info(f"epoch {epoch + 1}/{max_train_epochs}  avr_loss={loss_recorder.moving_average:.4f}  step={global_step}"
-                    + (f"  lr={optimizer.param_groups[0]['lr']:.3e}" if scheduler is not None else ""))
+        _ep_steps = global_step - _epoch_step0
+        _ep_secs = time.time() - _epoch_t0
+        _rate = f"  {_ep_secs / _ep_steps:.2f}s/it" if _ep_steps > 0 else ""
+        if _ep_steps > 0 and _epoch_rate_prev:
+            # Only flag a real change; epoch-to-epoch jitter of a few percent is normal, and in
+            # component rotation each window trains a different share of the model.
+            _drift = (_ep_secs / _ep_steps) / _epoch_rate_prev
+            if _drift >= 1.15 or _drift <= 0.87:
+                _rate += f" ({_drift:.2f}x vs last epoch)"
+        if _ep_steps > 0:
+            _epoch_rate_prev = _ep_secs / _ep_steps
+        # Cumulative across FT pause/resume, matching checkpoint numbering (H3 twin; the
+        # offset is 0 on fresh and LoRA runs, so nothing changes there).
+        logger.info(f"epoch {epoch + 1 + ft_epoch_offset}/{max_train_epochs + ft_epoch_offset}  avr_loss={loss_recorder.moving_average:.4f}  step={global_step}"
+                    + _rate
+                    + (f"  lr={optimizer.param_groups[0]['lr']:.3e}" if (scheduler is not None and optimizer is not None) else ""))
+        if rotator is not None and torch.cuda.is_available():
+            # Per-window peak, reset at each rotation — the H3 twin of this line is what
+            # calibrated that family's window planner, and _K2FT_OVERHEAD_GB here is still
+            # a DERIVED guess with no field measurement behind it. GB (1e9), never GiB:
+            # the planner constants are GB, and mixing the two cost H3 a full GB of
+            # headroom before it was caught (27 Aug).
+            logger.info("[ft-rotation] window peak VRAM: %.1f GB",
+                        torch.cuda.max_memory_allocated() / 1e9)
 
         # Attention backend: cuDNN's kernel is ~6% faster per step but costs ~1.3 s per distinct
         # sequence shape to plan, so it only wins on runs long enough to amortize that. After a
@@ -2035,46 +3062,100 @@ def train_krea2(
         # Live caption repair: apply caption edits queued from the Problem Images window, and
         # (when enabled) auto-recaption confirmed-stuck images with the same Qwen3-VL — both
         # re-encode in place so the next epoch trains on the fixed captions.
-        _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_swap,
+        # NOT under a fine-tune: the re-encode moves the whole DiT to CPU and restores it
+        # through a blocks_to_swap-aware path the FT rotation streamer knows nothing about
+        # (same reason auto-recaption is disarmed above). Manual edits stay queued and
+        # apply in the next LoRA-mode run.
+        if ft_rotation:
+            _q = os.path.join(output_dir, "loss_log", "caption_updates.json")
+            if os.path.exists(_q):
+                logger.info("[ft-rotation] caption edits are queued but held — live caption "
+                            "re-encode is not available under a fine-tune; they will apply "
+                            "in the next LoRA-mode run on this dataset.")
+        else:
+            _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_swap,
                                loss_watch, epoch + 1,
                                auto_recaption=auto_recaption, trigger_word=trigger_word,
+                               trigger_position=trigger_position,
                                recaptioned=recaptioned, image_dir=ar_image_dir,
                                caption_ext=ar_caption_ext,
                                recaption_instruction=recaption_instruction,
                                recaption_instruction_detailed=recaption_instruction_detailed)
 
         state_saved_this_epoch = False
+        ft_ckpt_saved_this_epoch = False
         if save_every_n_epochs and (epoch + 1) % save_every_n_epochs == 0 and (epoch + 1) < max_train_epochs:
-            # comfy_format so a user's picked-best epoch is byte-format-identical to the final
-            # artifact (LoKR: LyCORIS-standard keys). No-op for standard LoRA.
-            _save_lora(network, os.path.join(output_dir, f"{output_name}-{epoch + 1:06d}.safetensors"),
-                       network_dim, network_alpha, dtype, extra_metadata=_sai_metadata(),
-                       comfy_format=True)
-            # Resumable state rides the checkpoint cadence. Safe to snapshot here: pending_accum
-            # was flushed above, the adaptive-LR watcher has already made its call for this epoch,
-            # and any queued caption updates are applied — so the optimizer is settled.
-            if save_state:
-                # NON-FATAL by design. A real run (7 Aug, RunPod) died at 27% of 55 hours
-                # because rng.pt hit a full network volume — for a file whose only job is to
-                # make resume nicer. The checkpoint itself had already saved. State saving must
-                # never cost a run; if the disk is truly full, the next EPOCH CHECKPOINT will
-                # fail and that one is rightly fatal.
-                try:
-                    _save_training_state(output_dir, output_name, network, optimizer,
-                                         epoch=epoch + 1, global_step=global_step,
-                                         network_dim=network_dim, network_alpha=network_alpha, dtype=dtype,
-                                         extra={"adaptive_lr_state": adaptive.state_dict()} if adaptive else None)
-                    state_saved_this_epoch = True
-                except Exception as _se:
-                    logger.error("[state] saving the resume state FAILED (%s: %s). This is "
-                                 "almost always the disk — on RunPod the volume quota is "
-                                 "invisible from inside the pod (the dashboard is the only true "
-                                 "reading), so writes fail with no warning. Training continues; "
-                                 "this epoch has no resume point. The epoch checkpoint itself "
-                                 "already saved.", type(_se).__name__, _se)
-                prune_state_dirs(output_dir, output_name, keep_last_n_states)
+            if rotator is not None:
+                # The full checkpoint IS the resumable state under fine-tuning: the LoRA is
+                # inert and the optimizer may be None (fused backward), so a state dir would
+                # snapshot nothing real. To continue a fine-tune, point --dit at the saved
+                # checkpoint (structurally identical to the RAW base). The next start window
+                # rides in the metadata so the GUI's Resume can pick it up without the console.
+                _ck = os.path.join(output_dir,
+                                   f"{output_name}-{epoch + 1 + ft_epoch_offset:06d}.safetensors")
+                _next_w = rot_schedule.window_at(epoch + 1)
+                _save_full_checkpoint(rotator, raw_path, _ck, extra_metadata={
+                    "fizgig_next_start_window": str(_next_w),
+                    "fizgig_ft_n_windows": str(rot_schedule.n_windows),
+                    "fizgig_ft_epochs_done": str(epoch + 1 + ft_epoch_offset)})
+                ft_ckpt_saved_this_epoch = True
+                logger.info("[ft-rotation] to continue from this checkpoint: --dit %s "
+                            "--finetune_start_window %d", os.path.basename(_ck), _next_w)
+                if save_state:
+                    logger.info("[ft-rotation] state dirs are skipped — the full checkpoint "
+                                "is the state; swap the base to continue training.")
+            else:
+                # comfy_format so a user's picked-best epoch is byte-format-identical to the final
+                # artifact (LoKR: LyCORIS-standard keys). No-op for standard LoRA.
+                _save_lora(network, os.path.join(output_dir, f"{output_name}-{epoch + 1:06d}.safetensors"),
+                           network_dim, network_alpha, dtype, extra_metadata=_sai_metadata(),
+                           comfy_format=True)
+                # Resumable state rides the checkpoint cadence. Safe to snapshot here: pending_accum
+                # was flushed above, the adaptive-LR watcher has already made its call for this epoch,
+                # and any queued caption updates are applied — so the optimizer is settled.
+                if save_state:
+                    # NON-FATAL by design. A real run (7 Aug, RunPod) died at 27% of 55 hours
+                    # because rng.pt hit a full network volume — for a file whose only job is to
+                    # make resume nicer. The checkpoint itself had already saved. State saving must
+                    # never cost a run; if the disk is truly full, the next EPOCH CHECKPOINT will
+                    # fail and that one is rightly fatal.
+                    try:
+                        _save_training_state(output_dir, output_name, network, optimizer,
+                                             epoch=epoch + 1, global_step=global_step,
+                                             network_dim=network_dim, network_alpha=network_alpha, dtype=dtype,
+                                             extra={"adaptive_lr_state": adaptive.state_dict()} if adaptive else None)
+                        state_saved_this_epoch = True
+                    except Exception as _se:
+                        logger.error("[state] saving the resume state FAILED (%s: %s). This is "
+                                     "almost always the disk — on RunPod the volume quota is "
+                                     "invisible from inside the pod (the dashboard is the only true "
+                                     "reading), so writes fail with no warning. Training continues; "
+                                     "this epoch has no resume point. The epoch checkpoint itself "
+                                     "already saved.", type(_se).__name__, _se)
+                    prune_state_dirs(output_dir, output_name, keep_last_n_states)
 
-        if (do_previews and sample_every_n_epochs and (epoch + 1) % sample_every_n_epochs == 0
+        if (rotator is not None and do_previews
+                and (ft_ckpt_saved_this_epoch or (epoch + 1) == max_train_epochs)):
+            # Fine-tune: previews ride the checkpoint saves (plus the final epoch) — each
+            # sample is the rehearsal of a file you can deploy. Clear the last step's
+            # loss/batch refs first: the loss tensor's graph metadata holds the window's
+            # Parameters (H3 field lesson, ab04379) and would pin them through the render.
+            loss = batch = None
+            logger.info(f"rendering previews (epoch {epoch + 1 + ft_epoch_offset}) via the "
+                        "fine-tune bracket (training DiT + fresh Turbo LoRA)...")
+            try:
+                _lp = _ft_bracket_preview(epoch + 1 + ft_epoch_offset)
+                if _lp:
+                    _last_sample_prompt = _lp
+            except Exception as _prev_err:
+                _oom = "out of memory" in str(_prev_err).lower()
+                logger.warning(
+                    f"[preview] epoch {epoch + 1 + ft_epoch_offset} preview failed "
+                    f"({'CUDA OOM' if _oom else type(_prev_err).__name__}); "
+                    f"disabling previews for the rest of the run. Training continues and "
+                    f"checkpoints still save normally.")
+                do_previews = False
+        elif (do_previews and sample_every_n_epochs and (epoch + 1) % sample_every_n_epochs == 0
                 and turbo_net is not None):
             # Turbo-LoRA mode: live network, resident DiT, no parking. The override TE encode
             # is the one VRAM risk (the ~8 GB Qwen3-VL loads alongside the resident trainer,
@@ -2114,7 +3195,8 @@ def train_krea2(
                 )
                 do_previews = False
             network.train()
-        elif do_previews and sample_every_n_epochs and (epoch + 1) % sample_every_n_epochs == 0:
+        elif (do_previews and sample_every_n_epochs and rotator is None
+                and (epoch + 1) % sample_every_n_epochs == 0):
             from safetensors.torch import load_file
             tmp = os.path.join(output_dir, "_sample_lora.safetensors")
             _save_lora(network, tmp, network_dim, network_alpha, dtype)
@@ -2202,7 +3284,35 @@ def train_krea2(
             # so a crash during the rewrite would destroy the very state we're pausing to keep.
             # The flag (not os.path.isdir) is the right check — a stale dir left by an earlier
             # run with the same name would wrongly suppress a real pause save.
-            if state_saved_this_epoch:
+            if rotator is not None:
+                # Under fine-tuning the full checkpoint IS the state — a state dir would hold
+                # only the inert LoRA (and the optimizer may be None under fused backward),
+                # and worse, an off-cadence pause used to save NOTHING at all: every epoch of
+                # dense training since the last cadence checkpoint silently vanished on exit.
+                if ft_ckpt_saved_this_epoch:
+                    logger.info(f"[pause] requested — epoch {epoch + 1 + ft_epoch_offset} checkpoint "
+                                "already saved this epoch; exiting cleanly")
+                    logger.info("[ft-rotation] paused. Continue with: --dit %s "
+                                "--finetune_start_window %d",
+                                f"{output_name}-{epoch + 1 + ft_epoch_offset:06d}.safetensors",
+                                rot_schedule.window_at(epoch + 1))
+                else:
+                    _pp = os.path.join(output_dir,
+                                       f"{output_name}-{epoch + 1 + ft_epoch_offset:06d}.safetensors")
+                    _next_w = rot_schedule.window_at(epoch + 1)
+                    try:
+                        _save_full_checkpoint(rotator, raw_path, _pp, extra_metadata={
+                            "fizgig_next_start_window": str(_next_w),
+                            "fizgig_ft_n_windows": str(rot_schedule.n_windows),
+                            "fizgig_ft_epochs_done": str(epoch + 1 + ft_epoch_offset)})
+                        logger.info("[ft-rotation] paused. Continue with: --dit %s "
+                                    "--finetune_start_window %d", os.path.basename(_pp), _next_w)
+                    except Exception as _se:
+                        logger.error("[pause] checkpoint save FAILED (%s: %s) — there is NO new "
+                                     "continuation point for this pause. Free disk space and "
+                                     "continue from the previous saved checkpoint.",
+                                     type(_se).__name__, _se)
+            elif state_saved_this_epoch:
                 logger.info(f"[pause] requested — state for epoch {epoch + 1} already saved; exiting cleanly")
             else:
                 logger.info(f"[pause] requested — saving state at epoch {epoch + 1} and exiting cleanly")
@@ -2231,7 +3341,9 @@ def train_krea2(
     # End-of-run state, so a finished LoRA can be trained further by raising max_train_epochs.
     # Skipped when the run trained nothing (resumed from a state already at the final epoch) —
     # the only dir we'd write is the one we resumed FROM, and the save overwrites in place.
-    if save_state_on_train_end and max_train_epochs > start_epoch:
+    # No state dir under fine-tuning: the LoRA is inert, the optimizer may be None (fused
+    # backward), and the full checkpoint below IS the continuation point.
+    if save_state_on_train_end and max_train_epochs > start_epoch and rotator is None:
         # Non-fatal: the final LoRA is already on disk; dying here would turn a finished run red.
         try:
             _save_training_state(output_dir, output_name, network, optimizer,
@@ -2249,12 +3361,28 @@ def train_krea2(
     # Record the context LoRA in metadata so users know to pair it at the same strength at
     # inference (the trained LoRA is context-dependent — same contract as Klein).
     extra = {"ss_optimizer": optimizer_label}
+    if slider_pairs:
+        # Deploy contract: the strength dial IS the slider. Tools read these to default
+        # their range (Repair Studio / Royale scrub ±).
+        extra.update({"ss_slider": "image_pairs",
+                      "ss_slider_diff_weight": f"{float(slider_diff_weight):g}"})
     if context_lora_path:
         extra.update({"ss_context_lora": os.path.basename(context_lora_path),
                       "ss_context_lora_strength": str(context_lora_strength)})
     # Full SAI ModelSpec block — same keys ComfyUI/model managers read (GUI: Other Options →
     # Metadata), plus trigger phrase and an auto-picked sample thumbnail.
     extra.update(_sai_metadata())
+    if rotator is not None:
+        # Fine-tune mode: the training lives in the base weights, not the (inert) LoRA.
+        _next_w = rot_schedule.window_at(max_train_epochs)
+        extra.update({"fizgig_next_start_window": str(_next_w),
+                      "fizgig_ft_n_windows": str(rot_schedule.n_windows),
+                      "fizgig_ft_epochs_done": str(max_train_epochs + ft_epoch_offset)})
+        _save_full_checkpoint(rotator, raw_path, out, extra_metadata=extra)
+        logger.info(f"saved fine-tuned checkpoint -> {out}")
+        logger.info("[ft-rotation] to train it further: --dit %s --finetune_start_window %d",
+                    os.path.basename(out), _next_w)
+        return out
     _save_lora(network, out, network_dim, network_alpha, dtype, extra_metadata=extra,
                comfy_format=True)
     logger.info(f"saved final LoRA -> {out}")
