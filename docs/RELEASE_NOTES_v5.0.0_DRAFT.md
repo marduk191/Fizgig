@@ -3,7 +3,9 @@
 <!-- DRAFT STATUS: builds as the FT release firms up. Before publishing:
      - DONE 29 Aug: NF4 quality signed off by Peter - every successful field run since 23 Aug ran the NF4 trunk (64-epoch fair-trial runs included) and the checkpoint is bf16 from the master regardless
      - DONE 29 Aug: 32 GB Krea 2 smoke green (NF4 default resolves flagless; 4 resident windows, peaks 22.6/20.8/20.8/20.8, ~1.0 s/it, bracket preview rendered, exit 0)
-     - contributor credits for the cycle get added in the usual style -->
+     - DONE 29 Aug: credits pass - no external code ships this cycle (150/150 commits
+       in-house, audited); the two community-REPORTED fixes carried from master are
+       credited in Also-in-this-release (JohnSiris #111, ritonV #94/#95/#110) -->
 
 Fine-tune the base model itself — on the card you already have.
 
@@ -86,6 +88,21 @@ add from our own tests, carefully: **multi-character and concept teaching seemed
 at a much deeper level than LoRA training, with much better results.** The rest — how far
 this actually goes — we're deliberately leaving for you to discover. Field reports
 genuinely shape what gets built next.
+
+## Also in this release
+
+- **The installer now checks an existing venv before trusting it.** A venv silently
+  outlives the Python it was built from, and the old installer reused it anyway —
+  failing three steps later with a wall of text that pointed everywhere except the
+  cause. It now verifies the venv can actually start, explains what's wrong in one
+  sentence, and offers to recreate it. Surfaced by **[@JohnSiris](https://github.com/JohnSiris)**'s
+  thorough report (#111).
+- **Running out of system RAM no longer masquerades as success.** When the MiniMax text
+  encoder can't page-lock its staging, the console now prints your machine's real RAM
+  numbers and says plainly that a later "CUDA error: out of memory" with an empty-looking
+  GPU is a RAM shortfall — with the actual fixes — instead of promising the run would
+  complete. Root-caused across **[@ritonV](https://github.com/ritonV)**'s reports
+  (#94, #95, #110).
 
 A personal note on where this is at: I first got fine-tuning working on Krea 2 shortly
 after its release, and I've been deliberately cautious about shipping it — first proving
