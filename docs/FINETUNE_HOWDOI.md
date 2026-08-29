@@ -5,6 +5,13 @@ The extended companion to the README's fine-tuning section, for **Krea 2** and
 new to fine-tuning and coming from LoRA training, read the first four answers in order —
 they're the ones that save you a wasted overnight run.
 
+> **One idea makes everything else here make sense: an "epoch" trains one slice of the
+> model.** The trainable window rotates each epoch, so it takes a full cycle — typically
+> **4 epochs** — for every part of the model to train once. Rule of thumb: **4 fine-tune
+> epochs ≈ 1 true epoch of the whole model.** That's why the epoch defaults look high,
+> and why saves land on cycle boundaries — each saved checkpoint is a whole, evenly
+> trained model.
+
 ---
 
 ## How do I start a fine-tune?

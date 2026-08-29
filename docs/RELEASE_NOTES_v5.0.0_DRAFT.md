@@ -23,6 +23,12 @@ Krea 2 Adaptive LR steps aside automatically), set your output drive, keep your 
 tokens — done. Step-by-step recipes for both, and every other question:
 **[docs/FINETUNE_HOWDOI.md](docs/FINETUNE_HOWDOI.md)**.
 
+> **One idea makes everything else here make sense: an "epoch" trains one slice of the
+> model.** The trainable window rotates each epoch, so it takes a full cycle — typically
+> **4 epochs** — for every part of the model to train once. Rule of thumb: **4 fine-tune
+> epochs ≈ 1 true epoch of the whole model.** That's why the epoch defaults look high,
+> and why saves land on cycle boundaries — each saved checkpoint is a whole, evenly
+> trained model.
 **What can my card fine-tune?**
 
 | Your card | Krea 2 — photos | MiniMax H3 — photos | H3 — voice | H3 — video, confirmed | H3 — video on likeness blocks, expected |

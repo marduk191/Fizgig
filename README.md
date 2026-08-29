@@ -247,10 +247,18 @@ LoRA** on the Training tab.
 > technique is model-agnostic at heart — it opens the door to fine-tuning other models,
 > and I'm open to going there. But for that to happen it needs practical community
 > support around those models — code, PRs, testing, that kind of thing — so I have the
-> time necessary to make it happen. — Peter (New to fine-tuning? The extended
-**["How do I…?" guide](docs/FINETUNE_HOWDOI.md)** answers everything this section can't fit —
-including **five-minute recipes for both families**: tick Fine-tune, let the settings
-switch themselves, and change almost nothing.)
+> time necessary to make it happen. — Peter
+
+New to fine-tuning? The extended **["How do I…?" guide](docs/FINETUNE_HOWDOI.md)** answers
+everything this section can't fit — including **five-minute recipes for both families**:
+tick Fine-tune, let the settings switch themselves, and change almost nothing.
+
+> **One idea makes everything else here make sense: an "epoch" trains one slice of the
+> model.** The trainable window rotates each epoch, so it takes a full cycle — typically
+> **4 epochs** — for every part of the model to train once. Rule of thumb: **4 fine-tune
+> epochs ≈ 1 true epoch of the whole model.** That's why the epoch defaults look high,
+> and why saves land on cycle boundaries — each saved checkpoint is a whole, evenly
+> trained model.
 
 > **Note on VRAM:** the "trains on 8 GB" figures elsewhere in this README are for **LoRA**
 > training. Full fine-tuning is a different animal — but it now **tiers itself to your card**,
