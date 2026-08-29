@@ -246,6 +246,27 @@ LoRA** on the Training tab.
 > halves the model held on the card and is what makes 16 GB fit. The planner measures your
 > free VRAM at launch and prints the plan it chose.
 
+**What can my card fine-tune?** The short answer, at the default training resolution:
+
+<!-- DRAFT NOTE (not rendered): the video-clip column for 32 GB depends on the planner
+     activation term (Q2+Q4 bundle) landing before release - today a 32 GB card picks the
+     resident plan and fails on clips >0.9 s while 16/24 GB pass them. 16 GB and 24 GB clip
+     cells are MEASURED (28 Aug runs, fizgig-ft-runs/clipq2); 32 GB @ 2.3 s needs one
+     verifying run after the planner change. Remove this note once both are done. -->
+
+| Your card | Krea 2 — photos | MiniMax H3 — photos | H3 — voice | H3 — video clips (with sound) |
+|---|---|---|---|---|
+| **16 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** |
+| **24 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** |
+| **32 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** |
+
+A few things worth knowing about that table: clip lengths follow Gizmo's grid, so **2.3 s means
+the 56-frame slot** — cut your clips there and everything fits. Longer clips (3.8 s / 5.2 s)
+currently need more than 32 GB; that ceiling is about activation memory, not the model, and
+it's the next thing on the bench. One clip anywhere in your folder trains the **whole** model
+(that's what video needs), so a mixed photos + clips dataset uses the clip column. And 12 GB
+cards train **LoRAs**, not fine-tunes — 16 GB is the fine-tune floor.
+
 **Which model files.** Fine-tuning uses the same training bases you already have — nothing new to
 download:
 
