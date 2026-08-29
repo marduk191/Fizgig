@@ -59,7 +59,16 @@ never passes through a quantiser.
 If "a 33B video model fine-tuning on 16 GB" reads like a trick — the numbers are
 measured, not projected: **8.8–12.3 GB peaks on a 16 GB card for H3, 8.4–11.0 GB for
 Krea 2**, and the console prints your own run's peak every epoch so you can watch the
-claim hold live. The full mechanism, the card tiers, and every "how do I" question:
+claim hold live.
+
+The streaming machinery underneath stands on community shoulders: the fine-tune's
+frozen-block ring grew out of **[@rintic-13](https://github.com/rintic-13)**'s one-way
+H2D block streaming (and his 32B text-encoder layer streaming is why small cards can
+caption at all), while **[@mabseyuk](https://github.com/mabseyuk)**'s text-encoder
+streaming and RAM-aware pinned staging keep the small-card path graceful end to end —
+his fallback guards fired, correctly, during the fine-tune gate runs themselves.
+
+The full mechanism, the card tiers, and every "how do I" question:
 **[docs/FINETUNE_HOWDOI.md](docs/FINETUNE_HOWDOI.md)**.
 
 ## One number to respect: the learning rate
