@@ -149,6 +149,19 @@ full-model fine-tuning, and it shrinks the windows so every VRAM tier gets easie
 exception is video: clips train the whole model regardless, so the checkbox mainly
 matters for photo/voice datasets.
 
+## Do the problem-image tools work on a fine-tune? (Krea 2)
+
+Mostly, yes. **Detect problem images**, **per-image adaptive LR** and **look-outlier
+warmup** all work under a fine-tune — their throttles ride the same per-step loss scaling
+the regularisation multiplier uses, and detection judges each image against the rest of
+the dataset at the same epoch, so the rotation's epoch-to-epoch shifts cancel out.
+
+Two exceptions, both deliberate: **(global) Adaptive LR** switches off when you tick
+Fine-tune — rotation boundaries look like instability to its plateau watcher — and
+**auto-recaption** is hidden under a fine-tune (its between-epoch caption re-encode isn't
+fine-tune-safe yet). Caption edits queued from the Problem Images window during a
+fine-tune are held and apply in your next LoRA-mode run on that dataset.
+
 ## What are regularisation images, and what does LR × do?
 
 Full fine-tuning moves every weight, so a long run on a handful of subjects can drift the

@@ -2483,6 +2483,22 @@ def train_krea2(
     # Also used to load/store <image_dir>/fizgig_excluded.json (exclusions travel with the dataset).
     recaptioned = {}   # key -> AI recaption attempts used (max 2; 2nd is the detailed pass)
     ar_image_dir, ar_caption_ext = None, ".txt"
+    if auto_recaption and ft_rotation:
+        # The between-epoch recaption loads the VLM by moving the WHOLE DiT to CPU and
+        # restoring it through a blocks_to_swap-aware path that knows nothing about the FT
+        # rotation streamer — on the streamed tier the restore would hoist every streamed
+        # block back onto the card behind the offloader's bookkeeping. The GUI hides the
+        # checkbox under a fine-tune; this is the belt for CLI runs and stale configs.
+        # The OTHER watch features stay: their multipliers ride the same loss-scaling the
+        # FT regularisation path uses (fused backward consumes the scaled grads), and
+        # detection judges each image against the cohort at the same epoch, so rotation's
+        # boundary shifts cancel — unlike the global adaptive watcher, which reads
+        # absolute movement and is disabled under FT for exactly that reason.
+        logger.info("[ft-rotation] auto-recaption is not available under a base-model "
+                    "fine-tune yet — detection, per-image LR and look-outlier warmup all "
+                    "still run. Fix stuck captions from the Problem Images window instead; "
+                    "manual edits queued there still apply at epoch boundaries in LoRA runs.")
+        auto_recaption = False
     watch_enabled = (log_per_image_loss or per_image_lr or auto_recaption
                      or warmup_look_outliers or _loss_log_env())
     if watch_enabled:
@@ -3003,7 +3019,18 @@ def train_krea2(
         # Live caption repair: apply caption edits queued from the Problem Images window, and
         # (when enabled) auto-recaption confirmed-stuck images with the same Qwen3-VL — both
         # re-encode in place so the next epoch trains on the fixed captions.
-        _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_swap,
+        # NOT under a fine-tune: the re-encode moves the whole DiT to CPU and restores it
+        # through a blocks_to_swap-aware path the FT rotation streamer knows nothing about
+        # (same reason auto-recaption is disarmed above). Manual edits stay queued and
+        # apply in the next LoRA-mode run.
+        if ft_rotation:
+            _q = os.path.join(output_dir, "loss_log", "caption_updates.json")
+            if os.path.exists(_q):
+                logger.info("[ft-rotation] caption edits are queued but held — live caption "
+                            "re-encode is not available under a fine-tune; they will apply "
+                            "in the next LoRA-mode run on this dataset.")
+        else:
+            _apply_caption_updates(output_dir, group, te_path, device, dit, blocks_to_swap,
                                loss_watch, epoch + 1,
                                auto_recaption=auto_recaption, trigger_word=trigger_word,
                                trigger_position=trigger_position,

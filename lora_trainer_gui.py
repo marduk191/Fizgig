@@ -7370,6 +7370,16 @@ class LoRATrainerGUI:
         for w in (self._krea2_ft_frame, self._krea2_ft_fused_cb, self._krea2_fast_ft_cb,
                   self._krea2_reg_frame, self._krea2_ft_hint):
             self._set_widget_visible(w, on)
+        # Auto-recaption is hidden under a fine-tune: its between-epoch VLM load moves the
+        # whole DiT off the card through a blocks_to_swap-aware restore that knows nothing
+        # about the FT rotation streamer — on the 16 GB streamed tier the restore would
+        # hoist every streamed block back onto the card behind the offloader's bookkeeping.
+        # The other three watch toggles stay: their multipliers ride the same loss-scaling
+        # the FT regularisation path uses, and detection compares each image against the
+        # cohort at the same epoch, so rotation's boundary shifts cancel. The trainer
+        # disarms a ticked-but-hidden box too, so this is presentation, not the guard.
+        if hasattr(self, "_krea2_autorecap_cb"):
+            self._set_widget_visible(self._krea2_autorecap_cb, not on)
         # Network Type (LoRA/LoKR) is meaningless under a base-model fine-tune — the adapter
         # is inert. Hide the row while FT is on; restore the normal swap when it goes off.
         if hasattr(self, "_network_type_rowf"):
