@@ -2176,6 +2176,21 @@ def train_krea2(
             logger.info("[ft-rotation] streaming frozen blocks from CPU — only the trainable "
                         "window stays resident.")
         logger.info("[ft-rotation] FULL FINE-TUNE — %s", rot_schedule.describe())
+        # Max epochs snaps UP to end on a cycle boundary — an off-cycle total leaves the
+        # FINAL checkpoint (the one people keep) with some components trained one more
+        # pass than others. Start-aware, so a resumed leg still lands on the original
+        # total when that total was cycle-aligned. Before the too-short warning below,
+        # which must judge the post-snap value. (H3's twin lives at its save-snap site.)
+        from fizgig.krea2.rotation import snap_ft_epochs as _snap_ep
+        _snapped_ep = _snap_ep(max_train_epochs, rot_schedule.cycle_epochs,
+                               start_window=int(finetune_start_window or 0),
+                               rotate_every=max(1, int(finetune_rotate_every or 1)))
+        if _snapped_ep != max_train_epochs:
+            logger.info("[ft-rotation] Max epochs %d would end mid-cycle (%d-epoch cycle) "
+                        "— snapping to %d so the final checkpoint ends with every "
+                        "component evenly trained.",
+                        max_train_epochs, rot_schedule.cycle_epochs, _snapped_ep)
+            max_train_epochs = _snapped_ep
         # Two pre-flight honesty checks (log-only — a power user gets the facts, not a gate):
         # (1) FT has never been run on AMD/ROCm, and the NF4 default leans on bitsandbytes
         # Linear4bit, whose ROCm wheel is the least-travelled part of that stack. Say so up

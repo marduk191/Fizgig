@@ -122,6 +122,26 @@ def component_gb_per_block(block: nn.Module, prefixes) -> dict:
     return out
 
 
+def snap_ft_epochs(max_epochs, cycle_epochs, start_window=0, rotate_every=1):
+    """Snap a fine-tune's epoch count UP so the run ENDS on a rotation-cycle boundary.
+
+    An off-cycle total leaves the final checkpoint with some components trained one more
+    pass than others - and the final save is the one most people keep. Snap UP, never
+    down: the typed number expressed how much training the user wants at minimum (same
+    doctrine as retirement stops and the save cadence).
+
+    Start-aware for pause/resume: a resumed leg begins mid-cycle at start_window, so the
+    snap aligns start + length to a boundary - which means a leg resumed from a run whose
+    ORIGINAL total was cycle-aligned snaps by zero, and pause/resume keeps landing on the
+    original total. Pure, so the arithmetic is pinnable without a card."""
+    m = int(max_epochs)
+    cyc = max(1, int(cycle_epochs))
+    if m <= 0:
+        return m
+    pos = (int(start_window or 0) * max(1, int(rotate_every))) % cyc
+    rem = (pos + m) % cyc
+    return m if rem == 0 else m + (cyc - rem)
+
 def plan_component_windows(usable_gb, span, n_blocks, comp_gb, overhead_gb,
                            trunk_gb_per_block, slots_gb, allow_stream=True,
                            max_sane_windows=12):

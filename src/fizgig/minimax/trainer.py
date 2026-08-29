@@ -3199,6 +3199,20 @@ def train_minimax(
         # 2.5x the saves they asked for (field: 10 on a 4-cycle silently became 4).
         # 0 = final only.
         _cyc = rot_schedule.cycle_epochs
+        # Max epochs snaps UP to end on a cycle boundary too — an off-cycle total leaves
+        # the FINAL checkpoint (the one people keep) with some components trained one
+        # more pass than others. Start-aware, so a resumed leg still lands on the
+        # original total when that total was cycle-aligned.
+        from fizgig.krea2.rotation import snap_ft_epochs as _snap_ep
+        _snapped_ep = _snap_ep(max_train_epochs, _cyc,
+                               start_window=int(finetune_start_window or 0),
+                               rotate_every=max(1, int(finetune_rotate_every or 1)))
+        if _snapped_ep != max_train_epochs:
+            logger.info("[h3-ft] Max epochs %d would end mid-cycle (%d-epoch cycle) — "
+                        "snapping to %d so the final checkpoint ends with every "
+                        "component evenly trained.",
+                        max_train_epochs, _cyc, _snapped_ep)
+            max_train_epochs = _snapped_ep
         if save_every_n_epochs and save_every_n_epochs % _cyc != 0:
             _snapped_save = ((save_every_n_epochs + _cyc - 1) // _cyc) * _cyc
             logger.info("[h3-ft] Save every %d epoch(s) doesn't line up with the %d-epoch "

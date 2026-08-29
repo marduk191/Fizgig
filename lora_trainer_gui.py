@@ -7403,7 +7403,13 @@ class LoRATrainerGUI:
     MINIMAX_FT_DEFAULTS = {
         "LEARNING_RATE": "1e-5",          # a starting point, NOT a calibrated H3 recipe —
                                           # nobody has tuned FT rates on this model yet
-        "MAX_TRAIN_EPOCHS": "26",         # several full cycles at any window shape
+        "MAX_TRAIN_EPOCHS": "100",        # a realistic fine-tune length (Peter, 29 Aug:
+                                          # 26 was "far too small"; his field A/Bs ran 64
+                                          # and kept improving). Clean at BOTH full-speed
+                                          # plans — 25 cycles at 4 windows, 20 at 5 — and
+                                          # the trainer now snaps any total UP to a cycle
+                                          # boundary at launch anyway (snap_ft_epochs),
+                                          # so odd window counts still end evenly trained.
         # SAVE_EVERY_N_EPOCHS is NOT a static recipe value: the cycle length depends on the
         # window mode/size, so _refresh_minimax_ft_save_box keeps the box in step live.
         "GRADIENT_ACCUMULATION": "1",     # fused backward consumes grads as they land
@@ -7444,8 +7450,11 @@ class LoRATrainerGUI:
         without this, rotate-every 1 -> 2 -> 1 stranded the box at 8, because 8 is a
         multiple of 4 and looked like a user choice (field). A USER-typed value is kept
         when it's 0 (final-only) or a non-zero multiple of the cycle (a deliberate sparser
-        cadence); anything else is rewritten to one-save-per-cycle. Trainer-side snap stays
-        authoritative at launch."""
+        cadence); anything else is rewritten to the suggestion: EVERY SECOND CYCLE (8 on
+        the 4-window baseline, 10 on a 5-window plan) — saves are ~21 GB each and previews
+        ride them, so once-per-cycle doubled the disk and preview cost for no gain (Peter,
+        29 Aug: ~10 epochs is the right feel). Trainer-side snap stays authoritative at
+        launch."""
         # The stop-epoch hint quotes the same cycle length — keep the two in step (cheap,
         # and this refresh fires on every cycle-affecting control).
         try:
@@ -7463,8 +7472,8 @@ class LoRATrainerGUI:
             cur = int(str(entry.get()).strip() or 0)
         except ValueError:
             cur = -1
-        if cur == cyc:
-            self._minimax_ft_save_autoset = cyc     # already right — claim it as ours
+        if cur == 2 * cyc:
+            self._minimax_ft_save_autoset = 2 * cyc  # already right — claim it as ours
             return
         if cur != getattr(self, "_minimax_ft_save_autoset", None):
             if cur == 0 or (cur > 0 and cur % cyc == 0):
@@ -7475,7 +7484,7 @@ class LoRATrainerGUI:
         # they asked for. A GUI-owned value just tracks the cycle itself.
         _target = (((cur + cyc - 1) // cyc) * cyc
                    if cur > 0 and cur != getattr(self, "_minimax_ft_save_autoset", None)
-                   else cyc)
+                   else 2 * cyc)
         try:
             _was = str(entry.cget("state"))
             if _was == "disabled":

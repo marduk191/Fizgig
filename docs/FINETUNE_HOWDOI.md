@@ -31,7 +31,8 @@ The whole recipe, using what the GUI already sets for you:
 1. **Load the ✨ MiniMax H3 Fast preset** (Training tab, Load Preset).
 2. **Tick ⚗ Fine-tune the BASE MODEL.** The moment you tick it, the learning rate
    switches to **1e-5** and the epochs and save cadence move to fine-tune values — the
-   Save-every box follows your card's cycle length live, so trust its guidance.
+   Save-every box suggests a save every second cycle (~8–10 epochs; previews ride the
+   saves) and follows your card's plan live, so trust its guidance.
 3. **Set Max epochs and Save every N epochs** to taste — the GUI guides both. Save-every
    snaps to full cycles so every checkpoint compares like-for-like.
 4. **Leave the learning rate at 1e-5**, or raise it to **3e-5 at most** — never higher.
@@ -110,12 +111,18 @@ always prints the plan.
 
 **At least one full cycle, or some weights never train at all.** A cycle is one pass of
 the rotation — 4 epochs in the standard component plan, more when your card's plan splits
-windows (the console prints your cycle length at launch).
+windows (the console prints your cycle length at launch). Both your **Max epochs** and
+**Save every** snap up to cycle boundaries automatically, so every checkpoint — including
+the final one — ends with every component evenly trained.
 
-On large datasets, budget generously: fine-tuning can take **~30× the steps you're used
-to from LoRA runs**, because only one component of the model trains at a time where a
-LoRA trains all of its weights every step. Checkpoint saves snap to cycle boundaries so
-every save compares like-for-like.
+Beyond that, **there is no standard number**: the right length depends on your learning
+rate, your dataset size, and what you're teaching. The H3 default of 100 epochs is a
+generous scrub-range for a typical small dataset, not a target — **a large dataset
+probably needs far fewer epochs** (each epoch is more steps, so the model sees more per
+cycle). The honest method is the one the defaults are built for: save once per cycle,
+then compare checkpoints and find where yours peaks. One warning stands either way:
+only one component trains at a time, so total *steps* run well past LoRA habits —
+budget wall-clock and disk accordingly.
 
 ## How do I fine-tune on video clips? (H3)
 
