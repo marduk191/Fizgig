@@ -243,7 +243,10 @@ LoRA** on the Training tab.
 > myself, then refining it through the MiniMax H3 work. This is the point where it needs
 > the community to develop further. I don't expect every scenario to work perfectly yet —
 > but it works, the numbers below are measured, and there's a solid foundation here to
-> build on. Field reports genuinely shape what gets built next. — Peter (New to fine-tuning? The extended
+> build on. Field reports genuinely shape what gets built next. I'm also aware this
+> technique is model-agnostic at heart — it opens the door to fine-tuning other models,
+> and I'm open to going there. But for that to happen it needs practical community
+> support around those models, so I have the time necessary to make it happen. — Peter (New to fine-tuning? The extended
 **["How do I…?" guide](docs/FINETUNE_HOWDOI.md)** answers everything this section can't fit —
 including **five-minute recipes for both families**: tick Fine-tune, let the settings
 switch themselves, and change almost nothing.)
