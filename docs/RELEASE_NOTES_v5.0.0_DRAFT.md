@@ -1,7 +1,7 @@
 # Fizgig v5.0.0 — DRAFT (do not publish)
 
 <!-- DRAFT STATUS: builds as the FT release firms up. Before publishing:
-     - NF4-vs-fp8 quality A/B result folds into the "default" paragraph
+     - DONE 29 Aug: NF4 quality signed off by Peter - every successful field run since 23 Aug ran the NF4 trunk (64-epoch fair-trial runs included) and the checkpoint is bf16 from the master regardless
      - DONE 29 Aug: 32 GB Krea 2 smoke green (NF4 default resolves flagless; 4 resident windows, peaks 22.6/20.8/20.8/20.8, ~1.0 s/it, bracket preview rendered, exit 0)
      - contributor credits for the cycle get added in the usual style -->
 
