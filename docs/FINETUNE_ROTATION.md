@@ -62,6 +62,11 @@ this inside 32 GB.
 
 ## Measured (RTX 5090, 32 GB, 36-image dataset at 0.25 MP)
 
+> **These are the fp8-era baselines.** The shipped fine-tune default is now a **4-bit NF4**
+> frozen base, which changes the picture: full-depth component windows peak ~16 GB at a
+> 24 GB budget (~21-23 GB uncapped on 32 GB) at the same ~1.0 s/it, and streaming reaches
+> 16 GB cards. Current numbers: README fine-tuning section + EVAL_full_model_h3_video.md.
+
 | Config | Peak VRAM | s/it | Windows/cycle | Time per full cycle |
 |---|---|---|---|---|
 | 4 blocks resident | 24.8 GB | 0.93 | 7 | 234 s |

@@ -110,6 +110,13 @@ margin for the recommended path.
 
 ## Why 24 GB is currently out
 
+**SUPERSEDED (27-29 Aug 2026): 24 GB is IN - and so is 16.** The NF4 frozen trunk (now
+the shipped fine-tune default) halves the resident base, Route A depth-splitting landed,
+and the clip activation term sizes windows for video. The analysis below is the fp8-era
+reasoning that led there; its peak table is also in the design-era units the overhead
+recalibration corrected. Current measured tiers live in the README fine-tuning section
+and EVAL_full_model_h3_video.md.
+
 Component mode's VRAM peak is set by ONE window: `mlp.fc1` across all 50 blocks is
 15.4 GB of trainable bf16, and the measured full-model peaks per window are (5090,
 0.25 MP, batch 1, fused backward, gradient checkpointing):

@@ -239,11 +239,11 @@ bottleneck — on a single consumer GPU. Tick **⚗ Fine-tune the BASE MODEL ins
 LoRA** on the Training tab.
 
 > **Note on VRAM:** the "trains on 8 GB" figures elsewhere in this README are for **LoRA**
-> training. Full fine-tuning is a different animal — but it now **tiers itself to your card**:
-> ~32 GB runs the classic full-depth windows at full speed, ~24 GB depth-splits them into more
-> (still full speed), and 16 GB streams the frozen blocks from system RAM at ~1.5× the step
-> time. Both families reach 16 GB: fine-tuning defaults to a **4-bit NF4** frozen base, which
-> halves the model held on the card and is what makes 16 GB fit. The planner measures your
+> training. Full fine-tuning is a different animal — but it now **tiers itself to your card**,
+> and fine-tuning defaults to a **4-bit NF4** frozen base that halves the model held on the
+> card: on **32 GB and 24 GB** the classic full-depth windows stay resident at full speed, and
+> on **16 GB** the frozen blocks stream from system RAM — slower steps, but the same
+> component-mode learning. The planner measures your
 > free VRAM at launch and prints the plan it chose.
 
 **What can my card fine-tune?** The short answer, at the default training resolution:
@@ -294,16 +294,13 @@ and frees each gradient the moment it lands (worth 5.2 GB); and **Adafactor**'s 
 
 **It sizes itself to your card.** Leave **Window** on **Auto (by VRAM)** and Fizgig measures the
 memory actually free at launch, picks the largest window that fits, and prints what it chose and
-why. Measured Krea 2 peaks (RTX 5090, past a rotation boundary — which is where the peak actually is):
+why. Measured Krea 2 peaks (RTX 5090):
 
 | Window mode | Peak VRAM | Speed | Fits |
 |---|---|---|---|
-| **component** — every window spans all 28 blocks | 27.7 GB | ~1.0 s/it | 32 GB |
-| block, 8 per window + streaming | 20.7 GB | ~2–3× slower | **24 GB** |
-| block, 4 per window + streaming | 18.7 GB | ~2–3× slower | **24 GB** |
-| block, 2 per window + streaming | 17.6 GB | ~2–3× slower | **24 GB** |
-| component + **4-bit NF4** base, full-depth windows | 16.0 GB | ~1.0 s/it | **24 GB** |
-| component + **4-bit NF4** base + streaming | 11.0 GB | ~2.8 s/it | **16 GB** |
+| **component + 4-bit NF4 (the default)** — full-depth windows, resident | ~16 GB (24 GB budget) / ~21–23 GB (32 GB, more headroom held) | ~1.0 s/it | **24 GB and up** |
+| component + **4-bit NF4** + streaming | 8.4–11.0 GB | ~2.8 s/it | **16 GB** |
+| component on the **fp8 base** (explicit Base-precision pick) — depth-split + streamed | 15.6–17.6 GB | ~3.0 s/it | 24 GB |
 
 **4-bit NF4 is the fine-tune default**, and you don't have to do anything to get it. It halves
 the frozen base, which on a 24 GB card is enough to keep the classic full-depth component
@@ -327,7 +324,7 @@ and below that the frozen out-of-window blocks **stream from system RAM** — sl
 still component-mode learning. The console prints the chosen plan and why.
 
 **Block mode remains an explicit Window-dropdown choice** — contiguous depth slices with frozen
-blocks streamed (the measured table above). It's **not yet quality-tested**; every good result so
+blocks streamed, slower than component at every budget. It's **not yet quality-tested**; every good result so
 far came from component runs.
 
 ### MiniMax H3 fine-tuning
@@ -346,10 +343,13 @@ the model's full depth from the very first epoch.
   out-of-window blocks also **stream from system RAM** (~7 GB staged, a 9-window cycle):
   measured peaks 8.8–12.3 GB at **~1.5× the step time** — a full fine-tune of a 33B video model
   on a 16 GB card. The console prints the chosen plan and why.
-- **Full-model fine-tuning (likeness off) is the heavy path**, and it is what any dataset
-  containing video clips uses, since clips train the whole model. Measured on a 5090 it peaks
-  ~29 GB — it fits a 32 GB card, but with little room, and the small-card tiers are much
-  tighter for it.
+- **Full-model fine-tuning (likeness off, or any dataset with video clips) plans itself too.**
+  On stills it fits right down the range — measured peaks 17.3–18.7 GB on a 24 GB budget and
+  8.8–11.6 GB streamed on 16 GB. Clip datasets additionally reserve activation memory before
+  the windows are sized (clips cost VRAM per frame of length), which is what the card table
+  above reflects — and when clips are too long for your card, the trainer says so up front,
+  with the fix (cut to the 2.3 s Gizmo slot, or lower Target Megapixels), instead of failing
+  mid-run.
 - **System RAM:** the bf16 master copy is ~23 GB (likeness) to ~38 GB (full model), and spills
   to disk automatically when RAM is tight — full-model fine-tuning runs on a 64 GB box.
 - **Disk:** each save is a full **~21 GB** int8 checkpoint.
@@ -486,7 +486,7 @@ Fizgig ships as a ready-made cloud image — the **whole app in a browser tab**,
 - **Disk** — ~10 GB for the venv, plus ~40 GB for model files.
 - **Full fine-tuning** (experimental, Krea 2 & MiniMax H3) asks for more than the above, and
   tiers itself to your card: on the default 4-bit NF4 base, **24 GB** runs the full-depth
-  component cycle at full speed and **16 GB** streams the frozen blocks from RAM at ~1.5× the
+  component cycle at full speed and **16 GB** streams the frozen blocks from RAM at ~1.5–3× the
   step time, both families. Add the bf16 master in RAM (spilled to disk
   automatically on H3), and disk for saves — **~26 GB per Krea 2 checkpoint, ~21 GB per
   H3 one**. Each
