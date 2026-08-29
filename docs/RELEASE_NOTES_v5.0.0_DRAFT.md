@@ -1,8 +1,6 @@
 # Fizgig v5.0.0 — DRAFT (do not publish)
 
 <!-- DRAFT STATUS: builds as the FT release firms up. Before publishing:
-     - planner activation term must land (32 GB clip column depends on it) + one
-       verifying 32 GB clip run
      - NF4-vs-fp8 quality A/B result folds into the "default" paragraph
      - 32 GB Krea 2 smoke of the NF4 default
      - contributor credits for the cycle get added in the usual style -->

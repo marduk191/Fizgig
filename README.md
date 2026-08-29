@@ -248,12 +248,6 @@ LoRA** on the Training tab.
 
 **What can my card fine-tune?** The short answer, at the default training resolution:
 
-<!-- DRAFT NOTE (not rendered): the video-clip column for 32 GB depends on the planner
-     activation term (Q2+Q4 bundle) landing before release - today a 32 GB card picks the
-     resident plan and fails on clips >0.9 s while 16/24 GB pass them. 16 GB and 24 GB clip
-     cells are MEASURED (28 Aug runs, fizgig-ft-runs/clipq2); 32 GB @ 2.3 s needs one
-     verifying run after the planner change. Remove this note once both are done. -->
-
 | Your card | Krea 2 — photos | MiniMax H3 — photos | H3 — voice | H3 — video clips (with sound) |
 |---|---|---|---|---|
 | **16 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** |

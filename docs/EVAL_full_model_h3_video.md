@@ -99,7 +99,7 @@ forward itself once windows are small.
 
 | tier | plan | 22 fr (0.9 s) | 56 fr (2.3 s) | 124 fr (5.2 s) |
 |---|---|---|---|---|
-| 32 GB resident | 4 windows | **PASS** (peaks 23.4/17.3/28.5/20.8) | FAIL (fc1, e3) | FAIL (qkv, e1 backward) |
+| 32 GB resident | 4 windows | **PASS** (peaks 23.4/17.3/28.5/20.8) | FAIL (fc1, e3) -> **PASS post-fix** (5-window split, max 24.9) | FAIL (qkv, e1 backward) -> honest refusal post-fix |
 | 24 GB | 8-window split | *predicted pass* | **PASS** (max 21.2 / 23.88) | FAIL (step 0, forward) |
 | 16 GB | streamed, 16 windows | **PASS** (max 11.6 / 15.9 — identical to stills) | **PASS** (steady 10.1–11.1) | *predicted ~16.0, at the line* |
 
@@ -115,7 +115,14 @@ planner. **At 0.25 MP there is currently no configuration that full-model-trains
 clips on ≤32 GB.** The fix is exactly the Q4 bundle below: give `plan_component_windows`
 an activation term (`~0.145 GB × latent_frames × mp/0.25`, from the largest cached item)
 so it downshifts to split/streamed plans — and refuses honestly when even streaming
-cannot fit. Not built — Peter's call, per this doc's own rule.
+cannot fit. **BUILT 29 Aug (3706893), Peter's word given, and gate-run measured**:
+`ft_clip_activation_gb` (0.145/latent-frame + a 2.0 GB fragmentation margin, clip
+datasets only; the probe keys on the cache header's `audio_only` discriminator so voice
+placeholders cannot trip it). 32 GB x 56-frame now plans a 5-window resident split and
+PASSES (peaks 24.9/18.7/22.5/23.2/22.5 — the fc1 epoch that OOM'd at ~30.5 peaked 22.5);
+32 GB x 22-frame deliberately goes 4->5 windows (fc1 headroom 2.0 -> ~9 GB); 16 GB x
+124-frame now refuses up front with the cut-to-2.3 s remedy instead of OOMing mid-run.
+Stills plans are bit-identical (act = 0); Krea 2 and every LoRA path untouched.
 
 ## Q4 — the freed-NF4-share term is unmodelled (cheap, worth doing with Q2)
 
