@@ -56,8 +56,18 @@ claim hold live. The full mechanism, the card tiers, and every "how do I" questi
 
 The built-in **Checkpoint to LoRA** utility diffs your fine-tune against the base and
 extracts an ordinary, shareable LoRA at any rank — the quality of a full fine-tune, in
-a file ComfyUI already knows how to use. Or keep the checkpoint: it's a valid training
-base itself, and Pause / Resume works mid-fine-tune with everything carried over.
+a file ComfyUI already knows how to use. It works very well: in our testing, rank 64 was
+perceptually indistinguishable from the full checkpoint. Or keep the checkpoint: it's a
+valid training base itself, and Pause / Resume works mid-fine-tune with everything
+carried over.
+
+## What we'll say, and what we won't
+
+The numbers above are the cold, hard, measured facts — that's the release. What we can
+add from our own tests, carefully: **multi-character and concept teaching seemed to land
+at a much deeper level than LoRA training, with much better results.** The rest — how far
+this actually goes — we're deliberately leaving for you to discover. Field reports
+genuinely shape what gets built next.
 
 <!-- sections to add as the release firms up: intelligent-trainer features on FT
      (problem images, adaptive throttle), likeness-mode recommendation, RAM/disk

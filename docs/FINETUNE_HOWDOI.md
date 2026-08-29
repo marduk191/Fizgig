@@ -63,6 +63,7 @@ Even shorter, because ticking the box sets everything that matters:
 5. **Change the Output Directory** to a drive with room (each save is ~26 GB).
 6. **Make sure your captions use a trigger token** — an invented word, not a common one.
 7. Press Start. Leave everything else alone.
+
 ## What learning rate should I use?
 
 **Lower than you're used to.** A LoRA nudges a small adapter riding on a frozen model; a
@@ -222,10 +223,10 @@ exactly which ingredient is missing.
 
 Run **Checkpoint to LoRA** (`run_diff_to_lora.bat`) — it diffs your fine-tune against the
 base model and extracts the difference as an ordinary kohya `.safetensors` at several
-ranks at once. Measured on a three-subject fine-tune: **rank 64 was perceptually
-indistinguishable from the full checkpoint** at ~0.5 GB, and even rank 8 kept the
-identities cleanly separate. The result loads anywhere a normal LoRA does, ComfyUI
-included.
+ranks at once. Measured: **rank 64 was perceptually indistinguishable from the full
+checkpoint** at ~0.5 GB, and quality degrades smoothly at lower ranks. In our testing an
+extracted LoRA came out better than one trained directly at the same rank. The result
+loads anywhere a normal LoRA does, ComfyUI included.
 
 ## NF4 or fp8 Base precision?
 
@@ -274,6 +275,9 @@ the ROCm stack. It may work; either way, a field report on GitHub genuinely help
 A LoRA constrains every update to a low-rank subspace, so concepts compete for the same
 handful of directions — which is why LoRAs tend to drag pose, framing and lighting toward
 the training set along with the likeness. A full-rank update can change how the model
-*represents* a concept, so it composes with what the model already knows. And with
-Checkpoint to LoRA at the end, you don't have to choose between fine-tune quality and a
-shareable file.
+*represents* a concept, so it composes with what the model already knows. **In our own
+tests, multi-character and concept teaching seemed to land at a much deeper level than
+LoRA training, with much better results.** And with Checkpoint to LoRA at the end — which
+works very well — you don't have to choose between fine-tune quality and a shareable
+file. Beyond that: this feature is young, and we're deliberately letting the community
+find the ceiling. Field reports genuinely shape what gets built next.

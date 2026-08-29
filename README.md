@@ -294,7 +294,10 @@ epoch count all carry over.
 same handful of directions. That's why LoRAs tend to drag pose, framing and lighting toward the
 training set along with the likeness — they behave a bit like a filter over the model's output. A
 full-rank update can change how the model *represents* a concept, so it composes with what the
-model already knows.
+model already knows. **In our own tests, multi-character and concept teaching seemed to land at
+a much deeper level than LoRA training, with much better results** — and the built-in
+**Checkpoint to LoRA** converter turns the result into a shareable file, and works very well.
+Beyond that, we're deliberately letting the community find the ceiling.
 
 **How it fits.** A naive full fine-tune of Krea 2 (12.9B) needs roughly **78 GB** — bf16 weights,
 gradients and optimizer state at once. Rotating windows make only part of the model trainable at a
@@ -438,15 +441,14 @@ A fine-tune produces a **~26 GB checkpoint**, which is not what anyone wants to 
 you started from and the checkpoint you produced, and extracts the difference as an ordinary
 kohya `.safetensors` — at several ranks at once, since one SVD per layer serves them all.
 
-This turned out to work far better than expected. On a three-subject fine-tune, **rank 64 was
-perceptually indistinguishable from the full 26 GB checkpoint** at ~0.5 GB, and even rank 8 kept
-the three identities cleanly separate — what degrades at low rank is likeness *precision*, not
-separation, and it degrades smoothly rather than falling off a cliff.
+This turned out to work far better than expected: **rank 64 was perceptually
+indistinguishable from the full 26 GB checkpoint** at ~0.5 GB, and quality degrades smoothly
+at lower ranks rather than falling off a cliff.
 
-The result worth knowing: a **rank-128 LoRA trained directly** on the same three subjects was a
-mushy failure, while a **rank-64 LoRA extracted** from the fine-tune is perfect. Sixty-four
-directions are enough to *hold* a solution that 128 trainable directions could not *find*. So
-fine-tune-then-extract isn't a workaround — the full-rank phase is the mechanism, and the
+The result worth knowing: in our testing, a LoRA **extracted** from a fine-tune came out
+better than a LoRA **trained directly** at the same or higher rank on the same dataset. A
+low-rank file can *hold* a solution that low-rank training struggles to *find* — so
+fine-tune-then-extract isn't a workaround; the full-rank phase is the mechanism, and the
 extraction is nearly free. (Details and the experiments behind it: **[docs/FINETUNE_ROTATION.md](docs/FINETUNE_ROTATION.md)**.)
 
 ### What it costs you
