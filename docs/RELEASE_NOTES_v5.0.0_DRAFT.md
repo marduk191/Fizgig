@@ -13,7 +13,11 @@ Everything Fizgig trains has been a LoRA: an adapter riding on a frozen model. T
 release trains the **model itself** — full-rank updates, no adapter, no rank
 bottleneck — for both **Krea 2** (12.9B) and **MiniMax H3** (33B video), on a single
 consumer GPU. One checkbox on the Training tab; the planner reads your free VRAM at
-launch, picks the plan that fits, and prints what it chose.
+launch, picks the plan that fits, and prints what it chose. The quickest route on either family is genuinely five minutes: tick Fine-tune (the
+learning rate, epochs and save cadence switch to fine-tune values by themselves — and on
+Krea 2 Adaptive LR steps aside automatically), set your output drive, keep your trigger
+tokens — done. Step-by-step recipes for both, and every other question:
+**[docs/FINETUNE_HOWDOI.md](docs/FINETUNE_HOWDOI.md)**.
 
 **What can my card fine-tune?**
 

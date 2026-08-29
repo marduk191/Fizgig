@@ -237,7 +237,9 @@ Settings are read at launch; Pause → Resume relaunches with your current setti
 Everything above trains a **LoRA**. This trains the **base model itself** — no adapter, no rank
 bottleneck — on a single consumer GPU. Tick **⚗ Fine-tune the BASE MODEL instead of training a
 LoRA** on the Training tab. (New to fine-tuning? The extended
-**["How do I…?" guide](docs/FINETUNE_HOWDOI.md)** answers everything this section can't fit.)
+**["How do I…?" guide](docs/FINETUNE_HOWDOI.md)** answers everything this section can't fit —
+including **five-minute recipes for both families**: tick Fine-tune, let the settings
+switch themselves, and change almost nothing.)
 
 > **Note on VRAM:** the "trains on 8 GB" figures elsewhere in this README are for **LoRA**
 > training. Full fine-tuning is a different animal — but it now **tiers itself to your card**,

@@ -24,13 +24,52 @@ Before your first run, do two things:
 2. **Check your learning rate** (next answer). This is the single most common way to ruin
    a fine-tune.
 
+## What's the quickest way to fine-tune MiniMax H3?
+
+The whole recipe, using what the GUI already sets for you:
+
+1. **Load the ✨ MiniMax H3 Fast preset** (Training tab, Load Preset).
+2. **Tick ⚗ Fine-tune the BASE MODEL.** The moment you tick it, the learning rate
+   switches to **1e-5** and the epochs and save cadence move to fine-tune values — the
+   Save-every box follows your card's cycle length live, so trust its guidance.
+3. **Set Max epochs and Save every N epochs** to taste — the GUI guides both. Save-every
+   snaps to full cycles so every checkpoint compares like-for-like.
+4. **Leave the learning rate at 1e-5**, or raise it to **3e-5 at most** — never higher.
+5. **Leave Optimised Likeness Learning on.**
+6. **Change the Output Directory** to a drive with room (each save is ~21 GB).
+7. **Make sure your captions use a trigger token** — an invented word, not a common one.
+8. Press Start. Leave everything else alone.
+
+That's it — the planner does the VRAM thinking, previews ride the checkpoint saves, and
+every save is a deployable model.
+
+## What's the quickest way to fine-tune Krea 2?
+
+Even shorter, because ticking the box sets everything that matters:
+
+1. **Tick ⚗ Fine-tune the BASE MODEL.** The moment you tick it: learning rate → **1e-5**,
+   epochs → **40** (ten full 4-window cycles), Save every → **4** (one per cycle, so
+   checkpoints compare like-for-like), and **Adaptive LR switches off automatically**
+   (rotation boundaries read as instability to it). Any preset you loaded first is fine —
+   the fine-tune recipe overrides the settings that matter.
+2. **Set Max epochs to taste.** Nobody has a canonical number for a diffusion DiT
+   fine-tune yet — the 40-epoch default gives you ten comparable checkpoints to scrub
+   through; find where yours peaks rather than trusting a number.
+3. **Leave the learning rate at 1e-5.** Experimenting higher is allowed (up to 1e-4 — it
+   trains) but the best results are realistically found lower.
+4. **Optional but recommended for long runs: regularisation images** (a folder of real
+   photos of the broader class) with **LR ×** at the default 0.2.
+5. **Change the Output Directory** to a drive with room (each save is ~26 GB).
+6. **Make sure your captions use a trigger token** — an invented word, not a common one.
+7. Press Start. Leave everything else alone.
 ## What learning rate should I use?
 
 **Lower than you're used to.** A LoRA nudges a small adapter riding on a frozen model; a
 fine-tune moves the model's own weights. The rates you know from LoRA training land very
 differently here.
 
-- **MiniMax H3: 3e-5.** Tested, fast, reliable. **1e-4 will destroy an H3 fine-tune** —
+- **MiniMax H3: ticking Fine-tune sets 1e-5** — the safe default. **3e-5** is the tested
+  faster rate and the most you should ever use; **1e-4 will destroy an H3 fine-tune** —
   that's measured, not folklore.
 - **Krea 2: 1e-5 is the safe recommendation.** You're welcome to *start experimenting* at
   1e-4 — it trains — but realistically the best results are found lower. Treat 1e-4 as
