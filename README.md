@@ -506,8 +506,6 @@ Being straight about the trade-offs, because they're real:
   deploy); judge those, evaluate checkpoints in ComfyUI, or extract a LoRA and scrub the epochs
   in LoRA Royale.
 
-Experimental, and on this branch only — master is untouched.
-
 ---
 
 ## Training (Klein 9B)
