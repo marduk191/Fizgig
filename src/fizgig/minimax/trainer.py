@@ -726,6 +726,66 @@ def _max_effective_mp(group):
     return best_mp, best_t
 
 
+def _max_clip_act_item(group):
+    """The dataset's heaviest CLIP, as (latent_t, spatial_mp) — (1, 0.0) when it has none.
+
+    Feeds the FT planner's clip activation term (ft_clip_activation_gb) and nothing else —
+    _max_effective_mp stays untouched because it feeds the LoRA-side plan_vram. Same
+    header-only scan and stale-stem filter as _max_effective_mp, with two differences:
+
+    * A CLIP is identified by its cache HEADER, never by filename: a 3-dim latent key
+      (`latent_{T}x{H}x{W}`) in a file with no `audio_only` key. Cache filenames strip the
+      source extension, so an extension test would need the source directory listing — and
+      that listing is optional here (missing dir just disables the staleness filter), which
+      would silently zero the activation term and reintroduce the exact OOM it prevents.
+    * VOICE items are excluded even though their placeholder latents are 3-dim and their
+      video frames genuinely forward: their spatial grid is 8x8 latent, so their own
+      activation cost tops out ~0.35 GB — inside the stills overhead's round-up, and
+      field-proven at every tier. What the exclusion actually protects is the flat
+      fragmentation MARGIN, which gates on T>1 and would tax every voice-only dataset
+      ~2.4 GB for nothing. The `audio_only` header key is the guarantee.
+
+    Heaviest = argmax of the per-item (T-1) x spatial_mp product (one step's peak belongs
+    to one item; two separate maxima would re-create the trap documented above)."""
+    from safetensors import safe_open
+    best_score, best_t, best_mp = 0.0, 1, 0.0
+    seen = set()
+    for ds in getattr(group, "datasets", []):
+        cache_dir = getattr(ds, "cache_directory", None)
+        if not cache_dir or cache_dir in seen or not os.path.isdir(cache_dir):
+            continue
+        seen.add(cache_dir)
+        _stems = None
+        _img_dir = getattr(ds, "image_directory", None)
+        if _img_dir and os.path.isdir(_img_dir):
+            _stems = {os.path.splitext(f)[0] for f in os.listdir(_img_dir)}
+        for name in os.listdir(cache_dir):
+            if not name.endswith(".safetensors"):
+                continue
+            if _stems is not None:
+                _stem = "_".join(name.split("_")[:-2])       # {basename}_{WxH}_{arch}
+                if _stem and _stem not in _stems:
+                    continue
+            try:
+                with safe_open(os.path.join(cache_dir, name), framework="pt") as f:
+                    keys = list(f.keys())
+                    if "audio_only" in keys:
+                        continue                              # voice item — see docstring
+                    for k in keys:
+                        if k.startswith("latent_") and not k.startswith("latent_control_"):
+                            dims = [int(d) for d in k[len("latent_"):].split("x")]
+                            if len(dims) != 3:
+                                continue                      # a still — no activation term
+                            t, h, w = dims
+                            spatial_mp = (h * 16) * (w * 16) / 1e6
+                            score = (t - 1) * spatial_mp
+                            if score > best_score:
+                                best_score, best_t, best_mp = score, t, spatial_mp
+            except Exception:
+                continue                      # unreadable cache: the caching pass will say so
+    return best_t, best_mp
+
+
 # The 0.5 GB / 0.25 MP checkpointed-activation anchor was MEASURED at 0.25 MP; everything
 # above it is linear extrapolation, and attention workspaces do not owe us linearity (4090
 # field OOM, 25 Aug — video items plan at effective MP 10-50x the anchor). The extrapolated
@@ -2918,21 +2978,46 @@ def train_minimax(
         # loaded, so the trunk it already holds is added back — the plan's model counts
         # the whole process footprint. FIZGIG_NO_FT_STREAM=1 is the debug kill-switch to
         # the resident-only plan (the streaming tier then refuses rather than OOMs).
+        #
+        # Clip datasets reserve their activation term BEFORE window sizing: the stills-
+        # calibrated overhead has no idea a 56-frame clip adds ~2.3 GB per step, and the
+        # measured consequence was a 32 GB card picking the resident 4-window plan and
+        # dying at fc1 while the 16/24 GB tiers (forced onto split/streamed plans) passed
+        # the same dataset. The term is per-STEP and plan-independent, so subtracting it
+        # from usable is exact for both the resident cap and the streaming budget.
+        # Gated on _n_clip_items — already zeroed above for finetune_scope == "photo",
+        # whose clip batches `continue` before any forward and so never spike.
+        from fizgig.minimax.rotation_ft import ft_clip_activation_gb
+        _act_gb = _act_margin_gb = 0.0
+        if _n_clip_items:
+            _clip_lt, _clip_smp = _max_clip_act_item(group)
+            _act_gb, _act_margin_gb = ft_clip_activation_gb(_clip_lt, _clip_smp)
+            if _act_gb > 0:
+                logger.info("[h3-ft] clip activations ~%.1f GB + %.1f GB fragmentation "
+                            "margin (%d-latent-frame clips at %.2f MP) reserved before "
+                            "window sizing", _act_gb, _act_margin_gb, _clip_lt, _clip_smp)
         try:
             from fizgig.utils.device import plannable_free_vram as _pfv0
             _usable = _pfv0() + 0.21 * _n_blocks - 1.5      # + resident trunk − reserve
         except Exception:
             _usable = 99.0
+        _usable -= _act_gb + _act_margin_gb
         _windows, ft_stream, _plan_why = plan_h3_ft_windows(
             _usable, subset=ft_subset, n_blocks=_n_blocks,
             allow_stream=os.environ.get("FIZGIG_NO_FT_STREAM") != "1")
         for _line in _plan_why:
             logger.info("[h3-ft] %s", _line)
         if _windows is None:
+            _clip_advice = (
+                f" This dataset's clips are the driver (~{_act_gb + _act_margin_gb:.1f} GB "
+                "of the budget is reserved for their activations, which is why the figure "
+                "above reads lower than your card's free VRAM): cutting the clips to the "
+                "56-frame / 2.3 s Gizmo slot, or lowering Target Megapixels, shrinks what "
+                "the plan needs." if _act_gb > 0 else "")
             raise RuntimeError(
                 f"[h3-ft] ~{_usable:.1f} GB of usable VRAM is below what the rotation "
                 "fine-tune needs even with depth-split windows and streamed frozen blocks. "
-                "Close other GPU apps, or train a LoRA instead.")
+                f"Close other GPU apps, or train a LoRA instead.{_clip_advice}")
         rotator = H3NF4Rotator(dit.blocks, master, key_prefix="blocks", device=device,
                                block_subset=ft_subset)
         _refiner = getattr(dit, "token_refiner", None)

@@ -236,10 +236,45 @@ H3_COMPONENT_GB_PER_BLOCK = {"attn.qkv_proj": 0.174, "attn.out_proj": 0.058,
 #
 # CALIBRATED ON STILLS. A clip's activations are ~30x the tokens, so these do NOT
 # transfer to video datasets; the trainer logs real per-window peaks every run.
+# For clip datasets the caller subtracts ft_clip_activation_gb() from usable first.
 _FT_OVERHEAD_GB = 14.5          # non-window peak with the full NF4 trunk resident
 _FT_NF4_GB_PER_BLOCK = 0.21     # trunk share reclaimed per streamed block (10.5 / 50)
 _FT_STREAM_SLOTS_GB = 2.0       # ring slots + copy-stream headroom when streaming
 _FT_MAX_SANE_WINDOWS = 12       # past this, a full-speed cycle is slower than streaming
+
+# The clip activation term (measured 28 Aug 2026, fizgig-ft-runs/clipq2 — six runs on a
+# real Gizmo-spec clip at 0.25 MP): each latent frame beyond a still's single frame adds
+# ~0.145 GB of per-step activation memory, linear across the measured range (7 -> 17
+# latent frames, extrapolating cleanly to the 37-frame failures) and PLAN-INDEPENDENT —
+# it is per-step memory, so splitting or streaming windows does not reduce it (the sim-24
+# 124-frame run died in the FORWARD with small split windows). The stills overhead above
+# already contains the 1-frame activation cost, hence (T - 1).
+_FT_ACT_GB_PER_LATENT_FRAME = 0.145
+# Fragmentation demands real headroom on clip runs: the 124-frame no-sim run fit on paper
+# (28.4 predicted vs ~30.6 available) and still died — ~4 GiB sat reserved-but-unallocated
+# with no expandable_segments on Windows. Applied only when clips are present so every
+# field-proven stills plan stays bit-identical.
+_FT_CLIP_FRAG_MARGIN_GB = 2.0
+
+
+def ft_clip_activation_gb(latent_t, spatial_mp):
+    """(activation_gb, margin_gb) a clip dataset costs on top of the stills overhead.
+
+    latent_t is the LARGEST clip's latent frame count (grid T = 5n+2; a still is 1) and
+    spatial_mp that same item's spatial megapixels — always the per-item pair, never
+    max-T x max-mp across different items (per-step peaks belong to one item at a time;
+    same two-maxima trap _max_effective_mp documents). Returned separately so console
+    lines can name the two constants instead of conflating them. Zero for stills.
+
+    mp scaling mirrors the LoRA planner's _ACT_GB_CKPT x mp/0.25 — modelled, only the
+    0.25 MP anchor is measured. Batch size > 1 with clips is deliberately NOT modelled:
+    both constants were measured at batch 1 (the FT norm), and silently scaling would
+    dress an unmeasured extrapolation as a measurement."""
+    t = max(1, int(latent_t))
+    if t <= 1:
+        return 0.0, 0.0
+    act = _FT_ACT_GB_PER_LATENT_FRAME * (t - 1) * (float(spatial_mp) / 0.25)
+    return act, _FT_CLIP_FRAG_MARGIN_GB
 
 
 def plan_h3_ft_windows(usable_gb, subset=None, n_blocks=50, allow_stream=True):
