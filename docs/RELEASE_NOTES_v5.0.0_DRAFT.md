@@ -29,9 +29,14 @@ tokens — done. Step-by-step recipes for both, and every other question:
 | **24 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** |
 | **32 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** |
 
-Clip lengths follow Gizmo's grid — 2.3 s is the 56-frame slot, so cut clips there and
-everything fits. Longer clips currently need more than 32 GB. One clip anywhere in the
-folder trains the whole model, so mixed photo + clip datasets use the clip column.
+Clip lengths follow Gizmo's grid — the **2.3 s (56-frame) slot is confirmed by measured
+runs on every tier**, and **3.8 s is confirmed on 32 GB** even with video training the
+whole model. The new **Restrict video to likeness blocks** tickbox (on by default with
+likeness mode — in our tests it trains video just as well, and far lighter on VRAM)
+extends the *expected* range to **5.2 s on 24 GB and 32 GB, 3.8 s on 16 GB** —
+conservative arithmetic from the measured constants. Whole-model 5.2 s clips need more
+than 32 GB (measured). With the restriction unticked, one clip anywhere in the folder
+trains the whole model, so mixed photo + clip datasets use the clip column.
 12 GB cards train LoRAs, not fine-tunes — 16 GB is the fine-tune floor. Every number
 in that table comes from a measured run, not an estimate. Two honest caveats: fine-tuning
 is **untested on AMD/ROCm** (every measured tier is NVIDIA), and **Krea 2 fine-tuning
@@ -81,6 +86,12 @@ add from our own tests, carefully: **multi-character and concept teaching seemed
 at a much deeper level than LoRA training, with much better results.** The rest — how far
 this actually goes — we're deliberately leaving for you to discover. Field reports
 genuinely shape what gets built next.
+
+A personal note on where this is at: I first got fine-tuning working on Krea 2 shortly
+after its release, and I've been deliberately cautious about shipping it — first proving
+it to myself, then refining it through the MiniMax H3 work. This is the point where it
+needs the community to develop further. I don't expect every scenario to work perfectly
+yet — but it works, and there's a solid foundation here to build on. — Peter
 
 <!-- sections to add as the release firms up: intelligent-trainer features on FT
      (problem images, adaptive throttle), likeness-mode recommendation, RAM/disk

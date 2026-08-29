@@ -236,7 +236,14 @@ Settings are read at launch; Pause → Resume relaunches with your current setti
 
 Everything above trains a **LoRA**. This trains the **base model itself** — no adapter, no rank
 bottleneck — on a single consumer GPU. Tick **⚗ Fine-tune the BASE MODEL instead of training a
-LoRA** on the Training tab. (New to fine-tuning? The extended
+LoRA** on the Training tab.
+
+> **A note on where this is at.** I first got fine-tuning working on Krea 2 shortly after
+> its release, and I've been deliberately cautious about shipping it — first proving it to
+> myself, then refining it through the MiniMax H3 work. This is the point where it needs
+> the community to develop further. I don't expect every scenario to work perfectly yet —
+> but it works, the numbers below are measured, and there's a solid foundation here to
+> build on. Field reports genuinely shape what gets built next. — Peter (New to fine-tuning? The extended
 **["How do I…?" guide](docs/FINETUNE_HOWDOI.md)** answers everything this section can't fit —
 including **five-minute recipes for both families**: tick Fine-tune, let the settings
 switch themselves, and change almost nothing.)
@@ -257,12 +264,18 @@ switch themselves, and change almost nothing.)
 | **24 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** |
 | **32 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** |
 
-A few things worth knowing about that table: clip lengths follow Gizmo's grid, so **2.3 s means
-the 56-frame slot** — cut your clips there and everything fits. Longer clips (3.8 s / 5.2 s)
-currently need more than 32 GB; that ceiling is about activation memory, not the model, and
-it's the next thing on the bench. One clip anywhere in your folder trains the **whole** model
-(that's what video needs), so a mixed photos + clips dataset uses the clip column. And 12 GB
-cards train **LoRAs**, not fine-tunes — 16 GB is the fine-tune floor.
+A few things worth knowing about that table: clip lengths follow Gizmo's grid, so **2.3 s
+means the 56-frame slot** — cut your clips there and everything fits, **confirmed by
+measured runs on every tier**. On **32 GB, 3.8 s is also confirmed**, even with video
+training the whole model. Beyond that, the **Restrict video to likeness blocks** tickbox
+(on by default with Optimised Likeness Learning — in our tests it trains video just as
+well, and it makes clips far lighter) extends the *expected* range: **up to 5.2 s on
+24 GB and 32 GB, and 3.8 s on 16 GB** — conservative arithmetic from the measured
+constants, not yet individually measured, so treat those as expected rather than
+promised. Whole-model 5.2 s clips need more than 32 GB (measured). With the restriction
+unticked, one clip anywhere in your folder trains the **whole** model, so a mixed
+photos + clips dataset uses the clip column. And 12 GB cards train **LoRAs**, not
+fine-tunes — 16 GB is the fine-tune floor.
 
 > **"A full fine-tune of a 12.9B–33B model on 16 GB" sounds like a trick, so here's the
 > arithmetic.** Only one slice of the model is ever trainable at a time — the trainable

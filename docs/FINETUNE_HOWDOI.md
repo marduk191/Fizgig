@@ -129,11 +129,18 @@ budget wall-clock and disk accordingly.
 
 1. **Cut your clips with Gizmo** — it produces exactly the spec H3 trains on (24 fps, the
    right frame counts) from any footage.
-2. **Keep clips at or under the 56-frame / 2.3 s slot.** That length trains on every card
-   tier down to 16 GB — measured. Longer clips (3.8 s / 5.2 s) currently need more than
-   32 GB; that ceiling is activation memory, not the model.
-3. Mind the mix: **one clip anywhere in your folder trains the whole model** (that's what
-   video needs), so a mixed photos + clips dataset runs at the clip tiers.
+2. **Leave "Restrict video to likeness blocks" ticked** (it's on by default with
+   Optimised Likeness Learning). In our tests it trains video just as well as the whole
+   model, and it makes clips far lighter on VRAM. Untick it only if you specifically
+   want video training the entire model.
+3. **Clip length — what's confirmed and what's expected.** The **2.3 s (56-frame) slot
+   is confirmed by measured runs on every tier**, whole model included, and **3.8 s is
+   confirmed on 32 GB** even whole-model. With the restriction ticked, the *expected*
+   range extends to **5.2 s on 24 GB and 32 GB, and 3.8 s on 16 GB** — conservative
+   arithmetic from the measured constants, not yet individually measured. Whole-model
+   5.2 s clips need more than 32 GB (measured).
+4. Mind the mix: with the restriction **unticked**, one clip anywhere in your folder
+   trains the whole model, so a mixed photos + clips dataset runs at the clip tiers.
 
 If your clips are too long for your card, the trainer tells you **before training
 starts** — with the fix (cut to the 2.3 s slot, or lower Target Megapixels) — instead of
@@ -153,9 +160,11 @@ visual stop to the current epoch, Resume, and it finishes voice-only.
 ## Should I leave Optimised Likeness Learning on? (H3)
 
 **Yes.** Matched runs came out clearly better on both look and prompt adherence than
-full-model fine-tuning, and it shrinks the windows so every VRAM tier gets easier. The
-exception is video: clips train the whole model regardless, so the checkbox mainly
-matters for photo/voice datasets.
+full-model fine-tuning, and it shrinks the windows so every VRAM tier gets easier. And
+as of this release video follows it too: the **Restrict video to likeness blocks**
+sub-tick (on by default) routes clips to the same identity blocks — in our tests that
+trains video just as well, and it makes clips far lighter on VRAM. Untick it for
+whole-model video.
 
 ## Do the problem-image tools work on a fine-tune? (Krea 2)
 

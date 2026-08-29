@@ -72,11 +72,15 @@ ranges vs full 50, judged by eye. If a clip zone exists it shrinks the cycle, th
 master, and the VRAM simultaneously, and every question below gets smaller. **Nothing to
 build; it needs Peter's video material and GPU time, not engineering.**
 
-*Status after the 28 Aug Q2 session: still open, deliberately.* The Q2 measurement
-dataset is 8 identical copies of ONE clip — overfit-one shaped, so a quality A/B on it
-would say nothing about generalisation. Needs a real multi-clip dataset. Note for that
-session: on a 5090 the resident full-model plan only fits ≤22-frame clips (Q2), so
-either run the A/B at 22 frames or wait for the planner activation term to land.
+*Status: FIELD-ANSWERED, 29 Aug.* Peter ran an overnight video fine-tune confined to
+the likeness blocks and it trained perfectly well — clips do NOT need all 50 blocks.
+Shipped the same day as the **Restrict video to likeness blocks** tickbox (f6f0151):
+--clip_blocks now exists with the same shape as photo_blocks/audio_blocks, the GUI
+passes the likeness set when the sub-tick is on (default on with likeness mode), and
+clip batches get their own per-batch confinement route. Whole-model video remains one
+untick away. What stays open from the original question is only the finer mapping —
+whether an even narrower clip zone exists — which is community-discoverable via
+--finetune_blocks as ever.
 
 ## Q2 — MEASURED (28 Aug 2026): the activation term is real, linear, and plan-independent
 
@@ -99,7 +103,7 @@ forward itself once windows are small.
 
 | tier | plan | 22 fr (0.9 s) | 56 fr (2.3 s) | 124 fr (5.2 s) |
 |---|---|---|---|---|
-| 32 GB resident | 4 windows | **PASS** (peaks 23.4/17.3/28.5/20.8) | FAIL (fc1, e3) -> **PASS post-fix** (5-window split, max 24.9) | FAIL (qkv, e1 backward) -> honest refusal post-fix |
+| 32 GB resident | 4 windows | **PASS** (peaks 23.4/17.3/28.5/20.8) | FAIL (fc1, e3) -> **PASS post-fix** (5-window split, max 24.9) | FAIL (qkv, e1 backward) -> **still FAILS post-fix** (qkv stays full-depth under the reduced cap; 90-frame / 3.8 s measured **PASS** instead, max 26.3) |
 | 24 GB | 8-window split | *predicted pass* | **PASS** (max 21.2 / 23.88) | FAIL (step 0, forward) |
 | 16 GB | streamed, 16 windows | **PASS** (max 11.6 / 15.9 — identical to stills) | **PASS** (steady 10.1–11.1) | *predicted ~16.0, at the line* |
 
