@@ -48,4 +48,7 @@ base itself, and Pause / Resume works mid-fine-tune with everything carried over
 
 <!-- sections to add as the release firms up: intelligent-trainer features on FT
      (problem images, adaptive throttle), likeness-mode recommendation, RAM/disk
-     requirements, upgrade notes, credits -->
+     requirements, upgrade notes, credits. MUST include the LR guidance from the README:
+     fine-tune rates are much lower than LoRA rates (H3 3e-5 tested / 1e-4 destroys;
+     Krea 2 may start at 1e-4 but best results are found lower), and the regularisation
+     LR x multiplier is a dial worth experimenting with. -->

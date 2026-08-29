@@ -380,12 +380,35 @@ previews ride them (rendered on the training DiT with the Turbo LoRA), numbering
 The output is a normal H3 checkpoint: load it in ComfyUI directly, or run **Checkpoint to LoRA**
 on it (the extractor decodes the int8 format natively) for a shareable LoRA.
 
+### Learning rates — lower than you're used to
+
+If you're coming from LoRA training, recalibrate before anything else: **fine-tuning wants
+much lower learning rates than LoRAs**. A LoRA nudges a small adapter riding on a frozen
+model; a fine-tune moves the model's own weights, so the rates you're used to typing land
+very differently here — what's a normal LoRA rate can wreck a fine-tune outright.
+
+- **MiniMax H3: use 3e-5.** It's the tested fast-and-reliable rate; **1e-4 will destroy an
+  H3 fine-tune** — that one is measured, not folklore.
+- **Krea 2: you're welcome to start at 1e-4** — it trains — but realistically the best
+  results are found lower. Treat 1e-4 as the top of the experiment range, not the recipe:
+  when a run looks almost right but slightly overcooked, the next move is a lower rate,
+  not fewer epochs.
+- **The regularisation LR × multiplier is part of the same tuning space** (next section).
+  It sets how hard the anchor pulls relative to your subject, and it's genuinely worth
+  experimenting with per dataset — 0.1–0.3 keeps it a tether, higher trains the reg set
+  more like real data.
+
 ### Optional: regularisation images
 
 Full fine-tuning moves every weight, so a long run on a handful of subjects drifts the model's
 whole notion of people — there's no low-rank bound to limit it the way there is with a LoRA. Point
 **Regularisation images** at a folder of ordinary photos of the broader class and they train at a
-reduced learning rate (**LR ×**, default 0.2) as an anchor rather than a lesson.
+reduced learning rate (**LR ×**, default 0.2) as an anchor rather than a lesson. That
+multiplier is a real dial, not a set-and-forget: **0.1–0.3** tethers the model's prior while
+your subject trains; push it toward **1.0** and the reg set trains like a second subject set —
+class-balanced training rather than a light anchor, which is a different (valid) thing. If a
+fine-tune drifts the broader class, raise it a step; if the subject learns too slowly, lower
+it. Worth a little experimentation per dataset.
 
 Use **real photos, not model output** — anchoring a fine-tune to its own samples distils its
 artifacts back in, and there's nothing bounding that drift. Caption them normally: anything you
