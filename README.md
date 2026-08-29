@@ -456,8 +456,12 @@ Being straight about the trade-offs, because they're real:
   the step time — both families. (Picking the fp8 base instead costs a 24 GB card depth-split,
   streamed windows at ~3× the step time, and doesn't fit 16 GB at all.) The console prints
   each run's plan; too little VRAM refuses cleanly instead of OOMing.
-- **System RAM** for the bf16 master copy, on top of VRAM: ~24 GB on Krea 2, ~23–38 GB on H3
-  (H3's spills to disk automatically when RAM is tight).
+- **System RAM** for the bf16 master copy, on top of VRAM: ~24 GB on Krea 2, ~23–38 GB on H3.
+  H3's spills to disk automatically; **Krea 2's does not, so Krea 2 fine-tuning realistically
+  wants 48 GB+ of system RAM** — the trainer warns at launch when RAM looks tight.
+- **NVIDIA only, for now.** Fine-tuning is untested on AMD/ROCm — every measured tier is
+  NVIDIA, and the NF4 default leans on bitsandbytes 4-bit, the least-travelled part of the
+  ROCm stack. Reports welcome either way.
 - **Disk — set your save location BEFORE the run.** Every save is a full checkpoint — ~26 GB
   on Krea 2, ~21 GB on H3 — and saving once per 4-epoch cycle is ~260 GB over a 40-epoch run.
   The **Output Directory** on the Training tab defaults to the same folder your LoRAs go to,

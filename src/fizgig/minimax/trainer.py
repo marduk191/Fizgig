@@ -2491,6 +2491,14 @@ def train_minimax(
                     finetune_scope,
                     f", blocks {finetune_blocks}" if finetune_blocks else "",
                     ", fused backward" if finetune_fused_backward else "")
+        # FT has never been run on AMD/ROCm — every measured tier is NVIDIA, and the NF4
+        # rotator leans on bitsandbytes 4-bit, the least-travelled part of the ROCm stack.
+        # Log-only: a power user gets the facts, not a gate. (Twin of the Krea 2 warning.)
+        if getattr(torch.version, "hip", None):
+            logger.warning("[h3-ft] heads-up: fine-tuning is UNTESTED on AMD/ROCm — every "
+                           "measured tier is NVIDIA. The NF4 rotator depends on bitsandbytes "
+                           "4-bit, the least-tested part of the ROCm stack. It may work; if "
+                           "it does (or doesn't), a report on GitHub genuinely helps.")
 
     # ---- dataset (built from the caches the two cache scripts wrote) ----
     shared_epoch = Value("i", 0)

@@ -31,7 +31,10 @@ Clip lengths follow Gizmo's grid — 2.3 s is the 56-frame slot, so cut clips th
 everything fits. Longer clips currently need more than 32 GB. One clip anywhere in the
 folder trains the whole model, so mixed photo + clip datasets use the clip column.
 12 GB cards train LoRAs, not fine-tunes — 16 GB is the fine-tune floor. Every number
-in that table comes from a measured run, not an estimate.
+in that table comes from a measured run, not an estimate. Two honest caveats: fine-tuning
+is **untested on AMD/ROCm** (every measured tier is NVIDIA), and **Krea 2 fine-tuning
+realistically wants 48 GB+ of system RAM** (its ~24 GB master lives in RAM; H3's spills
+to disk). The trainer says both out loud at launch where they apply.
 
 ## What makes it fit (yes, really, 16 GB)
 

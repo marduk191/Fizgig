@@ -252,8 +252,15 @@ The same training bases you already have — nothing new to download:
   runs. The ~66 GB bf16 file works for LoRA training only; the trainer refuses it for
   fine-tuning with a clear message.
 
-Plus system RAM for the bf16 master copy: ~24 GB on Krea 2, ~23–38 GB on H3 (H3's spills
-to disk automatically when RAM is tight).
+Plus system RAM for the bf16 master copy: ~24 GB on Krea 2, ~23–38 GB on H3. **H3's
+master spills to disk automatically when RAM is tight; Krea 2's does not** — so Krea 2
+fine-tuning realistically wants **48 GB+ of system RAM** for comfort (on less, expect
+paging, and remember the Windows quirk: running out of RAM surfaces as "CUDA error: out
+of memory" with the GPU nearly empty). The trainer warns at launch when RAM looks tight.
+
+One more honesty note: **fine-tuning is untested on AMD/ROCm** — every measured tier is
+NVIDIA, and the NF4 default depends on bitsandbytes 4-bit, the least-travelled part of
+the ROCm stack. It may work; either way, a field report on GitHub genuinely helps.
 
 ## Why fine-tune instead of training a LoRA?
 

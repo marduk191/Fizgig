@@ -2176,6 +2176,32 @@ def train_krea2(
             logger.info("[ft-rotation] streaming frozen blocks from CPU — only the trainable "
                         "window stays resident.")
         logger.info("[ft-rotation] FULL FINE-TUNE — %s", rot_schedule.describe())
+        # Two pre-flight honesty checks (log-only — a power user gets the facts, not a gate):
+        # (1) FT has never been run on AMD/ROCm, and the NF4 default leans on bitsandbytes
+        # Linear4bit, whose ROCm wheel is the least-travelled part of that stack. Say so up
+        # front rather than letting a default-config failure look like the user's fault.
+        if getattr(torch.version, "hip", None):
+            logger.warning("[ft-rotation] heads-up: fine-tuning is UNTESTED on AMD/ROCm — "
+                           "every measured tier is NVIDIA. The NF4 default depends on "
+                           "bitsandbytes 4-bit, the least-tested part of the ROCm stack. "
+                           "It may work; if it does (or doesn't), a report on GitHub "
+                           "genuinely helps.")
+        # (2) The Krea 2 bf16 master (~24 GB) lives in system RAM with no disk spill (H3's
+        # spills; Krea 2's does not). A short host leaves Windows paging, and paging
+        # surfaces as a misleading 'CUDA error: out of memory' with the GPU nearly empty
+        # (#94/#110's commit-charge trap). Warn while the user can still close things.
+        try:
+            import psutil as _ps
+            _avail = _ps.virtual_memory().available / 1e9
+            if _avail < 34.0:
+                logger.warning("[ft-rotation] system RAM is tight for a Krea 2 fine-tune: "
+                               "%.0f GB available, and the ~24 GB bf16 master plus staging "
+                               "wants ~34 GB free. Expect paging (slow steps), and know "
+                               "that running out surfaces as 'CUDA error: out of memory' "
+                               "with the GPU nearly empty. Close other apps, or use a "
+                               "machine with 48 GB+ of RAM for comfort.", _avail)
+        except Exception:
+            pass
         if rot_schedule.cycle_epochs > max_train_epochs:
             logger.warning("[ft-rotation] a full cycle needs %d epochs but max_train_epochs=%d — "
                            "blocks after window %d will NEVER train this run.",
