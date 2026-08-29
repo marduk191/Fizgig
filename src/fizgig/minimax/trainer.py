@@ -366,26 +366,34 @@ def snap_ft_stop(n, cycle, offset, local_max):
 
 
 def plan_ft_modality_routing(n_blocks, photo_blocks, audio_blocks,
-                             n_photo, n_voice, n_clip, explicit_subset=None):
+                             n_photo, n_voice, n_clip, explicit_subset=None,
+                             clip_blocks=None):
     """The fine-tune's modality-routing plan, as pure data: (cycle_subset, routes).
 
     cycle_subset: sorted block list the rotation cycle should span, or None for the full
     model — the UNION of what each modality present in the dataset needs (photos -> the
-    likeness set when given, voice -> the audio zone, clips -> full model for now).
-    routes: {"photo": set|None, "voice": set|None} — the per-batch confinement set for
-    each modality, or None when that modality may train the whole span (absent from the
-    dataset, no set configured, or the span already sits inside its set — the caller's
-    freeze list then comes out empty anyway; None here keeps the intent legible in logs).
+    likeness set when given, voice -> the audio zone, clips -> clip_blocks when given,
+    full model otherwise). clip_blocks landed 29 Aug from a field result: an overnight
+    video run confined to the likeness blocks worked, so "clips -> full model" is now the
+    fallback, not the law — the GUI's "Restrict video to likeness blocks" tickbox passes
+    the likeness set here, and unticking it (or CLI runs without --clip_blocks) keeps the
+    whole-model behaviour.
+    routes: {"photo": set|None, "voice": set|None, "clip": set|None} — the per-batch
+    confinement set for each modality, or None when that modality may train the whole
+    span (absent from the dataset, no set configured, or the span already sits inside
+    its set — the caller's freeze list then comes out empty anyway; None here keeps the
+    intent legible in logs).
 
-    An explicit --finetune_blocks subset wins: it is returned verbatim and both routes are
+    An explicit --finetune_blocks subset wins: it is returned verbatim and all routes are
     None (the validated manual workflow — the A/B that produced the 34-49 rule was run
     exactly this way). Kept as a module-level pure function so the truth table is pinnable
     without a training run."""
-    routes = {"photo": None, "voice": None}
+    routes = {"photo": None, "voice": None, "clip": None}
     if explicit_subset is not None:
         return sorted(explicit_subset), routes
     pb = set(parse_block_spec(photo_blocks, n_blocks)) if photo_blocks else None
     aud = set(parse_block_spec(audio_blocks, n_blocks)) if audio_blocks else None
+    cb = set(parse_block_spec(clip_blocks, n_blocks)) if clip_blocks else None
     full = set(range(n_blocks))
     union = set()
     if n_photo:
@@ -393,7 +401,7 @@ def plan_ft_modality_routing(n_blocks, photo_blocks, audio_blocks,
     if n_voice:
         union |= (aud if aud else full)
     if n_clip:
-        union |= full
+        union |= (cb if cb else full)
     if not union:
         union = full
     span = union
@@ -401,6 +409,8 @@ def plan_ft_modality_routing(n_blocks, photo_blocks, audio_blocks,
         routes["photo"] = pb
     if aud is not None and n_voice and not span.issubset(aud):
         routes["voice"] = aud
+    if cb is not None and n_clip and not span.issubset(cb):
+        routes["clip"] = cb
     return (sorted(union) if union != full else None), routes
 
 
@@ -2268,6 +2278,11 @@ def train_minimax(
                                      # The 20-49 recipe: photo gradients into the front trunk are
                                      # pure prior damage (deformed previews, eroded prompt
                                      # following) while identity lives in the back 30 blocks.
+    clip_blocks: str = None,         # FT only: confine CLIP steps to these blocks too (the GUI's
+                                     # "Restrict video to likeness blocks" tickbox passes the
+                                     # likeness set). Field result 29 Aug: an overnight video run
+                                     # confined this way trained perfectly well. Unset = clips
+                                     # train the whole model, the original behaviour.
     audio_blocks: str = None,        # Voice routing: audio-only steps update only these blocks
                                      # (+refiners). The 34-49 recipe (voice core 38-48 + shoulder,
                                      # RESEARCH_h3_block_map.md): audio gradients outside it
@@ -2904,7 +2919,8 @@ def train_minimax(
                         "wins over photo/voice routing.", finetune_blocks)
         _plan_subset, _ft_route = plan_ft_modality_routing(
             _n_blocks, photo_blocks, audio_blocks,
-            _n_photo_items, _n_voice_items, _n_clip_items, explicit_subset=ft_subset)
+            _n_photo_items, _n_voice_items, _n_clip_items, explicit_subset=ft_subset,
+            clip_blocks=clip_blocks)
         if ft_subset is None and _plan_subset is not None:
             ft_subset = _plan_subset
             logger.info("[h3-ft] the cycle tightens to blocks %s — the union of what "
@@ -2915,7 +2931,9 @@ def train_minimax(
                              else "photos -> full model") if _n_photo_items else None,
                             (f"voice -> {audio_blocks}" if audio_blocks
                              else "voice -> full model") if _n_voice_items else None,
-                            "clips -> full model" if _n_clip_items else None])))
+                            ((f"clips -> {clip_blocks} (restricted)" if clip_blocks
+                              else "clips -> full model")
+                             if _n_clip_items else None)])))
         if _ft_route["photo"] is not None:
             logger.info("[h3-ft] Optimised Likeness Learning on a mixed dataset: photo "
                         "batches freeze every block outside %s — the same photos-"
@@ -2925,6 +2943,9 @@ def train_minimax(
             logger.info("[h3-ft] voice routing: audio batches freeze every block "
                         "outside %s (the voice zone — audio gradients beyond it "
                         "corrupt the visual blocks).", audio_blocks)
+        if _ft_route["clip"] is not None:
+            logger.info("[h3-ft] video routing: clip batches freeze every block "
+                        "outside %s (Restrict video to likeness blocks).", clip_blocks)
         # RAM vs disk-backed master. The in-RAM dict is only irreplaceable for TRAINED
         # tensors; MasterStore reads untouched ones lazily from the int8 file and spills
         # trained bf16 to scratch — master RAM drops from whole-model to ~one tensor, which
@@ -3445,19 +3466,21 @@ def train_minimax(
     # per-tensor hooks never fire for a no-grad param, and the non-fused path simply
     # accumulates nothing. The always-on refiner is never in these lists (its Linears are
     # not block-indexed): it trains on every modality, matching the validated 34-49 run.
-    _ft_freeze = {"photo": [], "voice": []}
+    _ft_freeze = {"photo": [], "voice": [], "clip": []}
 
     def _ft_rebuild_freeze():
         _ft_freeze["photo"] = []
         _ft_freeze["voice"] = []
-        if rotator is None or not (_ft_route["photo"] or _ft_route["voice"]):
+        _ft_freeze["clip"] = []
+        if rotator is None or not (_ft_route["photo"] or _ft_route["voice"]
+                                   or _ft_route["clip"]):
             return
         for _k, _lin in rotator._targets(list(rotator.active)):
             _bi = int(_k.split(".")[1])
             for _cat, _allowed in _ft_route.items():
                 if _allowed is not None and _bi not in _allowed:
                     _ft_freeze[_cat].append(_lin.weight)
-        for _cat, _label in (("photo", "photo"), ("voice", "audio")):
+        for _cat, _label in (("photo", "photo"), ("voice", "audio"), ("clip", "video")):
             if _ft_freeze[_cat]:
                 logger.info("[h3-ft] this window: %d of %d tensors frozen on %s batches",
                             len(_ft_freeze[_cat]), len(params), _label)
@@ -4850,13 +4873,14 @@ def train_minimax(
             # Modality routing (FT): freeze the blocks this batch's modality must not touch
             # for the span of its forward+backward — a component window spans every block,
             # so this per-parameter freeze is the only way to express "photos stay inside
-            # 20-49, voice stays inside 34-49" while clips train the whole window. The
-            # fused per-tensor hooks never fire for a no-grad param; restored right after
-            # the backward (any exception here is fatal to the run anyway).
+            # 20-49, voice stays inside 34-49, clips inside clip_blocks when restricted".
+            # The fused per-tensor hooks never fire for a no-grad param; restored right
+            # after the backward (any exception here is fatal to the run anyway).
             _frz = []
             if rotator is not None:
                 _frz = (_ft_freeze["voice"] if _is_voice
-                        else (_ft_freeze["photo"] if _is_photo else []))
+                        else (_ft_freeze["photo"] if _is_photo
+                              else _ft_freeze["clip"]))
                 for _p in _frz:
                     _p.requires_grad_(False)
             if (distill and (_teacher_phase or not _p1_epochs) and "ref_hidden_states" in batch

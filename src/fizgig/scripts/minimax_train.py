@@ -164,6 +164,12 @@ def setup_parser() -> argparse.ArgumentParser:
                         "measurably corrupt the visual blocks (A/B, 24 Aug). Applies "
                         "under the rotation fine-tune, and in LoRA mode alongside "
                         "--photo_blocks.")
+    p.add_argument("--clip_blocks", default=None, metavar="SPEC",
+                   help="Fine-tune only: confine VIDEO CLIP training steps to these DiT "
+                        "blocks (the refiner always trains). The GUI's 'Restrict video to "
+                        "likeness blocks' passes the likeness set here — a confined "
+                        "overnight video run trained perfectly well (field, 29 Aug). "
+                        "Unset: clips train the full model, the original behaviour.")
     p.add_argument("--base_quant", default="auto", choices=["auto", "int8", "nf4"],
                    help="Frozen-base precision. 'int8' keeps the checkpoint's own ConvRot "
                         "weights (~0.17%% base error, ~21 GB) — what the reference trainer "
@@ -320,6 +326,7 @@ def main():
         include_patterns=args.include_patterns,
         train_blocks=args.train_blocks,
         photo_blocks=args.photo_blocks,
+        clip_blocks=args.clip_blocks,
         audio_blocks=args.audio_blocks,
         distill=args.distill,
         distill_weight=args.distill_weight,
