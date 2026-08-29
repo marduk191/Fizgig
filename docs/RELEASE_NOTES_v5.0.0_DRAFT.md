@@ -94,7 +94,8 @@ needs the community to develop further. I don't expect every scenario to work pe
 yet — but it works, and there's a solid foundation here to build on. I'm also aware this
 technique is model-agnostic at heart — it opens the door to fine-tuning other models, and
 I'm open to going there. But for that to happen it needs practical community support
-around those models, so I have the time necessary to make it happen. — Peter
+around those models — code, PRs, testing, that kind of thing — so I have the time
+necessary to make it happen. — Peter
 
 <!-- sections to add as the release firms up: intelligent-trainer features on FT
      (problem images, adaptive throttle), likeness-mode recommendation, RAM/disk

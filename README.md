@@ -246,7 +246,8 @@ LoRA** on the Training tab.
 > build on. Field reports genuinely shape what gets built next. I'm also aware this
 > technique is model-agnostic at heart — it opens the door to fine-tuning other models,
 > and I'm open to going there. But for that to happen it needs practical community
-> support around those models, so I have the time necessary to make it happen. — Peter (New to fine-tuning? The extended
+> support around those models — code, PRs, testing, that kind of thing — so I have the
+> time necessary to make it happen. — Peter (New to fine-tuning? The extended
 **["How do I…?" guide](docs/FINETUNE_HOWDOI.md)** answers everything this section can't fit —
 including **five-minute recipes for both families**: tick Fine-tune, let the settings
 switch themselves, and change almost nothing.)
