@@ -1993,11 +1993,13 @@ def train_krea2(
     # the training DiT itself with the Turbo LoRA applied fresh inside a deactivate/reactivate
     # bracket (the H3 pattern). Without the Turbo LoRA, previews stay off.
     # MUST stay after every other do_previews decision — the FT gate wins.
+    _ft_preview_gap_warned = False
     if do_previews and ft_rotation and not turbo_lora_path:
         logger.info("[ft-rotation] in-training previews need the Turbo LoRA (the standalone "
                     "Turbo checkpoint can't show fine-tuned weights) and none is configured — "
                     "previews off. Evaluate saved checkpoints in ComfyUI instead.")
         do_previews = False
+        _ft_preview_gap_warned = True
     encoded_prompts = sample_ae = sample_dir = None
     encoded_negative = None
     if do_previews:
@@ -2197,6 +2199,23 @@ def train_krea2(
                         "DiT via a deactivate/reactivate bracket with the Turbo LoRA applied "
                         "fresh each time.",
                         save_every_n_epochs if save_every_n_epochs else max_train_epochs)
+        elif sample_prompts and not _ft_preview_gap_warned:
+            # H3's 7377f2c twin: a prompts file is the clearest statement the user WANTS
+            # previews, so a silent off is the same class as the announce-then-never-render
+            # lie fixed there — say which ingredient is missing instead (the cadence flag
+            # is the one nobody guesses; a run with prompts but no cadence renders nothing).
+            # The FT turbo-lora gate above prints its own line; don't double up on it.
+            _missing = [m for m, ok in (
+                ("a sample cadence — set Sample every N epochs "
+                 "(--sample_every_n_epochs) or sample-at-first",
+                 bool(sample_every_n_epochs or sample_at_first)),
+                ("the Turbo LoRA", bool(turbo_lora_path)),
+                ("the VAE path", bool(vae_path)),
+                ("the text encoder path", bool(te_path))) if not ok]
+            if _missing:
+                logger.warning("[ft-rotation] previews are OFF for this run: a prompts "
+                               "file is set, but missing %s. With that in place previews "
+                               "ride the checkpoint saves.", "; ".join(_missing))
         if adaptive_lr:
             # The watcher reads epoch-to-epoch loss movement as signal. Rotation changes which
             # weights are trainable at the boundary, so every rotation looks like a step change
