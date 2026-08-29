@@ -226,6 +226,15 @@ Every save prints the exact continuation settings in the console — point the m
 (**--dit**) at your checkpoint and use the printed start-window. A finished fine-tune
 checkpoint is a valid training base for its family, so you can chain runs indefinitely.
 
+## Can I train LoRAs on top of my fine-tune?
+
+Yes — and this is one of the most useful things about it, even if it's easy to miss.
+Your fine-tuned checkpoint is a normal base model, so point the family's model path in
+**Preferences** at it and train LoRAs against it exactly as you would the stock base.
+Teach the base your world, style or cast with a fine-tune, then train quick LoRAs on top
+for individual subjects and concepts. One deployment note: a LoRA trained on your
+fine-tuned base pairs best with that same base at inference — load your checkpoint in
+ComfyUI and stack the LoRA on it, just like you trained it.
 ## How do I see previews during training?
 
 Previews **ride the checkpoint saves** — one render per save plus the final one, each

@@ -87,8 +87,9 @@ The built-in **Checkpoint to LoRA** utility diffs your fine-tune against the bas
 extracts an ordinary, shareable LoRA at any rank — the quality of a full fine-tune, in
 a file ComfyUI already knows how to use. It works very well: in our testing, rank 64 was
 perceptually indistinguishable from the full checkpoint. Or keep the checkpoint: it's a
-valid training base itself, and Pause / Resume works mid-fine-tune with everything
-carried over.
+valid training base itself — continue fine-tuning it, or (easy to miss) set it as the
+family's base in **Preferences** and **train LoRAs on top of your own fine-tuned model**.
+Pause / Resume works mid-fine-tune with everything carried over.
 
 ## What we'll say, and what we won't
 

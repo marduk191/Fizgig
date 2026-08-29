@@ -310,7 +310,10 @@ download:
   **not** work for fine-tuning; the trainer refuses it with a clear message.
 
 A finished fine-tune checkpoint is itself a valid base for either family — point the model path
-at it to train further (the console prints the exact continuation settings at every save). And
+at it to train further (the console prints the exact continuation settings at every save). And —
+easy to miss — you can set it as the family's base in **Preferences** and **train LoRAs on top of
+your own fine-tuned model**: teach the base your world or cast once, then quick LoRAs for
+individual subjects ride on it. Deploy those LoRAs with the same fine-tuned base in ComfyUI. And
 **Pause / Resume works on a fine-tune**: Pause saves a full checkpoint even between the regular
 save epochs, and Resume continues it — rotation window, checkpoint numbering and the remaining
 epoch count all carry over.
