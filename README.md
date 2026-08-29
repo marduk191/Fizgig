@@ -474,7 +474,7 @@ The result worth knowing: in our testing, a LoRA **extracted** from a fine-tune 
 better than a LoRA **trained directly** at the same or higher rank on the same dataset. A
 low-rank file can *hold* a solution that low-rank training struggles to *find* — so
 fine-tune-then-extract isn't a workaround; the full-rank phase is the mechanism, and the
-extraction is nearly free. (Details and the experiments behind it: **[docs/FINETUNE_ROTATION.md](docs/FINETUNE_ROTATION.md)**.)
+extraction is nearly free.
 
 ### What it costs you
 

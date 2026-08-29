@@ -99,3 +99,7 @@ docs/RUNPOD_TEMPLATE.md
 sync-to-remote.sh
 gizmo_settings.json
 docs/RESEARCH_*
+docs/DESIGN_component_ft_24gb.md
+docs/EVAL_full_model_h3_video.md
+docs/FINETUNE_ROTATION.md
+docs/DISTRIBUTED_FINETUNE.md
