@@ -13,7 +13,9 @@ Everything Fizgig trains has been a LoRA: an adapter riding on a frozen model. T
 release trains the **model itself** — full-rank updates, no adapter, no rank
 bottleneck — for both **Krea 2** (12.9B) and **MiniMax H3** (33B video), on a single
 consumer GPU. One checkbox on the Training tab; the planner reads your free VRAM at
-launch, picks the plan that fits, and prints what it chose. The quickest route on either family is genuinely five minutes: tick Fine-tune (the
+launch, picks the plan that fits, and prints what it chose.
+
+The quickest route on either family is genuinely five minutes: tick Fine-tune (the
 learning rate, epochs and save cadence switch to fine-tune values by themselves — and on
 Krea 2 Adaptive LR steps aside automatically), set your output drive, keep your trigger
 tokens — done. Step-by-step recipes for both, and every other question:
@@ -38,7 +40,8 @@ to disk). The trainer says both out loud at launch where they apply.
 
 ## What makes it fit (yes, really, 16 GB)
 
-A naive full fine-tune of Krea 2 needs ~78 GB. Fizgig's trainer rotates a trainable
+A naive full fine-tune of MiniMax H3's 33B would need roughly 200 GB; even Krea 2's
+12.9B needs ~78 GB. Fizgig's trainer rotates a trainable
 window through the model — every weight trains over a cycle, but gradients and
 optimizer state only ever exist for the active slice — on top of a **4-bit NF4 frozen
 base** (the fine-tune default: half the model held on the card, and on 24 GB it's
@@ -51,6 +54,16 @@ measured, not projected: **8.8–12.3 GB peaks on a 16 GB card for H3, 8.4–11.
 Krea 2**, and the console prints your own run's peak every epoch so you can watch the
 claim hold live. The full mechanism, the card tiers, and every "how do I" question:
 **[docs/FINETUNE_HOWDOI.md](docs/FINETUNE_HOWDOI.md)**.
+
+## One number to respect: the learning rate
+
+If you take a single thing from these notes: **fine-tuning wants much lower learning
+rates than LoRA training.** Ticking Fine-tune sets a safe **1e-5** for you on both
+families. On **MiniMax H3**, 3e-5 is the tested faster rate and the most you should ever
+use — **1e-4 will destroy an H3 fine-tune** (measured, not folklore). On **Krea 2**
+you're welcome to experiment up to 1e-4, but the best results are realistically found
+lower. And if you use regularisation images, their **LR ×** multiplier is a real dial —
+0.1–0.3 tethers the model's prior, higher trains them like a second subject set.
 
 ## When you're done
 
@@ -71,7 +84,4 @@ genuinely shape what gets built next.
 
 <!-- sections to add as the release firms up: intelligent-trainer features on FT
      (problem images, adaptive throttle), likeness-mode recommendation, RAM/disk
-     requirements, upgrade notes, credits. MUST include the LR guidance from the README:
-     fine-tune rates are much lower than LoRA rates (H3 3e-5 tested / 1e-4 destroys;
-     Krea 2 may start at 1e-4 but best results are found lower), and the regularisation
-     LR x multiplier is a dial worth experimenting with. -->
+     requirements, upgrade notes, credits. -->
