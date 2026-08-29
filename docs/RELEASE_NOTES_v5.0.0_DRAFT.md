@@ -29,7 +29,7 @@ folder trains the whole model, so mixed photo + clip datasets use the clip colum
 12 GB cards train LoRAs, not fine-tunes — 16 GB is the fine-tune floor. Every number
 in that table comes from a measured run, not an estimate.
 
-## What makes it fit
+## What makes it fit (yes, really, 16 GB)
 
 A naive full fine-tune of Krea 2 needs ~78 GB. Fizgig's trainer rotates a trainable
 window through the model — every weight trains over a cycle, but gradients and
@@ -38,6 +38,12 @@ base** (the fine-tune default: half the model held on the card, and on 24 GB it'
 also ~3× faster than the fp8 base because the windows stay resident). Your saved
 checkpoint is unaffected by any of this: it's written in bf16 from a master copy that
 never passes through a quantiser.
+
+If "a 33B video model fine-tuning on 16 GB" reads like a trick — the numbers are
+measured, not projected: **8.8–12.3 GB peaks on a 16 GB card for H3, 8.4–11.0 GB for
+Krea 2**, and the console prints your own run's peak every epoch so you can watch the
+claim hold live. The full mechanism, the card tiers, and every "how do I" question:
+**[docs/FINETUNE_HOWDOI.md](docs/FINETUNE_HOWDOI.md)**.
 
 ## When you're done
 

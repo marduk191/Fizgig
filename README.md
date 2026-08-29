@@ -236,7 +236,8 @@ Settings are read at launch; Pause → Resume relaunches with your current setti
 
 Everything above trains a **LoRA**. This trains the **base model itself** — no adapter, no rank
 bottleneck — on a single consumer GPU. Tick **⚗ Fine-tune the BASE MODEL instead of training a
-LoRA** on the Training tab.
+LoRA** on the Training tab. (New to fine-tuning? The extended
+**["How do I…?" guide](docs/FINETUNE_HOWDOI.md)** answers everything this section can't fit.)
 
 > **Note on VRAM:** the "trains on 8 GB" figures elsewhere in this README are for **LoRA**
 > training. Full fine-tuning is a different animal — but it now **tiers itself to your card**,
@@ -260,6 +261,16 @@ currently need more than 32 GB; that ceiling is about activation memory, not the
 it's the next thing on the bench. One clip anywhere in your folder trains the **whole** model
 (that's what video needs), so a mixed photos + clips dataset uses the clip column. And 12 GB
 cards train **LoRAs**, not fine-tunes — 16 GB is the fine-tune floor.
+
+> **"A full fine-tune of a 12.9B–33B model on 16 GB" sounds like a trick, so here's the
+> arithmetic.** Only one slice of the model is ever trainable at a time — the trainable
+> window rotates each epoch, so gradients and optimizer state exist for that slice alone.
+> The frozen rest is held **4-bit (NF4)** at half size and, on 16 GB, streamed from system
+> RAM. The bf16 master copy lives in CPU RAM, never on the card. Those three together are
+> the whole magic, and the numbers are measured, not projected: **8.8–12.3 GB peaks on a
+> 16 GB card for H3**, **8.4–11.0 GB for Krea 2** — and the console prints your own run's
+> peak every epoch, so you can watch the claim hold live. Mechanism, tiers and every
+> "how do I" in the extended guide: **[docs/FINETUNE_HOWDOI.md](docs/FINETUNE_HOWDOI.md)**.
 
 **Which model files.** Fine-tuning uses the same training bases you already have — nothing new to
 download:
@@ -352,7 +363,8 @@ the model's full depth from the very first epoch.
   mid-run.
 - **System RAM:** the bf16 master copy is ~23 GB (likeness) to ~38 GB (full model), and spills
   to disk automatically when RAM is tight — full-model fine-tuning runs on a 64 GB box.
-- **Disk:** each save is a full **~21 GB** int8 checkpoint.
+- **Disk:** each save is a full **~21 GB** int8 checkpoint — set the Training tab's **Output
+  Directory** to a drive with room *before* the run, or you'll be moving 20 GB files by hand after.
 - **Learning rate: 3e-5** — the tested fast-and-reliable rate for H3 fine-tuning. Anything as
   high as 1e-4 will destroy a fine-tune.
 - **Use unique trigger tokens** — strongly recommended: an invented token gives the fine-tune
@@ -444,8 +456,12 @@ Being straight about the trade-offs, because they're real:
   each run's plan; too little VRAM refuses cleanly instead of OOMing.
 - **System RAM** for the bf16 master copy, on top of VRAM: ~24 GB on Krea 2, ~23–38 GB on H3
   (H3's spills to disk automatically when RAM is tight).
-- **Disk.** Every save is a full checkpoint — ~26 GB on Krea 2, ~21 GB on H3. Saving once per
-  4-epoch cycle is ~260 GB over a 40-epoch run. Point the Output Directory somewhere with room.
+- **Disk — set your save location BEFORE the run.** Every save is a full checkpoint — ~26 GB
+  on Krea 2, ~21 GB on H3 — and saving once per 4-epoch cycle is ~260 GB over a 40-epoch run.
+  The **Output Directory** on the Training tab defaults to the same folder your LoRAs go to,
+  which is often not the drive you want holding a stack of 20+ GB files: change it to a roomy
+  drive before you press Start, because afterwards the only fix is moving huge files by hand.
+  (A Pause also writes a full checkpoint, on top of the regular cadence.)
 - **A low learning rate** — 1e-5 on Krea 2; **3e-5** is the tested rate on H3. LoRA-style rates
   (anything as high as 1e-4) will destroy a fine-tune.
 - **Run at least one full cycle** (4 epochs in component mode) or some weights never train at all.
