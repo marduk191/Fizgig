@@ -262,11 +262,11 @@ switch themselves, and change almost nothing.)
 
 **What can my card fine-tune?** The short answer, at the default training resolution:
 
-| Your card | Krea 2 — photos | MiniMax H3 — photos | H3 — voice | H3 — video clips (with sound) |
-|---|---|---|---|---|
-| **16 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** |
-| **24 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** |
-| **32 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** |
+| Your card | Krea 2 — photos | MiniMax H3 — photos | H3 — voice | H3 — video, confirmed | H3 — video on likeness blocks, expected |
+|---|---|---|---|---|---|
+| **16 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** | up to **3.8 s** |
+| **24 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** | up to **5.2 s** |
+| **32 GB** | ✅ | ✅ | ✅ | ✅ up to **3.8 s** | up to **5.2 s** |
 
 A few things worth knowing about that table: clip lengths follow Gizmo's grid, so **2.3 s
 means the 56-frame slot** — cut your clips there and everything fits, **confirmed by

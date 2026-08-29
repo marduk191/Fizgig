@@ -25,11 +25,11 @@ tokens — done. Step-by-step recipes for both, and every other question:
 
 **What can my card fine-tune?**
 
-| Your card | Krea 2 — photos | MiniMax H3 — photos | H3 — voice | H3 — video clips (with sound) |
-|---|---|---|---|---|
-| **16 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** |
-| **24 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** |
-| **32 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** |
+| Your card | Krea 2 — photos | MiniMax H3 — photos | H3 — voice | H3 — video, confirmed | H3 — video on likeness blocks, expected |
+|---|---|---|---|---|---|
+| **16 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** | up to **3.8 s** |
+| **24 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** | up to **5.2 s** |
+| **32 GB** | ✅ | ✅ | ✅ | ✅ up to **3.8 s** | up to **5.2 s** |
 
 Clip lengths follow Gizmo's grid — the **2.3 s (56-frame) slot is confirmed by measured
 runs on every tier**, and **3.8 s is confirmed on 32 GB** even with video training the
@@ -39,8 +39,9 @@ extends the *expected* range to **5.2 s on 24 GB and 32 GB, 3.8 s on 16 GB** —
 conservative arithmetic from the measured constants. Whole-model 5.2 s clips need more
 than 32 GB (measured). With the restriction unticked, one clip anywhere in the folder
 trains the whole model, so mixed photo + clip datasets use the clip column.
-12 GB cards train LoRAs, not fine-tunes — 16 GB is the fine-tune floor. Every number
-in that table comes from a measured run, not an estimate. Two honest caveats: fine-tuning
+12 GB cards train LoRAs, not fine-tunes — 16 GB is the fine-tune floor. Every number in the
+confirmed columns comes from a measured run, not an estimate; the expected column is
+conservative arithmetic from the measured constants. Two honest caveats: fine-tuning
 is **untested on AMD/ROCm** (every measured tier is NVIDIA), and **Krea 2 fine-tuning
 realistically wants 48 GB+ of system RAM** (its ~24 GB master lives in RAM; H3's spills
 to disk). The trainer says both out loud at launch where they apply.
