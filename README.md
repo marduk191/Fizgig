@@ -776,3 +776,11 @@ Fizgig is open source under the **[Apache License 2.0](LICENSE)** — free to us
 Copyright © 2026 Peter Neill.
 
 Model weights are **not** covered by this license — each model carries its own terms from its publisher (see the Download links in Preferences).
+
+---
+
+## Working with me
+
+I'm available for consulting on local AI training pipelines, custom workflow tooling, and
+private model work — the same engineering that's in Fizgig, applied to your studio's
+hardware and IP. Get in touch: **peter@shootthesound.com**.
