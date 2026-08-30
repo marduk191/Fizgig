@@ -247,7 +247,9 @@ exactly which ingredient is missing.
 
 ## How do I share a fine-tune? It's 26 GB!
 
-Run **Checkpoint to LoRA** (`run_diff_to_lora.bat`) — it diffs your fine-tune against the
+Run **Checkpoint to LoRA** — it lives in your **Fizgig folder as `run_diff_to_lora.bat`**
+(double-click it; it opens its own small window, separate from the main app). It diffs
+your fine-tune against the
 base model and extracts the difference as an ordinary kohya `.safetensors` at several
 ranks at once. Measured: **rank 64 was perceptually indistinguishable from the full
 checkpoint** at ~0.5 GB, and quality degrades smoothly at lower ranks. In our testing an

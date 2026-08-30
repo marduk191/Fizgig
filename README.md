@@ -425,7 +425,7 @@ an earlier save. Krea 2 fine-tunes behave exactly the same way — saves snap to
 previews ride them (rendered on the training DiT with the Turbo LoRA), numbering carries over.
 
 The output is a normal H3 checkpoint: load it in ComfyUI directly, or run **Checkpoint to LoRA**
-on it (the extractor decodes the int8 format natively) for a shareable LoRA.
+(`run_diff_to_lora.bat` in your Fizgig folder) on it (the extractor decodes the int8 format natively) for a shareable LoRA.
 
 ### Learning rates — lower than you're used to
 
@@ -465,7 +465,8 @@ one.
 ### Then turn it back into a LoRA
 
 A fine-tune produces a **~26 GB checkpoint**, which is not what anyone wants to share. The
-**Checkpoint to LoRA** utility (`run_diff_to_lora.bat`, its own small window) takes the base model
+**Checkpoint to LoRA** utility — **`run_diff_to_lora.bat` in your Fizgig folder**, which opens
+its own small window separate from the main app — takes the base model
 you started from and the checkpoint you produced, and extracts the difference as an ordinary
 kohya `.safetensors` — at several ranks at once, since one SVD per layer serves them all.
 
