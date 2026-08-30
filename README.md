@@ -466,7 +466,7 @@ one.
 
 A fine-tune produces a **~26 GB checkpoint**, which is not what anyone wants to share. The
 **Checkpoint to LoRA** utility — **`run_diff_to_lora.bat` in your Fizgig folder**, which opens
-its own small window separate from the main app — takes the base model
+its own small window separate from the main app (Linux/pods: `./run_diff_to_lora.sh`) — takes the base model
 you started from and the checkpoint you produced, and extracts the difference as an ordinary
 kohya `.safetensors` — at several ranks at once, since one SVD per layer serves them all.
 

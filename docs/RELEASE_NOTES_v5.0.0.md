@@ -83,7 +83,7 @@ lower. And if you use regularisation images, their **LR ×** multiplier is a rea
 
 ## When you're done
 
-The built-in **Checkpoint to LoRA** utility (**`run_diff_to_lora.bat` in your Fizgig folder** — it opens its own small window) diffs your fine-tune against the base and
+The built-in **Checkpoint to LoRA** utility (**`run_diff_to_lora.bat` in your Fizgig folder**, or `./run_diff_to_lora.sh` on Linux and pods — it opens its own small window) diffs your fine-tune against the base and
 extracts an ordinary, shareable LoRA at any rank — the quality of a full fine-tune, in
 a file ComfyUI already knows how to use. It works very well: in our testing, rank 64 was
 perceptually indistinguishable from the full checkpoint. Or keep the checkpoint: it's a
