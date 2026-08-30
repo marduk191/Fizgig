@@ -4390,6 +4390,15 @@ class LoRATrainerGUI:
         ttk.Combobox(self._krea2_ft_frame, textvariable=self.krea2_ft_every_var,
                      values=["1", "2", "3", "5"], state="readonly", width=4).pack(side=tk.LEFT)
         ttk.Label(self._krea2_ft_frame, text="epoch(s)").pack(side=tk.LEFT, padx=(4, 0))
+        # One-click launcher for the extractor — the H3 card's twin (pod users only have
+        # the browser GUI; hunting for run_diff_to_lora.bat/.sh there is real friction).
+        self._krea2_c2l_btn = ttk.Button(self._krea2_ft_frame, text="Checkpoint to LoRA…",
+                                         command=self._launch_diff_to_lora)
+        self._krea2_c2l_btn.pack(side=tk.LEFT, padx=(14, 0))
+        ToolTip(self._krea2_c2l_btn,
+                "Open the Checkpoint to LoRA tool (its own window): diff a fine-tuned "
+                "checkpoint against its base and extract a shareable LoRA at several ranks "
+                "at once. Same tool as run_diff_to_lora.bat / .sh in the Fizgig folder.")
 
         self.krea2_ft_fused_var = tk.BooleanVar(value=bool(self.settings.get("KREA2_FT_FUSED", True)))
         self._krea2_ft_fused_cb = ttk.Checkbutton(
@@ -4521,6 +4530,15 @@ class LoRATrainerGUI:
                         "fine-tune touches only these blocks. '20-49' is the measured likeness "
                         "recipe (protects the fragile 0-19 trunk) and roughly halves the "
                         "system-RAM master copy. Empty = the full model.")
+        # One-click launcher for the extractor — pod users only have the browser GUI, so
+        # "find run_diff_to_lora.bat in the folder" is real friction there (field, 29 Aug).
+        self._minimax_c2l_btn = ttk.Button(self._minimax_ft_frame, text="Checkpoint to LoRA…",
+                                           command=self._launch_diff_to_lora)
+        self._minimax_c2l_btn.pack(side=tk.LEFT, padx=(14, 0))
+        ToolTip(self._minimax_c2l_btn,
+                "Open the Checkpoint to LoRA tool (its own window): diff a fine-tuned "
+                "checkpoint against its base and extract a shareable LoRA at several ranks "
+                "at once. Same tool as run_diff_to_lora.bat / .sh in the Fizgig folder.")
 
         # Save-every follows the CYCLE, and the cycle follows these controls — so the box is
         # kept live rather than seeded with a stale constant (it used to sit at 13, the old
@@ -7554,6 +7572,26 @@ class LoRATrainerGUI:
         if changed:
             self.update_console("[fine-tune] applied the recommended base-model setup:\n  "
                                 + "\n  ".join(changed) + "\n")
+
+    def _launch_diff_to_lora(self):
+        """Open the Checkpoint to LoRA tool (its own window) from inside the app.
+
+        One click matters most on a RunPod pod, where the GUI in a browser tab is all the
+        user has — hunting for run_diff_to_lora.bat/.sh in a noVNC desktop is exactly how
+        a field user ended up invoking venv/bin/python by hand (29 Aug). Windows prefers
+        pythonw so no console flashes; everywhere else the venv python running this GUI
+        launches it directly."""
+        import subprocess
+        exe = sys.executable
+        if os.name == "nt":
+            _w = os.path.join(FIZGIG_DIR, "venv", "Scripts", "pythonw.exe")
+            if os.path.exists(_w):
+                exe = _w
+        try:
+            subprocess.Popen([exe, os.path.join(FIZGIG_DIR, "diff_to_lora_gui.py")],
+                             cwd=FIZGIG_DIR)
+        except Exception as e:
+            messagebox.showerror("Checkpoint to LoRA", f"Could not launch the tool: {e}")
 
     def _apply_minimax_ft_visibility(self):
         """FT sub-controls only while the checkbox is on. Everything that is ADAPTER machinery
