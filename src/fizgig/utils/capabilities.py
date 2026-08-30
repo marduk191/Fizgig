@@ -247,6 +247,203 @@ class MemoryStrategy:
     quant_int8: str = ""     # "" | "bf16" — W8A8 base with exact bf16 gradients
 
 
+# --- Rotating fine-tune window sizing ------------------------------------------------
+# Measured peak reserved VRAM on a 5090, 130 steps (past a rotation boundary — component's
+# peak IS the window switch, ~7 GB above steady state, so a shorter probe understates it
+# badly). Requirements add ~2 GB on top for the CUDA context, which torch's `reserved`
+# figure excludes, plus a little headroom.
+#
+#   component            27.67 GB   every window spans all 28 blocks (quality-preferred)
+#   block 8 + streaming  20.71 GB
+#   block 4 + streaming  18.70 GB
+#   block 2 + streaming  17.62 GB
+#
+# HISTORY (27 Aug): this table used to drive the auto pick, and its component row
+# excluded streaming on the reasoning that every block holds a trainable slice.
+# Depth-split component windows (the small-card tiers) dissolved that premise — an
+# out-of-window block is fully frozen and streamable — so auto now stays in component
+# mode at every depth (see recommend_ft_rotation) and the trainer's window planner
+# does the exact sizing at launch. The block rows remain for the explicit Window
+# dropdown choice, quality-untested as ever.
+FT_ROTATION_TIERS = [
+    # (min_free_gb, mode,        blocks, stream, measured_peak_gb)
+    (29.5, "component", 14, False, 27.67),
+    (22.5, "block",      8, True,  20.71),
+    (20.5, "block",      4, True,  18.70),
+    (19.5, "block",      2, True,  17.62),
+]
+
+# Component-mode auto ladder: (min_free_gb, stream, narrative). The window planner in
+# the trainer does the exact split arithmetic from the model's own Linear sizes; these
+# thresholds only decide the MODE and set expectations in the console.
+FT_COMPONENT_LADDER = [
+    (29.5, False, "full-depth component windows (the classic 4-window cycle)"),
+    (18.5, False, "component mode with depth-split windows — fat windows train in "
+                  "slices, still full speed"),
+    (12.5, True,  "component mode with depth-split windows + frozen-block streaming "
+                  "from RAM — steps slower for the PCIe trips"),
+]
+
+
+def recommend_ft_rotation(free_gb: Optional[float] = None):
+    """Pick a rotating fine-tune window config that fits the free VRAM.
+
+    Returns (mode, blocks_per_window, stream, reasons) where `reasons` is a list of lines
+    for the console. Budgets from FREE VRAM rather than card capacity, so another app
+    holding the GPU is accounted for.
+    """
+    if free_gb is None:
+        try:
+            # plannable_free_vram honours FIZGIG_SIM_VRAM_GB, so FT sizing is testable on
+            # the small-card simulator like every other planner (post-merge follow-up).
+            from fizgig.utils.device import plannable_free_vram
+            free_gb = plannable_free_vram()
+        except Exception:
+            free_gb = None
+    if free_gb is None:
+        return ("component", 14, False,
+                ["could not read free VRAM — falling back to component mode"])
+    try:
+        if is_rocm():
+            # Tiers were measured on a 5090; ROCm allocator behaviour differs enough that
+            # the numbers are advisory there. Don't refuse — warn.
+            logger.warning("[ft-rotation] tier table was measured on NVIDIA (5090); on ROCm "
+                           "treat the picked window as a starting point and watch VRAM.")
+    except Exception:
+        pass
+
+    # Component mode at every depth (27 Aug): depth-split windows made every card tier
+    # a component tier — block mode remains an explicit Window-dropdown choice only.
+    for min_free, stream, narrative in FT_COMPONENT_LADDER:
+        if free_gb >= min_free:
+            return ("component", 14, stream,
+                    [f"{free_gb:.1f} GB free -> {narrative}; the window planner sizes "
+                     "the exact splits at launch and prints them"])
+
+    lo = FT_COMPONENT_LADDER[-1]
+    return ("component", 14, True,
+            [f"{free_gb:.1f} GB free is below the ~{lo[0]:.1f} GB the smallest streamed "
+             "component plan was budgeted for — trying anyway; the window planner will "
+             "refuse cleanly if it truly cannot fit."])
+
+
+def _nvidia_smi_used_gb() -> Optional[float]:
+    """Total VRAM in use per the DRIVER (every process), in GB. None when unreadable
+    (no nvidia-smi on ROCm, or parsing failed) — callers treat None as 'guard is a no-op'."""
+    smi = shutil.which("nvidia-smi")
+    if smi is None:
+        return None
+    try:
+        import subprocess
+        out = subprocess.run([smi, "--query-gpu=memory.used",
+                              "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=15)
+        return int(out.stdout.strip().splitlines()[0]) / 1024.0
+    except Exception:
+        return None
+
+
+def wait_for_gpu_handoff(threshold_gb: float = 6.0, timeout_s: float = 180.0,
+                         poll_s: float = 5.0) -> None:
+    """Driver-level VRAM handoff guard — call BEFORE a fine-tune claims the card.
+
+    WDDM virtualizes memory per process, so the trainer's own mem_get_info can NEVER see a
+    just-finished trainer that is still tearing down (unwinding a ~38 GB Python heap takes
+    a while after the 'completed' line). Uploading a 21 GB base while the old process still
+    holds its copy overcommits the card, and WDDM's demotion to shared memory is STICKY —
+    the demoted blocks crawl when they first rotate in, so the slowdown surfaces mid-run
+    (field: epochs 6-7 of a back-to-back fine-tune), not at load. nvidia-smi reads the
+    driver's global view, which sees every process — so the guard runs there.
+
+    Must run before this process's first CUDA call: after CUDA init, our own context is
+    part of the total and the threshold arithmetic assumes we hold ~nothing yet."""
+    used = _nvidia_smi_used_gb()
+    if used is None or used < threshold_gb:
+        return
+    import time
+    logger.info(
+        "[ft-guard] another process is still holding ~%.1f GB of VRAM — waiting up to "
+        "%.0f s for it to let go. A just-finished fine-tune can take a minute to fully "
+        "exit; restarting Fizgig between fine-tunes always guarantees a clean handoff.",
+        used, timeout_s)
+    start = time.monotonic()
+    while time.monotonic() - start < timeout_s:
+        time.sleep(poll_s)
+        used = _nvidia_smi_used_gb()
+        if used is None or used < threshold_gb:
+            logger.info("[ft-guard] VRAM released after %.0f s — proceeding.",
+                        time.monotonic() - start)
+            return
+    logger.warning(
+        "[ft-guard] still ~%.1f GB held elsewhere after %.0f s — starting anyway. If this "
+        "run trains slow, close other GPU apps, or restart Fizgig between fine-tunes.",
+        used, timeout_s)
+
+
+def _available_ram_gb():
+    """(available_gb, total_gb) physical RAM, or (None, None) when unreadable."""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class _MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            ms = _MS(dwLength=ctypes.sizeof(_MS))
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+            return ms.ullAvailPhys / 2**30, ms.ullTotalPhys / 2**30
+        with open("/proc/meminfo") as f:
+            info = {l.split(":")[0]: int(l.split()[1]) for l in f if ":" in l}
+        return info["MemAvailable"] / 2**20, info["MemTotal"] / 2**20
+    except Exception:
+        return None, None
+
+
+def wait_for_ram_recovery(timeout_s: float = 180.0, poll_s: float = 5.0) -> None:
+    """The RAM leg of the fine-tune handoff guard — call right after wait_for_gpu_handoff.
+
+    A single H3 fine-tune commits ~120 GB (bf16 master + CUDA's system-RAM backing under
+    WDDM + park arenas), and a just-finished one takes a while to hand that back. A second
+    fine-tune started into that teardown gets its master evicted to the pagefile AS IT IS
+    BUILT, and the evictions bite when each window first rotates in — measured in the field
+    as a crawl through cycle 1, worst at its last windows (epochs 6-7). Physical
+    availability climbs back within a minute or two of the old process dying, so waiting is
+    both observable and sufficient. Threshold: 40%% of total RAM (a 128 GB box waits for
+    ~51 GB — master + working margin; scales down for smaller boxes, where the run was
+    always going to lean on the pagefile anyway)."""
+    avail, total = _available_ram_gb()
+    if avail is None or total is None:
+        return
+    need = 0.40 * total
+    if avail >= need:
+        return
+    import time
+    logger.info(
+        "[ft-guard] only %.0f GB of %.0f GB RAM is available — a fine-tune wants ~%.0f GB "
+        "before its master builds, so waiting up to %.0f s for Windows to hand memory back "
+        "(a just-finished fine-tune releases ~120 GB and that takes a minute; restarting "
+        "Fizgig between fine-tunes always guarantees a clean handoff).",
+        avail, total, need, timeout_s)
+    start = time.monotonic()
+    while time.monotonic() - start < timeout_s:
+        time.sleep(poll_s)
+        avail, _ = _available_ram_gb()
+        if avail is None or avail >= need:
+            logger.info("[ft-guard] RAM recovered (%.0f GB available) after %.0f s — "
+                        "proceeding.", avail or 0.0, time.monotonic() - start)
+            return
+    logger.warning(
+        "[ft-guard] still only %.0f GB of RAM available after %.0f s — starting anyway. If "
+        "this run crawls in its first cycle, restart Fizgig between fine-tunes.",
+        avail or 0.0, timeout_s)
+
+
 def recommend_krea2_strategy(vram_gb: Optional[float] = None,
                              caps: Optional[Capabilities] = None,
                              mp: float = 0.25, batch: int = 1,

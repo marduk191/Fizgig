@@ -23,17 +23,40 @@ def _safe_pin(t: torch.Tensor) -> torch.Tensor:
     'CUDA error: out of memory' that has nothing to do with VRAM (#94: a 24 GB-RAM box
     with a 24 GB 3090 crashed at load). Streaming works fine from unpinned RAM — the
     H2D copies just lose their async overlap — so a failed pin must degrade, not crash.
-    Same contract as the DiT streamers' _pin_failed fallback."""
+    Same contract as the DiT streamers' _pin_failed fallback.
+
+    What the message says matters as much as the fallback. The old wording promised
+    "caching completes" and advised closing other apps — but on the boxes that actually
+    reach here, caching then dies minutes later at the first encode, because Windows
+    backs GPU allocations with commit charge and the ~19 GB of unpinned staging has
+    already eaten it (#94 -> #95 -> #110, the same reporter three times, each round
+    sent back to free more RAM that was never the whole story). A failed pin on a
+    19 GB staging is measured evidence about THIS machine, so print the numbers and
+    name the options that actually exist, without pretending the run is safe."""
     if _PIN_STATE["failed"]:
         return t
     try:
         return t.pin_memory()
     except Exception as exc:
         _PIN_STATE["failed"] = True
+        _ram = ""
+        try:
+            import psutil
+            _vm = psutil.virtual_memory()
+            _ram = (f" This machine has {_vm.total / 1e9:.0f} GB of RAM in total, "
+                    f"{_vm.available / 1e9:.0f} GB of it available right now.")
+        except Exception:
+            pass
         print(f"[minimax-te] pinned-RAM allocation failed ({type(exc).__name__}) — "
-              "staging the packed encoder in ordinary RAM instead; H2D copies run "
-              "synchronously (slower, but caching completes). Freeing system RAM "
-              "(close other apps) restores the fast pinned path.", flush=True)
+              "staging the packed encoder in ordinary RAM instead; H2D copies now run "
+              f"synchronously (slower).{_ram} Worth knowing before you wait on it: the "
+              "host could not page-lock the ~19 GB this encoder stages, and GPU "
+              "allocations are backed by the same commit charge — so if this run stops "
+              "with 'CUDA error: out of memory' while the card looks nearly empty, that "
+              "is this shortfall, not your VRAM. Caching WITHOUT references is a far "
+              "smaller build and fits machines this one does not; otherwise more system "
+              "RAM (48 GB+ is comfortable) or a much larger Windows pagefile is what "
+              "this path needs.", flush=True)
         return t
 
 

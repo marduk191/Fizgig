@@ -43,31 +43,20 @@ if not os.environ.get("PYTORCH_CUDA_ALLOC_CONF") and os.environ.get("FIZGIG_NO_E
         "backend:cudaMallocAsync" if sys.platform == "win32" else "expandable_segments:True"
     )
 
-# GPU selection lives with upstream's chooser now (_apply_cuda_device_pref /
-# _visible_gpu_index / the Graphics Card card in Preferences, issue #60). It arrived at the same
-# mechanism this fork used -- CUDA_VISIBLE_DEVICES, NVML enumeration, VRAM bar following the mask
-# -- and additionally re-stamps training subprocesses from the CURRENT pref, so a change reaches
-# the next run without an app restart. So the parallel implementation was dropped rather than
-# carried, and three corrections were ported ONTO upstream's instead; each is marked [fork] at
-# its site.
+# GPU selection lives with upstream's chooser (_apply_cuda_device_pref / _visible_gpu_index /
+# the Graphics Card card in Preferences: issues #60 and #104). It reached the same mechanism this
+# fork used -- CUDA_VISIBLE_DEVICES, NVML enumeration, VRAM bar following the mask -- then went
+# further: subprocesses are re-stamped from the CURRENT pref (a change reaches the next run
+# without restarting the app), and the selection travels as a GPU UUID, which is immune to NVML
+# and CUDA disagreeing about index order. That UUID fix supersedes this fork's CUDA_DEVICE_ORDER
+# =PCI_BUS_ID workaround for the same bug, so that workaround is gone.
 #
-# _nvml_gpu_count stays up here because _apply_cuda_device_pref runs on the import path and needs
-# it to reject an index that no longer exists.
-
-
-def _nvml_gpu_count():
-    """Physical GPU count via NVML, or None if NVML cannot answer.
-
-    NVML only -- no nvidia-smi fallback -- because this runs on the import path and shelling out
-    would add up to seconds to every launch. None means "cannot tell", which callers treat as
-    "do not second-guess the user".
-    """
-    try:
-        import pynvml
-        pynvml.nvmlInit()
-        return int(pynvml.nvmlDeviceGetCount())
-    except Exception:
-        return None
+# Two [fork] corrections remain, marked at their sites in this file:
+#   - _visible_gpu_index resolves the active card by torch's UUID when NOTHING is pinned, the
+#     one case neither #60 nor #104 covers (upstream returns 0, which on mixed cards is the
+#     wrong card).
+#   - _apply_cuda_device_pref refuses a selection whose card is absent, rather than masking the
+#     process down to nothing.
 
 # OpenMP wait policy, also before anything loads torch (which loads libiomp on Windows).
 # Intel OpenMP's default is to keep its whole thread pool ACTIVELY SPINNING for 200 ms
@@ -665,6 +654,12 @@ MINIMAX_NUM_BLOCKS = 50          # H3's DiT block count (MiniMaxH3Config.num_lay
 # photo gradients deform anatomy. One place to tweak as the add-back ladder refines the figures.
 MINIMAX_LIKENESS_BLOCKS = "20-49"
 
+# Voice routing — the block set audio-only steps train. 34-49 per the block map (audio core
+# 38-48 peak 41-42, shoulder 34-37) and Peter's A/B (24 Aug): audio-only trained at 34-49 is
+# clean; at 20-49 the audio training corrupted the visual blocks. Clips still train the full
+# model (pending the same test for video).
+MINIMAX_AUDIO_BLOCKS = "34-49"
+
 # Base Precision — the label the user sees, and the --base_quant value it sends. Auto plans the
 # quantisation and the block-swap count together (see plan_base_quant in minimax/trainer.py);
 # an explicit pick is never overridden, the swap plan is built around it instead.
@@ -704,6 +699,30 @@ MINIMAX_TRAIN_BASE_OPTIONS = [
 def minimax_train_base(raw):
     """Dropdown label -> canonical base key. Anything unrecognised is the fl2va default."""
     return "ref2va" if "ref2va" in str(raw or "").lower() else "fl2va"
+
+
+def ft_checkpoint_continuation(path):
+    """(next_window, epochs_done) for a rotation fine-tune checkpoint.
+
+    A fine-tune's continuation point is the full checkpoint itself, not a state dir. The
+    trainers stamp `fizgig_next_start_window` (where the rotation cycle picks back up) and
+    `fizgig_ft_epochs_done` (cumulative epochs trained) into every FT save; the epoch count
+    also lives in the filename's -NNNNNN, which wins when present (the un-numbered FINAL
+    artifact has only the metadata). Anything missing reads as 0 — a continuation that
+    restarts the cycle at window 0 is degraded, not wrong."""
+    next_window, epochs_done = 0, 0
+    try:
+        from safetensors import safe_open
+        with safe_open(path, framework="pt") as f:
+            md = f.metadata() or {}
+        next_window = int(md.get("fizgig_next_start_window", 0))
+        epochs_done = int(md.get("fizgig_ft_epochs_done", 0))
+    except Exception:
+        pass
+    m = re.search(r"-(\d{6})\.safetensors$", os.path.basename(path or ""))
+    if m:
+        epochs_done = int(m.group(1))
+    return next_window, epochs_done
 
 
 # Built-in presets — always available in the Load Preset dropdown, prefixed with ✨ to distinguish
@@ -1219,12 +1238,14 @@ DEFAULT_PREFS = {
 
 
 def _enumerate_gpus():
-    """[(index, name, total_gb)] for every card in the machine, or [] if it cannot be read.
+    """[(index, name, total_gb, uuid)] for every card in the machine, or [] if it cannot be read.
 
     Deliberately NOT torch.cuda: touching it creates the CUDA context, which fixes the visible
     device set for the life of the process - i.e. asking torch what GPUs exist would defeat the
     setting this list feeds. NVML and nvidia-smi both enumerate the real hardware regardless of
-    CUDA_VISIBLE_DEVICES, which is exactly what a chooser needs."""
+    CUDA_VISIBLE_DEVICES, which is exactly what a chooser needs. UUID is included so that
+    CUDA_VISIBLE_DEVICES can be set by UUID — immune to NVML vs. CUDA index reordering on
+    Windows when the display GPU is not the fastest card (issue #104)."""
     try:
         import pynvml
         pynvml.nvmlInit()
@@ -1232,22 +1253,24 @@ def _enumerate_gpus():
         for i in range(pynvml.nvmlDeviceGetCount()):
             h = pynvml.nvmlDeviceGetHandleByIndex(i)
             name = pynvml.nvmlDeviceGetName(h)
+            uuid = pynvml.nvmlDeviceGetUUID(h)
+            uuid = uuid.decode() if isinstance(uuid, bytes) else uuid
             out.append((i, name.decode() if isinstance(name, bytes) else name,
-                        pynvml.nvmlDeviceGetMemoryInfo(h).total / (1024 ** 3)))
+                        pynvml.nvmlDeviceGetMemoryInfo(h).total / (1024 ** 3), uuid))
         if out:
             return out
     except Exception:
         pass
     try:
         import subprocess
-        r = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.total",
+        r = subprocess.run(["nvidia-smi", "--query-gpu=index,name,memory.total,uuid",
                             "--format=csv,noheader,nounits"],
                            capture_output=True, text=True, timeout=6,
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         out = []
         for line in r.stdout.strip().splitlines():
-            idx, name, mb = [p.strip() for p in line.split(",")]
-            out.append((int(idx), name, int(mb) / 1024))
+            idx, name, mb, uuid = [p.strip() for p in line.split(",")]
+            out.append((int(idx), name, int(mb) / 1024, uuid))
         return out
     except Exception:
         return []
@@ -1264,37 +1287,22 @@ def _apply_cuda_device_pref(prefs) -> str:
     meant it, and silently overriding that from a saved pref would be worse than not having the
     pref at all."""
     if os.environ.get("CUDA_VISIBLE_DEVICES"):
-        # [fork] Order applies to an inherited mask too, so the index someone typed means the
-        # same card it means everywhere else.
-        _pin_device_order()
         return os.environ["CUDA_VISIBLE_DEVICES"]
     want = str(prefs.get("cuda_device", "")).strip()
-    if not want.isdigit():
+    if not want:
         return ""
-    # [fork] Refuse an index that no longer exists (card pulled, slots reordered). Exporting it
-    # anyway masks the process down to NOTHING, and every tool then dies on "No CUDA GPUs are
-    # available" for the whole session -- a worse failure than ignoring a stale pref.
-    _count = _nvml_gpu_count()
-    if _count is not None and int(want) >= _count:
-        return ""
-    _pin_device_order()
+    # [fork] Refuse a selection whose card is no longer present (pulled, or a prefs.json copied
+    # between machines). Exporting it anyway masks the process down to NOTHING, and every tool
+    # then dies on "No CUDA GPUs are available" for the whole session -- a worse failure than
+    # ignoring a stale pref. Checks UUID and legacy index alike; if the hardware cannot be read
+    # at all, the user is not second-guessed.
+    _present = _enumerate_gpus()
+    if _present:
+        _known = {u for _i, _n, _g, u in _present} | {str(_i) for _i, _n, _g, _u in _present}
+        if want not in _known:
+            return ""
     os.environ["CUDA_VISIBLE_DEVICES"] = want
     return want
-
-
-def _pin_device_order():
-    """[fork] Make CUDA number devices the way NVML and nvidia-smi do (PCI bus order).
-
-    CUDA's default is "fastest first", and the chooser enumerates via NVML, so on a box with
-    mixed cards the two disagree and the pref selects a DIFFERENT card than its own label names.
-    Measured on a 3060 + 5090 machine: NVML says 0=3060, 1=5090, while an unqualified
-    CUDA_VISIBLE_DEVICES=0 lands on the 5090 -- picking "0: RTX 3060" would have given the 5090,
-    and the VRAM bar would then read the idle card.
-
-    Only called when a device is actually being pinned, so a machine left alone keeps whatever
-    ordering torch would have chosen. setdefault, so an explicit CUDA_DEVICE_ORDER still wins.
-    """
-    os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
 
 
 def _auto_detect_blocks_to_swap() -> int:
@@ -1350,6 +1358,23 @@ def load_prefs() -> dict:
         _m = re.match(r'\s*(\d+)', _legacy_gpu)
         if _m and not _legacy_gpu.lower().startswith("auto"):
             prefs["cuda_device"] = _m.group(1)
+    # [fork] Second migration: a cuda_device holding a bare INDEX is now ambiguous. Both the old
+    # chooser and this fork's saved an NVML index, but #104 made CUDA_VISIBLE_DEVICES carry a UUID
+    # and dropped the CUDA_DEVICE_ORDER=PCI_BUS_ID pin that used to make the two numberings agree.
+    # So on a machine where NVML and CUDA order differently, a legacy index now exports as a CUDA
+    # index and lands on the OTHER card -- measured here: saved index 1 (NVML: RTX 5090) opened
+    # the RTX 3060, while the status bar still read the 5090. Resolve the index against NVML once,
+    # at load, and store the UUID it meant. Left alone if the hardware cannot be read or the index
+    # no longer exists, so nothing is invented.
+    _cd = str(prefs.get("cuda_device", "")).strip()
+    if _cd.isdigit():
+        try:
+            for _i, _n, _gb, _uuid in _enumerate_gpus():
+                if _i == int(_cd) and _uuid:
+                    prefs["cuda_device"] = _uuid
+                    break
+        except Exception:
+            pass
     # Resolve portable directory paths to absolute.
     for key in _PORTABLE_DIR_KEYS:
         if key in prefs and isinstance(prefs[key], str):
@@ -2676,18 +2701,25 @@ class LoRATrainerGUI:
         change that, it only changes what torch can see. So on a two-GPU box with
         CUDA_VISIBLE_DEVICES=1, training runs on physical card 1 while an unqualified NVML read
         reports card 0 — the status bar then shows a card that is doing nothing (issue #60).
-        Torch's cuda:0 is the FIRST entry in the list, hence [0].
+        Torch's cuda:0 is the FIRST entry in the list, hence [0]. When CUDA_VISIBLE_DEVICES
+        holds a UUID (new format), map it back to NVML index via _gpu_info.
 
-        [fork] When the list is EMPTY or a UUID, 0 is a guess, and on mixed cards a wrong one:
-        CUDA orders "fastest first" by default, so on a 3060 + 5090 box torch's cuda:0 is the
-        5090 while NVML's index 0 is the 3060 — the same idle-card reading #60 set out to fix,
-        just in the unpinned case. Resolve it properly by matching torch's device UUID against
-        NVML's, but only once torch has built its context of its own accord: this runs on the
-        status bar's 1 Hz poll and must never import torch or force a CUDA init itself. Cached
-        once found, since the visible set cannot change mid-process."""
+        [fork] When the list is EMPTY -- nothing pinned, the default -- 0 is a guess, and on
+        mixed cards a wrong one: CUDA orders "fastest first", so on a 3060 + 5090 box torch's
+        cuda:0 is the 5090 while NVML index 0 is the 3060. That is the same idle-card reading
+        #60 and #104 set out to fix, in the one case neither covers. Resolved by matching torch's
+        own device UUID against NVML's, but only once torch has built its context of its own
+        accord: this runs on the status bar's 1 Hz poll and must never import torch or force a
+        CUDA init itself. Cached once found, since the visible set cannot change mid-process."""
         raw = (os.environ.get("CUDA_VISIBLE_DEVICES") or "").split(",")[0].strip()
         if raw.isdigit():
             return int(raw)
+        if raw:
+            # UUID - look up NVML index from _gpu_info
+            for _k, _info in getattr(self, "_gpu_info", {}).items():
+                if _info[3] == raw:
+                    return _info[0]
+            return 0
         if getattr(self, "_resolved_gpu_index", None) is not None:
             return self._resolved_gpu_index
         try:
@@ -3351,7 +3383,9 @@ class LoRATrainerGUI:
         _how = ("On RunPod, Fizgig updates itself every time you restart the pod — just stop "
                 "and start it to get the latest."
                 if _running_on_pod() else
-                "To update: close Fizgig and run update_fizgig.bat.")
+                ("To update: close Fizgig and run update_fizgig_rocm.bat."
+                 if os.environ.get("FIZGIG_GPU_BACKEND", "").lower() == "rocm" else
+                 "To update: close Fizgig and run update_fizgig.bat."))
         tk.Label(pad, text=_how, font=(FONT_FAMILY, 9), fg=COLORS["text_muted"],
                  bg=COLORS["bg_deep"], wraplength=WRAP, justify=tk.LEFT).pack(
             anchor=tk.W, pady=(0, 10))
@@ -3375,7 +3409,9 @@ class LoRATrainerGUI:
                      bg=COLORS["accent_subtle"]).pack(anchor=tk.W, padx=12, pady=(10, 0))
             _upd = ("Restart the pod (stop and start it) to update."
                     if _running_on_pod() else
-                    "Close Fizgig and run update_fizgig.bat to update.")
+                    ("Close Fizgig and run update_fizgig_rocm.bat to update."
+                     if os.environ.get("FIZGIG_GPU_BACKEND", "").lower() == "rocm" else
+                     "Close Fizgig and run update_fizgig.bat to update."))
             tk.Label(card, text=f"You're on {_git_describe_version() or 'an older build'}. {_upd}",
                      font=(FONT_FAMILY, 9), fg=COLORS["text_explain"], bg=COLORS["accent_subtle"],
                      wraplength=WRAP - 24, justify=tk.LEFT).pack(anchor=tk.W, padx=12, pady=(2, 8))
@@ -4412,6 +4448,276 @@ class LoRATrainerGUI:
                   foreground=COLORS["text_explain"], font=(FONT_FAMILY, 9, "italic"), justify=tk.LEFT, wraplength=720)
         self._krea2_losswatch_hint.grid(row=24, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
 
+        # --- Full fine-tune (rotating windows) — Krea 2 only, experimental branch.
+        # Trains the BASE MODEL directly instead of a LoRA, a window of weights at a time so
+        # a 12.9B full fine-tune fits a consumer card. Output is a full checkpoint.
+        self.krea2_finetune_var = tk.BooleanVar(value=bool(self.settings.get("KREA2_FINETUNE", False)))
+        self._krea2_ft_cb = ttk.Checkbutton(
+            training_content,
+            text="⚗ Fine-tune the BASE MODEL instead of training a LoRA (experimental)",
+            variable=self.krea2_finetune_var,
+            command=lambda: self._on_krea2_ft_toggle(),
+        )
+        self._krea2_ft_cb.grid(row=60, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(10, 0))
+
+        self._krea2_ft_frame = ttk.Frame(training_content)
+        self._krea2_ft_frame.grid(row=61, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(2, 0))
+        ttk.Label(self._krea2_ft_frame, text="Window:").pack(side=tk.LEFT, padx=(16, 4))
+        self.krea2_ft_mode_var = tk.StringVar(
+            value=str(self.settings.get("KREA2_FT_MODE", "Auto (by VRAM)")))
+        _ftm = ttk.Combobox(self._krea2_ft_frame, textvariable=self.krea2_ft_mode_var,
+                            values=["Auto (by VRAM)", "component", "block"],
+                            state="readonly", width=15)
+        _ftm.pack(side=tk.LEFT)
+        _ftm.bind("<<ComboboxSelected>>", lambda e: self._apply_krea2_ft_visibility())
+        ToolTip(_ftm, "Auto (recommended): sizes the window to the VRAM free at launch and prints "
+                      "what it picked and why. Component needs ~29.5 GB free; below that it drops to "
+                      "block mode with frozen-block streaming, which fits a 24 GB card.  |  "
+                      "component: attention, then each MLP matrix, across ALL 28 blocks — "
+                      "every window trains the model's full depth, so a concept is learned by every "
+                      "layer at once. 4 windows per cycle.  |  "
+                      "block: contiguous slices of blocks. Fewer windows, but each trains only part "
+                      "of the depth at a time.")
+        self._krea2_ft_blocks_lbl = ttk.Label(self._krea2_ft_frame, text="Blocks/window:")
+        self._krea2_ft_blocks_lbl.pack(side=tk.LEFT, padx=(14, 4))
+        self.krea2_ft_blocks_var = tk.StringVar(value=str(self.settings.get("KREA2_FT_BLOCKS", "14")))
+        self._krea2_ft_blocks_cb = ttk.Combobox(self._krea2_ft_frame, textvariable=self.krea2_ft_blocks_var,
+                                                values=["4", "8", "12", "14", "18"], state="readonly", width=4)
+        self._krea2_ft_blocks_cb.pack(side=tk.LEFT)
+        ToolTip(self._krea2_ft_blocks_cb, "How many of the 28 blocks train at once (block mode). "
+                                          "Measured on a 32 GB card: 4 -> 24.8 GB, 8 -> 24.2 GB, "
+                                          "14 -> 27.5 GB, 18 -> 29.5 GB. More blocks = fewer windows "
+                                          "= each block gets a bigger share of the run.")
+        ttk.Label(self._krea2_ft_frame, text="Rotate every:").pack(side=tk.LEFT, padx=(14, 4))
+        self.krea2_ft_every_var = tk.StringVar(value=str(self.settings.get("KREA2_FT_EVERY", "1")))
+        ttk.Combobox(self._krea2_ft_frame, textvariable=self.krea2_ft_every_var,
+                     values=["1", "2", "3", "5"], state="readonly", width=4).pack(side=tk.LEFT)
+        ttk.Label(self._krea2_ft_frame, text="epoch(s)").pack(side=tk.LEFT, padx=(4, 0))
+        # One-click launcher for the extractor — the H3 card's twin (pod users only have
+        # the browser GUI; hunting for run_diff_to_lora.bat/.sh there is real friction).
+        self._krea2_c2l_btn = ttk.Button(self._krea2_ft_frame, text="Checkpoint to LoRA…",
+                                         command=self._launch_diff_to_lora)
+        self._krea2_c2l_btn.pack(side=tk.LEFT, padx=(14, 0))
+        ToolTip(self._krea2_c2l_btn,
+                "Open the Checkpoint to LoRA tool (its own window): diff a fine-tuned "
+                "checkpoint against its base and extract a shareable LoRA at several ranks "
+                "at once. Same tool as run_diff_to_lora.bat / .sh in the Fizgig folder.")
+
+        self.krea2_ft_fused_var = tk.BooleanVar(value=bool(self.settings.get("KREA2_FT_FUSED", True)))
+        self._krea2_ft_fused_cb = ttk.Checkbutton(
+            training_content,
+            text="Free each gradient as it lands (saves ~5 GB; disables gradient clipping)",
+            variable=self.krea2_ft_fused_var,
+        )
+        self._krea2_ft_fused_cb.grid(row=62, column=0, columnspan=2, sticky=tk.W, padx=(21, 5), pady=(2, 0))
+
+        self.krea2_fast_ft_var = tk.BooleanVar(value=bool(self.settings.get("KREA2_FAST_FT", False)))
+        self._krea2_fast_ft_cb = ttk.Checkbutton(
+            training_content,
+            text="⚡ Fast FT — per-tensor fp8 + _scaled_mm on the frozen base (experimental)",
+            variable=self.krea2_fast_ft_var,
+        )
+        self._krea2_fast_ft_cb.grid(row=63, column=0, columnspan=2, sticky=tk.W, padx=(21, 5), pady=(2, 0))
+        ToolTip(self._krea2_fast_ft_cb,
+                "Runs the frozen base through torch._scaled_mm instead of dequantising every "
+                "weight on every forward. Needs an RTX 40-series or newer (SM 8.9+); silently "
+                "falls back to the normal path per-Linear if anything doesn't fit, and the "
+                "console says so.\n\n"
+                "Costs accuracy: ~1.5x the per-Linear forward error of the default path "
+                "(3.7e-02 vs 2.5e-02, measured on real Krea 2 weights). Most of that is NOT the "
+                "scale change (only 1.10x) — _scaled_mm needs the activations in fp8 too, and the "
+                "default path keeps them in bf16. That is the price of the fp8 GEMM.\n\n"
+                "Off by default so the default path stays exactly as it was. The saved checkpoint "
+                "comes from the bf16 master either way, so this never changes what lands on disk — "
+                "only the frozen forward the trainable window sees.\n\n"
+                "Measured 1.14x on a 5090 (0.849 -> 0.742 s/it, component mode, epoch 4) — about "
+                "12% off the wall clock. Loss runs ~1.4% higher at the same step, as a lossier "
+                "frozen base predicts. Whether that costs output quality is NOT established — "
+                "compare checkpoints before trusting it on a real run.")
+
+        # Optional regularisation set. Real photos, not model output: anchoring to the model's
+        # own samples distils its artifacts back in, and a full fine-tune moves every weight so
+        # there is nothing bounding the drift. Trained at a fixed low LR so it tethers the prior
+        # rather than teaching a new one.
+        self._krea2_reg_frame = ttk.Frame(training_content)
+        self._krea2_reg_frame.grid(row=64, column=0, columnspan=2, sticky=tk.W, padx=(21, 5), pady=(6, 0))
+        ttk.Label(self._krea2_reg_frame, text="Regularisation images (optional):").pack(side=tk.LEFT)
+        self.krea2_reg_dir_var = tk.StringVar(value=str(self.settings.get("KREA2_REG_DIR", "")))
+        _regent = ttk.Entry(self._krea2_reg_frame, textvariable=self.krea2_reg_dir_var, width=40)
+        _regent.pack(side=tk.LEFT, padx=(6, 4))
+        ttk.Button(self._krea2_reg_frame, text="Browse", width=8,
+                   command=self._browse_krea2_reg_dir).pack(side=tk.LEFT)
+        # Typed paths need the same TOML rewrite the Browse button triggers.
+        self.krea2_reg_dir_var.trace_add(
+            "write", lambda *_a: self.auto_save_dataset_config_silent())
+        ttk.Label(self._krea2_reg_frame, text="LR ×").pack(side=tk.LEFT, padx=(14, 2))
+        self.krea2_reg_mult_var = tk.StringVar(value=str(self.settings.get("KREA2_REG_MULT", "0.2")))
+        ttk.Combobox(self._krea2_reg_frame, textvariable=self.krea2_reg_mult_var,
+                     values=["0.05", "0.1", "0.2", "0.3", "0.5", "0.75", "1.0"],
+                     state="normal", width=5).pack(side=tk.LEFT)
+        ToolTip(_regent,
+                "A folder of ordinary photos of the broader class — men, women, people — with "
+                "normal detailed captions. Leave empty to train without one.\n\n"
+                "Why real photos and not model output: generated regularisation images anchor "
+                "the model to its own artifacts, and a full fine-tune moves every weight, so "
+                "there is nothing bounding that drift. Real photos are an external reference.\n\n"
+                "They train at the LR multiplier beside this box. 0.1-0.3 keeps them a nudge — "
+                "tethering the model's prior rather than replacing it. Higher values train them "
+                "more like real data: at 1.0 they are simply a second subject set, which is a "
+                "different (valid) thing — class-balanced training rather than a light anchor.\n\n"
+                "Captions matter: anything you leave unsaid gets attributed to the class word "
+                "itself. Caption them as you would any training image.")
+
+        self._krea2_ft_hint = ttk.Label(training_content,
+                  text="Trains the base model's own weights, not an adapter — no rank bottleneck, so concepts "
+                       "don't compete for the same directions. Only part of the model is trainable at a time and "
+                       "the window rotates, which is what makes a 12.9B fine-tune fit; a full cycle is 4 epochs in "
+                       "component mode, so run at least that many or some weights never train (the console warns "
+                       "you). Use a LOW learning rate — 1e-5 or below; LoRA rates will wreck a base model. "
+                       "Network Rank/Alpha are ignored. Adaptive LR and in-training previews are turned off "
+                       "automatically, so there are no in-training previews — judge the saved checkpoints in "
+                       "ComfyUI. EACH SAVE IS A FULL ~26 GB CHECKPOINT; saving every 4 epochs lands one per "
+                       "full cycle, when every component has had the same number of passes and checkpoints "
+                       "compare like-for-like (~260 GB over a 40-epoch run). Checkpoints are written to the Output Directory above "
+                       "(the usual LoRA folder) — point it somewhere with room, e.g. your ComfyUI models/unet. "
+                       "Test the result in ComfyUI as a normal Krea 2 model.",
+                  foreground=COLORS["text_explain"], font=(FONT_FAMILY, 9, "italic"),
+                  justify=tk.LEFT, wraplength=720)
+        self._krea2_ft_hint.grid(row=65, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 6))
+
+        # --- Full fine-tune (rotating windows) — MiniMax H3. Same idea as the Krea 2 card:
+        # trains the BASE (the int8 checkpoint's own weights), a window of blocks at a time.
+        # Output is a full ~21 GB checkpoint per save. Rows 66-69 (Krea's card is 60-65; each
+        # family's card hides under the other).
+        self.minimax_finetune_var = tk.BooleanVar(
+            value=bool(self.settings.get("MINIMAX_FINETUNE", False)))
+        self._minimax_ft_cb = ttk.Checkbutton(
+            training_content,
+            text="⚗ Fine-tune the BASE MODEL instead of training a LoRA (experimental)",
+            variable=self.minimax_finetune_var,
+            command=lambda: self._on_minimax_ft_toggle(),
+        )
+        self._minimax_ft_cb.grid(row=66, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(10, 0))
+
+        self._minimax_ft_frame = ttk.Frame(training_content)
+        self._minimax_ft_frame.grid(row=67, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(2, 0))
+        # Component windows are THE mode (24 Aug: the old Blocks/window picker with its
+        # 4/6/8-block windows is gone — block mode never matched component's likeness speed).
+        # Each window is one matmul (attention qkv/out, MLP fc1/fc2) across EVERY block:
+        # full model depth per window, 4 windows per cycle, on an NF4-resident base.
+        ttk.Label(self._minimax_ft_frame, text="Rotate every:").pack(side=tk.LEFT, padx=(16, 4))
+        self.minimax_ft_every_var = tk.StringVar(
+            value=str(self.settings.get("MINIMAX_FT_EVERY", "1")))
+        ttk.Combobox(self._minimax_ft_frame, textvariable=self.minimax_ft_every_var,
+                     values=["1", "2", "3"], state="readonly", width=4).pack(side=tk.LEFT)
+        ttk.Label(self._minimax_ft_frame, text="epoch(s)").pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(self._minimax_ft_frame, text="Train on:").pack(side=tk.LEFT, padx=(14, 4))
+        self.minimax_ft_scope_var = tk.StringVar(
+            value=str(self.settings.get("MINIMAX_FT_SCOPE", "All media")))
+        _mfts = ttk.Combobox(self._minimax_ft_frame, textvariable=self.minimax_ft_scope_var,
+                             values=["All media", "Photos only"], state="readonly", width=11)
+        _mfts.pack(side=tk.LEFT)
+        ToolTip(_mfts, "A dataset FILTER, not a mode. All media (default) fine-tunes on "
+                       "everything in the folder — photos, clips, voice. Photos only is the "
+                       "override for a mixed folder: clips and voice are skipped and the run "
+                       "behaves as if the dataset were photos-only (with Optimised Likeness "
+                       "on, the cycle then tightens to the identity blocks). On a dataset "
+                       "that's already just photos this choice changes nothing.")
+        ttk.Label(self._minimax_ft_frame, text="Blocks:").pack(side=tk.LEFT, padx=(14, 4))
+        self.minimax_ft_blockspec_var = tk.StringVar(
+            value=str(self.settings.get("MINIMAX_FT_BLOCKSPEC", "")))
+        _mftbs = ttk.Entry(self._minimax_ft_frame, textvariable=self.minimax_ft_blockspec_var,
+                           width=10)
+        _mftbs.pack(side=tk.LEFT)
+        ToolTip(_mftbs, "Optional: restrict the rotation cycle to a block range — the whole "
+                        "fine-tune touches only these blocks. '20-49' is the measured likeness "
+                        "recipe (protects the fragile 0-19 trunk) and roughly halves the "
+                        "system-RAM master copy. Empty = the full model.")
+        # One-click launcher for the extractor — pod users only have the browser GUI, so
+        # "find run_diff_to_lora.bat in the folder" is real friction there (field, 29 Aug).
+        self._minimax_c2l_btn = ttk.Button(self._minimax_ft_frame, text="Checkpoint to LoRA…",
+                                           command=self._launch_diff_to_lora)
+        self._minimax_c2l_btn.pack(side=tk.LEFT, padx=(14, 0))
+        ToolTip(self._minimax_c2l_btn,
+                "Open the Checkpoint to LoRA tool (its own window): diff a fine-tuned "
+                "checkpoint against its base and extract a shareable LoRA at several ranks "
+                "at once. Same tool as run_diff_to_lora.bat / .sh in the Fizgig folder.")
+
+        # Save-every follows the CYCLE, and the cycle follows these controls — so the box is
+        # kept live rather than seeded with a stale constant (it used to sit at 13, the old
+        # full-model N=4 cycle, whatever mode was picked; the trainer's launch-time snap then
+        # silently corrected it and the box looked ignored).
+        for _v in (self.minimax_ft_every_var, self.minimax_ft_blockspec_var):
+            _v.trace_add("write", lambda *_a: self._refresh_minimax_ft_save_box())
+
+        self.minimax_ft_fused_var = tk.BooleanVar(
+            value=bool(self.settings.get("MINIMAX_FT_FUSED", True)))
+        self._minimax_ft_fused_cb = ttk.Checkbutton(
+            training_content,
+            text="Free each gradient as it lands (fits the window; disables gradient clipping)",
+            variable=self.minimax_ft_fused_var,
+        )
+        self._minimax_ft_fused_cb.grid(row=68, column=0, columnspan=2, sticky=tk.W,
+                                       padx=(21, 5), pady=(2, 0))
+
+        # Optional regularisation set — same doctrine as the Krea 2 FT card (real photos of
+        # the broader class, trained at a fixed low LR as a prior anchor), with H3-specific
+        # lifecycle: reg stills follow the photo routing (likeness window) and stop with the
+        # visual category under 'Finish one category early'. Entirely optional — empty = off.
+        self._minimax_reg_frame = ttk.Frame(training_content)
+        self._minimax_reg_frame.grid(row=69, column=0, columnspan=2, sticky=tk.W,
+                                     padx=(21, 5), pady=(6, 0))
+        ttk.Label(self._minimax_reg_frame, text="Regularisation images (optional):").pack(side=tk.LEFT)
+        self.minimax_reg_dir_var = tk.StringVar(value=str(self.settings.get("MINIMAX_REG_DIR", "")))
+        _mregent = ttk.Entry(self._minimax_reg_frame, textvariable=self.minimax_reg_dir_var, width=40)
+        _mregent.pack(side=tk.LEFT, padx=(6, 4))
+        ttk.Button(self._minimax_reg_frame, text="Browse", width=8,
+                   command=self._browse_minimax_reg_dir).pack(side=tk.LEFT)
+        self.minimax_reg_dir_var.trace_add(
+            "write", lambda *_a: self.auto_save_dataset_config_silent())
+        ttk.Label(self._minimax_reg_frame, text="LR ×").pack(side=tk.LEFT, padx=(14, 2))
+        self.minimax_reg_mult_var = tk.StringVar(value=str(self.settings.get("MINIMAX_REG_MULT", "0.2")))
+        ttk.Combobox(self._minimax_reg_frame, textvariable=self.minimax_reg_mult_var,
+                     values=["0.05", "0.1", "0.2", "0.3", "0.5", "0.75", "1.0"],
+                     state="normal", width=5).pack(side=tk.LEFT)
+        ToolTip(_mregent,
+                "A folder of ordinary REAL photos of the broader class — people, faces — with "
+                "normal detailed captions. Leave empty to train without one.\n\n"
+                "A full fine-tune moves the base weights with nothing bounding the drift; these "
+                "anchor the model's prior while your subject data pulls it. Real photos, not "
+                "model output — generated images anchor the model to its own artifacts.\n\n"
+                "They train at the LR multiplier beside this box (0.1-0.3 keeps them a nudge; "
+                "keep them the MINORITY of the dataset or the nudge stops reading as one), "
+                "follow the same photo routing as your subject stills, and stop when photos & "
+                "clips stop under 'Finish one category early' — once subject pressure ends, the "
+                "counter-pressure ends with it. Stills only: they tether the visual prior; the "
+                "audio prior is protected by voice routing instead.\n\n"
+                "With Optimised Likeness on, the anchor pulls only on the likeness blocks — "
+                "the same territory your subject photos train, which is the point. On an "
+                "audio-only dataset, adding reg stills widens the rotation cycle to include "
+                "the photo blocks (the console prints the new span).")
+
+        self._minimax_ft_hint = ttk.Label(training_content,
+                  text="Trains the base model's own weights, not an adapter — Network Type "
+                       "and Blocks to Train hide while this is on (they're LoRA machinery); "
+                       "Optimised Likeness Learning keeps working with its usual meaning. "
+                       "Each window is one matmul (attention qkv/out, MLP fc1/fc2) across "
+                       "every block — full model depth per window, 4 windows per cycle, on "
+                       "an NF4-resident base (the saved checkpoint is still exact int8). "
+                       "The Blocks field above is an optional manual restriction of the "
+                       "whole fine-tune. Needs a 32 GB card and ~64 GB of system RAM. "
+                       "A full ~21 GB checkpoint saves once per COMPLETED CYCLE (every "
+                       "block equally trained — the save box snaps to the cycle "
+                       "automatically), and previews ride along with each save (plus the "
+                       "final one), so every sample matches a checkpoint you can deploy. "
+                       "Photos-only dataset? Leave 'Train on' "
+                       "alone — there's nothing to skip. Use a LOW learning rate (1e-5 to "
+                       "start; H3 is uncalibrated — compare checkpoints). Point the Output "
+                       "Directory somewhere with room, judge results in ComfyUI, and distil "
+                       "to a shareable LoRA with Checkpoint to LoRA.",
+                  foreground=COLORS["text_explain"], font=(FONT_FAMILY, 9, "italic"),
+                  justify=tk.LEFT, wraplength=720)
+        self._minimax_ft_hint.grid(row=70, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 6))
         # --- Per-step movement clip (MiniMax only) -----------------------------------------
         # Whichever block sits LAST in the trained range absorbs 2-4x the median block's
         # movement from epoch 1 (measured across four runs; cutting blocks just moves the hot
@@ -4616,6 +4922,10 @@ class LoRATrainerGUI:
         # the full model. BooleanVar in self.entries so presets/queue/last-train carry it free.
         self.entries["MINIMAX_LIKENESS_OPT"] = tk.BooleanVar(
             value=bool(self.settings.get("MINIMAX_LIKENESS_OPT", True)))
+        # Under FT the tickbox changes the rotation-cycle length (50 blocks -> the 20-49
+        # tighten), so the Save-every suggestion follows it live.
+        self.entries["MINIMAX_LIKENESS_OPT"].trace_add(
+            "write", lambda *_a: self._refresh_minimax_ft_save_box())
         self._minimax_likeness_cb = ttk.Checkbutton(
             training_content, text="Optimised Likeness Learning",
             variable=self.entries["MINIMAX_LIKENESS_OPT"])
@@ -4623,14 +4933,39 @@ class LoRATrainerGUI:
                                        padx=5, pady=(8, 0))
         self._minimax_likeness_hint = ttk.Label(
             training_content,
-            text=f"Photos train the identity blocks ({MINIMAX_LIKENESS_BLOCKS}) only — "
+            text=f"Photos train the identity blocks ({MINIMAX_LIKENESS_BLOCKS}) only and "
+                 f"voice recordings train the audio zone ({MINIMAX_AUDIO_BLOCKS}) only — "
                  "protecting the base model's rendering, anatomy and prompt following — while "
-                 "video and audio clips always train the full model. Measured result: sharper, "
-                 "more prompt-responsive, better sound, faster to converge. Untick for style or "
+                 "video clips train the full model. Measured result: sharper, more "
+                 "prompt-responsive, better sound, faster to converge. Untick for style or "
                  "scene training (the Style preset does).",
             foreground=COLORS["text_explain"], font=(FONT_FAMILY, 9, "italic"), justify=tk.LEFT, wraplength=720)
         self._minimax_likeness_hint.grid(row=40, column=0, columnspan=2, sticky=tk.W,
                                          padx=5, pady=(0, 4))
+        self._MINIMAX_LIKENESS_HINT_LORA = self._minimax_likeness_hint.cget("text")
+        self._MINIMAX_LIKENESS_HINT_FT = (
+            f"Under fine-tune this keeps its exact LoRA meaning: photos feed only the "
+            f"identity blocks ({MINIMAX_LIKENESS_BLOCKS}), voice feeds only the audio zone "
+            f"({MINIMAX_AUDIO_BLOCKS}) — and video follows the restriction tickbox below "
+            f"(on: clips train {MINIMAX_LIKENESS_BLOCKS} too; off: clips train the full "
+            f"model). The rotation cycle tightens automatically to the union of what your "
+            f"dataset actually trains. Untick for style/scene fine-tunes — voice still "
+            f"routes to its zone either way. An explicit Blocks range above always wins.")
+        # Restrict video to likeness blocks — FT-only sub-tick of likeness mode (Peter,
+        # 29 Aug: a confined overnight video run trained perfectly well; on by default,
+        # untick for whole-model video). Emitted as --clip_blocks by the FT builder only;
+        # shown only when the family is MiniMax AND Fine-tune AND likeness are all on
+        # (managed by _sync_minimax_likeness_state, which fires on all three).
+        self.entries["MINIMAX_FT_CLIP_LIKENESS"] = tk.BooleanVar(
+            value=bool(self.settings.get("MINIMAX_FT_CLIP_LIKENESS", True)))
+        self._minimax_ft_clip_cb = ttk.Checkbutton(
+            training_content,
+            text=f"Restrict video to likeness blocks ({MINIMAX_LIKENESS_BLOCKS}) — in our "
+                 "tests this trains video just as well, and it makes clips far lighter on "
+                 "VRAM. Untick to train video on the whole model.",
+            variable=self.entries["MINIMAX_FT_CLIP_LIKENESS"])
+        self._minimax_ft_clip_cb.grid(row=41, column=0, columnspan=2, sticky=tk.W,
+                                      padx=(21, 5), pady=(0, 4))
         # trace, not command=: preset loads set the var programmatically and must re-grey too.
         self.entries["MINIMAX_LIKENESS_OPT"].trace_add(
             "write", lambda *_a: self._sync_minimax_likeness_state())
@@ -5533,6 +5868,61 @@ class LoRATrainerGUI:
             self.adaptive_lr_var.set(bool(preset["ADAPTIVE_LR"]))
             if hasattr(self, '_on_adaptive_lr_toggle'):
                 self._on_adaptive_lr_toggle()
+            # Re-apply the Learning Rate AFTER the toggle has settled. The entries loop above
+            # runs while the LR box still reflects the PREVIOUS adaptive state — and a write to
+            # a disabled ttk.Entry is silently dropped. Restoring a non-adaptive run while
+            # adaptive happened to be on therefore kept the old rate, which on a fine-tune is
+            # the difference between 1e-5 and a LoRA-grade 1e-4.
+            _lr_entry = self.entries.get("LEARNING_RATE")
+            if "LEARNING_RATE" in preset and _lr_entry is not None:
+                try:
+                    _was = _lr_entry.cget("state")
+                    _lr_entry.config(state="normal")
+                    _lr_entry.delete(0, tk.END)
+                    _lr_entry.insert(0, str(preset["LEARNING_RATE"]))
+                    _lr_entry.config(state=_was)
+                except (AttributeError, tk.TclError):
+                    pass
+
+        # Krea 2 base-model fine-tune. Captured by _collect_preset_values but never applied
+        # back, so "Load Settings From Last Train" silently dropped the entire fine-tune
+        # config — mode, window size, fused backward, Fast FT and the regularisation set.
+        # Order matters: the fine-tune flag goes first, because the regularisation block is
+        # only written to the dataset TOML while fine-tune is on.
+        _ft_map = [
+            ("KREA2_FINETUNE", "krea2_finetune_var", bool),
+            ("KREA2_FT_MODE", "krea2_ft_mode_var", str),
+            ("KREA2_FT_BLOCKS", "krea2_ft_blocks_var", str),
+            ("KREA2_FT_EVERY", "krea2_ft_every_var", str),
+            ("KREA2_FT_FUSED", "krea2_ft_fused_var", bool),
+            ("KREA2_FAST_FT", "krea2_fast_ft_var", bool),
+            ("KREA2_REG_DIR", "krea2_reg_dir_var", str),
+            ("KREA2_REG_MULT", "krea2_reg_mult_var", str),
+            ("MINIMAX_FINETUNE", "minimax_finetune_var", bool),
+            ("MINIMAX_FT_EVERY", "minimax_ft_every_var", str),
+            ("MINIMAX_FT_SCOPE", "minimax_ft_scope_var", str),
+            ("MINIMAX_FT_BLOCKSPEC", "minimax_ft_blockspec_var", str),
+            ("MINIMAX_FT_FUSED", "minimax_ft_fused_var", bool),
+            ("MINIMAX_REG_DIR", "minimax_reg_dir_var", str),
+            ("MINIMAX_REG_MULT", "minimax_reg_mult_var", str),
+        ]
+        _ft_touched = False
+        for _key, _attr, _cast in _ft_map:
+            if _key in preset and hasattr(self, _attr):
+                try:
+                    getattr(self, _attr).set(_cast(preset[_key]))
+                    _ft_touched = True
+                except Exception:
+                    pass
+        if _ft_touched:
+            # Show/hide the fine-tune panel to match, and rewrite the dataset TOML so the
+            # regularisation block tracks the restored state rather than the previous run's.
+            if hasattr(self, "_apply_krea2_ft_visibility"):
+                self._apply_krea2_ft_visibility()
+            if hasattr(self, "_apply_minimax_ft_visibility"):
+                self._apply_minimax_ft_visibility()
+            if hasattr(self, "auto_save_dataset_config_silent"):
+                self.auto_save_dataset_config_silent()
 
         # LEARNING_RATE is state-gated: the adaptive checkbox greys the LR box, and a tk
         # Entry silently DROPS delete/insert while disabled — so the generic loop above
@@ -6393,6 +6783,21 @@ class LoRATrainerGUI:
         _grab("krea2_per_image_lr_var", "KREA2_PER_IMAGE_LR")
         _grab("krea2_auto_recaption_var", "KREA2_AUTO_RECAPTION")
         _grab("krea2_warmup_look_var", "KREA2_WARMUP_LOOK")
+        _grab("krea2_finetune_var", "KREA2_FINETUNE")
+        _grab("krea2_fast_ft_var", "KREA2_FAST_FT")
+        _grab("krea2_reg_dir_var", "KREA2_REG_DIR")
+        _grab("krea2_reg_mult_var", "KREA2_REG_MULT")
+        _grab("krea2_ft_mode_var", "KREA2_FT_MODE")
+        _grab("krea2_ft_blocks_var", "KREA2_FT_BLOCKS")
+        _grab("krea2_ft_every_var", "KREA2_FT_EVERY")
+        _grab("krea2_ft_fused_var", "KREA2_FT_FUSED")
+        _grab("minimax_finetune_var", "MINIMAX_FINETUNE")
+        _grab("minimax_ft_every_var", "MINIMAX_FT_EVERY")
+        _grab("minimax_ft_scope_var", "MINIMAX_FT_SCOPE")
+        _grab("minimax_ft_blockspec_var", "MINIMAX_FT_BLOCKSPEC")
+        _grab("minimax_ft_fused_var", "MINIMAX_FT_FUSED")
+        _grab("minimax_reg_dir_var", "MINIMAX_REG_DIR")
+        _grab("minimax_reg_mult_var", "MINIMAX_REG_MULT")
         # MiniMax reference distillation. A plain StringVar, so the generic self.entries sweep
         # above does NOT see it — without this a queued distillation run loses its reference
         # and silently becomes an ordinary run (tests/test_minimax_distill_gui.py).
@@ -6767,6 +7172,9 @@ class LoRATrainerGUI:
         self.entries["MIXED_STOP_EPOCH"].insert(
             0, str(self.settings.get("MIXED_STOP_EPOCH", "")))
         self.entries["MIXED_STOP_EPOCH"].pack(side=tk.LEFT, padx=(0, 8))
+        # Under FT the hint shows live where a typed epoch will land (cycle-boundary snap).
+        self.entries["MIXED_STOP_EPOCH"].bind(
+            "<KeyRelease>", lambda _e: self._refresh_mixed_stop_hint())
         self.entries["MIXED_STOP_MODE"] = ttk.Combobox(_msf, values=_RETIRE_MODES, width=26,
                                                        state="readonly")
         self.entries["MIXED_STOP_MODE"].set(
@@ -6782,6 +7190,10 @@ class LoRATrainerGUI:
                          "its steps entirely: faster epochs, but that category goes unwatched.",
             font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
             justify=tk.LEFT, wraplength=720)
+        self._MIXED_STOP_HINT_LORA = self._mixed_stop_hint.cget("text")
+        # FT text is rebuilt live by _refresh_mixed_stop_hint (the cycle length rides on
+        # Rotate every); this placeholder is only ever shown for a frame at build time.
+        self._MIXED_STOP_HINT_FT = ""
 
         # The raw share, revealed only under Custom — the named options are the point.
         self._minimax_shift_label = ttk.Label(parent, text="Clean-end share:")
@@ -6918,7 +7330,7 @@ class LoRATrainerGUI:
                             "in the README.")
     _MINIMAX_BLOCKS_HINT_LOCKED = ("Disabled by Optimised Likeness Learning above — untick it "
                                    "to hand-pick blocks. While it's on, photos train "
-                                   f"{MINIMAX_LIKENESS_BLOCKS} and clips train all 50.")
+                                   f"{MINIMAX_LIKENESS_BLOCKS}; video follows the restriction tickbox.")
 
     def _sync_minimax_likeness_state(self):
         """Grey Blocks to Train while Optimised Likeness Learning owns the block choice.
@@ -6932,12 +7344,21 @@ class LoRATrainerGUI:
             return
         locked = self._is_minimax_arch() and bool(
             self.entries["MINIMAX_LIKENESS_OPT"].get())
+        # The video-restriction sub-tick shows only where it means something: MiniMax
+        # family, Fine-tune ON, likeness ON. (LoRA-mode clips keep whole-model behaviour;
+        # the builder only emits --clip_blocks under FT regardless, so this is
+        # presentation — the flag gate is the guard.)
+        _clip_cb = getattr(self, "_minimax_ft_clip_cb", None)
+        if _clip_cb is not None and _clip_cb.winfo_exists():
+            _show = locked and bool(getattr(self, "minimax_finetune_var", None)
+                                    and self.minimax_finetune_var.get())
+            self._set_widget_visible(_clip_cb, _show)
         if locked:
             combo.config(state="disabled")
             hint.config(text=self._MINIMAX_BLOCKS_HINT_LOCKED)
             lbl = getattr(self, "_minimax_blocks_count", None)
             if lbl is not None and lbl.winfo_exists():
-                lbl.config(text=f"photos: {MINIMAX_LIKENESS_BLOCKS} · clips: all 50",
+                lbl.config(text=f"photos: {MINIMAX_LIKENESS_BLOCKS} · clips: see video restriction",
                            fg=COLORS["text_explain"])
         else:
             combo.config(state="")               # editable, the widget's natural state
@@ -6995,6 +7416,363 @@ class LoRATrainerGUI:
                 sec.pack_forget()
         except Exception:
             pass
+
+    # Recommended base-model fine-tune setup. Applied when the checkbox is ticked so the
+    # whole recipe comes as one decision instead of six. Values come from the measured runs
+    # on this branch; the LR especially — LoRA rates (1e-4+) destroy a base model.
+    KREA2_FT_DEFAULTS = {
+        "LEARNING_RATE": "1e-5",
+        "MAX_TRAIN_EPOCHS": "40",         # 10 full 4-window cycles — an overnight run you can
+                                          # scrub through; nobody has tuned this recipe on a
+                                          # diffusion DiT, so compare checkpoints to find where
+                                          # it peaks rather than trusting the number
+        "SAVE_EVERY_N_EPOCHS": "4",       # one per full cycle: every component has had the same
+                                          # number of passes, so checkpoints are comparable
+                                          # like-for-like. ~26 GB each -> 10 files / ~260 GB
+                                          # over a 40-epoch run
+        "GRADIENT_ACCUMULATION": "1",     # fused backward consumes grads as they land
+        "MAX_GRAD_NORM": "0",             # global clipping is impossible under fused backward
+        "NETWORK_TYPE": "LoRA (standard)",  # FT trains the BASE — a LoKR adapter would sit
+                                            # inert burning VRAM, so the recipe resets it
+    }
+
+    def _on_krea2_ft_toggle(self):
+        """User ticked/unticked base-model fine-tuning. Only push the recipe on the way ON,
+        so re-showing the tab never stomps values the user has since tuned."""
+        self._apply_krea2_ft_visibility()
+        # The regularisation block is fine-tune-only, so the TOML changes with this toggle.
+        self.auto_save_dataset_config_silent()
+        if bool(self.krea2_finetune_var.get()):
+            self._apply_krea2_ft_defaults()
+
+    def _apply_krea2_ft_defaults(self):
+        """Set the whole fine-tune recipe in one go, and say what changed."""
+        changed = []
+        # Adaptive LR goes off FIRST: the trainer disables it anyway (rotation boundaries read
+        # as instability), and while it's on the Learning Rate box is greyed out — writing the
+        # recipe's 1e-5 into a disabled Entry silently does nothing, which left fine-tune runs
+        # starting at a LoRA-grade LR.
+        if getattr(self, "adaptive_lr_var", None) is not None and self.adaptive_lr_var.get():
+            self.adaptive_lr_var.set(False)
+            try:
+                self._on_adaptive_lr_toggle()
+            except Exception:
+                pass
+            changed.append("Adaptive LR: on -> off (incompatible with rotation)")
+        for key, val in self.KREA2_FT_DEFAULTS.items():
+            entry = self.entries.get(key)
+            if entry is None:
+                continue
+            try:
+                before = entry.get()
+                if str(before).strip() == val:
+                    continue
+                # Belt and braces: a disabled Entry rejects delete/insert, so re-enable it for
+                # the write and put its state back.
+                _was = str(entry.cget("state"))
+                if _was == "disabled":
+                    entry.config(state="normal")
+                entry.delete(0, tk.END)
+                entry.insert(0, val)
+                if _was == "disabled":
+                    entry.config(state=_was)
+                changed.append(f"{key.replace('_', ' ').title()}: {before} -> {val}")
+            except Exception:
+                pass
+        if getattr(self, "lr_scheduler_var", None) is not None and self.lr_scheduler_var.get() != "constant":
+            was = self.lr_scheduler_var.get()
+            self.lr_scheduler_var.set("constant")
+            changed.append(f"LR Scheduler: {was} -> constant")
+        if changed:
+            self.update_console("[fine-tune] applied the recommended base-model setup:\n  "
+                                + "\n  ".join(changed) + "\n")
+
+    def _browse_krea2_reg_dir(self):
+        """Pick the optional regularisation image folder (Krea 2 fine-tune)."""
+        from tkinter import filedialog
+        d = filedialog.askdirectory(title="Regularisation images (optional)",
+                                    initialdir=self.krea2_reg_dir_var.get() or None)
+        if d:
+            self.krea2_reg_dir_var.set(d)
+            self.auto_save_dataset_config_silent()   # the TOML carries the reg block
+
+    def _browse_minimax_reg_dir(self):
+        """Pick the optional regularisation image folder (MiniMax H3 fine-tune)."""
+        from tkinter import filedialog
+        d = filedialog.askdirectory(title="Regularisation images (optional)",
+                                    initialdir=self.minimax_reg_dir_var.get() or None)
+        if d:
+            self.minimax_reg_dir_var.set(d)
+            self.auto_save_dataset_config_silent()   # the TOML carries the reg block
+
+    def _apply_krea2_ft_visibility(self):
+        """Show the fine-tune knobs only when base-model fine-tuning is on, and the
+        blocks-per-window picker only in block mode (component windows are fixed)."""
+        if not hasattr(self, "_krea2_ft_frame"):
+            return
+        on = bool(self.krea2_finetune_var.get())
+        for w in (self._krea2_ft_frame, self._krea2_ft_fused_cb, self._krea2_fast_ft_cb,
+                  self._krea2_reg_frame, self._krea2_ft_hint):
+            self._set_widget_visible(w, on)
+        # Auto-recaption is hidden under a fine-tune: its between-epoch VLM load moves the
+        # whole DiT off the card through a blocks_to_swap-aware restore that knows nothing
+        # about the FT rotation streamer — on the 16 GB streamed tier the restore would
+        # hoist every streamed block back onto the card behind the offloader's bookkeeping.
+        # The other three watch toggles stay: their multipliers ride the same loss-scaling
+        # the FT regularisation path uses, and detection compares each image against the
+        # cohort at the same epoch, so rotation's boundary shifts cancel. The trainer
+        # disarms a ticked-but-hidden box too, so this is presentation, not the guard.
+        if hasattr(self, "_krea2_autorecap_cb"):
+            self._set_widget_visible(self._krea2_autorecap_cb, not on)
+        # Network Type (LoRA/LoKR) is meaningless under a base-model fine-tune — the adapter
+        # is inert. Hide the row while FT is on; restore the normal swap when it goes off.
+        if hasattr(self, "_network_type_rowf"):
+            self._set_widget_visible(self.labels["NETWORK_TYPE"], not on)
+            self._set_widget_visible(self._network_type_rowf, not on)
+            if on:
+                self.hide_row("LOKR_FACTOR")
+                self.show_row("NETWORK_DIM")
+                self.show_row("NETWORK_ALPHA")
+            else:
+                self._on_network_type_changed()
+        block_mode = str(self.krea2_ft_mode_var.get()) == "block"   # Auto picks its own
+        if on and block_mode:
+            self._krea2_ft_blocks_lbl.pack(side=tk.LEFT, padx=(14, 4))
+            self._krea2_ft_blocks_cb.pack(side=tk.LEFT)
+        else:
+            self._krea2_ft_blocks_lbl.pack_forget()
+            self._krea2_ft_blocks_cb.pack_forget()
+
+    # --- MiniMax H3 rotation fine-tune (mirrors the Krea 2 card) --------------------------
+    MINIMAX_FT_DEFAULTS = {
+        "LEARNING_RATE": "1e-5",          # a starting point, NOT a calibrated H3 recipe —
+                                          # nobody has tuned FT rates on this model yet
+        "MAX_TRAIN_EPOCHS": "100",        # a realistic fine-tune length (Peter, 29 Aug:
+                                          # 26 was "far too small"; his field A/Bs ran 64
+                                          # and kept improving). Clean at BOTH full-speed
+                                          # plans — 25 cycles at 4 windows, 20 at 5 — and
+                                          # the trainer now snaps any total UP to a cycle
+                                          # boundary at launch anyway (snap_ft_epochs),
+                                          # so odd window counts still end evenly trained.
+        # SAVE_EVERY_N_EPOCHS is NOT a static recipe value: the cycle length depends on the
+        # window mode/size, so _refresh_minimax_ft_save_box keeps the box in step live.
+        "GRADIENT_ACCUMULATION": "1",     # fused backward consumes grads as they land
+        "MAX_GRAD_NORM": "0",             # global clipping is impossible under fused backward
+        "NETWORK_TYPE": "LoRA (standard)",  # FT trains the BASE — reset the adapter selector
+    }
+
+    def _on_minimax_ft_toggle(self):
+        """Recipe pushed on the way ON only, so re-showing the tab never stomps tuned values.
+
+        The likeness tickbox needs NO bridging here: --photo_blocks (and --audio_blocks)
+        travel under FT and the TRAINER resolves them — the cycle tightens to the union of
+        what the dataset trains, and each modality is confined to its own blocks per batch.
+        The Blocks field stays purely manual."""
+        self._apply_minimax_ft_visibility()
+        # The video-restriction sub-tick lives with likeness but only under FT — re-sync
+        # so toggling FT shows/hides it without touching the likeness box itself.
+        self._sync_minimax_likeness_state()
+        if bool(self.minimax_finetune_var.get()):
+            self._apply_minimax_ft_defaults()
+            self._refresh_minimax_ft_save_box()
+
+    def _minimax_ft_cycle_estimate(self):
+        """Epochs per full rotation cycle — the 32 GB BASELINE of 4 component windows
+        (qkv / out / fc1 / fc2) x rotate-every. Since the small-card tiers landed this is
+        an estimate, not exact: the trainer's window planner depth-splits fat windows on
+        24 GB (5 windows) and streams on 16 GB (more), resolved from free VRAM at LAUNCH —
+        unknowable here. The trainer's own cycle snap stays authoritative and logs when
+        it corrects the Save-every box."""
+        try:
+            _every = max(1, int(str(self.minimax_ft_every_var.get()).strip() or 1))
+        except ValueError:
+            _every = 1
+        return 4 * _every
+
+    def _refresh_minimax_ft_save_box(self):
+        """Keep Save-every in step with the cycle the FT controls imply.
+
+        Ownership decides what may be rewritten: a value the GUI itself wrote (tracked in
+        _minimax_ft_save_autoset) is only ever a suggestion and always follows the cycle —
+        without this, rotate-every 1 -> 2 -> 1 stranded the box at 8, because 8 is a
+        multiple of 4 and looked like a user choice (field). A USER-typed value is kept
+        when it's 0 (final-only) or a non-zero multiple of the cycle (a deliberate sparser
+        cadence); anything else is rewritten to the suggestion: EVERY SECOND CYCLE (8 on
+        the 4-window baseline, 10 on a 5-window plan) — saves are ~21 GB each and previews
+        ride them, so once-per-cycle doubled the disk and preview cost for no gain (Peter,
+        29 Aug: ~10 epochs is the right feel). Trainer-side snap stays authoritative at
+        launch."""
+        # The stop-epoch hint quotes the same cycle length — keep the two in step (cheap,
+        # and this refresh fires on every cycle-affecting control).
+        try:
+            self._refresh_mixed_stop_hint()
+        except Exception:
+            pass
+        if not bool(getattr(self, "minimax_finetune_var", None)
+                    and self.minimax_finetune_var.get()):
+            return
+        entry = self.entries.get("SAVE_EVERY_N_EPOCHS")
+        if entry is None:
+            return
+        cyc = self._minimax_ft_cycle_estimate()
+        try:
+            cur = int(str(entry.get()).strip() or 0)
+        except ValueError:
+            cur = -1
+        if cur == 2 * cyc:
+            self._minimax_ft_save_autoset = 2 * cyc  # already right — claim it as ours
+            return
+        if cur != getattr(self, "_minimax_ft_save_autoset", None):
+            if cur == 0 or (cur > 0 and cur % cyc == 0):
+                return                              # the user's own deliberate cadence
+        # A user-typed non-multiple snaps UP to the next cycle multiple (10 on a 4-cycle
+        # -> 12): the typed number expressed how SPARSE they want 20 GB saves — and,
+        # since previews follow saves, previews — so one-per-cycle would be 2.5x what
+        # they asked for. A GUI-owned value just tracks the cycle itself.
+        _target = (((cur + cyc - 1) // cyc) * cyc
+                   if cur > 0 and cur != getattr(self, "_minimax_ft_save_autoset", None)
+                   else 2 * cyc)
+        try:
+            _was = str(entry.cget("state"))
+            if _was == "disabled":
+                entry.config(state="normal")
+            entry.delete(0, tk.END)
+            entry.insert(0, str(_target))
+            if _was == "disabled":
+                entry.config(state=_was)
+            self._minimax_ft_save_autoset = _target
+        except Exception:
+            pass
+
+    def _apply_minimax_ft_defaults(self):
+        """Same shape as _apply_krea2_ft_defaults — one recipe write, with a console report."""
+        changed = []
+        if getattr(self, "adaptive_lr_var", None) is not None and self.adaptive_lr_var.get():
+            self.adaptive_lr_var.set(False)
+            try:
+                self._on_adaptive_lr_toggle()
+            except Exception:
+                pass
+            changed.append("Adaptive LR: on -> off (incompatible with rotation)")
+        for key, val in self.MINIMAX_FT_DEFAULTS.items():
+            entry = self.entries.get(key)
+            if entry is None:
+                continue
+            try:
+                before = entry.get()
+                if str(before).strip() == val:
+                    continue
+                _was = str(entry.cget("state"))
+                if _was == "disabled":
+                    entry.config(state="normal")
+                entry.delete(0, tk.END)
+                entry.insert(0, val)
+                if _was == "disabled":
+                    entry.config(state=_was)
+                changed.append(f"{key.replace('_', ' ').title()}: {before} -> {val}")
+            except Exception:
+                pass
+        if changed:
+            self.update_console("[fine-tune] applied the recommended base-model setup:\n  "
+                                + "\n  ".join(changed) + "\n")
+
+    def _launch_diff_to_lora(self):
+        """Open the Checkpoint to LoRA tool (its own window) from inside the app.
+
+        One click matters most on a RunPod pod, where the GUI in a browser tab is all the
+        user has — hunting for run_diff_to_lora.bat/.sh in a noVNC desktop is exactly how
+        a field user ended up invoking venv/bin/python by hand (29 Aug). Windows prefers
+        pythonw so no console flashes; everywhere else the venv python running this GUI
+        launches it directly."""
+        import subprocess
+        exe = sys.executable
+        if os.name == "nt":
+            _w = os.path.join(FIZGIG_DIR, "venv", "Scripts", "pythonw.exe")
+            if os.path.exists(_w):
+                exe = _w
+        try:
+            subprocess.Popen([exe, os.path.join(FIZGIG_DIR, "diff_to_lora_gui.py")],
+                             cwd=FIZGIG_DIR)
+        except Exception as e:
+            messagebox.showerror("Checkpoint to LoRA", f"Could not launch the tool: {e}")
+
+    def _apply_minimax_ft_visibility(self):
+        """FT sub-controls only while the checkbox is on. Everything that is ADAPTER machinery
+        hides under FT rather than sitting there silently ignored — Network Type, Optimised
+        Likeness Learning, and Blocks to Train (the FT card's own Blocks field is the
+        fine-tune's block restriction)."""
+        if not hasattr(self, "_minimax_ft_frame"):
+            return
+        on = bool(self.minimax_finetune_var.get())
+        for w in (self._minimax_ft_frame, self._minimax_ft_fused_cb,
+                  self._minimax_reg_frame, self._minimax_ft_hint):
+            self._set_widget_visible(w, on)
+        # The likeness tickbox STAYS — same meaning, different mechanism: under FT it drives
+        # the Blocks field (whole fine-tune on the identity blocks) instead of masking photo
+        # steps. Its hint swaps to say so. Blocks to Train is adapter-only and hides.
+        if hasattr(self, "_minimax_likeness_hint"):
+            self._minimax_likeness_hint.config(
+                text=self._MINIMAX_LIKENESS_HINT_FT if on else self._MINIMAX_LIKENESS_HINT_LORA)
+        for w in (getattr(self, "_minimax_blocks_label", None),
+                  getattr(self, "_minimax_blocks_frame", None),
+                  getattr(self, "_minimax_blocks_hint", None),
+                  # Medium to High LR is a LoRA-mode knob (it rewrites the optimizer's
+                  # param-group LR at boundary steps — machinery FT doesn't have). Hidden
+                  # under FT; the builder also suppresses the flag.
+                  getattr(self, "_minimax_hnlr_label", None),
+                  getattr(self, "_minimax_hnlr_frame", None),
+                  getattr(self, "_minimax_hnlr_hint", None)):
+            if w is not None:
+                self._set_widget_visible(w, not on)
+        if hasattr(self, "_network_type_rowf"):
+            self._set_widget_visible(self.labels["NETWORK_TYPE"], not on)
+            self._set_widget_visible(self._network_type_rowf, not on)
+            if on:
+                self.hide_row("LOKR_FACTOR")
+                self.show_row("NETWORK_DIM")
+                self.show_row("NETWORK_ALPHA")
+            else:
+                self._on_network_type_changed()
+        # 'Finish one category early' STAYS under FT (retirement works there now, stop-only
+        # at cycle boundaries) — its mode picker hides and its hint swaps.
+        self._refresh_mixed_stop_hint()
+        # A restored session can come up with FT already ON and a stale non-multiple in
+        # the save box (field: 10 survived an app restart and the trainer silently snapped
+        # it) — visibility runs on every restore/arch-switch, so re-snap here too. No-op
+        # when FT is off (the refresh early-returns).
+        self._refresh_minimax_ft_save_box()
+
+    def _refresh_mixed_stop_hint(self):
+        """Swap the 'Finish one category early' hint and hide the anchor/stop picker under
+        FT — retirement there is stop-only and lands on rotation-cycle boundaries. The FT
+        text is rebuilt live: the cycle length rides on Rotate every, and a typed epoch
+        gets its snap target spelled out (the trainer's snap stays authoritative)."""
+        if not hasattr(self, "_mixed_stop_hint"):
+            return
+        on = bool(getattr(self, "minimax_finetune_var", None)
+                  and self.minimax_finetune_var.get())
+        _mode = self.entries.get("MIXED_STOP_MODE")
+        if _mode is not None:
+            self._set_widget_visible(_mode, not on)
+        if not on:
+            self._mixed_stop_hint.config(text=self._MIXED_STOP_HINT_LORA)
+            return
+        cyc = self._minimax_ft_cycle_estimate()
+        try:
+            _n = int(str(self.entries["MIXED_STOP_EPOCH"].get()).strip() or 0)
+        except (ValueError, KeyError, tk.TclError):
+            _n = 0
+        _snap = ((_n + cyc - 1) // cyc) * cyc if _n > 0 else 0
+        _ex = (f" Your epoch {_n} lands at {_snap}."
+               if _n > 0 and _snap != _n else "")
+        self._MIXED_STOP_HINT_FT = (
+            "Under fine-tune the finished category STOPS outright (no anchor mode), and "
+            "the stop lands on a rotation-cycle boundary — epochs snap UP to the next "
+            f"multiple of the {cyc}-epoch cycle, so every window sees the same data mix "
+            f"for equal passes before it changes.{_ex} Great for a polish tail: stop "
+            "photos & clips and let the voice keep refining its own blocks, or the "
+            "reverse.")
+        self._mixed_stop_hint.config(text=self._MIXED_STOP_HINT_FT)
 
     def _refresh_optimizer_choices(self, is_krea2: bool):
         """Point the Optimizer Type dropdown at the selected family's catalog."""
@@ -7123,10 +7901,26 @@ class LoRATrainerGUI:
         # wired into krea2_train for now — hide them under Klein.
         for w in (self._krea2_losswatch_frame, self._krea2_perimglr_cb,
                   self._krea2_autorecap_cb, self._krea2_warmuplook_cb,
-                  self._krea2_losswatch_hint,
+                  self._krea2_losswatch_hint, self._krea2_ft_cb,
                   # torch.compile is wired into krea2_train only.
                   self._compile_blocks_label, self.compile_blocks_check, self._compile_blocks_hint):
             self._set_widget_visible(w, is_krea2)
+        # The FT sub-controls are gated by the checkbox as well as by the family. Gate on
+        # the family, NOT native: each family's FT visibility logic also swaps the Network
+        # Type rows, which the other family's logic must never touch. Away from a family,
+        # its FT sub-widgets hide outright (the family loop above only covers the checkbox).
+        if is_krea2:
+            self._apply_krea2_ft_visibility()
+        elif hasattr(self, "_krea2_ft_frame"):
+            for w in (self._krea2_ft_frame, self._krea2_ft_fused_cb, self._krea2_fast_ft_cb,
+                      self._krea2_reg_frame, self._krea2_ft_hint):
+                self._set_widget_visible(w, False)
+        if is_minimax:
+            self._apply_minimax_ft_visibility()
+        elif hasattr(self, "_minimax_ft_frame"):
+            for w in (self._minimax_ft_frame, self._minimax_ft_fused_cb,
+                      self._minimax_reg_frame, self._minimax_ft_hint):
+                self._set_widget_visible(w, False)
         # Network Type (LoRA/LoKR) is wired for BOTH native families (krea2_train and
         # minimax_train take --network_type/--lokr_factor); Klein trains standard only.
         # The row frame carries the combo + hint together. The speed note is Krea 2-only:
@@ -7154,6 +7948,7 @@ class LoRATrainerGUI:
                   self._minimax_capdrop_label, self._minimax_capdrop_frame,
                   self._minimax_capdrop_hint,
                   self._minimax_mc_frame,
+                  self._minimax_ft_cb,
                   ):
             self._set_widget_visible(w, is_minimax)
         # The clean-end box answers to BOTH the family and the dropdown: visible only for MiniMax,
@@ -7212,6 +8007,8 @@ class LoRATrainerGUI:
             # Restore the rank/alpha <-> factor row swap for the current selection.
             self._on_network_type_changed()
         else:
+            for w in (self._krea2_ft_frame, self._krea2_ft_fused_cb, self._krea2_ft_hint):
+                self._set_widget_visible(w, False)
             # Klein always shows rank/alpha and never the factor, whatever the combo holds.
             self.show_row("NETWORK_DIM")
             self.show_row("NETWORK_ALPHA")
@@ -7960,13 +8757,18 @@ class LoRATrainerGUI:
         return 0  # safe fallback — avoid the buggy swap path on detection failure
 
     def _on_gpu_choice(self, _event=None):
-        """Save the picked GPU as a bare index. Label -> index, since the combobox shows names."""
+        """Save the picked GPU by UUID. Label -> UUID, so CUDA_VISIBLE_DEVICES is immune to
+        NVML vs. CUDA index reordering (issue #104)."""
         _picked = self._gpu_choice_var.get()
-        _idx = next((k for k, v in self._gpu_choice_labels.items() if v == _picked), "")
-        self.prefs_vars["cuda_device"].set(_idx)          # trace writes prefs.json
+        _uuid = ""
+        for k, v in self._gpu_choice_labels.items():
+            if v == _picked:
+                _uuid = self._gpu_info.get(k, (None, None, None, ""))[3] or ""
+                break
+        self.prefs_vars["cuda_device"].set(_uuid)          # trace writes prefs.json
         self.update_console(
             f"[gpu] training will use {_picked}. Restart Fizgig to move the workbench tools too.\n"
-            if _idx else "[gpu] back to the system default GPU.\n")
+            if _uuid else "[gpu] back to the system default GPU.\n")
 
     def _cuda_env_for_subprocess(self, env):
         """Stamp the chosen GPU onto a subprocess environment.
@@ -7976,7 +8778,7 @@ class LoRATrainerGUI:
         restarted, which is the one place it easily can take effect immediately."""
         _want = str(self.prefs_vars["cuda_device"].get()).strip() if hasattr(
             self, "prefs_vars") else ""
-        if _want.isdigit() and not getattr(self, "_cuda_device_env_locked", False):
+        if _want and not getattr(self, "_cuda_device_env_locked", False):
             env["CUDA_VISIBLE_DEVICES"] = _want
         return env
 
@@ -17184,11 +17986,23 @@ class LoRATrainerGUI:
             ttk.Label(gpu_card, text="Use GPU:").grid(row=0, column=0, sticky=tk.W,
                                                       padx=(0, 10), pady=4)
             self._gpu_choice_labels = {"": "System default (GPU 0)"}
-            for _i, _name, _gb in _gpus:
+            self._gpu_info = {}
+            for _i, _name, _gb, _uuid in _gpus:
                 self._gpu_choice_labels[str(_i)] = f"{_i}: {_name} ({_gb:.0f} GB)"
+                self._gpu_info[str(_i)] = (_i, _name, _gb, _uuid)
+            self._nvml_init = False  # reset so first _read_vram() uses correct index
+            _saved_gpu = str(self.prefs.get("cuda_device", "")).strip()
+            # Match saved value: UUID (new format) or index (legacy prefs.json)
+            _matched_key = ""
+            if _saved_gpu:
+                _matched_key = next(
+                    (k for k, v in self._gpu_choice_labels.items()
+                     if self._gpu_info.get(k, (None, None, None, None))[3] == _saved_gpu
+                     or k == _saved_gpu),
+                    "")
             self._gpu_choice_var = tk.StringVar(
                 value=self._gpu_choice_labels.get(
-                    str(self.prefs.get("cuda_device", "")).strip(),
+                    _matched_key,
                     self._gpu_choice_labels[""]))
             _gpu_combo = ttk.Combobox(
                 gpu_card, textvariable=self._gpu_choice_var,
@@ -24130,6 +24944,36 @@ class LoRATrainerGUI:
                 except ValueError:
                     pass
 
+            # Optional regularisation set (fine-tune only, per family): a second dataset
+            # block marked is_reg, so the cache scripts pick it up for free and the trainer
+            # can find its items. Only written when a folder is set — no folder, no block,
+            # nothing changes. Fine-tune only: with FT off the block must not be written at
+            # all, or the reg images would be cached and trained as ordinary subjects at
+            # full LR. Arch-scoped: each family's reg row + FT toggle only speak for their
+            # own family (a stale toggle from the other family must not leak a block in).
+            if self._is_minimax_arch():
+                reg_dir = (self.minimax_reg_dir_var.get().strip().replace("\\", "/")
+                           if hasattr(self, "minimax_reg_dir_var") else "")
+                reg_on = bool(getattr(self, "minimax_finetune_var", None)
+                              and self.minimax_finetune_var.get())
+            else:
+                reg_dir = (self.krea2_reg_dir_var.get().strip().replace("\\", "/")
+                           if hasattr(self, "krea2_reg_dir_var") else "")
+                reg_on = bool(self._is_krea2_arch()
+                              and getattr(self, "krea2_finetune_var", None)
+                              and self.krea2_finetune_var.get())
+            if reg_on and reg_dir and os.path.isdir(reg_dir) and not is_jsonl and not is_video:
+                toml_lines.append("")
+                toml_lines.append("[[datasets]]")
+                toml_lines.append(f'image_directory = "{reg_dir}"')
+                _reg_cache = self.prefs_vars["cache_dir"].get().strip() if "cache_dir" in self.prefs_vars else ""
+                if _reg_cache:
+                    # Its own subfolder for the same reason the subject set gets one: the
+                    # trainer globs the cache dir, so a shared folder mixes the two sets.
+                    _reg_cache = self._cache_dir_for(_reg_cache, reg_dir)
+                    toml_lines.append(f'cache_directory = "{_reg_cache.replace(chr(92), "/")}"')
+                toml_lines.append("is_reg = true")
+
             return dataset_name, "\n".join(toml_lines) + "\n"
 
     def show_context_menu(self, event):
@@ -24790,7 +25634,9 @@ class LoRATrainerGUI:
         # built and we skip re-caching, so wiping it would leave the resumed run with no latents
         # /text. Read the resume path from the entry (the live source of truth at this point).
         _resume_entry = self.entries.get("RESUME_TRAINING")
-        _is_resuming_clear = bool(_resume_entry and _resume_entry.get().strip())
+        # An armed FT continuation is a resume too — same cache, same frozen dataset.
+        _is_resuming_clear = bool((_resume_entry and _resume_entry.get().strip())
+                                  or self._ft_resume_active())
         cache_dir = self.dataset_cache_dir_var.get().strip()
         if cache_dir and os.path.isdir(cache_dir) and not _is_resuming_clear:
             try:
@@ -24887,6 +25733,8 @@ class LoRATrainerGUI:
             "MINIMAX_BLOCKS": ("all" if self.entries["MINIMAX_LIKENESS_OPT"].get()
                                else minimax_block_spec(self.entries["MINIMAX_BLOCKS"].get())),
             "MINIMAX_LIKENESS_OPT": bool(self.entries["MINIMAX_LIKENESS_OPT"].get()),
+            "MINIMAX_FT_CLIP_LIKENESS": bool(self.entries["MINIMAX_FT_CLIP_LIKENESS"].get())
+            if "MINIMAX_FT_CLIP_LIKENESS" in self.entries else True,
             "MINIMAX_TRAIN_ADALN": bool(self.entries["MINIMAX_TRAIN_ADALN"].get()),
             "MINIMAX_DISTILL": bool(self.minimax_distill_var.get()),
             # Canonical key ("fl2va"/"ref2va"), never the display label. Preset-immune by
@@ -25010,8 +25858,10 @@ class LoRATrainerGUI:
             """Called when training finishes - cleanup watchers"""
             self.stop_samples_watcher()
 
-        # On resume, skip cache preparation entirely — the cache is already built from the original launch.
-        is_resuming = bool(self.settings.get("RESUME_TRAINING", "").strip())
+        # On resume, skip cache preparation entirely — the cache is already built from the
+        # original launch. An armed FT continuation counts: it is the same run continuing.
+        is_resuming = bool(self.settings.get("RESUME_TRAINING", "").strip()
+                           or self._ft_resume_active())
         if self.enable_cache_var.get() and not is_resuming:
             self.update_console(f"Starting cache preparation for {arch}...\n")
 
@@ -25115,9 +25965,17 @@ class LoRATrainerGUI:
 
     def build_training_command(self, config):
         """Build the training command based on architecture configuration"""
+        # Stamp whether THIS launch is a rotation fine-tune (and which family), for the
+        # pause exit-handler: an FT pause leaves a full checkpoint rather than a state dir,
+        # and the Tk checkbox can be flipped mid-run, so the truth is recorded at launch.
+        self._launched_ft_family = None
         if config.get("is_krea2"):
+            if bool(getattr(self, "krea2_finetune_var", None) and self.krea2_finetune_var.get()):
+                self._launched_ft_family = "krea2"
             return self._build_krea2_train_command()
         if config.get("is_minimax"):
+            if bool(getattr(self, "minimax_finetune_var", None) and self.minimax_finetune_var.get()):
+                self._launched_ft_family = "minimax"
             return self._build_minimax_train_command()
         arch = self.settings["ARCHITECTURE"]
         # Same reasoning as _venv_python: fall back to whatever is on PATH when the bundled venv
@@ -25617,17 +26475,33 @@ class LoRATrainerGUI:
         Model paths come from Preferences (krea2_*); rank/alpha/lr/epochs/save/seed and the
         auto-resolved Blocks Swap come from the shared Training-tab knobs; sample resolution +
         frequency come from the Samples tab (same source Klein uses)."""
+        # Armed fine-tune continuation (Resume after an FT pause): --dit becomes the pause
+        # checkpoint — a one-run override, the preference is never touched — and the epoch
+        # count is what's left of the original total. No --resume: FT has no state dirs.
+        _fr = self._ft_resume_active()
+        if getattr(self, "_ft_resume", None) and not _fr:
+            self.update_console("[resume] armed fine-tune continuation IGNORED — the run being "
+                                "launched is a different name or not a fine-tune.\n")
+        _dit = _fr["checkpoint"] if _fr else self._krea2_pref("krea2_raw_dit")
+        try:
+            _epochs = int(str(self.settings["MAX_TRAIN_EPOCHS"]))
+        except (KeyError, ValueError, TypeError):
+            _epochs = 1
+        if _fr:
+            _epochs = max(1, _epochs - int(_fr.get("epochs_done", 0)))
+            self.update_console(f"[resume] continuing fine-tune from "
+                                f"{os.path.basename(_dit)} — {_epochs} epoch(s) to run\n")
         cmd = [
             self._venv_python(),
             self._krea2_script("krea2_train.py"),
-            "--dit", self._krea2_pref("krea2_raw_dit"),
+            "--dit", _dit,
             "--dataset_config", self.settings["DATASET_CONFIG"],
             "--output_dir", self.settings["LORA_OUTPUT_DIR"],
             "--output_name", self.settings["LORA_NAME"],
             "--network_dim", str(self.settings["NETWORK_DIM"]),
             "--network_alpha", str(self.settings["NETWORK_ALPHA"]),
             "--learning_rate", str(self.settings["LEARNING_RATE"]),
-            "--max_train_epochs", str(self.settings["MAX_TRAIN_EPOCHS"]),
+            "--max_train_epochs", str(_epochs),
             "--save_every_n_epochs", str(self.settings["SAVE_EVERY_N_EPOCHS"]),
             "--blocks_to_swap", str(self.settings["BLOCKS_SWAP"]),
             "--seed", str(self.settings["SEED"]),
@@ -25635,7 +26509,11 @@ class LoRATrainerGUI:
         ]
         # LoKR (Kronecker) — dim/alpha still ride along above but the trainer ignores them;
         # the factor is the dial. Klein's builder never reads NETWORK_TYPE (standard only).
-        if str(self.settings.get("NETWORK_TYPE", "")).startswith("LoKR"):
+        # Never emitted under base-model fine-tuning: the adapter is inert there, so a LoKR
+        # would only burn VRAM (the trainer coerces too — belt and braces). Tk var read
+        # directly, same rule as the FT flags below (ab3cca2).
+        if (str(self.settings.get("NETWORK_TYPE", "")).startswith("LoKR")
+                and not bool(self.krea2_finetune_var.get())):
             cmd += ["--network_type", "lokr",
                     "--lokr_factor", str(self.settings.get("LOKR_FACTOR", 8))]
         # State saving. Krea 2 previously wrote state ONLY on Pause, so a crash or a run that
@@ -25793,6 +26671,51 @@ class LoRATrainerGUI:
             cmd.append("--per_image_lr")
         if _watch_ok and self.krea2_warmup_look_var.get():
             cmd.append("--warmup_look_outliers")
+        # Full base-model fine-tune (experimental): rotating trainable windows, full checkpoint out.
+        # Read the Tk vars DIRECTLY, like every other krea2 toggle here — self.settings is only
+        # refreshed when a preset is collected, so reading it made this silently never fire and
+        # the run trained a LoRA instead.
+        if bool(self.krea2_finetune_var.get()):
+            mode = str(self.krea2_ft_mode_var.get() or "auto")
+            if mode.lower().startswith("auto"):
+                mode = "auto"   # the trainer resolves it from free VRAM at launch
+            try:
+                nblocks = int(str(self.krea2_ft_blocks_var.get()))
+            except ValueError:
+                nblocks = 14
+            try:
+                every = int(str(self.krea2_ft_every_var.get()))
+            except ValueError:
+                every = 1
+            cmd += ["--finetune_rotation", str(max(1, nblocks)),
+                    "--finetune_rotation_mode", mode,
+                    "--finetune_rotate_every", str(max(1, every))]
+            # Base precision under FINE-TUNE: NF4 is the trainer's default now, so an
+            # explicit fp8 pick needs saying out loud. At the CLI an fp8 choice emits NO
+            # flag (fp8_scaled = not --no_fp8, true by default), which is indistinguishable
+            # from "Auto" — without this the dropdown's fp8 entry would silently produce
+            # NF4 and the control would be lying. LoRA runs are untouched: this sits inside
+            # the fine-tune branch.
+            try:
+                if self._base_precision() == "fp8":
+                    cmd.append("--ft_base_fp8")
+            except Exception:
+                pass
+            if _fr:
+                # Continuation: pick the rotation cycle back up where the pause left it
+                # (from the checkpoint's metadata) instead of restarting at window 0.
+                cmd += ["--finetune_start_window", str(int(_fr.get("next_window", 0)))]
+            if bool(self.krea2_ft_fused_var.get()):
+                cmd.append("--finetune_fused_backward")
+            if bool(self.krea2_fast_ft_var.get()):
+                cmd.append("--fast_ft")
+            _reg = self.krea2_reg_dir_var.get().strip()
+            if _reg and os.path.isdir(_reg):
+                try:
+                    _rm = float(self.krea2_reg_mult_var.get())
+                except ValueError:
+                    _rm = 0.2
+                cmd += ["--reg_lr_multiplier", str(max(0.0, _rm))]
         if _watch_ok and self.krea2_auto_recaption_var.get():
             cmd.append("--auto_recaption")
             # Trigger word from the Captions tab — appended (', <trigger>') to AI captions if
@@ -25871,7 +26794,11 @@ class LoRATrainerGUI:
                 # with the Turbo LoRA @1.0 — no Turbo checkpoint load, no CPU parking. The
                 # trainer prefers --turbo_lora over --turbo_dit when both are given, and falls
                 # back to the Turbo checkpoint by itself if the LoRA file has gone missing.
-                if self._krea2_preview_engine() == "raw_lora":
+                # Under a fine-tune the Turbo LoRA is REQUIRED for previews (the trained
+                # weights live in the base, which the standalone Turbo can't show), so the
+                # engine preference is overridden and the LoRA travels regardless.
+                if (self._krea2_preview_engine() == "raw_lora"
+                        or bool(self.krea2_finetune_var.get())):
                     _tlora = self._krea2_pref("krea2_turbo_lora")
                     if not _tlora or not os.path.isfile(_tlora):
                         # First use after an update: fetch it now (~470 MB, idempotent — the
@@ -25927,24 +26854,41 @@ class LoRATrainerGUI:
         NF4-quantized frozen base. No samples, no block swap, no context LoRA, no LoKR, no
         per-image loss watch: just the core knobs (rank/alpha/lr/epochs/save/seed/optimizer) plus
         adaptive LR and output metadata. Model paths come from Preferences (minimax_*)."""
+        # Armed fine-tune continuation (Resume after an FT pause): --dit becomes the pause
+        # checkpoint — a one-run override that outranks the distill/ref2va choice too — and
+        # the epoch count is what's left of the original total. No --resume under FT.
+        _fr = self._ft_resume_active()
+        if getattr(self, "_ft_resume", None) and not _fr:
+            self.update_console("[resume] armed fine-tune continuation IGNORED — the run being "
+                                "launched is a different name or not a fine-tune.\n")
+        _dit = (_fr["checkpoint"] if _fr
+                else (self._krea2_pref("minimax_ref_dit")
+                      if ((self.settings.get("MINIMAX_DISTILL")
+                           or self.settings.get("MINIMAX_TRAIN_BASE") == "ref2va")
+                          and self._krea2_pref("minimax_ref_dit"))
+                      else self._krea2_pref("minimax_dit")))
+        try:
+            _epochs = int(str(self.settings["MAX_TRAIN_EPOCHS"]))
+        except (KeyError, ValueError, TypeError):
+            _epochs = 1
+        if _fr:
+            _epochs = max(1, _epochs - int(_fr.get("epochs_done", 0)))
+            self.update_console(f"[resume] continuing fine-tune from "
+                                f"{os.path.basename(_dit)} — {_epochs} epoch(s) to run\n")
         cmd = [
             self._venv_python(),
             self._krea2_script("minimax_train.py"),
             # Distillation trains against ref2va — the teacher only exists on that model.
             # Otherwise the Training Base dropdown decides: ref2va when the user deploys on
             # the r2v workflow, the ordinary fl2va base by default.
-            "--dit", (self._krea2_pref("minimax_ref_dit")
-                      if ((self.settings.get("MINIMAX_DISTILL")
-                           or self.settings.get("MINIMAX_TRAIN_BASE") == "ref2va")
-                          and self._krea2_pref("minimax_ref_dit"))
-                      else self._krea2_pref("minimax_dit")),
+            "--dit", _dit,
             "--dataset_config", self.settings["DATASET_CONFIG"],
             "--output_dir", self.settings["LORA_OUTPUT_DIR"],
             "--output_name", self.settings["LORA_NAME"],
             "--network_dim", str(self.settings["NETWORK_DIM"]),
             "--network_alpha", str(self.settings["NETWORK_ALPHA"]),
             "--learning_rate", str(self.settings["LEARNING_RATE"]),
-            "--max_train_epochs", str(self.settings["MAX_TRAIN_EPOCHS"]),
+            "--max_train_epochs", str(_epochs),
             "--save_every_n_epochs", str(self.settings["SAVE_EVERY_N_EPOCHS"]),
             "--seed", str(self.settings["SEED"]),
         ]
@@ -26004,7 +26948,12 @@ class LoRATrainerGUI:
         if _shift is not None:
             cmd += ["--shift", f"{_shift:g}"]
         _hl = minimax_highnoise_lr(self.settings.get("MINIMAX_HIGHNOISE_LR_PCT"))
-        if _hl is not None and abs(_hl - 1.0) > 1e-9:
+        _ft_now = bool(getattr(self, "minimax_finetune_var", None)
+                       and self.minimax_finetune_var.get())
+        # Not under FT: the band multiplier rewrites optimizer param-group LRs, which the
+        # fused fine-tune doesn't have (and rotation rebuilds discard the stash). The GUI
+        # hides the control under FT; a stale saved value must not resurrect the flag.
+        if _hl is not None and abs(_hl - 1.0) > 1e-9 and not _ft_now:
             cmd += ["--highnoise_lr_scale", f"{_hl:g}"]
         # Per-category retirement (mixed visual+voice datasets). One category, one epoch —
         # sent only when the epoch is set: the flag's presence means the run used it.
@@ -26015,19 +26964,36 @@ class LoRATrainerGUI:
         if _n > 0:
             _flag = ("visual" if "photo" in
                      str(self.settings.get("MIXED_STOP_CATEGORY", "")).lower() else "audio")
-            _mode = ("stop" if "stop" in
-                     str(self.settings.get("MIXED_STOP_MODE", "")).lower() else "anchor")
+            # Under FT only "stop" exists (the anchor rides param-group LR machinery FT
+            # doesn't have) and the trainer snaps the epoch to a rotation-cycle boundary.
+            _mode = ("stop" if (_ft_now or "stop" in
+                     str(self.settings.get("MIXED_STOP_MODE", "")).lower()) else "anchor")
             cmd += [f"--{_flag}_stop_epoch", str(_n), f"--{_flag}_stop_mode", _mode]
         # Blocks to Train — only sent when it's a real range; "all" is the trainer's own default,
         # and not sending it keeps the flag's presence meaning "this run was a block experiment".
+        _mft_cmd_on = bool(getattr(self, "minimax_finetune_var", None)
+                           and self.minimax_finetune_var.get())
         _blocks = minimax_block_spec(self.settings.get("MINIMAX_BLOCKS", "all"))
-        if _blocks.lower() != "all":
+        if _blocks.lower() != "all" and not _mft_cmd_on:
             cmd += ["--train_blocks", _blocks]
         # Optimised Likeness Learning — photo steps train the identity blocks only, clips train
         # everything. The launch dict already forced MINIMAX_BLOCKS to "all" when this is on, so
-        # the two flags never fight.
+        # the two flags never fight. The flag TRAVELS under fine-tune too: the trainer honours
+        # the same semantics there (cycle-tighten on photo-only data, per-parameter photo
+        # freezing on mixed). --train_blocks stays adapter-only and is never emitted under FT.
         if self.settings.get("MINIMAX_LIKENESS_OPT"):
             cmd += ["--photo_blocks", MINIMAX_LIKENESS_BLOCKS]
+            # Restrict video to likeness blocks (FT only, on by default with likeness):
+            # a confined overnight video run trained perfectly well (field, 29 Aug).
+            # Unticked, clips keep the original whole-model behaviour.
+            if _mft_cmd_on and self.settings.get("MINIMAX_FT_CLIP_LIKENESS", True):
+                cmd += ["--clip_blocks", MINIMAX_LIKENESS_BLOCKS]
+        # Voice routing — audio steps train only the measured voice zone (34-49): outside it
+        # they corrupt the visual blocks (A/B, 24 Aug). Under FT it always travels (the
+        # trainer also tightens the cycle to the union of what the dataset trains); in LoRA
+        # mode it is part of Optimised Likeness Learning. Harmless without audio files.
+        if _ft_now or self.settings.get("MINIMAX_LIKENESS_OPT"):
+            cmd += ["--audio_blocks", MINIMAX_AUDIO_BLOCKS]
         # Reference distillation. Both flags travel together; the trainer also needs --vae to
         # encode the reference, which the sample block may already have added.
         if self.settings.get("MINIMAX_DISTILL"):
@@ -26045,9 +27011,42 @@ class LoRATrainerGUI:
         # Depth-split LR is RETIRED (Peter, 9 Aug): it was the manual precursor of the limiter
         # + governor, which target whoever actually runs hot instead of a guessed range. The
         # controls are hidden and a stale saved range is deliberately not sent.
+        # Rotation fine-tune. Read from the Tk vars, not self.settings — the Krea builder
+        # learned the hard way that reading settings made the flags silently never fire.
+        _mft_on = bool(getattr(self, "minimax_finetune_var", None)
+                       and self.minimax_finetune_var.get())
+        if _mft_on:
+            # Component is the only mode (24 Aug — block/numeric windows removed).
+            cmd += ["--finetune_rotation", "1", "--finetune_rotation_mode", "component"]
+            _mfte = str(self.minimax_ft_every_var.get()).strip()
+            cmd += ["--finetune_rotate_every", _mfte if _mfte.isdigit() else "1"]
+            if _fr:
+                # Continuation: pick the rotation cycle back up where the pause left it
+                # (from the checkpoint's metadata) instead of restarting at window 0.
+                cmd += ["--finetune_start_window", str(int(_fr.get("next_window", 0)))]
+            if str(self.minimax_ft_scope_var.get()).startswith("Photos"):
+                cmd += ["--finetune_scope", "photo"]
+            _mftspec = str(self.minimax_ft_blockspec_var.get()).strip()
+            if _mftspec:
+                cmd += ["--finetune_blocks", _mftspec]
+            if not bool(self.minimax_ft_fused_var.get()):
+                cmd += ["--no_finetune_fused_backward"]
+            # Regularisation LR multiplier — only meaningful when the TOML carries the
+            # is_reg block (same gate as the block writer: FT on + a real folder).
+            _mreg = (self.minimax_reg_dir_var.get().strip()
+                     if hasattr(self, "minimax_reg_dir_var") else "")
+            if _mreg and os.path.isdir(_mreg):
+                try:
+                    _mrm = float(self.minimax_reg_mult_var.get())
+                except ValueError:
+                    _mrm = 0.2
+                # Floor 0.01: 0.0 would still pay a full forward/backward per reg step
+                # for a near-zero update — clearing the folder is how you disable this.
+                cmd += ["--reg_lr_multiplier", str(max(0.01, _mrm))]
         # LoKR (Kronecker) — dim/alpha still ride along above but the trainer ignores them;
-        # the factor is the dial. Same flags as the Krea 2 builder.
-        if str(self.settings.get("NETWORK_TYPE", "")).startswith("LoKR"):
+        # the factor is the dial. Same flags as the Krea 2 builder. Suppressed under FT: the
+        # trainer builds no adapter at all there.
+        if str(self.settings.get("NETWORK_TYPE", "")).startswith("LoKR") and not _mft_on:
             cmd += ["--network_type", "lokr",
                     "--lokr_factor", str(self.settings.get("LOKR_FACTOR", 8))]
         # In-training previews. Prompts come from the Samples tab (same widgets every family
@@ -26273,6 +27272,51 @@ class LoRATrainerGUI:
         candidates.sort(reverse=True)
         return os.path.join(out_dir, candidates[0][1])
 
+    def _detect_latest_ft_checkpoint(self):
+        """The FT twin of _detect_latest_state_dir: highest-numbered
+        <output_name>-NNNNNN.safetensors in the output dir. Fine-tunes leave full
+        checkpoints, never state dirs — the checkpoint IS the continuation point."""
+        import re as _re
+        out_dir = self.settings.get("LORA_OUTPUT_DIR", "") or "."
+        out_name = self.settings.get("LORA_NAME", "") or ""
+        if not out_name or not os.path.isdir(out_dir):
+            return None
+        pattern = _re.compile(rf"^{_re.escape(out_name)}-(\d{{6}})\.safetensors$")
+        candidates = []
+        try:
+            for entry in os.listdir(out_dir):
+                m = pattern.match(entry)
+                if m and os.path.isfile(os.path.join(out_dir, entry)):
+                    candidates.append((int(m.group(1)), entry))
+        except Exception:
+            return None
+        if not candidates:
+            return None
+        candidates.sort(reverse=True)
+        return os.path.join(out_dir, candidates[0][1])
+
+    def _ft_resume_active(self):
+        """The armed fine-tune continuation for THIS launch, or None.
+
+        Guarded twice: the run being launched must still be a fine-tune of the same family
+        (unticking the FT box means the user wants something else), and its output name must
+        match the paused run's — a queued job launched via 'Start next now' while an FT
+        continuation is armed must not consume another run's checkpoint."""
+        _fr = getattr(self, "_ft_resume", None)
+        if not _fr:
+            return None
+        if self._is_krea2_arch():
+            _on = bool(getattr(self, "krea2_finetune_var", None) and self.krea2_finetune_var.get())
+        elif self._is_minimax_arch():
+            _on = bool(getattr(self, "minimax_finetune_var", None) and self.minimax_finetune_var.get())
+        else:
+            _on = False
+        if not _on:
+            return None
+        if str(self.settings.get("LORA_NAME", "")) != str(_fr.get("output_name", "")):
+            return None
+        return _fr
+
     POD_STOP_COUNTDOWN = 120   # seconds
 
     def _maybe_stop_pod_after_training(self):
@@ -26430,18 +27474,29 @@ class LoRATrainerGUI:
                     f"Start Training to retry it), or open the queue (📋, bottom right) and "
                     f"'Start next now' to skip to the next job.\n")
         if getattr(self, "training_state", "idle") == "pausing" and return_code == 0:
-            # Successful graceful exit — record paused state
-            state_dir = self._detect_latest_state_dir()
+            # Successful graceful exit — record paused state. A fine-tune leaves a full
+            # checkpoint rather than a state dir (state dirs would hold only the inert
+            # LoRA), so the paused artifact is detected per the launch's stamped mode.
+            _ft_pause = bool(getattr(self, "_launched_ft_family", None))
+            if _ft_pause:
+                state_dir = self._detect_latest_ft_checkpoint()
+            else:
+                state_dir = self._detect_latest_state_dir()
             if state_dir is None:
-                self.update_console("[pause] WARN: no state directory found after pause exit. Treating as idle.\n")
+                self.update_console(
+                    "[pause] WARN: no fine-tune checkpoint found after pause exit. Treating as idle.\n"
+                    if _ft_pause else
+                    "[pause] WARN: no state directory found after pause exit. Treating as idle.\n")
                 self.training_state = "idle"
             else:
                 self.paused_state_path = state_dir
+                self.paused_mode = "ft" if _ft_pause else "state"
                 # Persist sidecar so paused state survives GUI restart
                 try:
                     import json as _json
                     out_dir = self.settings.get("LORA_OUTPUT_DIR", "") or "."
                     sidecar = {
+                        "mode": self.paused_mode,
                         "state_path": state_dir,
                         "output_name": self.settings.get("LORA_NAME", ""),
                         "dataset_config": self.settings.get("DATASET_CONFIG", ""),
@@ -26455,6 +27510,9 @@ class LoRATrainerGUI:
                     self.update_console(f"[pause] WARN: failed to write sidecar: {e}\n")
                 self.training_state = "paused"
                 self.update_console(
+                    f"\n=== PAUSED — fine-tune checkpoint saved at {os.path.basename(state_dir)}. "
+                    f"Click Resume Training to continue. ===\n\n"
+                    if _ft_pause else
                     f"\n=== PAUSED — state saved at {state_dir}. Click Resume Training to continue. ===\n\n"
                 )
         else:
@@ -26470,27 +27528,64 @@ class LoRATrainerGUI:
             self.settings["RESUME_TRAINING"] = ""
         except Exception:
             pass
+        # Same hygiene for the FT twin: the armed continuation lives until its run ends
+        # (it must survive the async caption-worker launch path), then dies here.
+        self._ft_resume = None
         self._refresh_training_buttons()
 
     def _resume_training(self):
-        """Re-launch training from the latest paused state directory."""
+        """Re-launch training from the latest paused state (state dir, or FT checkpoint).
+
+        A LoRA pause resumes via --resume <state dir>. A rotation fine-tune has no state
+        dirs — its continuation is a fresh run whose --dit is the pause checkpoint, whose
+        rotation cycle picks up at the window stamped in that checkpoint's metadata, and
+        whose epoch count is what's left of the original total. The optimizer's second
+        moments reset across that hop — the same reset every rotation boundary already
+        performs, so it costs what one rotation costs."""
         if getattr(self, "training_state", "idle") != "paused":
             messagebox.showinfo("Not Paused", "No paused training to resume.")
             return
         state_path = getattr(self, "paused_state_path", None)
-        if not state_path or not os.path.isdir(state_path):
-            messagebox.showerror("Error", f"Paused state directory not found:\n{state_path}")
-            return
-        # Inject resume path into settings + entry field, then reuse the standard start_training flow
-        self.settings["RESUME_TRAINING"] = state_path
-        try:
-            entry = self.entries.get("RESUME_TRAINING")
-            if entry is not None:
-                entry.delete(0, tk.END)
-                entry.insert(0, state_path)
-        except Exception:
-            pass
-        self.update_console(f"\n=== RESUMING from {state_path} ===\n\n")
+        if getattr(self, "paused_mode", "state") == "ft":
+            if not state_path or not os.path.isfile(state_path):
+                messagebox.showerror("Error", f"Paused fine-tune checkpoint not found:\n{state_path}")
+                return
+            next_window, epochs_done = ft_checkpoint_continuation(state_path)
+            try:
+                total = int(str(self.entries["MAX_TRAIN_EPOCHS"].get()).strip() or 0)
+            except (KeyError, ValueError, TypeError):
+                total = 0
+            if total - epochs_done <= 0:
+                messagebox.showinfo(
+                    "Nothing left to train",
+                    f"This fine-tune has already trained {epochs_done} epoch(s) — at or past "
+                    f"Max Train Epochs ({total}).\n\n"
+                    f"{os.path.basename(state_path)} IS the finished model — deploy it as-is.\n\n"
+                    f"To train it further, raise Max Train Epochs above {epochs_done} and click "
+                    "Resume Training again.")
+                return
+            # Arm the one-shot continuation. The command builders consume it (guarded by
+            # family + output name); the exit handler clears it when the run ends.
+            self._ft_resume = {"checkpoint": state_path, "next_window": next_window,
+                               "epochs_done": epochs_done,
+                               "output_name": self.settings.get("LORA_NAME", "")}
+            self.update_console(
+                f"\n=== RESUMING fine-tune from {os.path.basename(state_path)} — "
+                f"{total - epochs_done} epoch(s) remaining, rotation window {next_window} ===\n\n")
+        else:
+            if not state_path or not os.path.isdir(state_path):
+                messagebox.showerror("Error", f"Paused state directory not found:\n{state_path}")
+                return
+            # Inject resume path into settings + entry field, then reuse the standard start_training flow
+            self.settings["RESUME_TRAINING"] = state_path
+            try:
+                entry = self.entries.get("RESUME_TRAINING")
+                if entry is not None:
+                    entry.delete(0, tk.END)
+                    entry.insert(0, state_path)
+            except Exception:
+                pass
+            self.update_console(f"\n=== RESUMING from {state_path} ===\n\n")
         self.start_training()
         # Only a start that actually LAUNCHED consumes the pause. start_training can decline
         # (validation, disk headroom, epochs-left) — destroying the sidecar and flipping the
@@ -26519,8 +27614,14 @@ class LoRATrainerGUI:
             with open(sidecar, "r") as f:
                 meta = _json.load(f)
             state_path = meta.get("state_path", "")
-            if state_path and os.path.isdir(state_path):
+            # "ft" pauses point at a full checkpoint FILE (fine-tunes have no state dirs);
+            # LoRA pauses point at a state DIRECTORY. Validate whichever this one is.
+            _mode = str(meta.get("mode", "state") or "state")
+            _ok = bool(state_path) and (os.path.isfile(state_path) if _mode == "ft"
+                                        else os.path.isdir(state_path))
+            if _ok:
                 self.paused_state_path = state_path
+                self.paused_mode = _mode
                 # Restore the paused run's frozen dataset config (#98) so a cross-restart
                 # resume trains the dataset it started with — the resume launch keeps an
                 # existing snapshot instead of re-freezing whatever the Start tab shows.
@@ -26531,8 +27632,9 @@ class LoRATrainerGUI:
                 self.training_state = "paused"
                 self._refresh_training_buttons()
                 self.update_console(
-                    f"=== Paused training detected: {meta.get('output_name','?')} "
-                    f"at state {os.path.basename(state_path)}. Click Resume Training to continue. ===\n"
+                    f"=== Paused {'fine-tune' if _mode == 'ft' else 'training'} detected: "
+                    f"{meta.get('output_name','?')} "
+                    f"at {os.path.basename(state_path)}. Click Resume Training to continue. ===\n"
                 )
         except Exception:
             pass

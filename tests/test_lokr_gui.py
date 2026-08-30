@@ -117,6 +117,33 @@ root.update()
 ck("loading a built-in preset resets Network Type to standard",
    g.entries["NETWORK_TYPE"].get() == "LoRA (standard)", g.entries["NETWORK_TYPE"].get())
 
+# --- 4. fine-tune × LoKR mutual exclusion (ft-rotation branch) ----------------------------
+# FT trains the base; the adapter is inert. LoKR must vanish from the UI and the command.
+if hasattr(g, "krea2_finetune_var"):
+    g.entries["NETWORK_TYPE"].set("LoKR (Kronecker)")
+    g.krea2_finetune_var.set(True)
+    g._apply_krea2_ft_visibility()
+    root.update()
+    ck("FT on -> Network Type row hidden", not _visible(g._network_type_rowf))
+    ck("  FT on -> factor hidden, rank/alpha shown (FT recipe uses them for nothing, "
+       "but Klein parity keeps them)", not _visible(g._lokr_factor_rowf)
+       and _visible(g.entries["NETWORK_DIM"]))
+    g.settings["NETWORK_TYPE"] = "LoKR (Kronecker)"
+    cmd = g._build_krea2_train_command()
+    ck("  FT on -> --network_type NOT emitted even with LoKR selected",
+       "--network_type" not in cmd)
+    ck("  FT on -> FT flags emitted", "--finetune_rotation" in cmd)
+    ck("  FT recipe pins standard LoRA",
+       g.KREA2_FT_DEFAULTS.get("NETWORK_TYPE") == "LoRA (standard)")
+    g.krea2_finetune_var.set(False)
+    g._apply_krea2_ft_visibility()
+    root.update()
+    ck("FT off -> Network Type row back, LoKR wiring restored",
+       _visible(g._network_type_rowf) and _visible(g._lokr_factor_rowf))
+    cmd = g._build_krea2_train_command()
+    ck("  FT off -> --network_type lokr emitted again",
+       "--network_type" in cmd and "--finetune_rotation" not in cmd)
+
 root.destroy()
 print()
 print("ALL PASS" if not fails else f"{len(fails)} FAILED: {fails}")

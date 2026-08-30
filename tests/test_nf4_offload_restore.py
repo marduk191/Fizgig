@@ -119,7 +119,16 @@ def main():
                 "an NF4 restore is exclusive again — see issue #17")
     n = src.count("move_nf4_to_device(dit, device)")
     ok &= check("all three restore sites present", n == 3, f"found {n}")
-    ok &= check("compute_loss takes an explicit device", "device=None):" in src)
+    # Was a source-text check for the literal "device=None):", which broke the moment the
+    # signature grew past one line and the parameter stopped being the last one — the parameter
+    # was still there, correct and defaulted. Ask the function itself instead, so reformatting
+    # and new parameters cannot produce a false failure (or, worse, a false pass).
+    import inspect
+    from fizgig.krea2.trainer import compute_loss as _cl
+    _p = inspect.signature(_cl).parameters.get("device")
+    ok &= check("compute_loss takes an explicit device",
+                _p is not None and _p.default is None,
+                f"device param: {_p!r}")
 
     print()
     print("all passed" if ok else "FAILURES — see above")
