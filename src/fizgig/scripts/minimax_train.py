@@ -170,11 +170,13 @@ def setup_parser() -> argparse.ArgumentParser:
                         "likeness blocks' passes the likeness set here — a confined "
                         "overnight video run trained perfectly well (field, 29 Aug). "
                         "Unset: clips train the full model, the original behaviour.")
-    p.add_argument("--base_quant", default="auto", choices=["auto", "int8", "nf4"],
+    p.add_argument("--base_quant", default="auto", choices=["auto", "int8", "nf4", "hqq"],
                    help="Frozen-base precision. 'int8' keeps the checkpoint's own ConvRot "
                         "weights (~0.17%% base error, ~21 GB) — what the reference trainer "
                         "does. 'nf4' decodes then 4-bit quantizes (~9.5%% error, ~11 GB). "
-                        "'auto' picks int8 for a pre-quantized file, nf4 otherwise.")
+                        "'hqq' decodes then HQQ 4-bit quantizes (~6.3%% error, ~15 GB, ~half "
+                        "the step speed). 'auto' picks int8 for a pre-quantized "
+                        "file, nf4 otherwise — never hqq.")
     p.add_argument("--no_quantize", action="store_true",
                    help="Train on the bf16 base (no NF4) — needs ~66 GB VRAM.")
     p.add_argument("--blocks_to_swap", default="auto",
@@ -224,6 +226,17 @@ def setup_parser() -> argparse.ArgumentParser:
                         "training step. Pair with --sample_steps 6.")
     p.add_argument("--turbo_lora_strength", type=float, default=0.75,
                    help="Preview strength for --turbo_lora_path (0.75 recommended)")
+    p.add_argument("--context_lora_path", default=None,
+                   help="Context LoRA: an existing H3 LoRA loaded FROZEN and ACTIVE under the "
+                        "trainable one, in training and previews. The output is trained to be "
+                        "paired with it at inference. Not available with --finetune_rotation.")
+    p.add_argument("--context_lora_strength", type=float, default=1.0,
+                   help="Strength the context LoRA rides at (0.0-2.0)")
+    p.add_argument("--training_adapter_path", default=None,
+                   help="Training adapter (Ostris, ostris/minimax_h3_training_adapter): a frozen "
+                        "LoRA at 1.0 that de-distills the base while yours learns — on for every "
+                        "training step, off for previews. Use the fl2va or ref2va file to match "
+                        "--dit. Not available with --finetune_rotation.")
     p.add_argument("--sample_audio", action="store_true",
                    help="Clip previews carry their generated SOUND: the jointly-denoised "
                         "audio rows are decoded to a .wav beside each sample. Needs "
@@ -367,6 +380,9 @@ def main():
         sample_seed=args.sample_seed,
         turbo_lora_path=args.turbo_lora_path,
         turbo_lora_strength=args.turbo_lora_strength,
+        context_lora_path=args.context_lora_path,
+        context_lora_strength=args.context_lora_strength,
+        training_adapter_path=args.training_adapter_path,
         sample_audio=args.sample_audio,
         audio_vae_path=args.audio_vae,
         finetune_rotation=args.finetune_rotation,

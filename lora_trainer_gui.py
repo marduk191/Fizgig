@@ -520,7 +520,7 @@ def minimax_lownoise_to_shift(pct):
 
 
 def minimax_highnoise_lr(pct):
-    """'Medium to High LR adjustment' (percent) -> a plain multiplier. None if unusable.
+    """'Medium to High Noise LR' (percent) -> a plain multiplier. None if unusable.
 
     Applies to steps drawn ABOVE sigma 0.5 — the same threshold the low-noise box is defined
     against, so the two controls always agree about where the boundary is. 100 means unchanged.
@@ -625,15 +625,13 @@ MINIMAX_STRUCTURE_OPTIONS = {
 }
 MINIMAX_STRUCTURE_DESC = {
     "Likeness and Style — 60% clean-end":
-        "Most of the run on nearly-clean images. Skin, hair and identity are learned there — and "
-        "so is style, which is a surface property rather than a compositional one. The tuned "
-        "default for stills.",
+        "Most of the run on nearly-clean images — the tuned default for stills. See the MiniMax "
+        "section of the README.",
     "Model default, movement — 8% clean-end":
-        "The schedule H3's own flow shift implies, and what the reference trainer uses. Weighted "
-        "to movement and composition rather than fine detail.",
+        "The reference trainer's schedule, weighted to movement and composition. See the MiniMax "
+        "section of the README.",
     "Custom":
-        "Type your own share. Below ~50% the high-noise steps become the majority, which is what "
-        "the LR adjustment beside this is for.",
+        "Type your own clean-end share. See the MiniMax section of the README.",
 }
 MINIMAX_STRUCTURE_DEFAULT = "Likeness and Style — 60% clean-end"
 
@@ -667,6 +665,7 @@ MINIMAX_BASE_QUANT_OPTIONS = [
     "Auto (recommended)",
     "int8 · most accurate, needs ~30 GB free",
     "4-bit · fits smaller cards",
+    "4-bit HQQ · lower error than 4-bit, slower",
 ]
 
 
@@ -675,6 +674,8 @@ def minimax_base_quant(raw):
     s = str(raw or "").split("·")[0].strip().lower()
     if s.startswith("int8"):
         return "int8"
+    if "hqq" in s:                    # before the 4-bit test — "4-bit HQQ" starts with 4-bit
+        return "hqq"
     if s.startswith("4-bit") or s.startswith("nf4"):
         return "nf4"
     return "auto"
@@ -945,6 +946,13 @@ MINIMAX_BUILT_IN_PRESETS = {
         # clips train the full model. The one measured exception is style — the Style preset
         # turns it off (style needs the early blocks).
         "MINIMAX_LIKENESS_OPT": True,
+        # Training adapter ships ON (Peter, 2 Sep): measured on the same dataset/seed it hit
+        # 50% likeness seven epochs sooner and peaked higher (61 vs 57). Every H3 preset
+        # inherits this — Style included, the adapter is about the base, not the blocks.
+        "MINIMAX_TRAINING_ADAPTER": True,
+        # Restrict video to the likeness blocks — the sub-tick of likeness mode, on by default
+        # (LoRA and FT alike since 2 Sep). Hidden, and not emitted, when likeness is off.
+        "MINIMAX_FT_CLIP_LIKENESS": True,
         "MINIMAX_SLOW_BLOCKS": "", "MINIMAX_SLOW_LR_SCALE": "0.2",
         # The one experiment that graduated: the limiter ships ON. Validated on a real A/B
         # (8 Aug) — the last trained block always hogs 2-4x the median block's movement and
@@ -1189,6 +1197,12 @@ DEFAULT_PREFS = {
     # Turbo LoRA — optional, previews only: 6-step in-training samples with the community Turbo
     # applied at ~75% on top of the training adapter, exactly how fast ComfyUI inference runs it.
     "minimax_turbo_lora": "",
+    # Training adapters (Ostris, ostris/minimax_h3_training_adapter) — one per base. The
+    # Training tab's tickbox loads the one matching the selected base, frozen at 1.0, on for
+    # every training step and off for previews. Fetched by the updater and the model
+    # downloader; never required.
+    "minimax_training_adapter": "",
+    "minimax_ref_training_adapter": "",
     # Output directories — relative to repo root, portable across clones/moves.
     # Resolved to absolute in load_prefs(); in-memory pref values are absolute.
     # All three live as top-level folders inside the repo:
@@ -1595,6 +1609,16 @@ PRESETS = {
 
 
 class LoRATrainerGUI:
+    def _splash_status(self, text):
+        """Forward a build-phase line to the launch splash, if one is up (main() parks it
+        on the root for the duration of the constructor). No-op otherwise."""
+        splash = getattr(self.master, "_fizgig_splash", None)
+        if splash is not None:
+            try:
+                splash.status(text)
+            except Exception:
+                pass
+
     def __init__(self, master):
         self.master = master
         master.title("Fizgig — Klein 9B & Krea 2 LoRA Studio")
@@ -1811,6 +1835,8 @@ class LoRATrainerGUI:
             # everything. On by default: it is the measured best recipe for the character/voice
             # work H3 is for. The Style preset turns it OFF (style needs the early blocks).
             "MINIMAX_LIKENESS_OPT": True,
+            "MINIMAX_TRAINING_ADAPTER": True,
+            "MINIMAX_FT_CLIP_LIKENESS": True,
             "MINIMAX_DISTILL": False,      # off = ordinary training
             # Which H3 base ordinary training runs on ("fl2va"/"ref2va"). NOT in any preset —
             # the Training Base dropdown's var lives outside self.entries by design.
@@ -1993,18 +2019,34 @@ class LoRATrainerGUI:
         self.entries = {}
         self.labels = {}  # Store label widgets for dynamic updates
         self.rows = {}    # Store row widgets for show/hide
+        # Each tab reports to the launch splash (#115) — the status line is the only sign
+        # of life while ~8 s of widgets get built, and each call pumps the event loop so
+        # Windows never ghosts the splash as "Not responding".
+        self._splash_status("Building the Start tab…")
         self.create_start_tab()
+        self._splash_status("Building the Training tab…")
         self.create_training_settings()
+        self._splash_status("Building the Captions tab…")
         self.create_caption_generator()
+        self._splash_status("Building the Image Prep tab…")
         self.create_image_converter()
+        self._splash_status("Building the Samples tab…")
         self.create_samples_settings()
+        self._splash_status("Building the Profiler…")
         self.create_profiler_tab()
+        self._splash_status("Building the Repair Studio…")
         self.create_repair_studio_tab()
+        self._splash_status("Building LoRA the Explorer…")
         self.create_explorer_tab()
+        self._splash_status("Building LoRA Royale…")
         self.create_lora_royale_tab()
+        self._splash_status("Building the Extract tab…")
         self.create_extract_tab()
+        self._splash_status("Building the Metadata tab…")
         self.create_metadata_tab()
+        self._splash_status("Building Preferences…")
         self.create_prefs_tab()
+        self._splash_status("Restoring your last session…")
         # Restore remembered Repair Studio / Explorer Setup fields + attach save traces.
         # After ALL tabs exist: restoring fires their traces, which touch other tabs' widgets.
         self._restore_workbench_setup_fields()
@@ -3767,7 +3809,9 @@ class LoRATrainerGUI:
                 ("minimax_audio_vae",
                  "Audio VAE (~605 MB) — train on the sound in video clips, and on voices"),
                 ("minimax_turbo_lora",
-                 "Turbo LoRA (~780 MB) — fast 6-step in-training previews"))
+                 "Turbo LoRA (~780 MB) — fast 6-step in-training previews"),
+                ("minimax_training_adapter",
+                 "Training adapter (~155 MB) — faster, higher likeness (Ostris)"))
                 if not str(self.prefs.get(key, "") or "").strip()]
             if not missing:
                 return
@@ -4795,10 +4839,9 @@ class LoRATrainerGUI:
             "<<ComboboxSelected>>", lambda _e: self._sync_distill_weight_state())
         self._minimax_distill_hint = ttk.Label(
             training_content,
-            text="EXPERIMENT — teaches your LoRA to reproduce identity from the trigger word "
-                 "the way H3 does when shown a photo, using your own dataset as the "
-                 "references. Needs the ref2va model in Preferences. Full write-up in the "
-                 "README.",
+            text="EXPERIMENT — teaches the LoRA to reproduce identity the way H3 does when shown "
+                 "a photo. Needs the ref2va model in Preferences. See the MiniMax section of "
+                 "the README.",
             foreground=COLORS["text_explain"], font=(FONT_FAMILY, 9, "italic"), justify=tk.LEFT, wraplength=720)
         self._minimax_distill_hint.grid(row=36, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
 
@@ -4933,29 +4976,23 @@ class LoRATrainerGUI:
                                        padx=5, pady=(8, 0))
         self._minimax_likeness_hint = ttk.Label(
             training_content,
-            text=f"Photos train the identity blocks ({MINIMAX_LIKENESS_BLOCKS}) only and "
-                 f"voice recordings train the audio zone ({MINIMAX_AUDIO_BLOCKS}) only — "
-                 "protecting the base model's rendering, anatomy and prompt following — while "
-                 "video clips train the full model. Measured result: sharper, more "
-                 "prompt-responsive, better sound, faster to converge. Untick for style or "
-                 "scene training (the Style preset does).",
+            text=f"Photos train the identity blocks ({MINIMAX_LIKENESS_BLOCKS}) only, voice the "
+                 f"audio zone ({MINIMAX_AUDIO_BLOCKS}) only, clips the full model. Untick for "
+                 "style or scene training. See the MiniMax section of the README.",
             foreground=COLORS["text_explain"], font=(FONT_FAMILY, 9, "italic"), justify=tk.LEFT, wraplength=720)
         self._minimax_likeness_hint.grid(row=40, column=0, columnspan=2, sticky=tk.W,
                                          padx=5, pady=(0, 4))
         self._MINIMAX_LIKENESS_HINT_LORA = self._minimax_likeness_hint.cget("text")
         self._MINIMAX_LIKENESS_HINT_FT = (
-            f"Under fine-tune this keeps its exact LoRA meaning: photos feed only the "
-            f"identity blocks ({MINIMAX_LIKENESS_BLOCKS}), voice feeds only the audio zone "
-            f"({MINIMAX_AUDIO_BLOCKS}) — and video follows the restriction tickbox below "
-            f"(on: clips train {MINIMAX_LIKENESS_BLOCKS} too; off: clips train the full "
-            f"model). The rotation cycle tightens automatically to the union of what your "
-            f"dataset actually trains. Untick for style/scene fine-tunes — voice still "
-            f"routes to its zone either way. An explicit Blocks range above always wins.")
-        # Restrict video to likeness blocks — FT-only sub-tick of likeness mode (Peter,
-        # 29 Aug: a confined overnight video run trained perfectly well; on by default,
-        # untick for whole-model video). Emitted as --clip_blocks by the FT builder only;
-        # shown only when the family is MiniMax AND Fine-tune AND likeness are all on
-        # (managed by _sync_minimax_likeness_state, which fires on all three).
+            f"Same meaning under fine-tune: photos train the identity blocks "
+            f"({MINIMAX_LIKENESS_BLOCKS}), voice the audio zone ({MINIMAX_AUDIO_BLOCKS}), "
+            f"video follows the tickbox below. See the MiniMax section of the README.")
+        # Restrict video to likeness blocks — sub-tick of likeness mode, LoRA and FT alike
+        # (Peter, 29 Aug: a confined overnight video run trained perfectly well; on by
+        # default, untick for whole-model video; extended to LoRA runs 2 Sep). Emitted as
+        # --clip_blocks whenever likeness is on; shown when the family is MiniMax and
+        # likeness is on (managed by _sync_minimax_likeness_state). The settings key keeps
+        # its historical MINIMAX_FT_ name so presets and saved settings still match.
         self.entries["MINIMAX_FT_CLIP_LIKENESS"] = tk.BooleanVar(
             value=bool(self.settings.get("MINIMAX_FT_CLIP_LIKENESS", True)))
         self._minimax_ft_clip_cb = ttk.Checkbutton(
@@ -4970,12 +5007,31 @@ class LoRATrainerGUI:
         self.entries["MINIMAX_LIKENESS_OPT"].trace_add(
             "write", lambda *_a: self._sync_minimax_likeness_state())
 
+        # --- Training adapter (Ostris) — MiniMax LoRA runs only ---------------------------
+        # A BooleanVar in self.entries so presets/queue/last-train carry it. The builder
+        # resolves the FILE from Preferences per the selected base (fl2va/ref2va); the
+        # tickbox greys out with a pointer when that pref is empty. Independent of the
+        # Context LoRA box: adapter first, then the user's context, then the trainable LoRA.
+        self.entries["MINIMAX_TRAINING_ADAPTER"] = tk.BooleanVar(
+            value=bool(self.settings.get("MINIMAX_TRAINING_ADAPTER", True)))
+        self._minimax_adapter_cb = ttk.Checkbutton(
+            training_content, text="Training adapter (Ostris) — de-distills the base while your LoRA learns",
+            variable=self.entries["MINIMAX_TRAINING_ADAPTER"])
+        self._minimax_adapter_cb.grid(row=42, column=0, columnspan=2, sticky=tk.W,
+                                      padx=5, pady=(8, 0))
+        self._minimax_adapter_hint = ttk.Label(
+            training_content,
+            text="Loads Ostris's training adapter (ostris/minimax_h3_training_adapter) frozen at "
+                 "1.0 under your LoRA for every training step, and switches it off for previews "
+                 "and in your saved file.",
+            foreground=COLORS["text_explain"], font=(FONT_FAMILY, 9, "italic"), justify=tk.LEFT, wraplength=720)
+        self._minimax_adapter_hint.grid(row=43, column=0, columnspan=2, sticky=tk.W,
+                                        padx=5, pady=(0, 4))
+
         # Answers "when do changes take effect?" (issue #40) right where people wonder it.
         ttk.Label(training_content,
-                  text="When do changes apply? Settings are read when a run launches — changing "
-                       "them mid-run does nothing. Pause → Resume relaunches with your current "
-                       "settings, so these can be changed at a pause. Dataset/caption changes "
-                       "need a fresh run (Resume skips re-caching).",
+                  text="Settings are read when a run launches; Pause → Resume picks up changes, "
+                       "dataset/caption changes need a fresh run.",
                   foreground=COLORS["text_explain"], font=(FONT_FAMILY, 9, "italic"),
                   justify=tk.LEFT, wraplength=720).grid(
             row=30, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 6))
@@ -5321,7 +5377,7 @@ class LoRATrainerGUI:
         self._minimax_quant_frame = ttk.Frame(memory_content)
         self._minimax_quant_frame.grid(row=16, column=1, sticky=tk.W, padx=5, pady=(8, 0))
         self.entries["MINIMAX_BASE_QUANT"] = ttk.Combobox(
-            self._minimax_quant_frame, values=list(MINIMAX_BASE_QUANT_OPTIONS), width=30,
+            self._minimax_quant_frame, values=list(MINIMAX_BASE_QUANT_OPTIONS), width=48,
             state="readonly")
         self.entries["MINIMAX_BASE_QUANT"].set(
             str(self.settings.get("MINIMAX_BASE_QUANT", MINIMAX_BASE_QUANT_OPTIONS[0])))
@@ -5329,8 +5385,10 @@ class LoRATrainerGUI:
         self._minimax_quant_hint = ttk.Label(
             memory_content,
             text="Auto reads your FREE VRAM at launch and picks the base precision and block "
-                 "swap together — int8 is the most accurate, 4-bit fits smaller cards. Full "
-                 "write-up in the README.",
+                 "swap together — int8 is the most accurate, 4-bit fits smaller cards. 4-bit "
+                 "HQQ sits between them (about a third less base error than 4-bit, ~45% more "
+                 "VRAM, roughly half the step speed); Auto never picks it. "
+                 "Full write-up in the README.",
             foreground=COLORS["text_explain"], font=(FONT_FAMILY, 9, "italic"), justify=tk.LEFT, wraplength=720)
         self._minimax_quant_hint.grid(row=17, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
 
@@ -7215,7 +7273,7 @@ class LoRATrainerGUI:
 
         # Always visible: a preset recommends a value, the user can override it without that
         # counting as a different structure.
-        self._minimax_hnlr_label = ttk.Label(parent, text="Medium to High LR:")
+        self._minimax_hnlr_label = ttk.Label(parent, text="Medium to High Noise LR:")
         self._minimax_hnlr_label.grid(row=25, column=0, sticky=tk.W, padx=5, pady=(2, 8))
         self._minimax_hnlr_frame = ttk.Frame(parent)
         self._minimax_hnlr_frame.grid(row=25, column=1, columnspan=2, sticky=tk.W,
@@ -7233,10 +7291,8 @@ class LoRATrainerGUI:
         # without the Turbo LoRA and 100% holds face SHAPE better every time.
         self._minimax_hnlr_hint = tk.Label(
             parent,
-            text="What the noisier steps — where pose, framing and face shape are decided — do to "
-                 "the learning rate. Lowering it biases the run toward surface detail at the cost "
-                 "of shape — useful for a skin-texture LoRA, not for a likeness one. Across five "
-                 "datasets 100 held face shape better, and nothing distorted at any setting.",
+            text="Scales the learning rate of the noisy-half steps (pose, framing, face shape). "
+                 "See the MiniMax section of the README.",
             font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
             justify=tk.LEFT, wraplength=700)
         self._minimax_hnlr_hint.grid(row=26, column=0, columnspan=3, sticky=tk.W,
@@ -7332,6 +7388,14 @@ class LoRATrainerGUI:
                                    "to hand-pick blocks. While it's on, photos train "
                                    f"{MINIMAX_LIKENESS_BLOCKS}; video follows the restriction tickbox.")
 
+    def _minimax_adapter_pref_key(self):
+        """The training-adapter pref that matches the base this run trains on — ref2va when
+        the Training Base dropdown says so or the run is a distillation run (both put --dit
+        on the reference model), fl2va otherwise. Mirrors the --dit choice in the builder."""
+        _ref = bool(self.settings.get("MINIMAX_DISTILL")
+                    or minimax_train_base(self.settings.get("MINIMAX_TRAIN_BASE")) == "ref2va")
+        return "minimax_ref_training_adapter" if _ref else "minimax_training_adapter"
+
     def _sync_minimax_likeness_state(self):
         """Grey Blocks to Train while Optimised Likeness Learning owns the block choice.
 
@@ -7344,15 +7408,12 @@ class LoRATrainerGUI:
             return
         locked = self._is_minimax_arch() and bool(
             self.entries["MINIMAX_LIKENESS_OPT"].get())
-        # The video-restriction sub-tick shows only where it means something: MiniMax
-        # family, Fine-tune ON, likeness ON. (LoRA-mode clips keep whole-model behaviour;
-        # the builder only emits --clip_blocks under FT regardless, so this is
-        # presentation — the flag gate is the guard.)
+        # The video-restriction sub-tick shows wherever likeness mode is on — LoRA and
+        # fine-tune alike since 2 Sep (same behaviour: clip steps confined to the likeness
+        # blocks; the LoRA path masks per step, the FT path tightens the cycle).
         _clip_cb = getattr(self, "_minimax_ft_clip_cb", None)
         if _clip_cb is not None and _clip_cb.winfo_exists():
-            _show = locked and bool(getattr(self, "minimax_finetune_var", None)
-                                    and self.minimax_finetune_var.get())
-            self._set_widget_visible(_clip_cb, _show)
+            self._set_widget_visible(_clip_cb, locked)
         if locked:
             combo.config(state="disabled")
             hint.config(text=self._MINIMAX_BLOCKS_HINT_LOCKED)
@@ -7721,7 +7782,13 @@ class LoRATrainerGUI:
                   # under FT; the builder also suppresses the flag.
                   getattr(self, "_minimax_hnlr_label", None),
                   getattr(self, "_minimax_hnlr_frame", None),
-                  getattr(self, "_minimax_hnlr_hint", None)):
+                  getattr(self, "_minimax_hnlr_hint", None),
+                  # The training adapter is a LoRA-run aid (a frozen layer the trainable
+                  # LoRA stacks on; the rotation FT has nothing to stack). Hidden under FT
+                  # and ignored by the builder there — its saved value is left alone so it
+                  # comes back exactly as set when FT is unticked.
+                  getattr(self, "_minimax_adapter_cb", None),
+                  getattr(self, "_minimax_adapter_hint", None)):
             if w is not None:
                 self._set_widget_visible(w, not on)
         if hasattr(self, "_network_type_rowf"):
@@ -7939,6 +8006,7 @@ class LoRATrainerGUI:
                   self._minimax_hnlr_label, self._minimax_hnlr_frame, self._minimax_hnlr_hint,
                   self._minimax_blocks_label, self._minimax_blocks_frame, self._minimax_blocks_hint,
                   self._minimax_likeness_cb, self._minimax_likeness_hint,
+                  self._minimax_adapter_cb, self._minimax_adapter_hint,
                   self._minimax_distill_frame, self._minimax_distill_hint,
                   self._minimax_quant_label, self._minimax_quant_frame,
                   self._minimax_quant_hint,
@@ -7998,11 +8066,12 @@ class LoRATrainerGUI:
         else:
             self.show_row("OPTIMIZER_TYPE")
 
-        # Context LoRA is wired for Klein and Krea 2 but NOT MiniMax — hide the whole row there
-        # rather than show a picker the trainer silently ignores.
+        # Context LoRA is wired for all three families (MiniMax since 2 Sep 2026: frozen +
+        # active on the resident DiT, so it's live in previews too). Under MiniMax fine-tune
+        # it's refused at validation — the rotation path has no LoRA network to stack on.
         for w in (self._contextlora_label, self._contextlora_frame,
                   self._contextlora_desc_label, self._contextlora_warn_label):
-            self._set_widget_visible(w, not is_minimax)
+            self._set_widget_visible(w, True)
         if native:
             # Restore the rank/alpha <-> factor row swap for the current selection.
             self._on_network_type_changed()
@@ -17961,9 +18030,27 @@ class LoRATrainerGUI:
                           "minimax_h3_turbo_v4_step600.safetensors (you may already have it in "
                           "ComfyUI's loras folder)",
         )
+        mr = self._add_pref_row(
+            mm_card, mr, "Training adapter (fl2va):", "minimax_training_adapter",
+            "OPTIONAL — Ostris's training adapter for the standard fl2va base, switched on by the "
+            "'Training adapter' tickbox on the Training tab. A frozen LoRA that de-distills the base "
+            "while yours learns: in our A/B it reached 50% likeness seven epochs sooner and peaked "
+            "higher. On for every training step, off for previews, never in your saved LoRA. The "
+            "updater fetches it; so does the download button below.",
+            download_url="https://huggingface.co/ostris/minimax_h3_training_adapter/blob/main/minimax_h3_training_adapter_v1.safetensors",
+            download_note="~155MB — ostris/minimax_h3_training_adapter → minimax_h3_training_adapter_v1.safetensors",
+        )
+        mr = self._add_pref_row(
+            mm_card, mr, "Training adapter (ref2va):", "minimax_ref_training_adapter",
+            "OPTIONAL — the same adapter for runs on the Reference (ref2va) base: the tickbox picks "
+            "this one automatically when the Training Base dropdown is on ref2va or the run is a "
+            "distillation run.",
+            download_url="https://huggingface.co/ostris/minimax_h3_training_adapter/blob/main/minimax_h3_ref2va_training_adapter_v1.safetensors",
+            download_note="~155MB — ostris/minimax_h3_training_adapter → minimax_h3_ref2va_training_adapter_v1.safetensors",
+        )
         self._add_fetch_models_row(
             mm_card, mr, "minimax",
-            "Fetches the DiT, text encoder, both VAEs and the Turbo LoRA above, plus the Krea 2 Qwen3-VL captioning "
+            "Fetches the DiT, text encoder, both VAEs, the Turbo LoRA and both training adapters above, plus the Krea 2 Qwen3-VL captioning "
             "text encoder (~47 GB all in), and fills in these paths for you — plus the small "
             "helper models (Florence-2 captioner, face model for the Look "
             "Filter and likeness scoring, EN→ZH translator, Gizmo's Whisper transcriber — "
@@ -25344,9 +25431,24 @@ class LoRATrainerGUI:
             except ValueError:
                 errors.append("Learning rate must be a valid number")
 
-        # Context LoRA validation (supported by both Klein and Krea 2).
+        # Training adapter (MiniMax): needs the pref for the selected base, and never under FT.
+        _mm_ft_on = bool(getattr(self, "minimax_finetune_var", None) and self.minimax_finetune_var.get())
+        if (self._is_minimax_arch() and not _mm_ft_on
+                and bool(self.entries.get("MINIMAX_TRAINING_ADAPTER")
+                         and self.entries["MINIMAX_TRAINING_ADAPTER"].get())):
+            # (Under fine-tune the tickbox is hidden and the builder ignores it — no error.)
+            _ak = self._minimax_adapter_pref_key()
+            if not self._krea2_pref(_ak):
+                errors.append("Training adapter is ticked but its file isn't set in Preferences "
+                              f"({'ref2va' if 'ref' in _ak else 'fl2va'}) — run the updater or the "
+                              "MiniMax download button in Preferences, or untick it")
+        # Context LoRA validation (all three families; MiniMax refuses it under fine-tune).
         ctx_path = self.entries.get("CONTEXT_LORA_PATH").get().strip() if "CONTEXT_LORA_PATH" in self.entries else ""
         if ctx_path:
+            if (self._is_minimax_arch() and bool(getattr(self, "minimax_finetune_var", None)
+                                                 and self.minimax_finetune_var.get())):
+                errors.append("Context LoRA is not available with MiniMax H3 fine-tuning — "
+                              "untick Fine-tune (train a LoRA) or clear the Context LoRA")
             if not os.path.exists(ctx_path):
                 errors.append(f"Context LoRA file does not exist: {ctx_path}")
             elif not ctx_path.lower().endswith(".safetensors"):
@@ -25736,6 +25838,7 @@ class LoRATrainerGUI:
             "MINIMAX_FT_CLIP_LIKENESS": bool(self.entries["MINIMAX_FT_CLIP_LIKENESS"].get())
             if "MINIMAX_FT_CLIP_LIKENESS" in self.entries else True,
             "MINIMAX_TRAIN_ADALN": bool(self.entries["MINIMAX_TRAIN_ADALN"].get()),
+            "MINIMAX_TRAINING_ADAPTER": bool(self.entries["MINIMAX_TRAINING_ADAPTER"].get()),
             "MINIMAX_DISTILL": bool(self.minimax_distill_var.get()),
             # Canonical key ("fl2va"/"ref2va"), never the display label. Preset-immune by
             # design — the var is outside self.entries and _collect_preset_values skips it.
@@ -26850,10 +26953,10 @@ class LoRATrainerGUI:
         return cmd
 
     def _build_minimax_train_command(self):
-        """Build the native MiniMax H3 training command — barebones image-only LoRA over an
-        NF4-quantized frozen base. No samples, no block swap, no context LoRA, no LoKR, no
-        per-image loss watch: just the core knobs (rank/alpha/lr/epochs/save/seed/optimizer) plus
-        adaptive LR and output metadata. Model paths come from Preferences (minimax_*)."""
+        """Build the native MiniMax H3 training command: LoRA / LoKR / rotation fine-tune over
+        the int8 / NF4 / HQQ base, with previews (Turbo), block swap, context LoRA and output
+        metadata. Model paths come from Preferences (minimax_*). No per-image loss watch or
+        adaptive LR (retired for this family)."""
         # Armed fine-tune continuation (Resume after an FT pause): --dit becomes the pause
         # checkpoint — a one-run override that outranks the distill/ref2va choice too — and
         # the epoch count is what's left of the original total. No --resume under FT.
@@ -26983,10 +27086,10 @@ class LoRATrainerGUI:
         # freezing on mixed). --train_blocks stays adapter-only and is never emitted under FT.
         if self.settings.get("MINIMAX_LIKENESS_OPT"):
             cmd += ["--photo_blocks", MINIMAX_LIKENESS_BLOCKS]
-            # Restrict video to likeness blocks (FT only, on by default with likeness):
-            # a confined overnight video run trained perfectly well (field, 29 Aug).
+            # Restrict video to likeness blocks (on by default with likeness, LoRA and FT
+            # alike): a confined overnight video run trained perfectly well (field, 29 Aug).
             # Unticked, clips keep the original whole-model behaviour.
-            if _mft_cmd_on and self.settings.get("MINIMAX_FT_CLIP_LIKENESS", True):
+            if self.settings.get("MINIMAX_FT_CLIP_LIKENESS", True):
                 cmd += ["--clip_blocks", MINIMAX_LIKENESS_BLOCKS]
         # Voice routing — audio steps train only the measured voice zone (34-49): outside it
         # they corrupt the visual blocks (A/B, 24 Aug). Under FT it always travels (the
@@ -27139,6 +27242,19 @@ class LoRATrainerGUI:
         resume_path = (self.settings.get("RESUME_TRAINING") or "").strip()
         if resume_path:
             cmd += ["--resume", resume_path]
+        # Training adapter — Ostris's frozen de-distillation LoRA at 1.0 under everything else,
+        # the file chosen to match the base this run trains on (validation already checked it
+        # exists and that this isn't a fine-tune).
+        if self.settings.get("MINIMAX_TRAINING_ADAPTER") and not _mft_cmd_on:
+            _adapter = self._krea2_pref(self._minimax_adapter_pref_key())
+            if _adapter:
+                cmd += ["--training_adapter_path", _adapter]
+        # Context LoRA — an existing H3 LoRA frozen + active under the trainable one (LoRA runs
+        # only; validation refuses the fine-tune combination before we get here).
+        ctx_path = (self.settings.get("CONTEXT_LORA_PATH") or "").strip()
+        if ctx_path:
+            ctx_strength = (self.settings.get("CONTEXT_LORA_STRENGTH") or "1.0").strip() or "1.0"
+            cmd += ["--context_lora_path", ctx_path, "--context_lora_strength", ctx_strength]
         # Adaptive LR is RETIRED for MiniMax (Peter, 9 Aug): ticking it silently disabled the
         # governor and warmup (both defer to it), quietly dismantling the stability stack. The
         # control is hidden under this family and a stale saved ADAPTIVE_LR=True is deliberately
@@ -27719,15 +27835,41 @@ class LoRATrainerGUI:
     # (save_settings/load_settings removed: 160 lines of dead code with no
     #  callers, duplicating the preset system with a 4-key save/load asymmetry.)
 
-if __name__ == "__main__":
+def main(root=None, splash=None):
+    """Build and run the app.
+
+    launch.pyw passes a withdrawn root plus a live splash (it put them up before this
+    file was even compiled — #115). Run directly (`python lora_trainer_gui.py`, the Linux
+    launcher) both are created here, so the splash still covers the tab build. Either
+    way the main window stays hidden until every tab exists, then appears fully drawn and
+    the splash closes — no blank window while the tabs fill in."""
     # Set unique app ID so Windows taskbar shows our icon, not Python's
     try:
         import ctypes
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('fizgig.lora.studio')
     except Exception:
         pass
-    root = tk.Tk()
+    if root is None:
+        root = tk.Tk()
+        root.withdraw()
+    if splash is None:
+        try:
+            from fizgig_splash import Splash
+            splash = Splash(root, "Building the interface…")
+        except Exception:
+            splash = None
+    root._fizgig_splash = splash          # read by LoRATrainerGUI._splash_status
+    if splash is not None:
+        splash.status("Building the interface…")
     gui = LoRATrainerGUI(root)
+    root._fizgig_splash = None
+    root.deiconify()
+    try:
+        root.update_idletasks()
+    except Exception:
+        pass
+    if splash is not None:
+        splash.close()
     # Detect leftover paused training state from a prior session
     try:
         gui._check_for_paused_state_on_startup()
@@ -27740,3 +27882,7 @@ if __name__ == "__main__":
     except Exception:
         pass
     root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

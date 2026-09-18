@@ -119,10 +119,12 @@ def main():
                 "an NF4 restore is exclusive again — see issue #17")
     n = src.count("move_nf4_to_device(dit, device)")
     ok &= check("all three restore sites present", n == 3, f"found {n}")
-    # Was a source-text check for the literal "device=None):", which broke the moment the
-    # signature grew past one line and the parameter stopped being the last one — the parameter
-    # was still there, correct and defaulted. Ask the function itself instead, so reformatting
-    # and new parameters cannot produce a false failure (or, worse, a false pass).
+    # Both sides fixed this independently: it was a source grep for the literal "device=None):",
+    # which broke once the signature grew past one line and device stopped being the last kwarg.
+    # Upstream widened the grep to a regex; this asks the function itself, which is stricter —
+    # it sees the real signature after decorators and cannot be satisfied by a comment, a
+    # docstring, or a second def of the same name further down the file. It also pins the DEFAULT,
+    # not just the parameter's presence.
     import inspect
     from fizgig.krea2.trainer import compute_loss as _cl
     _p = inspect.signature(_cl).parameters.get("device")

@@ -473,6 +473,16 @@ _RESIDENT_PRUNED_GB = 10.5
 # int8 base (base_quant=int8, the reference's own storage): the 200 block linears stay 1 byte
 # per param instead of NF4's 0.5, and the refiner/AdaLN load dense — ~19.3 + ~1.5 GB.
 _RESIDENT_INT8_GB = 21.0
+# HQQ 4-bit g16 (rintic-13, #102): 0.5 B/param of codes + two bf16 group vectors at 1/16 =
+# 0.75 B/param against NF4's ~0.52 (block-64 absmax, double-quantized) — ~45% more resident
+# for the same quantized mass. PRUNED figure MEASURED (2 Sep, 5090, pruned int8 file
+# decoded to HQQ): ~15.5 GB process right after load incl. the 0.6 GB adapter, ~22 GB
+# steady in training at 0.25 MP with no checkpointing, 1.45 it/s vs NF4's 2.6 it/s on the
+# same run (PyTorch-path dequant in forward AND backward; hqq's CUDA kernel is not
+# installed). The bf16-file figure is still the B/param ratio over _RESIDENT_GB — no bf16
+# checkpoint on the bench box. HQQ stays explicit-pick only (Auto never chooses it).
+_RESIDENT_HQQ_GB = 22.0
+_RESIDENT_HQQ_PRUNED_GB = 15.0
 # int8 dequantizes a bf16 weight per matmul (fc1 is 28672x5376 = 308 MB). A few are live at
 # once, but they are NOT retained for backward — _Int8RotLinearFn recomputes the weight in its
 # own backward, so the cost is a handful of transients rather than one per layer. (Before that
@@ -1150,21 +1160,24 @@ def _load_h3_egrid():
     return _EGRID_CACHE[0]
 
 
-def _turbo_adaln_forward(base, A, B, table, egrid):
-    """A replacement AdalnProj.forward that adds the Turbo's AdaLN update.
+def _turbo_adaln_forward(base, updates, table, egrid):
+    """A replacement AdalnProj.forward that adds one or more full-model AdaLN LoRA updates.
 
-    The update lives in the full model's silu(t_emb) space; the pruned base only has curve
+    Each update lives in the full model's silu(t_emb) space; the pruned base only has curve
     rows, so each incoming t_emb row is matched to its nearest table row (the model built it
     by lerping adjacent rows — half a grid step of error at worst, larryvrh's own approach)
     and the corresponding full-width grid row stands in: x += B @ A @ silu(t_emb). Strength
-    is folded into B at collection time."""
+    is folded into B at collection time. `updates` is a list of (A, B): a context LoRA's
+    rows and the preview Turbo's rows both land on the same module, and they must ADD, not
+    replace each other."""
     def forward(t_emb):
         import torch.nn.functional as _F
         x = base.linear(_F.silu(t_emb) if base.apply_silu else t_emb)
         idx = torch.cdist(t_emb.detach().float(),
                           table.to(t_emb.device, torch.float32)).argmin(dim=1)
         st = egrid.to(t_emb.device)[idx].to(x.dtype)
-        x = x + (B.to(x) @ (A.to(x) @ st.T)).T
+        for A, B in updates:
+            x = x + (B.to(x) @ (A.to(x) @ st.T)).T
         x = x.view(x.shape[0] * base.modalities, base.expand * base.hidden)
         return x.chunk(base.expand, dim=-1)
     return forward
@@ -1187,11 +1200,14 @@ def turbo_adaln_patch(dit, pairs, device, dtype, egrid=None):
         return 0
     eg = egrid.to(device)
     n = 0
+    by_mod = {}
     for mod, A, B in pairs:
         if A.shape[1] != eg.shape[1]:
             continue
-        mod.forward = _turbo_adaln_forward(mod, A.to(device, dtype), B.to(device, dtype),
-                                           table, eg)
+        by_mod.setdefault(id(mod), (mod, []))[1].append((A.to(device, dtype),
+                                                          B.to(device, dtype)))
+    for mod, updates in by_mod.values():
+        mod.forward = _turbo_adaln_forward(mod, updates, table, eg)
         n += 1
     return n
 
@@ -1206,7 +1222,7 @@ def turbo_adaln_unpatch(pairs):
             pass
 
 
-def load_preview_turbo(dit, path, strength):
+def load_preview_turbo(dit, path, strength, tag="turbo"):
     """The Turbo LoRA, wired for previews: applied ONCE to the live DiT with every module
     DISABLED, weights parked on CPU. The preview phase flips `enabled` on and moves the
     weights to the GPU; afterwards both revert. A disabled LoRAInfModule's forward is a pure
@@ -1260,11 +1276,35 @@ def load_preview_turbo(dit, path, strength):
     net.requires_grad_(False)
     for m in net.unet_loras:
         m.enabled = False
-    logger.info(f"[turbo] {len(net.unet_loras)} modules wired at strength {strength:g}"
+    logger.info(f"[{tag}] {len(net.unet_loras)} modules wired at strength {strength:g}"
                 + (f" + {len(adaln_pairs)} adaln via run-time injection"
                    if adaln_pairs else "")
                 + (f" ({len(dropped)} skipped)" if dropped else ""))
     return net, adaln_pairs
+
+
+def load_context_lora(dit, path, strength, device, dtype, tag="context", label="Context LoRA"):
+    """A Context LoRA: an existing LoRA loaded FROZEN and ACTIVE on the base before the
+    trainable network wraps it, so the new LoRA learns to coexist with it (Klein and Krea 2
+    have the same feature). Same loader as the preview Turbo — H3's shape prefilter and the
+    pruned-base AdaLN injection are exactly what a foreign H3 LoRA needs — but the modules
+    stay ENABLED and resident for every training step, and its AdaLN rows are injected for
+    the same span. Previews render with it OFF (context_lora_set_active) — the deployment
+    view, which for a training adapter is the whole point.
+
+    Returns (network, adaln_pairs)."""
+    from fizgig.networks.lora import assert_lora_family_matches
+    assert_lora_family_matches(path, "minimax", label)
+    net, pairs = load_preview_turbo(dit, path, strength, tag=tag)
+    net.to(device=device, dtype=dtype).eval()
+    for m in net.unet_loras:
+        m.enabled = True
+    n_ad = turbo_adaln_patch(dit, pairs, device, dtype)
+    logger.info(f"[{tag}] {os.path.basename(path)} active at {float(strength):g} — "
+                f"{len(net.unet_loras)} modules"
+                + (f" + {n_ad} adaln injected" if n_ad else "")
+                + "; the trainable LoRA learns on top of it")
+    return net, pairs
 
 
 @contextlib.contextmanager
@@ -1758,6 +1798,11 @@ class BlockLimiter:
         with _t.no_grad():
             if hasattr(mod, "qdata"):                        # ConvRotInt8Linear
                 return float((mod.qdata.float() * mod.wscale.float()).norm())
+            if hasattr(mod, "W_q"):                          # HQQ4bitLinear: dequant on demand
+                try:
+                    return float(mod.weight.float().norm())
+                except Exception:
+                    return 0.0
             w = getattr(mod, "weight", None)
             if w is None:
                 return 0.0
@@ -2278,9 +2323,11 @@ def train_minimax(
                                      # The 20-49 recipe: photo gradients into the front trunk are
                                      # pure prior damage (deformed previews, eroded prompt
                                      # following) while identity lives in the back 30 blocks.
-    clip_blocks: str = None,         # FT only: confine CLIP steps to these blocks too (the GUI's
-                                     # "Restrict video to likeness blocks" tickbox passes the
-                                     # likeness set). Field result 29 Aug: an overnight video run
+    clip_blocks: str = None,         # Confine CLIP steps to these blocks too (the GUI's "Restrict
+                                     # video to likeness blocks" tickbox passes the likeness set).
+                                     # FT: the rotation cycle honours it; LoRA (2 Sep): the same
+                                     # per-step gradient mask as photo_blocks, keyed on clip-only
+                                     # windows. Field result 29 Aug: an overnight video run
                                      # confined this way trained perfectly well. Unset = clips
                                      # train the whole model, the original behaviour.
     audio_blocks: str = None,        # Voice routing: audio-only steps update only these blocks
@@ -2340,6 +2387,15 @@ def train_minimax(
     # the sampling phase, off again after. The training math never sees it.
     turbo_lora_path: str = None,
     turbo_lora_strength: float = 0.75,
+    # Context LoRA: an existing LoRA held frozen + active under the trainable one for every
+    # training step; OFF for previews, so they show the LoRA as it deploys. Recorded in the
+    # output metadata. Not available under rotation fine-tune.
+    context_lora_path: str = None,
+    context_lora_strength: float = 1.0,
+    # Training adapter (Ostris's assistant LoRA, ostris/minimax_h3_training_adapter): the
+    # same frozen-layer mechanism at a fixed strength of 1.0, stacked UNDER the context
+    # LoRA. De-distills the base while the LoRA learns; off for previews like the context.
+    training_adapter_path: str = None,
     # Previews with sound: decode the jointly-denoised audio rows to a .wav beside each clip
     # sample. Needs the audio VAE (its decoder half); silently off without it.
     sample_audio: bool = False,
@@ -2608,16 +2664,24 @@ def train_minimax(
     if not quantize:
         _base_mode = "none"
     # Any swap on a quantized base rides an H2D ring now — int8 through rintic-13's
-    # ConvRot ring (#73), NF4 through @mabseyuk's Linear4bit ring. Planner-owned, no
-    # opt-in; FIZGIG_NO_NF4_H2D=1 is the debug kill-switch back to classic parking.
+    # ConvRot ring (#73), NF4 through @mabseyuk's Linear4bit ring, HQQ through rintic-13's
+    # HQQ ring (#102). Planner-owned, no opt-in; FIZGIG_NO_NF4_H2D=1 is the debug
+    # kill-switch back to classic parking for both 4-bit rings.
     # Evaluated at USE time, not here: _base_mode is reassigned to the planner's
     # RESOLVED mode below (Auto's pre-plan guess of int8 can resolve to nf4 under the
     # streaming floor), and a snapshot taken now made the kill-switch dead on exactly
     # the default path where the NF4 ring is reached (audit, 25 Aug).
     def _ring_planned():
         return (_base_mode == "int8"
-                or (_base_mode == "nf4"
+                or (_base_mode in ("nf4", "hqq")
                     and os.environ.get("FIZGIG_NO_NF4_H2D") != "1"))
+
+    def _resident_for(mode, pruned):
+        if mode == "int8":
+            return _RESIDENT_INT8_GB
+        if mode == "hqq":
+            return _RESIDENT_HQQ_PRUNED_GB if pruned else _RESIDENT_HQQ_GB
+        return _RESIDENT_PRUNED_GB if pruned else _RESIDENT_GB
     if str(blocks_to_swap).lower() == "auto":
         if torch.cuda.is_available() and quantize:
             from fizgig.utils.device import plannable_free_vram
@@ -2644,16 +2708,16 @@ def train_minimax(
                 # An explicit choice is never overridden — the plan is built AROUND it, or the
                 # swap count would be sized for a quantisation that will not run.
                 _mode = base_quant
-                _res = (_RESIDENT_INT8_GB if _mode == "int8"
-                        else _RESIDENT_PRUNED_GB if _pruned else _RESIDENT_GB)
                 n_swap, _ckpt_auto = plan_vram(
-                    _free_gb, mp=_mp, resident_gb=_res,
+                    _free_gb, mp=_mp, resident_gb=_resident_for(_mode, _pruned),
                     transient_gb=_INT8_TRANSIENT_GB if _mode == "int8" else 0.0,
                     adapter_gb=_adapter)
                 _why = f"base precision pinned to {_mode} by the user"
+                if _mode == "hqq":
+                    _why += (" (HQQ: ~45% more resident than nf4 and roughly half the "
+                             "step speed — PyTorch-path dequant)")
             _base_mode = _mode
-            _resident = (_RESIDENT_INT8_GB if _mode == "int8"
-                         else _RESIDENT_PRUNED_GB if _pruned else _RESIDENT_GB)
+            _resident = _resident_for(_mode, _pruned)
 
             logger.info(f"[vram] auto plan: free {_free_gb:.1f} GB, largest bucket {_mp:.2f} MP, "
                         f"base ~{_resident:.0f} GB ({_mode}, {'pruned' if _pruned else 'bf16'}), "
@@ -2778,6 +2842,21 @@ def train_minimax(
             _total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
         except Exception:
             _total_gb = 99.0
+        # Streamed plans (24 GB-class on the int8 base, typically 11 blocks out): the plan
+        # spends the card on the training step and leaves the preview ~4 GB, and a 56-frame
+        # 768 clip sample measurably OOMs in that (3 Sep, 24 GB sim: every arm — adapter on,
+        # off, and the previous release — OOM'd at 56 and landed at 22 after a wasted render).
+        # The ladder learned 22 the hard way once per run; learn it from the plan instead.
+        # Frames only — resolution stays where the user put it (768 is the training canvas).
+        _streams = isinstance(n_swap, int) and n_swap > 0 and not ft_rotation
+        if _streams and _total_gb >= 20.0 and int(sample_frames or 1) > 22:
+            logger.info(f"[preview] the plan streams {n_swap} blocks, which leaves clip "
+                        f"previews ~4 GB — {sample_frames} frames -> 22 up front (a 56-frame "
+                        f"768 clip OOMs at that headroom and would step down to 22 anyway). "
+                        f"Sound kept. Pick 22 frames on the Samples tab to make this the "
+                        f"setting rather than a clamp; lower Target Megapixels if you want "
+                        f"the longer preview back.")
+            sample_frames = 22
         if _total_gb < 20.0:
             _clamped = []
             if int(sample_frames or 1) > 22:
@@ -2832,9 +2911,10 @@ def train_minimax(
         # writeback half was always waste — a ring buffer + copy stream prefetches each
         # block while the previous computes. int8 rides rintic-13's ConvRot ring (#73);
         # NF4 rides @mabseyuk's Linear4bit ring (the tier 12 GB cards land on — his 5070
-        # went from 12-14 s/step parked to ~1 s/step streamed). enable_block_swap
-        # dispatches by module type and falls back to classic parking if a ring can't
-        # build; the later preview-restore calls re-enter it bare and inherit this mode.
+        # went from 12-14 s/step parked to ~1 s/step streamed); HQQ rides rintic-13's
+        # HQQ ring (#102, same per-slot design). enable_block_swap dispatches by module
+        # type and falls back to classic parking if a ring can't build; the later
+        # preview-restore calls re-enter it bare and inherit this mode.
         _use_h2d = _ring_planned()
         n_swap = dit.enable_block_swap(n_swap, h2d_only=_use_h2d, ring_size=2)
         _off = getattr(dit, "_h2d_offloader", None)
@@ -2843,7 +2923,7 @@ def train_minimax(
                         if not getattr(_off, "_pin_failed", False)
                         else "staged in ordinary RAM (pinning unavailable or RAM too "
                              "tight) — copies synchronous")
-            # Both ring classes declare kind/staged_gb; the explicit None test matters
+            # All three ring classes declare kind/staged_gb; the explicit None test matters
             # because `or` would swallow a legitimate 0.0 into the int8 estimate.
             _kind = getattr(_off, "kind", "?")
             _gb = getattr(_off, "staged_gb", None)
@@ -3335,6 +3415,55 @@ def train_minimax(
                                  network_alpha, lokr_factor)
         for _n in _rs_notes:
             logger.warning(f"[resume] {_n} — a resume continues the run it resumes")
+    # Context LoRA goes on FIRST, so the trainable network wraps a forward that already
+    # includes it (additive stack: base + context + trainable). Refused under rotation FT for
+    # the same reason the Turbo is deferred there — apply_to captures bound forwards that
+    # the rotator's class-swap would orphan — and unlike the Turbo it can't be re-applied
+    # per window without changing what the model trains against mid-run.
+    # Frozen layers, innermost first: training adapter, then the user's context LoRA. Both
+    # ride at their strength for every training step. Previews differ PER LAYER (Peter):
+    # the adapter switches OFF (it is a training aid — Ostris's assistant LoRA is inactive
+    # for every sample pass, and the LoRA deploys without it), the context LoRA stays ON
+    # (the LoRA deploys paired with it — Klein/Krea 2 semantics).
+    adapter_net, adapter_adaln = None, []
+    context_net, context_adaln = None, []
+    if training_adapter_path or context_lora_path:
+        if rotator is not None:
+            _what = "The training adapter" if training_adapter_path else "Context LoRA"
+            raise RuntimeError(f"{_what} is not available with fine-tuning on MiniMax H3 "
+                               "— untick Fine-tune (train a LoRA) or turn it off.")
+    if training_adapter_path:
+        if not os.path.isfile(training_adapter_path):
+            raise FileNotFoundError(f"Training adapter not found: {training_adapter_path} — "
+                                    "run the updater or the Preferences model download.")
+        adapter_net, adapter_adaln = load_context_lora(dit, training_adapter_path, 1.0,
+                                                       device, dtype, tag="adapter",
+                                                       label="Training adapter")
+    if context_lora_path:
+        if not os.path.isfile(context_lora_path):
+            raise FileNotFoundError(f"Context LoRA not found: {context_lora_path}")
+        context_net, context_adaln = load_context_lora(dit, context_lora_path,
+                                                       context_lora_strength, device, dtype)
+
+    def _frozen_for_preview():
+        """Adapter off, context on; AdaLN rows = context (+ the Turbo's, added by the
+        caller). Unpatch the training set FIRST — the rows share modules, and a patch
+        replaces the module forward wholesale."""
+        turbo_adaln_unpatch(adapter_adaln + context_adaln)
+        if adapter_net is not None:
+            for _m in adapter_net.unet_loras:
+                _m.enabled = False
+            logger.info("[preview] training adapter off for the render (deployment view)")
+
+    def _frozen_for_training():
+        """Back to the training stack: Turbo/preview rows out, adapter on, adapter +
+        context rows in. Idempotent — safe on the exception path."""
+        turbo_adaln_unpatch(context_adaln + turbo_adaln)
+        if adapter_net is not None:
+            for _m in adapter_net.unet_loras:
+                _m.enabled = True
+        if adapter_adaln or context_adaln:
+            turbo_adaln_patch(dit, adapter_adaln + context_adaln, device, dtype)
     if rotator is not None:
         # Rotation FT: no adapter at all. LoRA's apply_to captures each wrapped module's
         # BOUND forward, which the rotator's class-swap would orphan — a wrapped window
@@ -3561,11 +3690,31 @@ def train_minimax(
         _photo_used = format_block_spec(sorted(_pb_allowed))
         if _photo_mask_params:
             logger.info("[likeness] Optimised Likeness Learning ON — photo steps train blocks "
-                        "%s (+refiners, %d of %d tensors frozen on photos); video/audio clips "
-                        "train the full model", _photo_used, len(_photo_mask_params), len(params))
+                        "%s (+refiners, %d of %d tensors frozen on photos); video clips train %s",
+                        _photo_used, len(_photo_mask_params), len(params),
+                        (f"blocks {clip_blocks} (restricted)" if clip_blocks else "the full model"))
         else:
             logger.info("[likeness] photo_blocks %s covers every trained block — nothing to "
                         "mask (Blocks to Train already inside it?)", _photo_used)
+    # Clip routing, LoRA mode (Peter, 2 Sep — same behaviour as the FT tickbox): clip-only
+    # windows update only clip_blocks. Same mechanism as the photo mask.
+    _clip_mask_params = []
+    if clip_blocks and rotator is None:
+        _cb_allowed = set(parse_block_spec(clip_blocks, len(dit.blocks)))
+        _cmask_ids = set()
+        for _lora in network.unet_loras:
+            _nm = _lora.lora_name
+            if "token_refiner" in _nm:
+                continue
+            _m = re.search(r"blocks_(\d+)_", _nm)
+            if _m and int(_m.group(1)) not in _cb_allowed:
+                _cmask_ids.update(id(p) for p in _lora.parameters())
+        _clip_mask_params = [p for p in params if id(p) in _cmask_ids]
+        if _clip_mask_params:
+            logger.info("[likeness] video restriction ON — clip steps train blocks %s "
+                        "(+refiners, %d of %d tensors frozen on clips)",
+                        format_block_spec(sorted(_cb_allowed)),
+                        len(_clip_mask_params), len(params))
     # Voice routing, LoRA mode: audio-only steps update only audio_blocks (the measured
     # voice zone — audio gradients outside it corrupt the visual blocks). Same mechanism
     # as the photo mask, keyed on voice-only optimizer windows.
@@ -3953,8 +4102,18 @@ def train_minimax(
             "ss_train_adaln": "1" if _adaln_on else "0",
             "ss_distill": "dataset" if distill else "off",
             "ss_distill_weight": (f"{distill_weight:g}" if distill else "0"),
+            # Context LoRA: the file this LoRA was trained ON TOP OF and the strength it rode
+            # at — pair them the same way at inference (Klein/Krea 2 record the same keys).
+            "ss_context_lora": (os.path.basename(context_lora_path)
+                                if context_lora_path else "none"),
+            "ss_context_lora_strength": (f"{float(context_lora_strength):g}"
+                                         if context_lora_path else "0"),
+            "ss_training_adapter": (os.path.basename(training_adapter_path)
+                                    if training_adapter_path else "none"),
             "ss_slow_blocks": _slow_used or "none",
             "ss_photo_blocks": (_photo_used if _photo_mask_params else "off"),
+            "ss_clip_blocks": (str(clip_blocks) if (clip_blocks and (_clip_mask_params or rotator is not None))
+                               else "off"),
             "ss_block_limit": str(block_limit or 0),
             "ss_gradient_accumulation": str(_accum_n),
             "ss_adapter_ramp": f"{adapter_ramp:g}" if ramp is not None else "0",
@@ -4258,16 +4417,20 @@ def train_minimax(
                     except Exception:
                         pass
                 vram_line("preview-start")
+            # Training adapter OFF for the render, context LoRA ON (see the load block).
+            _frozen_for_preview()
             if turbo_net is not None:
                 # On for the sampling phase only: weights to the GPU (~0.8 GB), modules
                 # enabled at their strength, AdaLN injected. Off + back to CPU before decode.
                 turbo_net.to(device=device, dtype=dtype)
                 for _tm in turbo_net.unet_loras:
                     _tm.enabled = True
-                _n_ad = turbo_adaln_patch(dit, turbo_adaln, device, dtype)
+                _n_ad = turbo_adaln_patch(dit, context_adaln + turbo_adaln, device, dtype)
                 logger.info(f"[preview] Turbo LoRA on — {sample_steps} steps at "
                             f"{turbo_lora_strength:g}"
                             + (f", {_n_ad} adaln injected" if _n_ad else ""))
+            elif context_adaln:
+                turbo_adaln_patch(dit, context_adaln, device, dtype)
             _want_audio = bool(sample_audio and _frames > 1)
             _rendered = []
             for i, txt in enumerate(_prompts):
@@ -4350,6 +4513,7 @@ def train_minimax(
                 turbo_net.to("cpu")
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()      # its ~0.8 GB back before the decode phase
+            _frozen_for_training()
 
             # optimizer state back before anything else - the next training step needs it
             for _st, _k in _opt_parked:
@@ -4467,6 +4631,9 @@ def train_minimax(
                     torch.cuda.empty_cache()
             if _audio_dec_state["dec"] is not None:
                 _audio_dec_state["dec"].to("cpu")        # idempotent; covers a mid-decode raise
+            # The training stack must come BACK the same way (an exception mid-sample would
+            # otherwise leave every subsequent training step without the adapter).
+            _frozen_for_training()
             if turbo_net is not None:
                 # Idempotent, and NON-NEGOTIABLE on an exception mid-sample: a Turbo left
                 # enabled (or an injected AdaLN forward left installed) would ride every
@@ -4683,6 +4850,7 @@ def train_minimax(
     _pending = [0]                       # backwards accumulated since the last optimizer step
     _window_photo_only = [True]          # likeness mask: does this window hold ONLY photo steps?
     _window_voice_only = [True]          # voice-routing mask: ONLY audio steps in this window?
+    _window_clip_only = [True]           # clip-routing mask: ONLY video-clip steps in this window?
 
     def _boundary_step():
         """The optimizer step at a window boundary — shared by live iterations and by the
@@ -4715,6 +4883,11 @@ def train_minimax(
             for _p in _audio_mask_params:
                 _p.grad = None
         _window_voice_only[0] = True
+        # Clip routing, same rule again: a clip-only window drops the out-of-range grads.
+        if _clip_mask_params and _window_clip_only[0]:
+            for _p in _clip_mask_params:
+                _p.grad = None
+        _window_clip_only[0] = True
         if max_grad_norm and max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
         _bm = (sum(_band_acc) / len(_band_acc)) if _band_acc else 1.0
@@ -4850,6 +5023,8 @@ def train_minimax(
                 _window_photo_only[0] = False
             if not _is_voice:
                 _window_voice_only[0] = False
+            if _is_photo or _is_voice:
+                _window_clip_only[0] = False
             # Per-category retirement: past its stop epoch a category is either ANCHORED
             # (trains on at ANCHOR_LR_SCALE — rehearsal against drift on the shared adapters,
             # ledger stays live) or STOPPED (skipped outright — faster epochs, blind).
