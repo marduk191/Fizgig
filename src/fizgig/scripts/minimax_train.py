@@ -14,7 +14,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 # CUDA allocator policy, set before torch is imported below (the backend is fixed at CUDA init).
 # The 33B base + per-step tensor churn fragments the default allocator; expandable segments hold
 # the NF4 base within a 5090's budget. GUI sets this too; this covers headless runs.
-if not os.environ.get("PYTORCH_CUDA_ALLOC_CONF") and os.environ.get("FIZGIG_NO_EXPANDABLE") != "1":
+#
+# Not on Windows: the CUDA allocator there rejects the option outright ("expandable_segments not
+# supported on this platform") and falls back to the default allocator, so setting it bought
+# nothing and printed that warning on every launch (@marduk191's fix, same as train.py).
+if (
+    sys.platform != "win32"
+    and not os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+    and os.environ.get("FIZGIG_NO_EXPANDABLE") != "1"
+):
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ.setdefault("KMP_BLOCKTIME", "0")
 os.environ.setdefault("OMP_WAIT_POLICY", "PASSIVE")
@@ -40,7 +48,7 @@ def _shift_arg(v):
 
 
 def setup_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="MiniMax H3 image-only LoRA training (NF4 base, no samples)")
+    p = argparse.ArgumentParser(description="MiniMax H3 training: photos, video clips with sound, and voice recordings — LoRA, LoKR or full fine-tune")
     p.add_argument("--dit", required=True, help="H3 bf16 DiT (minimax_h3_fl2va_bf16.safetensors)")
     p.add_argument("--dataset_config", required=True, help="Dataset .toml")
     p.add_argument("--output_dir", required=True)
@@ -135,10 +143,19 @@ def setup_parser() -> argparse.ArgumentParser:
                    help="Ramp the LR linearly from 0 to the configured rate over the first N "
                         "epochs (fractions allowed). Static LR only — ignored under adaptive. "
                         "0 = off.")
-    p.add_argument("--ema_decay", type=float, default=0.0, metavar="D",
+    p.add_argument("--ema_decay", type=str, default="0", metavar="D",
                    help="Keep an exponential moving average of the adapter and save/preview THAT "
-                        "instead of the raw weights (0.99 recommended). Training still runs on "
-                        "the raw weights. 0 = off.")
+                        "instead of the raw weights (0.98 recommended). Training still runs on "
+                        "the raw weights. 0 = off. 'short' = short-run mode: the window is sized "
+                        "to the run (decay 1 - 4/steps, fast ramp) for short, high-LR runs.")
+    p.add_argument("--train_token_refiner", action="store_true",
+                   help="Train the text token refiner too (LoRA: its Linears join the targets; "
+                        "fine-tune: it trains alongside every window). Off by default: "
+                        "the refiner is the model's bridge from the text encoder into the DiT and "
+                        "sets how every prompt is read, and a LoRA on it moved that reading every "
+                        "epoch (preview judder, softer output). Leaving it off does not remove the "
+                        "model's ability to absorb a trigger word: the trigger is learned in the "
+                        "blocks' attention, where text meets image and sound.")
     p.add_argument("--no_train_adaln", dest="train_adaln", action="store_false",
                    help="EXPERIMENT: drop the per-block AdaLN adapters. AdaLN is a function of "
                         "the TIMESTEP only, so it cannot encode identity — yet on the pruned "
@@ -148,34 +165,34 @@ def setup_parser() -> argparse.ArgumentParser:
     p.add_argument("--train_blocks", default=None, metavar="SPEC",
                    help="EXPERIMENT: train only these DiT blocks (of 50) instead of all of them. "
                         "Ranges and singles, comma-separated: '14-37' or '3-12, 14-15, 22, 31-33'. "
-                        "The text refiner is always included. H3's blocks are identical and nobody "
-                        "has mapped what each one does, so any selection is a hypothesis — compare "
-                        "against a full-model run on the same dataset.")
+                        "H3's blocks are identical and nobody has mapped what each one does, so any "
+                        "selection is a hypothesis — compare against a full-model run on the same "
+                        "dataset.")
     p.add_argument("--photo_blocks", default=None, metavar="SPEC",
                    help="Optimised Likeness Learning: photo training steps update only these "
-                        "DiT blocks (the refiner always trains); video/audio clip steps update "
-                        "the full model. '20-49' is the measured likeness recipe — photo "
-                        "gradients into the front trunk erode rendering and anatomy while "
-                        "identity lives in the back blocks. Composes with --train_blocks.")
+                        "DiT blocks, and the backward stops at the first of them. '20-49' is the "
+                        "measured likeness recipe — photo gradients into the front trunk erode "
+                        "rendering and anatomy while identity lives in the back blocks. Pair with "
+                        "--clip_blocks and --audio_blocks (the GUI passes all three). Composes "
+                        "with --train_blocks.")
     p.add_argument("--audio_blocks", default=None, metavar="SPEC",
                    help="Voice routing: audio-only training steps update only these DiT "
-                        "blocks (the refiner always trains). '34-49' is the measured voice "
-                        "zone (core 38-48 + shoulder) — audio gradients outside it "
-                        "measurably corrupt the visual blocks (A/B, 24 Aug). Applies "
-                        "under the rotation fine-tune, and in LoRA mode alongside "
-                        "--photo_blocks.")
+                        "blocks, and the backward stops at the first of them. '34-49' is the "
+                        "measured voice zone (core 38-48 + shoulder) — audio gradients outside "
+                        "it measurably corrupt the visual blocks (A/B, 24 Aug). Applies under "
+                        "the rotation fine-tune, and in LoRA mode alongside --photo_blocks.")
     p.add_argument("--clip_blocks", default=None, metavar="SPEC",
-                   help="Fine-tune only: confine VIDEO CLIP training steps to these DiT "
-                        "blocks (the refiner always trains). The GUI's 'Restrict video to "
-                        "likeness blocks' passes the likeness set here — a confined "
-                        "overnight video run trained perfectly well (field, 29 Aug). "
-                        "Unset: clips train the full model, the original behaviour.")
+                   help="Confine VIDEO CLIP training steps to these DiT blocks (LoRA and "
+                        "fine-tune alike); the backward stops at the first of them. Optimised "
+                        "Likeness Learning passes the likeness set here — a confined overnight "
+                        "video run trained perfectly well (field, 29 Aug). Unset: clips train "
+                        "the full model.")
     p.add_argument("--base_quant", default="auto", choices=["auto", "int8", "nf4", "hqq"],
                    help="Frozen-base precision. 'int8' keeps the checkpoint's own ConvRot "
                         "weights (~0.17%% base error, ~21 GB) — what the reference trainer "
                         "does. 'nf4' decodes then 4-bit quantizes (~9.5%% error, ~11 GB). "
-                        "'hqq' decodes then HQQ 4-bit quantizes (~6.3%% error, ~15 GB, ~half "
-                        "the step speed). 'auto' picks int8 for a pre-quantized "
+                        "'hqq' decodes then HQQ 4-bit quantizes (~4.8%% error, ~15 GB; NF4's speed on "
+                        "streamed plans, ~half on a big card at swap 0). 'auto' picks int8 for a pre-quantized "
                         "file, nf4 otherwise — never hqq.")
     p.add_argument("--no_quantize", action="store_true",
                    help="Train on the bf16 base (no NF4) — needs ~66 GB VRAM.")
@@ -236,7 +253,27 @@ def setup_parser() -> argparse.ArgumentParser:
                    help="Training adapter (Ostris, ostris/minimax_h3_training_adapter): a frozen "
                         "LoRA at 1.0 that de-distills the base while yours learns — on for every "
                         "training step, off for previews. Use the fl2va or ref2va file to match "
-                        "--dit. Not available with --finetune_rotation.")
+                        "--dit. Under --finetune_rotation it rides as forward hooks (same "
+                        "contract; the checkpoint never contains it).")
+    p.add_argument("--tread_ratio", type=float, default=0.0,
+                   help="TREAD token routing: this fraction of the video tokens "
+                        "skips the main blocks [--tread_start, --tread_end) on every CLIP "
+                        "step and rejoins in its start-block state (arXiv 2501.04765). 0 = off. "
+                        "Photo steps and previews never route. Not available with "
+                        "--finetune_rotation.")
+    p.add_argument("--tread_start", type=int, default=2)
+    p.add_argument("--tread_end", type=int, default=47)
+    p.add_argument("--likeness_full_backward", action="store_true",
+                   help="A/B only. With --photo_blocks / --clip_blocks the default freezes the "
+                        "out-of-window LoRA params and the token refiner's LoRA before each masked "
+                        "step, so the backward stops at the first trained block (about 25%% faster "
+                        "per step; sharper, steadier previews). This flag restores the old full "
+                        "backward with the refiner training on every step.")
+    p.add_argument("--clip_still_as_photo", action="store_true",
+                   help="Every clip's picked still (its sharpest frame with a face, cached by "
+                        "minimax_cache_latents --clip_still) also trains as a photo on its own "
+                        "step, with the clip's caption. Frame 0 for clips cached without a pick. "
+                        "Voice items unaffected.")
     p.add_argument("--sample_audio", action="store_true",
                    help="Clip previews carry their generated SOUND: the jointly-denoised "
                         "audio rows are decoded to a .wav beside each sample. Needs "
@@ -340,18 +377,21 @@ def main():
         train_blocks=args.train_blocks,
         photo_blocks=args.photo_blocks,
         clip_blocks=args.clip_blocks,
+        likeness_cut_backward=not args.likeness_full_backward,
         audio_blocks=args.audio_blocks,
         distill=args.distill,
         distill_weight=args.distill_weight,
         distill_phase1_epochs=args.distill_phase1_epochs,
         train_adaln=args.train_adaln,
+        train_token_refiner=args.train_token_refiner,
         slow_blocks=args.slow_blocks,
         slow_block_lr_scale=args.slow_block_lr_scale,
         block_limit=args.block_limit,
         adapter_ramp=args.adapter_ramp,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         lr_warmup_epochs=args.lr_warmup_epochs,
-        ema_decay=args.ema_decay,
+        ema_decay=(args.ema_decay if str(args.ema_decay).strip().lower().startswith("short")
+                   else float(args.ema_decay or 0)),
         quantize=not args.no_quantize,
         shift=args.shift,
         highnoise_lr_scale=args.highnoise_lr_scale,
@@ -383,6 +423,10 @@ def main():
         context_lora_path=args.context_lora_path,
         context_lora_strength=args.context_lora_strength,
         training_adapter_path=args.training_adapter_path,
+        tread_ratio=args.tread_ratio,
+        tread_start=args.tread_start,
+        tread_end=args.tread_end,
+        clip_still_as_photo=args.clip_still_as_photo,
         sample_audio=args.sample_audio,
         audio_vae_path=args.audio_vae,
         finetune_rotation=args.finetune_rotation,

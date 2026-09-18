@@ -56,6 +56,19 @@ class SliderState:
     ref_image_path: str = ""
     ref_megapixels: float = 1.0
     ref_strength: float = 1.0
+    # MiniMax H3 video mode (Repair Studio, 3 Sep 2026). preview_frames: pixel frames on the
+    # 17n+5 grid (1 = still); 0 = the engine's default. keyframes: [(frame_index, latent)]
+    # built by H3RepairEngine.encode_keyframe — TENSORS, so deliberately NOT serialised
+    # (presets never carry a conditioning image); copied by reference.
+    preview_frames: int = 0
+    keyframes: Any = None
+    references: Any = None      # H3 ref2va: [(PIL at the reference canvas, latent)] — like keyframes
+    # Load strength of each LoRA (H3 Repair Studio): the strength it was designed to be used
+    # at. Every block slider is relative to it — a block at 1.0 IS the block at this strength
+    # — so the effective multiplier is slider × scale. Never baked into a saved file: the
+    # file stays at its original scale and is used at this strength, exactly as previewed.
+    primary_scale: float = 1.0
+    donor_scale: float = 1.0
 
     @classmethod
     def default_klein9b(cls) -> "SliderState":
@@ -89,6 +102,8 @@ class SliderState:
             "ref_image_path": self.ref_image_path,
             "ref_megapixels": self.ref_megapixels,
             "ref_strength": self.ref_strength,
+            "primary_scale": self.primary_scale,
+            "donor_scale": self.donor_scale,
         }
 
     @classmethod
@@ -105,6 +120,8 @@ class SliderState:
             ref_image_path=str(d.get("ref_image_path", "")),
             ref_megapixels=float(d.get("ref_megapixels", 1.0)),
             ref_strength=float(d.get("ref_strength", 1.0)),
+            primary_scale=float(d.get("primary_scale", 1.0)),
+            donor_scale=float(d.get("donor_scale", 1.0)),
         )
 
     def copy(self) -> "SliderState":
@@ -117,6 +134,9 @@ class SliderState:
             preview_width=self.preview_width, preview_height=self.preview_height,
             ref_image_path=self.ref_image_path, ref_megapixels=self.ref_megapixels,
             ref_strength=self.ref_strength,
+            preview_frames=self.preview_frames, keyframes=self.keyframes,
+            references=self.references,
+            primary_scale=self.primary_scale, donor_scale=self.donor_scale,
         )
 
     def mutate(self, active_blocks: set, num_mutations: int = 3,

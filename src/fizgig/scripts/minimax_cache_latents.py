@@ -44,6 +44,20 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_workers", type=int, default=None, help="Number of workers")
     parser.add_argument("--skip_existing", action="store_true", help="Skip existing cache files")
     parser.add_argument("--keep_cache", action="store_true", help="Keep stale cache files")
+    parser.add_argument("--megapixels", type=float, default=None,
+                        help="encode at this target megapixels instead of the config's resolution "
+                             "(the RefMod maker's reference pass: the mod's references at Target MP "
+                             "while the optimiser's own stills stay at 0.25 MP)")
+    parser.add_argument("--cache_suffix", default="",
+                        help="append to every dataset's cache folder (a second resolution cannot "
+                             "share a folder — cache files are named by the source image size)")
+    parser.add_argument("--captions_optional", action="store_true",
+                        help="take every image, captioned or not (a job that never trains — the "
+                             "RefMod plain encode — has no use for captions)")
+    parser.add_argument("--clip_still", action="store_true",
+                        help="For every clip, also pick its sharpest frame that shows a face and "
+                             "cache it as a still (the 'clip still as a photo' training item). "
+                             "With --skip_existing, clips cached without one are re-encoded.")
     return parser
 
 
@@ -56,7 +70,25 @@ def main():
     blueprint_gen = BlueprintGenerator(ConfigSanitizer())
     logger.info(f"Loading dataset config from {args.dataset_config}")
     user_config = load_user_config(args.dataset_config)
+    if args.megapixels:
+        import math as _math
+        _side = (int(_math.sqrt(float(args.megapixels) * 1_000_000)) // 16) * 16
+        user_config.setdefault("general", {})["resolution"] = [_side, _side]
+        for _ds in user_config.get("datasets", []) or []:
+            if "resolution" in _ds:
+                _ds["resolution"] = [_side, _side]
+        logger.info(f"[cache] resolution override: {args.megapixels:g} MP -> {_side}x{_side}")
+    if args.cache_suffix:
+        for _ds in user_config.get("datasets", []) or []:
+            _base = _ds.get("cache_directory") or _ds.get("image_directory") or ""
+            if _base:
+                _ds["cache_directory"] = _base.rstrip("/\\") + args.cache_suffix
+        logger.info(f"[cache] cache folders suffixed '{args.cache_suffix}'")
     blueprint = blueprint_gen.generate(user_config, args, architecture=ARCHITECTURE_MINIMAX)
+    if args.captions_optional:
+        from fizgig.dataset.image_dataset import ImageDirectoryDatasource
+        ImageDirectoryDatasource.captions_optional = True
+        logger.info("[cache] captions optional — every image is taken, captioned or not")
     datasets = generate_dataset_group_by_blueprint(blueprint.dataset_group).datasets
 
     logger.info(f"Loading H3 video VAE from {args.vae}")
@@ -88,7 +120,14 @@ def main():
         logger.info("[clip] no --audio_vae given: clips will train video only, and any sound "
                     "they carry is ignored.")
 
-    encode_datasets(datasets, lambda batch: encode_and_save_latents(vae, batch, audio_vae), args)
+    if args.clip_still:
+        # --skip_existing keeps a valid clip cache; this hook says a clip cached WITHOUT its
+        # still is not yet what this run asked for, so it goes through the encoder again.
+        from fizgig.dataset.image_dataset import ImageDataset as _ID
+        args.needs_reencode = (lambda path: _ID.latent_cache_frames(path) > 1
+                               and not _ID.latent_cache_has_still(path))
+    encode_datasets(datasets, lambda batch: encode_and_save_latents(vae, batch, audio_vae,
+                                                                    clip_still=args.clip_still), args)
 
 
 if __name__ == "__main__":

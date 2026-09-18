@@ -90,9 +90,15 @@ class LoRAModule(torch.nn.Module):
             for lora_up in self.lora_up:
                 torch.nn.init.zeros_(lora_up.weight)
 
-        if type(alpha) == torch.Tensor:
-            alpha = alpha.detach().float().numpy()  # without casting, bf16 causes error
-        alpha = self.lora_dim if alpha is None or alpha == 0 else alpha
+        if isinstance(alpha, torch.Tensor):
+            # A plain Python float, not a NumPy scalar: a NumPy scalar attribute traces as a
+            # tensor under torch.compile, so the inference epilogue's add(alpha=float(scale))
+            # became a data-dependent guard and Krea 2 + compile + a context LoRA crashed at the
+            # first step (GuardOnDataDependentSymNode, 13 Sep 2026). .item() keeps bf16 safe.
+            alpha = float(alpha.detach().float().item())
+        elif alpha is not None:
+            alpha = float(alpha)
+        alpha = float(self.lora_dim) if alpha is None or alpha == 0 else alpha
         self.scale = alpha / self.lora_dim
         self.register_buffer("alpha", torch.tensor(alpha))  # for save/load
 
@@ -272,14 +278,22 @@ class LoRAInfModule(LoRAModule):
         return weight
 
     def default_forward(self, x):
+        # Inference only (the training class above is untouched): the epilogue is ONE
+        # add with a scalar alpha instead of two bf16 multiplies and an add — three
+        # elementwise kernels over [tokens, out] per module became one. On the H3 Repair
+        # Studio that is ~1,000 module forwards per Dial render (measured 4 Sep: ~0.4 s of
+        # a 3.8 s move). Same maths; multiplier x scale is formed once in fp32.
         if self.split_dims is None:
             lx = self.lora_down(x)
             lx = self.lora_up(lx)
-            return self.org_forward(x) + lx * self.multiplier * self.scale
         else:
             lxs = [lora_down(x) for lora_down in self.lora_down]
             lxs = [lora_up(lx) for lora_up, lx in zip(self.lora_up, lxs)]
-            return self.org_forward(x) + torch.cat(lxs, dim=-1) * self.multiplier * self.scale
+            lx = torch.cat(lxs, dim=-1)
+        m = self.multiplier
+        if isinstance(m, torch.Tensor):                    # a tensor multiplier keeps the old path
+            return self.org_forward(x) + lx * m * self.scale
+        return torch.add(self.org_forward(x), lx, alpha=float(m) * float(self.scale))
 
     def compute_delta(self, x: torch.Tensor) -> torch.Tensor:
         """Return just the LoRA contribution (base output NOT added) for a given
@@ -1186,7 +1200,7 @@ class LoRANetwork(torch.nn.Module):
             # at the end of an epoch that is the moment RAM is tightest, and on constrained
             # boxes it raised MemoryError (or a safetensors-rust PanicException) BEFORE the
             # checkpoint was written, killing the run over optional indexing metadata
-            # (#92, diagnosed by David Maybank on a 12 GB / 64 GB box). Optional metadata
+            # (#92, diagnosed by @mabseyuk on a 12 GB / 64 GB box). Optional metadata
             # must never cost a checkpoint: on those two failures, skip the hashes and save;
             # anything else is a real bug and still raises.
             try:

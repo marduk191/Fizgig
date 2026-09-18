@@ -211,18 +211,46 @@ os.makedirs(SB2)
 shutil.copy(os.path.join(REPO, "launch.pyw"), os.path.join(SB2, "launch.pyw"))
 shutil.copy(os.path.join(REPO, "fizgig_splash.py"), os.path.join(SB2, "fizgig_splash.py"))
 MARK2 = os.path.join(SB2, "started.txt")
+# The stub must honour the launcher's main(root=, splash=) contract (#115). It used to write its
+# marker at IMPORT and define no main(): the marker appeared, this section passed — and then the
+# detached venv child called the missing main(), hit AttributeError, and the launcher's real
+# MessageBoxW landed on the desktop. This section cannot shadow ctypes the way 1-5 do (the child
+# is a fresh venv interpreter launched via Popen), so the stub has to be correct instead. Writing
+# the marker INSIDE main() also makes the check below mean what it says: main() actually ran.
 with open(os.path.join(SB2, "lora_trainer_gui.py"), "w", encoding="utf-8") as f:
-    f.write(f"with open({MARK2!r}, 'w') as fh: fh.write('started')\n")
+    f.write(textwrap.dedent(f"""
+        def main(root=None, splash=None):
+            with open({MARK2!r}, 'w') as fh:
+                fh.write('started')
+            for _obj, _meth in ((splash, 'close'), (root, 'destroy')):
+                try:
+                    getattr(_obj, _meth)()
+                except Exception:
+                    pass
+        """))
 r = subprocess.run([PY, "-m", "venv", "--without-pip", os.path.join(SB2, "venv")],
                    capture_output=True, text=True, timeout=120)
 if r.returncode == 0:
+    # The fake ctypes rides into the detached venv child through the inherited PYTHONPATH, so if
+    # the child ever fails, its error box is written to MSGBOX instead of popping a real modal on
+    # whoever is running the suite — which is exactly what happened when this stub lacked main().
+    if os.path.isfile(MSGBOX):
+        os.remove(MSGBOX)
+    _env6 = dict(os.environ)
+    _env6["PYTHONPATH"] = FAKECT
     r = subprocess.run([PY, os.path.join(SB2, "launch.pyw")], capture_output=True,
-                       text=True, cwd=SB2, timeout=40)
+                       text=True, cwd=SB2, timeout=40, env=_env6)
     ck("outer python hands off to the venv and exits 0", r.returncode == 0, r.stderr[-200:])
     end = time.time() + 25
     while time.time() < end and not os.path.isfile(MARK2):
         time.sleep(0.3)
     ck("  the venv child actually started the GUI", os.path.isfile(MARK2))
+    # The marker alone proved nothing about what happened AFTER it: the old stub passed the check
+    # above and then failed. Give the child time to finish, then require that it raised no report.
+    time.sleep(2)
+    ck("  and the child finished without raising an error report",
+       not os.path.isfile(MSGBOX) and not os.path.isfile(os.path.join(SB2, "launch_error.log")),
+       open(MSGBOX, encoding="utf-8").read()[:200] if os.path.isfile(MSGBOX) else "")
 else:
     ck("venv creation for the re-launch test", False, r.stderr[-200:])
 

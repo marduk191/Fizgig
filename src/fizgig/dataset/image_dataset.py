@@ -174,7 +174,17 @@ def glob_images(directory: str, base: str = "*", caption_extension: Optional[str
     if caption_extension is not None:
         caption_paths = glob.glob(os.path.join(glob.escape(directory), "*" + caption_extension))
         caption_bases = {os.path.splitext(os.path.basename(p))[0] for p in caption_paths}
+        skipped = sorted(os.path.basename(p) for p in img_paths
+                         if os.path.splitext(os.path.basename(p))[0] not in caption_bases)
         img_paths = [p for p in img_paths if os.path.splitext(os.path.basename(p))[0] in caption_bases]
+        if skipped:
+            # Say so, loudly: a clip or photo with no caption is left out of the run, and a
+            # dataset can lose all its clips this way without anyone noticing (a Reddit user's
+            # Gizmo segments, 17 Sep 2026). Files renamed after captioning are the usual cause.
+            shown = ", ".join(skipped[:8]) + (f", … {len(skipped) - 8} more" if len(skipped) > 8 else "")
+            logger.warning(f"[dataset] {len(skipped)} file(s) in {directory} have no {caption_extension} "
+                           f"caption and are LEFT OUT of training: {shown} — caption them (the Captions "
+                           f"tab does clips from their middle frame) or move them out of the folder")
 
     img_paths.sort()
     return img_paths
@@ -482,6 +492,20 @@ class BucketBatchManager:
         for item_info in bucket[start:end]:
             sd_latent = load_file(item_info.latent_cache_path)
             sd_te = load_file(item_info.text_encoder_output_cache_path)
+            if getattr(item_info, "still_only", False):
+                # the clip's still item: the cached sharpest-face frame when the cache pass
+                # made one, else frame 0 sliced from the clip latent [C, T, H, W] -> [C, H, W]
+                # (frame 0 of a causal VAE encodes pixel frame 0 alone). No sound either way.
+                if "still_latent" in sd_latent:
+                    _st = sd_latent["still_latent"]
+                    sd_latent = {f"latent_{_st.shape[1]}x{_st.shape[2]}": _st.contiguous()}
+                else:
+                    sd_latent = {k: (v[:, 0].contiguous() if (k.startswith("latent_") and v.dim() == 4) else v)
+                                 for k, v in sd_latent.items()
+                                 if k not in ("audio_latent", "audio_only")}
+            else:
+                # the clip itself never carries its still keys into the batch
+                sd_latent = {k: v for k, v in sd_latent.items() if k not in ("still_latent", "still_frame")}
             sd = {**sd_latent, **sd_te}
             # MiniMax H3 reference distillation only: sibling `..._teref{N}.safetensors` files
             # hold the TEACHER's conditioning (caption + a `<Picture 1>` vision block), its
@@ -558,6 +582,12 @@ class BucketBatchManager:
 class ImageDirectoryDatasource:
     """Loads images (and optional control images) from a directory on disk."""
 
+    # A job that never trains (the RefMod plain encode) has no use for captions: with this set
+    # on the CLASS before the dataset is built, every image is taken whether or not a caption
+    # file sits beside it, and a missing caption reads as "". Training paths leave it False —
+    # there the caption filter is what keeps an uncaptioned stray out of the run.
+    captions_optional: bool = False
+
     def __init__(
         self,
         image_directory: str,
@@ -575,7 +605,8 @@ class ImageDirectoryDatasource:
 
         logger.info(f"glob images in {self.image_directory}")
         self.image_paths = glob_images(self.image_directory,
-                                       caption_extension=self.caption_extension,
+                                       caption_extension=(None if self.captions_optional
+                                                          else self.caption_extension),
                                        extra_extensions=self.extra_extensions)
         _clips = sum(1 for p in self.image_paths
                      if os.path.splitext(p)[1].lower() in {e.lower() for e in VIDEO_EXTENSIONS})
@@ -700,6 +731,8 @@ class ImageDirectoryDatasource:
     def get_caption(self, idx: int) -> Tuple[str, str]:
         image_path = self.image_paths[idx]
         caption_path = os.path.splitext(image_path)[0] + self.caption_extension if self.caption_extension else ""
+        if self.captions_optional and not (caption_path and os.path.isfile(caption_path)):
+            return image_path, ""
         with open(caption_path, "rb") as f:
             raw = f.read()
         return image_path, decode_caption(raw, caption_path).strip()
@@ -729,6 +762,15 @@ class ImageDirectoryDatasource:
 
 class ImageDataset(torch.utils.data.Dataset):
     """Klein 9B image dataset with bucketing, caching, and batch management."""
+
+    # MiniMax H3 only (Peter, 7 Sep 2026): every cached CLIP also contributes ONE FRAME as a
+    # photo item — its own step, the clip's own text encoding. The frame is the clip's
+    # sharpest one that shows a face, picked and encoded at cache time (--clip_still) and
+    # stored in the clip's own cache file as `still_latent`. A clip cached without one falls
+    # back to frame 0 sliced from the clip latent (H3's causal VAE makes that slice the
+    # still's own encoding). Set on the CLASS by the trainer before the dataset group is
+    # generated (the blueprint path builds and prepares the datasets in one go).
+    clip_still_as_photo: bool = False
 
     def __init__(
         self,
@@ -1109,6 +1151,8 @@ class ImageDataset(torch.utils.data.Dataset):
         skipped_stale = 0
         skipped_wrong_reso = 0
         accepted_smaller_clips = 0
+        still_items = 0
+        still_frame0_fallback = 0
 
         bucketed: dict[Tuple, list[ItemInfo]] = {}   # (w, h), or ("audio", w, h) for voice items
         for cache_file in latent_cache_files:
@@ -1162,6 +1206,20 @@ class ImageDataset(torch.utils.data.Dataset):
             bucket = bucketed.get(bucket_key, [])
             for _ in range(self.num_repeats):
                 bucket.append(item_info)
+            # A clip's still as a photo of its own (see the class attribute): a derived item
+            # sharing both cache files, resolved in __getitem__. Voice items (audio sentinel
+            # bucket) never qualify; a still (3-D latent) is left alone.
+            if (self.clip_still_as_photo and bucket_key != ("audio",) + AUDIO_SENTINEL_RESO
+                    and self.latent_cache_frames(cache_file) > 1):
+                ff = ItemInfo(item_key + "#still", "", image_size, bucket_reso,
+                              latent_cache_path=cache_file)
+                ff.text_encoder_output_cache_path = te_cache
+                ff.still_only = True
+                for _ in range(self.num_repeats):
+                    bucket.append(ff)
+                still_items += self.num_repeats
+                if not self.latent_cache_has_still(cache_file):
+                    still_frame0_fallback += 1
             bucketed[bucket_key] = bucket
 
         if skipped_stale:
@@ -1181,9 +1239,44 @@ class ImageDataset(torch.utils.data.Dataset):
                 f"training them at the cached size. Re-running cache preparation with more "
                 f"free VRAM re-encodes them at full size.")
 
+        if still_items:
+            logger.info(
+                f"[dataset] {still_items} clip still(s) added as photo items — each clip's "
+                f"sharpest frame with a face trains as a still on its own step, with the "
+                f"clip's caption.")
+            if still_frame0_fallback:
+                logger.warning(
+                    f"[dataset] {still_frame0_fallback} clip(s) were cached without a picked "
+                    f"still — their frame 0 is used instead. Re-run caching with the tick on "
+                    f"(or flush the cache) to pick sharp frames for them.")
         self.batch_manager = BucketBatchManager(bucketed, self.batch_size, num_timestep_buckets=num_timestep_buckets)
         self.batch_manager.show_bucket_info()
         self.num_train_items = sum(len(b) for b in bucketed.values())
+
+    @staticmethod
+    def latent_cache_has_still(cache_file: str) -> bool:
+        """Whether a cached clip carries its picked still (`still_latent`), from the header."""
+        try:
+            from safetensors import safe_open
+            with safe_open(cache_file, framework="pt") as f:
+                return "still_latent" in f.keys()
+        except Exception:
+            return False
+
+    @staticmethod
+    def latent_cache_frames(cache_file: str) -> int:
+        """Latent frames in a cached item, from the header alone (1 for a still or on any
+        trouble reading)."""
+        try:
+            from safetensors import safe_open
+            with safe_open(cache_file, framework="pt") as f:
+                for k in f.keys():
+                    if k.startswith("latent_") and not k.startswith("latent_control_"):
+                        shape = f.get_slice(k).get_shape()
+                        return int(shape[1]) if len(shape) == 4 else 1
+        except Exception:
+            pass
+        return 1
 
     # -- epoch / seed management -------------------------------------------
 

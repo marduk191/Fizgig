@@ -37,12 +37,13 @@ The whole recipe, using what the GUI already sets for you:
 
 1. **Load the ✨ MiniMax H3 Fast preset** (Training tab, Load Preset).
 2. **Tick ⚗ Fine-tune the BASE MODEL.** The moment you tick it, the learning rate
-   switches to **1e-5** and the epochs and save cadence move to fine-tune values — the
+   switches to **3e-5** and the epochs and save cadence move to fine-tune values — the
    Save-every box suggests a save every second cycle (~8–10 epochs; previews ride the
    saves) and follows your card's plan live, so trust its guidance.
 3. **Set Max epochs and Save every N epochs** to taste — the GUI guides both. Save-every
    snaps to full cycles so every checkpoint compares like-for-like.
-4. **Leave the learning rate at 1e-5**, or raise it to **3e-5 at most** — never higher.
+4. **Leave the learning rate at 3e-5** — the tested rate, and the most you should use. If a
+   run looks too eager (drift, over-sharpening between checkpoints), come down to **1e-5**.
 5. **Leave Optimised Likeness Learning on.**
 6. **Change the Output Directory** to a drive with room (each save is ~21 GB).
 7. **Make sure your captions use a trigger token** — an invented word, not a common one.
@@ -77,9 +78,10 @@ Even shorter, because ticking the box sets everything that matters:
 fine-tune moves the model's own weights. The rates you know from LoRA training land very
 differently here.
 
-- **MiniMax H3: ticking Fine-tune sets 1e-5** — the safe default. **3e-5** is the tested
-  faster rate and the most you should ever use; **1e-4 will destroy an H3 fine-tune** —
-  that's measured, not folklore.
+- **MiniMax H3: ticking Fine-tune sets 3e-5** — the tested rate and the most you should
+  ever use. It starts there rather than lower so you can judge real results and come down to
+  **1e-5** if a run looks too eager, instead of waiting on a rate that is too slow to tell.
+  **1e-4 will destroy an H3 fine-tune** — that's measured, not folklore.
 - **Krea 2: 1e-5 is the safe recommendation.** You're welcome to *start experimenting* at
   1e-4 — it trains — but realistically the best results are found lower. Treat 1e-4 as
   the top of the experiment range, not the recipe. When a run looks almost right but
@@ -173,6 +175,18 @@ as of this release video follows it too: the **Restrict video to likeness blocks
 sub-tick (on by default) routes clips to the same identity blocks — in our tests that
 trains video just as well, and it makes clips far lighter on VRAM. Untick it for
 whole-model video.
+
+## Where did the EMA setting go? (H3)
+
+It is a LoRA-run control and the row hides when Fine-tune is ticked. EMA keeps a smoothed shadow copy of whatever is training and previews and saves from that copy. For a LoRA that shadow is a few hundred megabytes. Under fine-tune the thing training is the model itself, and it trains in rotating windows, so an honest shadow would be a second copy of the whole model in system RAM with the live window folded in as it trains, and the checkpoint would have to be written from it. That is a real feature with a real memory cost, not a tick, and it has not been built or measured yet. Until it is, a fine-tune saves the trained weights as they stand.
+
+## Should I train the text token refiner on a fine-tune? (H3)
+
+No, unless you are testing it. The refiner is the model's bridge from the text encoder into the DiT and sets how every prompt is read. Fine-tunes used to train it on every epoch, four times as often as any block matmul, and it was the tensor that moved most in every checkpoint. LoRA runs already leave it frozen because training it softened output and made previews judder without helping likeness; fine-tune now does the same. The trigger word is learned in the blocks' attention either way. The tickbox in Other Options ("Train the text token refiner") puts it back for an A/B.
+
+## Should I tick the training adapter on a fine-tune? (H3)
+
+You can. The training adapter (@ostris's de-distillation LoRA, on by default for every H3 LoRA run) is available under Fine-tune with the same contract: it rides frozen at 1.0 for every training step so the gradient is about your subject rather than about undoing H3's distillation, it switches off for previews, and it is never written into the checkpoint — the file you get is a plain H3 fine-tune. It is on by default under Fine-tune as it is for LoRA runs; the LoRA-mode numbers (faster likeness, higher peak, no frying with other Turbo LoRAs) are the reason, and an A/B on your own dataset — same seed, adapter on versus off — is how to check it for yourself. The file is the same one your LoRA runs use (Preferences → Training adapter, fl2va or ref2va to match the base).
 
 ## Do the problem-image tools work on a fine-tune? (Krea 2)
 

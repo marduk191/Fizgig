@@ -42,6 +42,11 @@ functional flow-matching sampler (`src/fizgig/krea2/sampling.py`) are ported
 from ai-toolkit's `extensions_built_in/diffusion_models/{krea2,flux2}/src`,
 then adapted for Fizgig.
 
+The Automagic v3 optimizer (`src/fizgig/training/automagic3.py`) is kept
+byte-for-byte as upstream's `toolkit/optimizers/automagic3.py`, under a Fizgig
+header describing how it is constructed. Offered as an optimizer choice on the
+MiniMax H3 and Krea 2 LoRA paths.
+
 ```
 MIT License
 
@@ -106,6 +111,11 @@ installer uses code from that project as follows:
   comfyui-rocm's `install.bat` (adapted for Fizgig's venv and
   requirements). The batch file itself is Apache-2.0; the bundled
   `detect_gpu.py` remains GPL-3.0.
+- `run_fizgig_rocm.bat` / `run_fizgig_rocm.sh` — Fizgig-authored launchers.
+  Legacy RDNA1/2 SDP overrides, aotriton gating, and MIOpen/rocBLAS tensile
+  DB path setup are adapted from comfyui-rocm's `comfyui-rocm.bat`. The
+  launchers themselves are Apache-2.0; Windows detection still goes through
+  the GPL-3.0 `detect_gpu.py` above.
 
 `detect_gpu.py` is free software: you may redistribute and/or modify it under
 the terms of the GNU General Public License as published by the Free Software

@@ -473,7 +473,7 @@ _RESIDENT_PRUNED_GB = 10.5
 # int8 base (base_quant=int8, the reference's own storage): the 200 block linears stay 1 byte
 # per param instead of NF4's 0.5, and the refiner/AdaLN load dense — ~19.3 + ~1.5 GB.
 _RESIDENT_INT8_GB = 21.0
-# HQQ 4-bit g16 (rintic-13, #102): 0.5 B/param of codes + two bf16 group vectors at 1/16 =
+# HQQ 4-bit g8 w/ 8-bit group vectors (rintic-13, #102): 0.5 B/param of codes + two uint8 vectors at 1/8 =
 # 0.75 B/param against NF4's ~0.52 (block-64 absmax, double-quantized) — ~45% more resident
 # for the same quantized mass. PRUNED figure MEASURED (2 Sep, 5090, pruned int8 file
 # decoded to HQQ): ~15.5 GB process right after load incl. the 0.6 GB adapter, ~22 GB
@@ -562,7 +562,7 @@ def adapter_param_count(dit_path: str, include_patterns, network_type: str = "lo
         if len(shape) != 2:                     # Linears only, as create_modules wraps
             continue
         name = key[:-len(".weight")]
-        if not any(r.search(name) for r in rx):
+        if not any(r.fullmatch(name) for r in rx):   # fullmatch, as create_modules matches
             continue
         out_dim, in_dim = int(shape[0]), int(shape[1])
         if str(network_type).lower() == "lokr":
@@ -573,6 +573,18 @@ def adapter_param_count(dit_path: str, include_patterns, network_type: str = "lo
         else:
             total += int(network_dim) * (in_dim + out_dim)
     return total
+
+
+from fizgig.training.optimizers import optimizer_lr  # noqa: E402  (shared with the Krea 2 trainer)
+
+
+def drop_grad(p) -> None:
+    """Take this step's gradient away from `p` for every optimizer we run: `.grad`, and the
+    accumulation buffer Automagic v3 (non-fused, low-precision params) moves it into from its
+    post-accumulate hook — without this the masked tensor would still step."""
+    p.grad = None
+    if hasattr(p, "_accum_grad"):
+        del p._accum_grad
 
 
 def adapter_vram_gb(params: int, optimizer_type: str = "adamw8bit") -> float:
@@ -596,6 +608,79 @@ def adapter_vram_gb(params: int, optimizer_type: str = "adamw8bit") -> float:
     n_states = 1 if "lion" in key else 2        # Lion keeps momentum only
     state_bytes = (1 if "8bit" in key else 4) * n_states
     return params * (2 + state_bytes) / 1e9     # bf16 weight + optimizer state
+
+
+def frozen_lora_vram_gb(path: str, bytes_per_elem: int = 2) -> float:
+    """GB a FROZEN side LoRA holds on the card for the whole run — the training adapter, or a
+    Context LoRA. Read from the safetensors HEADER, so this works before the DiT is built, like
+    adapter_param_count.
+
+    load_context_lora does `net.to(device=device, dtype=dtype)`, so the file lands in the training
+    dtype (bf16 = 2 bytes), not the dtype it was stored in — count elements, not file bytes. It is
+    applied to the DiT and never freed, so it belongs in the resident term exactly like the
+    trainable adapter's weights. Any AdaLN rows the file carries are injected from the same
+    tensors and are counted here too.
+
+    Not a rounding error: the training adapter is on by default in every H3 preset. Fizgig's
+    Preferences download is ostris's v1 (rank 16, 0.155 GB resident); upstream also publishes a
+    v2 at rank 32, which is 0.310 GB if a user points the path at it. This reads whichever file
+    is configured rather than assuming either.
+    """
+    if not path:
+        return 0.0
+    try:
+        if not os.path.isfile(path):
+            return 0.0
+        import json
+        import struct
+        with open(path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            hdr = json.loads(f.read(n))
+        elems = 0
+        for key, ent in hdr.items():
+            if key == "__metadata__" or not isinstance(ent, dict):
+                continue
+            shape = ent.get("shape") or []
+            c = 1
+            for d in shape:
+                c *= int(d)
+            elems += c if shape else 0
+        return elems * int(bytes_per_elem) / 1e9
+    except Exception:
+        return 0.0     # unreadable header: plan as before rather than refuse to plan
+
+
+def ema_shadow_gb(params: int) -> float:
+    """GB the EMA shadow holds. EMAWeights keeps `p.detach().clone().float()` per trainable
+    parameter — a full FP32 copy on the same device, live for the whole run (swap_in/swap_out
+    only bracket saves and previews). Four bytes, not two: 1.25 GB on LoKR factor 8, which is
+    most of the planner's whole reserve. Zero when EMA is off, and FT rotation forces it off
+    before the plan runs."""
+    return max(0, int(params)) * 4 / 1e9
+
+
+def plan_adapter_gb(params: int, optimizer_type: str = "adamw8bit", *,
+                    training_adapter_path: str = None, context_lora_path: str = None,
+                    ema_decay: float = 0.0, ft_rotation: int = 0):
+    """Everything the adapter side of a run keeps resident, as (total, frozen_gb, ema_gb) GB.
+
+    Pure so the gating is testable: the planner runs deep inside train_minimax behind a GPU and a
+    21 GB checkpoint, and until this existed the only coverage of the gates was grepping the
+    source for the lines that implement them, which passes whether or not they run.
+
+    The gates mirror what the run actually does. The training adapter is resident under both
+    modes (under fine-tune rotation it rides as forward hooks). A Context LoRA is refused
+    under rotation (it raises at load time) and EMA is forced off by the FT coercion block,
+    so neither is resident there. Otherwise each term counts only when it is really present.
+    """
+    total = adapter_vram_gb(params, optimizer_type)
+    frozen = frozen_lora_vram_gb(training_adapter_path)
+    ema = 0.0
+    if not ft_rotation:
+        frozen += frozen_lora_vram_gb(context_lora_path)
+        if ema_decay and float(ema_decay) > 0:
+            ema = ema_shadow_gb(params)
+    return total + frozen + ema, frozen, ema
 
 
 def plan_base_quant(free_gb: float, pruned: bool, mp: float = 0.25, adapter_gb: float = 0.0):
@@ -976,7 +1061,7 @@ def compute_loss(model, latent: torch.Tensor, text_embeds: torch.Tensor, *,
                  sigma: torch.Tensor = None, shift: float = None, generator=None,
                  noise: torch.Tensor = None, audio_latent: torch.Tensor = None,
                  audio_weight: float = 1.0, video_weight: float = 1.0,
-                 parts_out: dict = None):
+                 parts_out: dict = None, ref_latents=None):
     """One training step's loss.
 
     latent      : [1, 24, T, H, W] clean VAE latent (x0). T=1 is a still.
@@ -1026,8 +1111,11 @@ def compute_loss(model, latent: torch.Tensor, text_embeds: torch.Tensor, *,
     noised = (1.0 - s) * x0 + s * noise
     t = (1.0 - sigma).to(device)
 
+    # ref_latents: RefMod mode — the mod rides as the reference block on every step (the LoRA
+    # learns what the reference can't carry). None = the ordinary step.
+    _ref_kw = {"ref_latents": ref_latents} if ref_latents else {}
     if audio_latent is None:
-        pred = model(noised.to(latent.dtype), t, text_embeds)
+        pred = model(noised.to(latent.dtype), t, text_embeds, **_ref_kw)
         loss = F.mse_loss(pred.float(), (x0 - noise).to(pred.dtype).float())
         if parts_out is not None:
             parts_out.update(video=float(loss.detach()), audio=None)
@@ -1048,7 +1136,7 @@ def compute_loss(model, latent: torch.Tensor, text_embeds: torch.Tensor, *,
     a_noised = (1.0 - sigma_a) * a0 + sigma_a * a_noise
 
     pred, pred_a = model(noised.to(latent.dtype), t, text_embeds,
-                         audio_rows=a_noised, return_audio=True)
+                         audio_rows=a_noised, return_audio=True, **_ref_kw)
     v_loss = F.mse_loss(pred.float(), (x0 - noise).to(pred.dtype).float())
     if pred_a is None:                      # pack_audio_rows off — nothing to train against
         if parts_out is not None:
@@ -1236,9 +1324,31 @@ def load_preview_turbo(dit, path, strength, tag="turbo"):
     and dropping them is what made few-step audio fall apart (Peter; same finding as
     larryvrh's dedicated loader node). They come back as (adaln_module, A, B*strength)
     pairs for turbo_adaln_patch's run-time injection during previews."""
+    from fizgig.networks.lora import create_network_from_weights
+    keep, adaln_pairs, dropped = _prefilter_frozen_lora(dit, path, strength)
+    net = create_network_from_weights(None, float(strength), keep, None, dit,
+                                      for_inference=True)
+    net.apply_to(text_encoders=None, unet=dit, apply_text_encoder=False, apply_unet=True)
+    # AFTER apply_to, or the modules keep their zero init and contribute nothing — the same
+    # trap the Krea 2 context-LoRA path documents.
+    net.load_state_dict(keep, strict=False)
+    net.requires_grad_(False)
+    for m in net.unet_loras:
+        m.enabled = False
+    logger.info(f"[{tag}] {len(net.unet_loras)} modules wired at strength {strength:g}"
+                + (f" + {len(adaln_pairs)} adaln via run-time injection"
+                   if adaln_pairs else "")
+                + (f" ({len(dropped)} skipped)" if dropped else ""))
+    return net, adaln_pairs
+
+
+def _prefilter_frozen_lora(dit, path, strength):
+    """A frozen LoRA file against THIS base: -> (keep, adaln_pairs, dropped). `keep` is the
+    kohya state dict restricted to Linears that exist here with matching shapes; the
+    full-model AdaLN rows come back as (AdalnProj, A, B*strength) pairs for the run-time
+    injection; `dropped` names what matched nothing (see load_preview_turbo)."""
     from safetensors.torch import load_file
-    from fizgig.networks.lora import (create_network_from_weights,
-                                      ensure_kohya_lora_state_dict)
+    from fizgig.networks.lora import ensure_kohya_lora_state_dict
     sd = ensure_kohya_lora_state_dict(load_file(path))
     linears = {f"lora_unet_{n.replace('.', '_')}": m
                for n, m in dit.named_modules() if isinstance(m, torch.nn.Linear)}
@@ -1267,20 +1377,36 @@ def load_preview_turbo(dit, path, strength, tag="turbo"):
         dropped.append(name)
     if not keep:
         raise RuntimeError("no module in this LoRA matches the loaded base — wrong file?")
-    net = create_network_from_weights(None, float(strength), keep, None, dit,
-                                      for_inference=True)
-    net.apply_to(text_encoders=None, unet=dit, apply_text_encoder=False, apply_unet=True)
-    # AFTER apply_to, or the modules keep their zero init and contribute nothing — the same
-    # trap the Krea 2 context-LoRA path documents.
-    net.load_state_dict(keep, strict=False)
-    net.requires_grad_(False)
-    for m in net.unet_loras:
-        m.enabled = False
-    logger.info(f"[{tag}] {len(net.unet_loras)} modules wired at strength {strength:g}"
-                + (f" + {len(adaln_pairs)} adaln via run-time injection"
-                   if adaln_pairs else "")
-                + (f" ({len(dropped)} skipped)" if dropped else ""))
-    return net, adaln_pairs
+    return keep, adaln_pairs, dropped
+
+
+def park_frozen_lora(net, adaln_pairs=None):
+    """Move a frozen LoRA network's parameters (and its AdaLN row tensors) to the CPU for a
+    phase that never runs it — the preview renders with the training adapter's modules
+    disabled, so its ~150 MB was dead weight on the card, and on a 24 GB card that is the
+    difference between a preview that pages on every step and one that doesn't (a 4090
+    report, 5 Sep 2026). Returns the bytes moved. FIZGIG_NO_ADAPTER_PARK=1 disables it."""
+    if os.environ.get("FIZGIG_NO_ADAPTER_PARK") == "1":
+        return 0
+    moved = 0
+    if net is not None:
+        for p in net.parameters():
+            if p.is_cuda:
+                moved += p.numel() * p.element_size()
+        net.to("cpu")
+    if adaln_pairs:
+        for i, (mod, A, B) in enumerate(adaln_pairs):
+            if A.is_cuda:
+                moved += (A.numel() * A.element_size() + B.numel() * B.element_size())
+            adaln_pairs[i] = (mod, A.to("cpu"), B.to("cpu"))
+    return moved
+
+
+def restore_frozen_lora(net, device):
+    """Back onto the card after the preview (dtype untouched). The AdaLN rows stay on the
+    CPU: turbo_adaln_patch copies them to the device when it installs them."""
+    if net is not None:
+        net.to(device)
 
 
 def load_context_lora(dit, path, strength, device, dtype, tag="context", label="Context LoRA"):
@@ -1305,6 +1431,81 @@ def load_context_lora(dit, path, strength, device, dtype, tag="context", label="
                 + (f" + {n_ad} adaln injected" if n_ad else "")
                 + "; the trainable LoRA learns on top of it")
     return net, pairs
+
+
+class FrozenLoraHooks:
+    """A frozen LoRA riding on the DiT as FORWARD HOOKS instead of wrapped forwards.
+
+    LoRAModule.apply_to sets an instance `forward` on each Linear that captures the OLD
+    bound forward — which the fine-tune rotator's `__class__` swap (Linear4bit <-> nn.Linear
+    on the same instance) orphans. A forward hook lives on the instance and runs after
+    whatever forward is live, so it survives every rotation, the Turbo's per-preview
+    apply_to/pop bracket, and a `--dit <checkpoint>` continuation. Same contract as the
+    LoRA-mode adapter: on for every training step (`enabled`), off + parked for previews,
+    never in the saved checkpoint (it touches no weight, only activations)."""
+
+    def __init__(self, net, path):
+        self.net, self.path = net, path
+        self.handles = []
+        self.enabled = True
+
+    @property
+    def n_modules(self):
+        return len(self.handles)
+
+    def set_enabled(self, on: bool):
+        self.enabled = bool(on)
+
+    def park(self):
+        return park_frozen_lora(self.net, None)
+
+    def restore(self, device):
+        restore_frozen_lora(self.net, device)
+
+    def remove(self):
+        for h in self.handles:
+            h.remove()
+        self.handles = []
+
+
+def attach_frozen_lora_hooks(dit, path, strength, device, dtype, tag="adapter",
+                             label="Training adapter"):
+    """The training adapter under fine-tune: frozen, active at `strength` as forward hooks
+    on every Linear the file matches (see FrozenLoraHooks). AdaLN rows are NOT hosted here
+    (their injection replaces module forwards — the class-swap trap again); v1/v2 carry
+    none, a file that does is logged and its rows skipped."""
+    from fizgig.networks.lora import assert_lora_family_matches, create_network_from_weights
+    assert_lora_family_matches(path, "minimax", label)
+    keep, adaln_pairs, dropped = _prefilter_frozen_lora(dit, path, strength)
+    net = create_network_from_weights(None, float(strength), keep, None, dit,
+                                      for_inference=True)
+    hooks = FrozenLoraHooks(net, path)
+    for m in net.unet_loras:
+        lin = m.org_module_ref[0]
+        if "org_module" in m._modules:
+            # A registered child until apply_to deletes it — here nothing deletes it, and
+            # net.to() would otherwise drag the base's NF4 Linears through a device move.
+            del m.org_module
+        m.enabled = True
+        # What apply_to would have done: register the module under its lora_name, so the
+        # state dict loads into it and net.parameters() / net.to() see its weights.
+        net.add_module(m.lora_name, m)
+
+        def _hook(_mod, inp, out, _m=m, _h=hooks):
+            if not _h.enabled:
+                return out
+            return out + _m.compute_delta(inp[0])
+        hooks.handles.append(lin.register_forward_hook(_hook))
+    net.load_state_dict(keep, strict=False)
+    net.to(device=device, dtype=dtype).eval()
+    net.requires_grad_(False)
+    if adaln_pairs:
+        logger.warning(f"[{tag}] {len(adaln_pairs)} AdaLN rows in {os.path.basename(path)} "
+                       "are not hosted under fine-tune — skipped")
+    logger.info(f"[{tag}] {os.path.basename(path)} attached as forward hooks at "
+                f"{float(strength):g} — {hooks.n_modules} modules"
+                + (f" ({len(dropped)} skipped)" if dropped else ""))
+    return hooks
 
 
 @contextlib.contextmanager
@@ -1491,7 +1692,7 @@ class AdaptiveLR:
 
         patience_up = 2
         patience_down = 2 if (self.stability_triggered or epoch == 1 or epoch >= 4) else 1
-        cur_lr = optimizer.param_groups[0]["lr"]
+        cur_lr = optimizer_lr(optimizer)
         new_lr = cur_lr
         cur_wn = self._weight_norm(network)
         weight_growth = None
@@ -1961,62 +2162,7 @@ def should_reassert_lr(*, resuming, adaptive, ramp, warmup_steps, global_step) -
     return True
 
 
-class EMAWeights:
-    """Exponential moving average of the trainable adapter — the smooth center of a rough
-    trajectory.
-
-    High static LRs take big Adam strides that zigzag around the good solution; the raw
-    weights at any single step are one corner of the zigzag, and that roughness reads as
-    distortion in samples. The EMA is the running average of the path, so what gets SAVED
-    (and previewed) is the center the strides orbit — the standard diffusion-training cure
-    for exactly this. Training itself always runs on the raw weights: swap_in/swap_out
-    bracket saves and previews only.
-
-    Decay ramps in as min(decay, (1+n)/(10+n)) so the first steps track the weights closely
-    instead of anchoring to the zero init. Shadow is fp32 (the adapter is small)."""
-
-    def __init__(self, network, decay: float):
-        self.decay = float(decay)
-        self.n = 0
-        self.params = [p for p in network.parameters() if p.requires_grad]
-        self.shadow = [p.detach().clone().float() for p in self.params]
-        self._backup = None
-
-    @torch.no_grad()
-    def update(self):
-        self.n += 1
-        d = min(self.decay, (1 + self.n) / (10 + self.n))
-        for s, p in zip(self.shadow, self.params):
-            s.mul_(d).add_(p.detach().float(), alpha=1.0 - d)
-
-    @torch.no_grad()
-    def swap_in(self):
-        """Put the averaged weights into the live network (for a save or a preview).
-
-        The raw-weight backup lives on CPU: swap_in brackets previews, and a clip preview
-        is exactly when GPU headroom is scarcest — a GPU-resident backup (~0.6 GB at LoKR
-        factor 8) was part of what tipped 32 GB cards back into the Windows VRAM spill."""
-        self._backup = [p.detach().to("cpu", copy=True) for p in self.params]
-        for s, p in zip(self.shadow, self.params):
-            p.data.copy_(s.to(p.device, p.dtype))
-
-    @torch.no_grad()
-    def swap_out(self):
-        """Restore the raw training weights. Must always pair with swap_in."""
-        for b, p in zip(self._backup, self.params):
-            p.data.copy_(b.to(p.device, p.dtype))
-        self._backup = None
-
-    def state_dict(self):
-        return {"n": self.n, "decay": self.decay,
-                "shadow": [s.detach().cpu() for s in self.shadow]}
-
-    def load_state_dict(self, sd):
-        self.n = int(sd["n"])
-        if len(sd["shadow"]) != len(self.shadow):
-            raise ValueError(f"EMA state has {len(sd['shadow'])} tensors, network has "
-                             f"{len(self.shadow)} — different run configuration?")
-        self.shadow = [t.to(s.device, torch.float32) for t, s in zip(sd["shadow"], self.shadow)]
+from fizgig.training.ema import EMAWeights  # noqa: E402  (moved to the shared module, 9 Sep 2026)
 
 
 # ---------------------------------------------------------------------------
@@ -2318,6 +2464,15 @@ def train_minimax(
     base_quant: str = "auto",
     include_patterns: list = None,
     train_blocks: str = None,        # "14-37" = train only that block range (experiment)
+    likeness_cut_backward: bool = True,  # Optimised Likeness (10 Sep 2026): on a masked step the
+                                     # out-of-window LoRA params AND the token refiner's LoRA
+                                     # are frozen BEFORE the forward, so autograd stops at the
+                                     # first trained block. Measured: -23% per step on int8,
+                                     # -27% on NF4 (0.25 MP); trained-block grads equal to the
+                                     # old post-hoc mask within run-to-run noise. Peter's A/B
+                                     # (same seed, 10 Sep): sharper previews, the epoch-to-epoch
+                                     # judder halved, likeness ahead at every epoch. False =
+                                     # the old full backward with the refiner training (A/B).
     photo_blocks: str = None,        # Optimised Likeness Learning: photo steps update only these
                                      # blocks (+refiners); video/audio clips update everything.
                                      # The 20-49 recipe: photo gradients into the front trunk are
@@ -2336,6 +2491,13 @@ def train_minimax(
                                      # measurably corrupt the visual blocks (A/B, 24 Aug —
                                      # audio-only @34-49 clean, @20-49 damaged visuals).
     train_adaln: bool = True,        # False = drop adaln_proj from the targets (pruned only)
+    train_token_refiner: bool = False,  # True = the text token refiner's Linears join the LoRA
+                                     # targets. Off by default (10 Sep 2026): the refiner is the
+                                     # model's bridge from the text encoder into the DiT and sets
+                                     # how every prompt is read; a LoRA on it moved that reading
+                                     # every epoch (preview judder, softer output). Photos, voice
+                                     # and video all measured sharper and steadier with it off; the
+                                     # trigger is learned in the blocks' attention regardless.
     distill: bool = False,           # reference distillation (references come from the dataset)
     distill_weight: float = 0.8,     # teacher share of the loss; the rest is the real photo
     distill_phase1_epochs: int = -1,  # identity-first: teacher-ONLY epochs, then photos-only
@@ -2396,6 +2558,16 @@ def train_minimax(
     # same frozen-layer mechanism at a fixed strength of 1.0, stacked UNDER the context
     # LoRA. De-distills the base while the LoRA learns; off for previews like the context.
     training_adapter_path: str = None,
+    # TREAD token routing (experiment): a random `tread_ratio` of the video tokens skips the
+    # main blocks [tread_start, tread_end) on every training forward and rejoins in its
+    # start-block state (arXiv 2501.04765) — fewer tokens through most of the model per step.
+    # 0.0 = off. Previews never route. Not available under rotation fine-tune.
+    tread_ratio: float = 0.0,
+    tread_start: int = 2,
+    tread_end: int = 47,
+    # Every clip's sharpest face frame (picked + cached by --clip_still) also trains as a
+    # photo: its own step, the clip's caption. Frame 0 when the cache has no pick (Peter, 7 Sep).
+    clip_still_as_photo: bool = False,
     # Previews with sound: decode the jointly-denoised audio rows to a .wav beside each clip
     # sample. Needs the audio VAE (its decoder half); silently off without it.
     sample_audio: bool = False,
@@ -2573,6 +2745,11 @@ def train_minimax(
 
     # ---- dataset (built from the caches the two cache scripts wrote) ----
     shared_epoch = Value("i", 0)
+    from fizgig.dataset.image_dataset import ImageDataset as _ImageDataset
+    _ImageDataset.clip_still_as_photo = bool(clip_still_as_photo)
+    if clip_still_as_photo:
+        logger.info("[dataset] clip stills train as photos too (each clip's sharpest frame "
+                    "with a face, on its own step with the clip's caption)")
     user_config = load_user_config(dataset_config)
     blueprint = BlueprintGenerator(ConfigSanitizer()).generate(
         user_config, argparse.Namespace(), architecture=ARCHITECTURE_MINIMAX)
@@ -2581,6 +2758,7 @@ def train_minimax(
     if group.num_train_items == 0:
         raise RuntimeError("No training items — run minimax_cache_latents then minimax_cache_text first.")
     logger.info(f"MiniMax H3 training: {group.num_train_items} items, {max_train_epochs} epochs")
+
 
     # FIZGIG_SAVED_TENSOR_AUDIT=1: account every tensor autograd saves for backward, with the
     # stack that saved it. Holders unregister on free, so whatever remains at a failed park is
@@ -2690,16 +2868,27 @@ def train_minimax(
             # The adapter is NOT a rounding error and it is not fixed: LoKR 8 trains ~313 M
             # parameters against a rank-16 LoRA's ~75 M, and fp32 Adam state is 4x the 8-bit
             # one. Planning without it was planning for a configuration nobody runs — the
-            # anchors were measured on rank-16 + adamw8bit (~0.45 GB) while the shipped default
-            # is LoKR 8 + adamw (~3.8 GB). Shapes come from the checkpoint header, so this is
-            # the real targeted module set for whichever file is loaded.
-            _pat = PRUNED_INCLUDE_PATTERNS if _pruned else DEFAULT_INCLUDE_PATTERNS
+            # anchors were measured on rank-16 + adamw8bit (~0.45 GB), while a LoKR 8 + adamw
+            # run (an opt-in Network Type; every shipped H3 preset is LoRA) reaches ~3.8 GB.
+            # Shapes come from the checkpoint header, so this is the real targeted module set
+            # for whichever file is loaded — and it must be the same pattern list the run will
+            # use, hence user_include_patterns first, exactly as the build resolves it below.
+            _pat = list(user_include_patterns or
+                        (PRUNED_INCLUDE_PATTERNS if _pruned else DEFAULT_INCLUDE_PATTERNS))
             if not train_adaln:
                 _pat = [p for p in _pat if "adaln" not in p]
+            if not train_token_refiner:
+                _pat = [p for p in _pat if "token_refiner" not in p]
             _ad_params = adapter_param_count(dit_path, _pat, network_type=network_type,
                                              network_dim=network_dim, lokr_factor=lokr_factor,
                                              train_blocks=train_blocks)
-            _adapter = adapter_vram_gb(_ad_params, optimizer_type)
+            # The frozen training adapter, a Context LoRA and the EMA shadow are resident for
+            # the whole run and were invisible to the plan until 10 Sep 2026 — see
+            # plan_adapter_gb for what each one is and when it counts.
+            _adapter, _frozen_gb, _ema_gb = plan_adapter_gb(
+                _ad_params, optimizer_type, training_adapter_path=training_adapter_path,
+                context_lora_path=context_lora_path, ema_decay=ema_decay,
+                ft_rotation=ft_rotation)
 
             if base_quant == "auto":
                 _mode, n_swap, _ckpt_auto, _why = plan_base_quant(
@@ -2714,15 +2903,21 @@ def train_minimax(
                     adapter_gb=_adapter)
                 _why = f"base precision pinned to {_mode} by the user"
                 if _mode == "hqq":
-                    _why += (" (HQQ: ~45% more resident than nf4 and roughly half the "
-                             "step speed — PyTorch-path dequant)")
+                    _why += (" (HQQ: ~45% more resident than nf4; NF4's speed when blocks "
+                             "stream, ~half at swap 0 — PyTorch-path dequant)")
             _base_mode = _mode
             _resident = _resident_for(_mode, _pruned)
 
+            _extra_bits = []
+            if _frozen_gb:
+                _extra_bits.append(f"+{_frozen_gb:.2f} GB frozen LoRAs")
+            if _ema_gb:
+                _extra_bits.append(f"+{_ema_gb:.2f} GB EMA shadow")
+            _extra_txt = (" " + " ".join(_extra_bits)) if _extra_bits else ""
             logger.info(f"[vram] auto plan: free {_free_gb:.1f} GB, largest bucket {_mp:.2f} MP, "
                         f"base ~{_resident:.0f} GB ({_mode}, {'pruned' if _pruned else 'bf16'}), "
                         f"adapter ~{_adapter:.1f} GB ({_ad_params/1e6:.0f} M params, "
-                        f"{optimizer_type}) -> blocks_to_swap={n_swap}, "
+                        f"{optimizer_type}){_extra_txt} -> blocks_to_swap={n_swap}, "
                         f"checkpointing={'on' if _ckpt_auto else 'off'}")
             logger.info(f"[vram] base precision: {_mode} — {_why}")
             if _mode == "nf4" and _pruned and base_quant == "auto":
@@ -2735,6 +2930,25 @@ def train_minimax(
                     "inference. To force the accurate base, set Base Precision to int8 — expect "
                     "block swap and a several-times-slower run — or close other GPU apps and "
                     "re-launch.")
+                # Do not make them guess which knob to turn. On a big trainable adapter the
+                # EMA shadow alone is over a GB of the budget (fp32, 4 bytes a parameter), and
+                # it is the cheapest thing here to give up — it changes what is SAVED, not what
+                # is learned. Only said when these terms are big enough to have mattered.
+                _plan_without = plan_base_quant(
+                    _free_gb, _pruned, mp=_mp, adapter_gb=_adapter - _frozen_gb - _ema_gb)[0]
+                if _plan_without == "int8":
+                    _cand = []
+                    if _ema_gb >= 0.3:
+                        _cand.append(f"the EMA shadow ({_ema_gb:.1f} GB — Weight averaging off "
+                                     f"still trains identically, it only changes what is saved)")
+                    if _frozen_gb >= 0.3:
+                        _cand.append(f"the frozen LoRAs riding under yours ({_frozen_gb:.1f} GB "
+                                     f"— the training adapter and any Context LoRA)")
+                    if _cand:
+                        logger.warning(
+                            "[vram] int8 WOULD have fitted without the extras this run keeps "
+                            "resident: " + ", and ".join(_cand) + ". Drop one to get the "
+                            "accurate base back.")
             if n_swap > 0 and not _ring_planned():
                 # Only the CLASSIC parking swap earns the scary line — ring-streamed
                 # blocks (int8 and NF4 alike) cross PCIe one-way with prefetch and cost
@@ -2830,6 +3044,32 @@ def train_minimax(
     do_previews = bool((sample_every_n_epochs or sample_at_first) and sample_prompts and te_path)
     encoded_prompts = encoded_negative = sample_dir = None
     if do_previews:
+        # Previews are the RAM-heavy path: each one parks the training base into system RAM
+        # (~21 GB int8) and streams the ~15 GB text encoder through it, on top of whatever
+        # int8 staging the plan already holds. On a 32 GB-RAM box that exhausts Windows'
+        # commit charge and the failure lands on the GUI as a bitmap-allocation error, not
+        # here (#120, a 24 GB card with 32 GB RAM over RDP). Say so up front — but only
+        # where the whole-base park happens: a 32 GB card keeps the base resident and parks
+        # just what the decode needs, so a 32 GB-RAM box is fine there.
+        try:
+            import psutil as _ps
+            _ram_total_gb = _ps.virtual_memory().total / 1e9
+            _vram_total_gb = (torch.cuda.get_device_properties(0).total_memory / 1e9
+                              if torch.cuda.is_available() else 0.0)
+        except Exception:
+            _ram_total_gb, _vram_total_gb = None, 0.0
+        if _ram_total_gb is not None and _ram_total_gb < 40.0 and 0.0 < _vram_total_gb < 30.0:
+            logger.warning(
+                f"[preview] this machine has {_ram_total_gb:.0f} GB of system RAM and a "
+                f"{_vram_total_gb:.0f} GB card. On a card below 32 GB each preview parks the "
+                f"training base (~21 GB) into RAM and streams the text encoder (~15 GB) "
+                f"through it, so with previews ON a MiniMax H3 run wants ~48 GB, or a "
+                f"system-managed paging file on a fast drive (Windows counts pagefile as "
+                f"commit). If the app closes with a 'not enough memory resources' dialog, or "
+                f"an RDP session drops, that is this: enlarge the paging file, and lighten the "
+                f"samples on the Samples tab — a smaller canvas such as 512x768, 22 frames "
+                f"rather than 56, or a still. As a last resort, untick Enable Sample Generation "
+                f"and judge the checkpoints in LoRA Royale afterwards.")
         from fizgig.minimax.sampling import encode_sample_prompts
         logger.info(f"[preview] pre-encoding {len(sample_prompts)} sample prompt(s) "
                     f"(the text encoder is freed before the DiT loads)...")
@@ -3130,11 +3370,21 @@ def train_minimax(
         rotator = H3NF4Rotator(dit.blocks, master, key_prefix="blocks", device=device,
                                block_subset=ft_subset)
         _refiner = getattr(dit, "token_refiner", None)
-        if _refiner is not None:
+        if _refiner is not None and train_token_refiner:
             # The always-on analogue of Krea's txtfusion: small, text-side, unquantized in
             # the int8 checkpoint (the NF4 rotator swaps its Params4bit Linears in from the
-            # master; small dense Linears just unfreeze).
+            # master; small dense Linears just unfreeze). Off by default (15 Sep 2026, Peter),
+            # as in LoRA mode: the refiner sets how every prompt is read, it trained at 4x
+            # the duty cycle of any block matmul and moved 1-2% per run against 0.2-0.4% on
+            # the blocks (Aug checkpoint audit) — the trunk-protection story that made
+            # likeness mode win under FT points the same way. --train_token_refiner puts it
+            # back; its keys then save exactly as before.
             rotator.activate_always("token_refiner", _refiner)
+            logger.info("[h3-ft] text token refiner TRAINS alongside every window "
+                        "(--train_token_refiner)")
+        elif _refiner is not None:
+            logger.info("[h3-ft] text token refiner frozen (tick 'Train the text token "
+                        "refiner' to include it — off by default, as for LoRA runs)")
         _cycle_n = len(ft_subset) if ft_subset else _n_blocks
         rot_schedule = RotationSchedule(_cycle_n, active=ft_rotation,
                                         rotate_every=max(1, int(finetune_rotate_every or 1)),
@@ -3389,6 +3639,11 @@ def train_minimax(
         else:
             logger.info("[base] AdaLN was not a target on this checkpoint; the toggle changes "
                         "nothing here.")
+    # The text token refiner is off by default (10 Sep 2026): a LoRA there re-tunes how every
+    # prompt is read, for every block on every step, and it cannot hold a subject. The blocks'
+    # attention learns the trigger on its own.
+    if not train_token_refiner:
+        include_patterns = [p for p in include_patterns if "token_refiner" not in p]
     _blocks_used = "all"
     if train_blocks:
         _n_blocks = len(dit.blocks)
@@ -3396,14 +3651,16 @@ def train_minimax(
         _sel = parse_block_spec(train_blocks, _n_blocks)
         _blocks_used = format_block_spec(_sel)
         logger.info("[base] EXPERIMENT: training blocks %s only (%d of %d), text refiner "
-                    "included. Nobody has mapped what H3's blocks do — judge this against a "
+                    "%s. Nobody has mapped what H3's blocks do — judge this against a "
                     "full-model run on the same dataset, not on its own.",
-                    _blocks_used, len(_sel), _n_blocks)
+                    _blocks_used, len(_sel), _n_blocks,
+                    "included" if train_token_refiner else "off")
     # Report what is ACTUALLY targeted: this used to key off the checkpoint alone, so a run with
     # --no_train_adaln announced "+ AdaLN" one line after saying AdaLN adapters were off.
     _adaln_on = bool(dit.pruned_adaln and train_adaln)
-    logger.info("[base] %s checkpoint; LoRA targets: attention + MLP + token refiner%s",
+    logger.info("[base] %s checkpoint; LoRA targets: attention + MLP%s%s",
                 "pruned (curve-table AdaLN)" if dit.pruned_adaln else "full bf16",
+                " + token refiner" if train_token_refiner else " (text token refiner off)",
                 " + AdaLN (deploy-consistent on this build; rank caps at 8)" if _adaln_on
                 else (" (AdaLN excluded - turned off for this run)" if dit.pruned_adaln
                       else " (AdaLN excluded - dropped by pruned inference builds)"))
@@ -3427,18 +3684,38 @@ def train_minimax(
     # (the LoRA deploys paired with it — Klein/Krea 2 semantics).
     adapter_net, adapter_adaln = None, []
     context_net, context_adaln = None, []
-    if training_adapter_path or context_lora_path:
+    if tread_ratio and float(tread_ratio) > 0.0:
         if rotator is not None:
-            _what = "The training adapter" if training_adapter_path else "Context LoRA"
-            raise RuntimeError(f"{_what} is not available with fine-tuning on MiniMax H3 "
-                               "— untick Fine-tune (train a LoRA) or turn it off.")
+            raise RuntimeError("TREAD token routing is not available with fine-tuning on "
+                               "MiniMax H3 — untick it or train a LoRA.")
+        dit._tread = (float(tread_ratio), int(tread_start), int(tread_end))
+        logger.info("[tread] token routing ON — %.0f%% of the video tokens skip blocks %d-%d "
+                    "on every CLIP step (they rejoin in their block-%d state; text, "
+                    "condition and audio rows always stay; photo steps — clip stills "
+                    "included — and previews never route). arXiv 2501.04765.",
+                    float(tread_ratio) * 100, int(tread_start), int(tread_end) - 1, int(tread_start))
+    adapter_hooks = None
+    if context_lora_path and rotator is not None:
+        raise RuntimeError("Context LoRA is not available with fine-tuning on MiniMax H3 "
+                           "— untick Fine-tune (train a LoRA) or turn it off.")
     if training_adapter_path:
         if not os.path.isfile(training_adapter_path):
             raise FileNotFoundError(f"Training adapter not found: {training_adapter_path} — "
                                     "run the updater or the Preferences model download.")
-        adapter_net, adapter_adaln = load_context_lora(dit, training_adapter_path, 1.0,
-                                                       device, dtype, tag="adapter",
-                                                       label="Training adapter")
+        if rotator is not None:
+            # Under rotation FT the adapter rides as forward hooks (apply_to's wrapped
+            # forwards would be orphaned by the class swap). Same contract as LoRA mode:
+            # on for every training step, off for previews, never in the checkpoint.
+            adapter_hooks = attach_frozen_lora_hooks(dit, training_adapter_path, 1.0,
+                                                     device, dtype, tag="adapter",
+                                                     label="Training adapter")
+            logger.info("[h3-ft] training adapter (hooks) — %d modules: on for every "
+                        "training step, off for previews, never in the checkpoint",
+                        adapter_hooks.n_modules)
+        else:
+            adapter_net, adapter_adaln = load_context_lora(dit, training_adapter_path, 1.0,
+                                                           device, dtype, tag="adapter",
+                                                           label="Training adapter")
     if context_lora_path:
         if not os.path.isfile(context_lora_path):
             raise FileNotFoundError(f"Context LoRA not found: {context_lora_path}")
@@ -3453,15 +3730,36 @@ def train_minimax(
         if adapter_net is not None:
             for _m in adapter_net.unet_loras:
                 _m.enabled = False
-            logger.info("[preview] training adapter off for the render (deployment view)")
+            _parked = park_frozen_lora(adapter_net, adapter_adaln)
+            _free_now = ""
+            if _parked and torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                    from fizgig.utils.device import plannable_free_vram
+                    _free_now = f", {plannable_free_vram():.1f} GB free now"
+                except Exception:
+                    pass
+            logger.info("[preview] training adapter off for the render (deployment view)"
+                        + (f" — parked on the CPU ({_parked / 2**30:.2f} GB back to the card"
+                           f"{_free_now})" if _parked else ""))
+        if adapter_hooks is not None:
+            adapter_hooks.set_enabled(False)
+            _parked = adapter_hooks.park()
+            logger.info("[preview] training adapter (hooks) off for the render (deployment "
+                        "view)" + (f" — parked on the CPU ({_parked / 2**30:.2f} GB back to "
+                                   "the card)" if _parked else ""))
 
     def _frozen_for_training():
         """Back to the training stack: Turbo/preview rows out, adapter on, adapter +
         context rows in. Idempotent — safe on the exception path."""
         turbo_adaln_unpatch(context_adaln + turbo_adaln)
         if adapter_net is not None:
+            restore_frozen_lora(adapter_net, device)
             for _m in adapter_net.unet_loras:
                 _m.enabled = True
+        if adapter_hooks is not None:
+            adapter_hooks.restore(device)
+            adapter_hooks.set_enabled(True)
         if adapter_adaln or context_adaln:
             turbo_adaln_patch(dit, adapter_adaln + context_adaln, device, dtype)
     if rotator is not None:
@@ -3512,7 +3810,7 @@ def train_minimax(
         import re as _re
         _targeted = [n for n, m in dit.named_modules()
                      if isinstance(m, torch.nn.Linear)
-                     and any(_re.search(p, n) for p in include_patterns)]
+                     and any(_re.fullmatch(p, n) for p in include_patterns)]   # fullmatch: what create_modules does
         if len(network.unet_loras) < len(_targeted):
             _kinds = sorted({type(dit.get_submodule(n)).__name__ for n in _targeted})
             raise RuntimeError(
@@ -3696,6 +3994,29 @@ def train_minimax(
         else:
             logger.info("[likeness] photo_blocks %s covers every trained block — nothing to "
                         "mask (Blocks to Train already inside it?)", _photo_used)
+    # Backward cut: the token refiner's LoRA must freeze on masked steps too. Its output enters
+    # the sequence at block 0 and is carried through every block, so a trainable refiner forces
+    # the gradient back through all 50 blocks whatever the block masks say (measured 10 Sep
+    # 2026: refiner trainable -> 50 blocks in the backward, no saving; frozen -> the window).
+    _refiner_params = []
+    if likeness_cut_backward and rotator is None and network is not None:
+        _ref_ids = set()
+        for _lora in network.unet_loras:
+            if "token_refiner" in _lora.lora_name:
+                _ref_ids.update(id(p) for p in _lora.parameters())
+        _refiner_params = [p for p in params if id(p) in _ref_ids]
+        if _refiner_params:
+            logger.info("[likeness] backward cut at the window: out-of-window LoRA params AND the "
+                        "token refiner's %d LoRA tensors are frozen before each masked step's "
+                        "forward (photo, clip and voice steps alike), so the backward stops at the "
+                        "first trained block. The refiner LoRA does not learn on masked steps "
+                        "(--likeness_full_backward restores the old behaviour).",
+                        len(_refiner_params))
+        else:
+            logger.info("[likeness] backward cut at the window: out-of-window LoRA params are "
+                        "frozen before each masked step's forward (photo, clip and voice steps "
+                        "alike), so the backward stops at the first trained block "
+                        "(--likeness_full_backward restores the old behaviour).")
     # Clip routing, LoRA mode (Peter, 2 Sep — same behaviour as the FT tickbox): clip-only
     # windows update only clip_blocks. Same mechanism as the photo mask.
     _clip_mask_params = []
@@ -3788,10 +4109,12 @@ def train_minimax(
         opt_params = None
         if finetune_fused_backward:
             _attach_fused(params)
+            _automagic = False
             optimizer, optimizer_label = None, "adafactor (rotation, fused backward)"
             logger.info("[h3-ft] optimizer-in-backward: each gradient is consumed and freed "
                         "as it lands (grad clipping and accumulation are off)")
         else:
+            _automagic = False
             optimizer, optimizer_label = _make_ft_optimizer(params)
         logger.info(f"optimizer: {optimizer_label} @ lr={learning_rate:.3e}")
     else:
@@ -3799,9 +4122,18 @@ def train_minimax(
         # structured tensors and the update degrades to lr*m/eps — measured at ~100x the
         # configured LR, which presented as melted anatomy at epoch 1. The floor caps that. It
         # is passed here and nowhere else: Krea 2 has never shown the failure.
+        _automagic = str(optimizer_type or "").lower() == "automagic3"
         optimizer, optimizer_label = create_optimizer(optimizer_type, opt_params, learning_rate,
                                                       optimizer_args, eps_floor_8bit=True)
         logger.info(f"optimizer: {optimizer_label} @ lr={learning_rate:.3e}")
+        if _automagic and optimizer is not None and optimizer.__class__.__name__ == "Automagic3":
+            logger.info("[optimizer] Automagic v3 owns the learning rate from here: %.2e is its start, and "
+                        "the per-step multipliers (adapter ramp, band, phase) are not applied — the "
+                        "controller sets the rate from the update signs. Its own trust-region clip "
+                        "bounds each step; max_grad_norm has no effect on low-precision LoRA params "
+                        "under it.", learning_rate)
+        elif _automagic:
+            _automagic = False        # fell back to AdamW (construction failed, logged above)
 
     limiter = None
     if block_limit and float(block_limit) > 0:
@@ -3825,7 +4157,23 @@ def train_minimax(
                         f"of a mature adapter; this keeps the RATIO steady instead of the rate.")
 
     ema = None
-    if ema_decay and float(ema_decay) > 0:
+    _ema_short = isinstance(ema_decay, str) and ema_decay.strip().lower().startswith("short")
+    if _ema_short:
+        # Short-run EMA (Peter, 10 Sep 2026): the normal ramp (1+n)/(10+n) never reaches 0.98 on a
+        # 40-step run — the saved weights are close to the raw walk, so a higher LR passes
+        # straight through. Size the window to the run instead: decay = 1 - 4/steps (the average
+        # spans roughly the last quarter of the run), with a fast ramp, so a 3-5x LR does the
+        # learning and the average removes the wobble. Batch size is 1 here, so steps = items x
+        # epochs.
+        _total = max(1, int(group.num_train_items) * max(1, int(max_train_epochs)))
+        _d = min(0.995, max(0.5, 1.0 - 4.0 / _total))
+        ema_decay = _d
+        ema = EMAWeights(network, _d, ramp=2)
+        logger.info(f"[ema] SHORT-RUN mode: {_total} steps -> decay {_d:.3f} (window ~ a quarter of "
+                    f"the run), fast ramp — checkpoints and previews use the average, training "
+                    f"runs on the raw weights")
+    elif ema_decay and float(ema_decay) > 0:
+        ema_decay = float(ema_decay)
         ema = EMAWeights(network, float(ema_decay))
         logger.info(f"[ema] ON at decay {float(ema_decay):g} — checkpoints and previews use the "
                     f"smoothed average of the training path; training itself runs on the raw "
@@ -4100,6 +4448,7 @@ def train_minimax(
             "ss_highnoise_lr_scale": f"{float(highnoise_lr_scale):g}",
             "ss_train_blocks": _blocks_used,
             "ss_train_adaln": "1" if _adaln_on else "0",
+            "ss_train_token_refiner": "1" if train_token_refiner else "0",
             "ss_distill": "dataset" if distill else "off",
             "ss_distill_weight": (f"{distill_weight:g}" if distill else "0"),
             # Context LoRA: the file this LoRA was trained ON TOP OF and the strength it rode
@@ -4108,17 +4457,22 @@ def train_minimax(
                                 if context_lora_path else "none"),
             "ss_context_lora_strength": (f"{float(context_lora_strength):g}"
                                          if context_lora_path else "0"),
+            "ss_tread": (f"{float(tread_ratio):g}@{int(tread_start)}-{int(tread_end)} clips"
+                         if tread_ratio and float(tread_ratio) > 0 else "off"),
+            "ss_clip_still_as_photo": str(bool(clip_still_as_photo)),
             "ss_training_adapter": (os.path.basename(training_adapter_path)
                                     if training_adapter_path else "none"),
             "ss_slow_blocks": _slow_used or "none",
             "ss_photo_blocks": (_photo_used if _photo_mask_params else "off"),
+            "ss_likeness_cut_backward": "1" if (likeness_cut_backward and rotator is None) else "0",
             "ss_clip_blocks": (str(clip_blocks) if (clip_blocks and (_clip_mask_params or rotator is not None))
                                else "off"),
             "ss_block_limit": str(block_limit or 0),
             "ss_gradient_accumulation": str(_accum_n),
             "ss_adapter_ramp": f"{adapter_ramp:g}" if ramp is not None else "0",
             "ss_lr_warmup_epochs": f"{lr_warmup_epochs:g}",
-            "ss_ema_decay": f"{ema_decay:g}" if ema is not None else "0",
+            "ss_ema_decay": (f"{float(ema_decay):g}" if ema is not None else "0"),
+            "ss_ema_mode": ("short" if _ema_short else ("fixed" if ema is not None else "off")),
             "ss_slow_block_lr_scale": (f"{slow_block_lr_scale:g}" if _slow_used else "1"),
             "ss_caption_dropout": f"{caption_dropout:g}" if uncond_text is not None else "0",
             # One [[datasets]] block per subject is how Multi Concept keeps two people apart, so
@@ -4531,11 +4885,15 @@ def train_minimax(
                     from fizgig.utils.device import plannable_free_vram as _pfv
                     _free = _pfv()
                     vram_line("pre-decode")
-                    if _frames > 1 and _free < 7.5:
+                    if _free < 7.5:
+                        # Stills included, not just clips: the decoder does not fit beside
+                        # the resident base on a tight card regardless of frame count — the
+                        # old _frames > 1 guard was a big-card assumption that turned into
+                        # an every-epoch OOM for still previews.
                         _need = (7.5 - _free) + 1.0
-                        logger.info(f"[preview] {_free:.1f} GB free is too tight for clip "
-                                    f"decode — parking ~{_need:.1f} GB of tail blocks for "
-                                    f"this decode pass.")
+                        logger.info(f"[preview] {_free:.1f} GB free is too tight for "
+                                    f"{'clip ' if _frames > 1 else ''}decode — parking "
+                                    f"~{_need:.1f} GB of tail blocks for this decode pass.")
                         park_dit_partial(dit, need_gb=_need)
                         gc.collect()
                         torch.cuda.empty_cache()
@@ -4616,6 +4974,14 @@ def train_minimax(
             if _audio_dec_state["dec"] is not None:
                 _audio_dec_state["dec"].to("cpu")     # ~0.45 GB back off the card
             vram_line("post-decode")
+            if _base_parked and decoder is not None:
+                # The decoder must be off the card before the parked tail blocks
+                # come back — with it resident there is not enough room for the
+                # restore. Idempotent with the finally, which covers the exception path.
+                decoder.to("cpu")
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             if _base_parked:
                 restore_parked_dit(dit, device, n_swap)   # swap-aware: never the whole base
                 gc.collect()
@@ -4656,7 +5022,7 @@ def train_minimax(
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            # Fragmentation guard for tight cards (#92, David Maybank's 12 GB report): the
+            # Fragmentation guard for tight cards (#92, @mabseyuk's 12 GB report): the
             # preview's block up/down churn + the 4.85 GB decoder round-trip fragment the
             # allocator reserve (his post-preview census: ~4.8 GB inactive split), and
             # Windows torch has no expandable_segments — the NEXT training step's first
@@ -4875,18 +5241,18 @@ def train_minimax(
         # the limiter were on (it ships retired).
         if _photo_mask_params and _window_photo_only[0]:
             for _p in _photo_mask_params:
-                _p.grad = None
+                drop_grad(_p)
         _window_photo_only[0] = True
         # Voice routing, same rule: a voice-only window drops the out-of-zone params' grads
         # (mixed windows mask nothing — conservative, exact at the default accumulation of 1).
         if _audio_mask_params and _window_voice_only[0]:
             for _p in _audio_mask_params:
-                _p.grad = None
+                drop_grad(_p)
         _window_voice_only[0] = True
         # Clip routing, same rule again: a clip-only window drops the out-of-range grads.
         if _clip_mask_params and _window_clip_only[0]:
             for _p in _clip_mask_params:
-                _p.grad = None
+                drop_grad(_p)
         _window_clip_only[0] = True
         if max_grad_norm and max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
@@ -4897,7 +5263,7 @@ def train_minimax(
         # `or _hn_active or _retire_active` is not decoration: warmup is retired for this
         # family and the ramp is OFF in the Fast preset, so without them this block never
         # runs for the preset most people use and the settings would silently do nothing.
-        if warmup_steps or ramp is not None or _p1_epochs or _hn_active or _retire_active:
+        if (warmup_steps or ramp is not None or _p1_epochs or _hn_active or _retire_active) and not _automagic:
             _wf = (min(1.0, (global_step + 1) / warmup_steps) if warmup_steps else 1.0)
             _rm = ramp.mult if ramp is not None else 1.0
             for _g in optimizer.param_groups:
@@ -5065,6 +5431,20 @@ def train_minimax(
                               else _ft_freeze["clip"]))
                 for _p in _frz:
                     _p.requires_grad_(False)
+            elif likeness_cut_backward:
+                # Backward cut (LoRA mode): the params this step's mask will discard anyway are
+                # frozen for the forward+backward, PLUS the token refiner's LoRA (its text rows
+                # enter at block 0 — trainable, it drags the backward through every block), so
+                # the graph ends at the first trained block: 20 for photos and clips, 34 for
+                # voice (Peter, 10 Sep: "do the same cut"). Exact per-step masking (a mixed
+                # accumulation window no longer trains the out-of-window blocks from its masked
+                # steps — those grads were None-d anyway on a single-modality window).
+                _frz = (list(_audio_mask_params) if _is_voice
+                        else (list(_photo_mask_params) if _is_photo else list(_clip_mask_params)))
+                if _frz:
+                    _frz = _frz + _refiner_params
+                for _p in _frz:
+                    _p.requires_grad_(False)
             if (distill and (_teacher_phase or not _p1_epochs) and "ref_hidden_states" in batch
                     and not _is_voice):
                 # `not _is_voice`: compute_distill_loss packs still-sized audio noise (4 rows)
@@ -5189,7 +5569,7 @@ def train_minimax(
         # LoRA-specific by construction — FT's movement signal is the per-window write-back log.
         if rotator is None:
             try:
-                _lr_now = optimizer.param_groups[0]["lr"]
+                _lr_now = optimizer_lr(optimizer)
                 _drift = max((float(l.lora_up.weight.detach().abs().max())
                               for l in network.unet_loras if hasattr(l, "lora_up")), default=0.0)
                 _bound = 3.0 * global_step * _lr_now

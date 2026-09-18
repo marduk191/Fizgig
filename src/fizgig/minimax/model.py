@@ -139,23 +139,38 @@ def audio_latents_for_frames(num_frames: int = 1) -> int:
 
 
 def pixel_frames_for_latent(latent_t: int) -> int:
-    """Latent frames -> the pixel frames they encode: 5n+2 latents <-> 17n+5 pixels.
+    """Latent frames -> the pixel frames they encode, summed off the (1, 4, 4, 4, 4) token
+    grid: 5n+2 latents <-> 17n+5 pixels (the trained / ComfyUI grid: 1, 5, 22, 39, 56, ...).
 
-    The lone-latent still (latent_t == 1) is its own case — one keyframe, one pixel frame.
-    Anything else must sit on the 5n+2 grid; a count off the grid means the caller built a
-    latent the VAE could never have produced, and silently rounding it would misalign the
-    audio clock against the video rows, so it raises instead."""
-    if latent_t == 1:
-        return 1
-    if latent_t < 2 or (latent_t - 2) % 5:
-        raise ValueError(f"latent_t={latent_t} is not on the 5n+2 grid (2, 7, 12, ...)")
-    return 17 * (latent_t - 2) // 5 + 5
+    A PARTIAL temporal group is exact arithmetic too (3 -> 9, 4 -> 13, 6 -> 18) — the audio
+    clock follows the summed pixel count, so nothing misaligns — but it is off-distribution:
+    neither the reference trainer nor ComfyUI ever builds one. Only the Repair Studio's
+    short-clip lengths ask for it (`latent_frames_for_pixels(..., exact=True)`); the trainer
+    snaps down and never does."""
+    t = int(latent_t)
+    if t < 1:
+        raise ValueError(f"latent_t={latent_t} must be >= 1")
+    return sum(FRAME_PER_TOKEN[k % 5] for k in range(t))
 
 
-def latent_frames_for_pixels(num_frames: int) -> int:
+def latent_frames_for_pixels(num_frames: int, exact: bool = False) -> int:
     """Pixel frames -> latent frames, snapping DOWN onto the 17n+5 grid like the reference
     trainer does (align_num_frames_down): 5..21 -> 2 latents, 22..38 -> 7, 124 -> 37.
-    num_frames == 1 is the still case -> 1 latent."""
+    num_frames == 1 is the still case -> 1 latent.
+
+    exact=True (Repair Studio short clips): the count must sit on the token grid itself —
+    1, 5, 9, 13, 17, 18, 22, 26, ... — and comes back as that many latents, partial temporal
+    group included (9 -> 3, 13 -> 4); anything else raises instead of snapping."""
+    if exact:
+        n = int(num_frames)
+        total, t = 0, 0
+        while total < n:
+            total += FRAME_PER_TOKEN[t % 5]
+            t += 1
+        if total != n:
+            raise ValueError(f"num_frames={num_frames} is not on the (1, 4, 4, 4, 4) token "
+                             f"grid (1, 5, 9, 13, 17, 18, 22, ...)")
+        return max(1, t)
     if num_frames <= 1:
         return 1
     n = max(5, int(num_frames))
@@ -196,14 +211,24 @@ def ref_row_count(refs) -> int:
 
 
 def image_position_ids(text_len, latent_h, latent_w, num_audio_latents: int = 0,
-                       refs=None, latent_t: int = 1) -> torch.Tensor:
-    """3-axis (t, h, w) position ids for a [text | refs | audio | video] sequence.
+                       refs=None, latent_t: int = 1, keyframes=None) -> torch.Tensor:
+    """3-axis (t, h, w) position ids for a [text | keyframes | refs | audio | video] sequence.
 
     Text rows: t = 0..text_len-1, h=w=0 — so prompt length shifts the whole media clock.
+    Keyframe rows (fl2va first/last-frame conditioning, `keyframes=[frame_index, ...]`): one
+    condition frame each on the TARGET's own grid, pinned to the moment it conditions —
+    t = target_origin + FRAME_RESCALE * frame_index, where target_origin is the cursor AFTER
+    the references (the reference packs keyframe cond rows before the refs but anchors them
+    on the target timeline: comfy/ldm/minimax/model.py::PackedLayout, cond_t). frame 0 is
+    the clip's first pixel frame; sum(_video_t_spans(latent_t)) == FRAME_RESCALE * frames,
+    so index frames-1 lands on the last pixel frame exactly.
     Reference rows (r2v): each reference image contributes its OWN area-normalized frame grid at
     t = cursor, and advances the cursor by 1.0. Ordered right after the text, matching the
     reference's segment order [text | cond | refs | target audio | target video]
-    (comfy/ldm/minimax/model.py::PackedLayout).
+    (comfy/ldm/minimax/model.py::PackedLayout). A reference entry may also be (h, w, t) with
+    t > 1: a VIDEO-kind reference block (what ComfyUI packs for a multi-frame RefMod) — its t
+    frames sit on the video clock from the cursor, _video_t_grid(t, cursor), and advance the
+    cursor by sum(_video_t_spans(t)), exactly PackedLayout's "video" branch.
     Audio rows: t = cursor + 0..A-1 repeated per channel, h = 0, w pinned to the frame grid's
     first column for channel 0 and its last for channel 1 (the reference's stereo convention).
     Video rows: latent_t frames, t-major (matching patchify_video's row order), each frame's
@@ -225,13 +250,33 @@ def image_position_ids(text_len, latent_h, latent_w, num_audio_latents: int = 0,
 
     rows = [text]
     cursor = float(text_len)
-    for rh, rw in (refs or ()):
+    ref_rows = []
+    for _ref in (refs or ()):
+        rh, rw = int(_ref[0]), int(_ref[1])
+        rt = int(_ref[2]) if len(_ref) > 2 else 1
         r_frame = _frame_grid(rh, rw)
+        if rt > 1:
+            # video-kind reference: t-major rows on the video clock, like the target's
+            _tg = _video_t_grid(rt, cursor)
+            g = torch.empty(rt * r_frame.shape[0], 3, dtype=torch.float64)
+            g[:, 0] = _tg.repeat_interleave(r_frame.shape[0])
+            g[:, 1:] = r_frame.repeat(rt, 1)
+            ref_rows.append(g)
+            cursor += float(sum(_video_t_spans(rt)))
+            continue
         g = torch.empty(r_frame.shape[0], 3, dtype=torch.float64)
         g[:, 0] = cursor
         g[:, 1:] = r_frame
-        rows.append(g)
+        ref_rows.append(g)
         cursor += 1.0
+    # Keyframe cond rows sit BETWEEN text and refs in the sequence, but their clock is the
+    # target's (post-ref cursor) — build them once the cursor is final, insert them first.
+    for idx in (keyframes or ()):
+        g = torch.empty(frame_rows, 3, dtype=torch.float64)
+        g[:, 0] = cursor + FRAME_RESCALE * float(idx)
+        g[:, 1:] = frame
+        rows.append(g)
+    rows.extend(ref_rows)
 
     if num_audio_latents:
         w_axis = _axis_from_sqrt_area(latent_w, 2, math.sqrt(latent_h * latent_w))
@@ -321,9 +366,68 @@ class Attention(nn.Module):
         q = q.transpose(0, 1).unsqueeze(0)
         k = k.transpose(0, 1).unsqueeze(0)
         v = v.transpose(0, 1).unsqueeze(0)
-        out = F.scaled_dot_product_attention(q, k, v)       # [1, H, S, D]
+        out = h3_attention(q, k, v)                         # [1, H, S, D]
         out = out.squeeze(0).transpose(0, 1).reshape(s, self.heads * self.head_dim)
         return self.out_proj(out)
+
+
+# ---- optional INT8 attention (comfy-kitchen) ------------------------------------------
+# NVIDIA's pure-INT8 SDPA from the comfy-kitchen wheel (Apache-2.0): Q / K / V to int8 after a
+# Hadamard rotation, P in uint8, softmax maths in fp32. Measured on a 5090 (5 Sep): 3.2x
+# PyTorch's attention at 1.3k tokens, 6-7x at 9k-18k (a 1024² × 56-frame clip's attention
+# goes from 6.3 s to 0.84 s per pass), at ~1.6% relative error per call against fp32 (the
+# bf16 path is 0.23%). An opt-in the H3 Repair Studio sets per render; nothing else turns it
+# on, and it is inference-only (never under grad). Three fallbacks, each announced once: the
+# package missing / not importable (AMD builds skip it), the kernel unavailable on this GPU
+# (compute < 7.5), a call raising at run time.
+_INT8_ATTN = {"wanted": False, "checked": False, "fn": None}
+
+
+def set_int8_attention(on: bool) -> None:
+    _INT8_ATTN["wanted"] = bool(on)
+
+
+def int8_attention_wanted() -> bool:
+    return bool(_INT8_ATTN["wanted"])
+
+
+def _int8_attention_fn():
+    st = _INT8_ATTN
+    if not st["checked"]:
+        st["checked"] = True
+        try:
+            import comfy_kitchen as _ck
+            if _ck.int8_attention_is_available():
+                st["fn"] = _ck.int8_attention
+                print("[h3] int8 attention: comfy-kitchen kernel active", flush=True)
+            else:
+                print("[h3] int8 attention: comfy-kitchen has no kernel for this GPU — "
+                      "PyTorch attention instead", flush=True)
+        except Exception as _e:
+            print(f"[h3] int8 attention: comfy-kitchen not available "
+                  f"({type(_e).__name__}) — PyTorch attention instead", flush=True)
+    return st["fn"]
+
+
+def int8_kernel_available() -> bool:
+    """True when the kernel is really there (import + GPU check + no run-time failure) —
+    what the studio's status line combines with its own tick. Not tied to the per-render
+    switch, which is only on while a render runs."""
+    return _int8_attention_fn() is not None
+
+
+def h3_attention(q, k, v):
+    """[1, H, S, D] SDPA — the int8 kernel when asked for and available, else PyTorch's."""
+    if _INT8_ATTN["wanted"] and not torch.is_grad_enabled():
+        fn = _int8_attention_fn()
+        if fn is not None:
+            try:
+                return fn(q, k, v)
+            except Exception as _e:
+                _INT8_ATTN["fn"] = None
+                print(f"[h3] int8 attention failed ({type(_e).__name__}: {_e}) — PyTorch "
+                      "attention for the rest of the run", flush=True)
+    return F.scaled_dot_product_attention(q, k, v)
 
 
 class MLP(nn.Module):
@@ -435,6 +539,12 @@ class FinalLayer(nn.Module):
 
 
 # --- model -------------------------------------------------------------------------------
+
+class ForwardAborted(RuntimeError):
+    """Raised between blocks when the module's `_abort_event` (set by the owner — the Repair
+    Studio engine's cancel) is set: a cancel lands within one block (~0.15 s) instead of at
+    the next sampler step (up to ~7 s at 56 frames full size)."""
+
 
 def _run_block(blocks, i, swap_from, h, t_emb, mod_row, cos, sin):
     """One DiT block, optionally CPU-parked ('block swap').
@@ -655,8 +765,16 @@ class MiniMaxH3DiT(nn.Module):
                 text_embeds: torch.Tensor, audio_noise: torch.Tensor = None, *,
                 audio_rows: torch.Tensor = None, return_audio: bool = False,
                 ref_latents=None, text_token_tags: torch.Tensor = None, seed: int = 0,
-                visual_cond_noise_aug: float = VISUAL_COND_TIMESTEP):
+                visual_cond_noise_aug: float = VISUAL_COND_TIMESTEP, keyframes=None):
         """
+        keyframes    : optional list of (frame_index, latent [1, C, 1, h, w]) — fl2va first /
+                       last-frame conditioning. Each is packed as a condition frame on the
+                       TARGET grid right after the text (before any refs), noise-augmented at
+                       VISUAL_COND_TIMESTEP with a role-pinned seed (H3Studio's convention:
+                       last frame 0, first frame 1, others 100+index — so the two never share
+                       a noise field), tagged video, pinned near clean, never denoised, and
+                       placed on the target clock at origin + FRAME_RESCALE * frame_index.
+                       Full strength only (no blend dial) — Repair Studio's contract.
         video_latent : [1, C=latents_dim, T, H, W] — a still (T=1, the keyframe layout) or a
                        clip (T on the 5n+2 latent grid; position ids and audio rows follow).
         t            : scalar or [1] flow time in [0, 1] (the value fed to the time embedder;
@@ -674,7 +792,9 @@ class MiniMaxH3DiT(nn.Module):
         ref_latents  : optional list of [1, C, 1, h, w] NORMALIZED reference latents (r2v). Each
                        is packed as condition rows right after the text: noise-augmented, tagged
                        video, pinned near clean, and never denoised. Their presence shifts the
-                       target's temporal origin (see image_position_ids).
+                       target's temporal origin (see image_position_ids). A [1, C, T, h, w]
+                       entry (T > 1) is a VIDEO-kind reference — a multi-frame RefMod — and
+                       rides on the video clock like ComfyUI's PackedLayout packs it.
         text_token_tags : optional [L] per-row modality tags for the text rows. Required when the
                        conditioning carries `<Picture i>` vision blocks, whose rows are VIDEO —
                        without it every text row is tagged TEXT and the vision rows are modulated
@@ -717,8 +837,34 @@ class MiniMaxH3DiT(nn.Module):
                     noise = torch.randn(r.shape, generator=gen, dtype=torch.float32).to(device)
                     r = visual_cond_noise_aug * r + (1.0 - visual_cond_noise_aug) * noise
                 _rows.append(r)
-                ref_shapes.append((z.shape[-2], z.shape[-1]))
+                ref_shapes.append((z.shape[-2], z.shape[-1], z.shape[2]))
             ref_embed = self.video_patch_proj(
+                torch.cat(_rows, dim=0).to(self.video_patch_proj.weight.dtype)).to(dtype)
+
+        # fl2va keyframe condition rows: the same row machinery as a reference, on the
+        # target's own grid, with a role-pinned noise seed per frame (see the docstring).
+        kf_indices, kf_embed = [], None
+        if keyframes:
+            _pixel_frames = pixel_frames_for_latent(latent_t)
+            _rows = []
+            for idx, z in keyframes:
+                idx = int(idx)
+                if z.shape[-2] != lat_h or z.shape[-1] != lat_w:
+                    raise ValueError(f"keyframe latent is {tuple(z.shape[-2:])} but the target "
+                                     f"grid is {(lat_h, lat_w)} — keyframes must be encoded at "
+                                     f"the clip's own size")
+                if not (0 <= idx < _pixel_frames):
+                    raise ValueError(f"keyframe index {idx} is outside the clip's "
+                                     f"{_pixel_frames} pixel frames")
+                r = patchify_video(z.to(device=device, dtype=torch.float32), self.patch_size)
+                if visual_cond_noise_aug < 1.0:
+                    _role = 1 if idx == 0 else (0 if idx == _pixel_frames - 1 else 100 + idx)
+                    gen = torch.Generator("cpu").manual_seed(_role)
+                    noise = torch.randn(r.shape, generator=gen, dtype=torch.float32).to(device)
+                    r = visual_cond_noise_aug * r + (1.0 - visual_cond_noise_aug) * noise
+                _rows.append(r)
+                kf_indices.append(idx)
+            kf_embed = self.video_patch_proj(
                 torch.cat(_rows, dim=0).to(self.video_patch_proj.weight.dtype)).to(dtype)
 
         # audio: silence (x0 = 0) noised on the audio schedule at the same schedule position as
@@ -757,17 +903,20 @@ class MiniMaxH3DiT(nn.Module):
             audio_embed = self.audio_patch_proj(
                 _arows.to(self.audio_patch_proj.weight.dtype)).to(dtype)
 
-        # pack [text | refs | audio | video] — the reference's segment order
+        # pack [text | keyframes | refs | audio | video] — the reference's segment order
         parts = ([text_states.to(dtype)]
+                 + ([kf_embed] if kf_embed is not None else [])
                  + ([ref_embed] if ref_embed is not None else [])
                  + ([audio_embed] if audio_embed is not None else [])
                  + [video_embed])
         h = torch.cat(parts, dim=0)
         seq_len = h.shape[0]
         n_video = video_embed.shape[0]
+        n_kf = 0 if kf_embed is None else kf_embed.shape[0]
         n_ref = 0 if ref_embed is None else ref_embed.shape[0]
+        n_cond = n_kf + n_ref                        # every condition row: keyframes then refs
         n_audio = 0 if audio_embed is None else audio_embed.shape[0]
-        audio_start = text_len + n_ref
+        audio_start = text_len + n_cond
         video_start = audio_start + n_audio
 
         # One modulation row-set per DISTINCT timestep (video/text at t, audio at t_audio),
@@ -776,7 +925,7 @@ class MiniMaxH3DiT(nn.Module):
         # Condition rows sit at max(t, aug) — near clean whatever the sampler is doing, so on a
         # late step they can share the video timestep and on an early one they need their own.
         t_parts = [t_val] + ([t_audio] if audio_embed is not None else [])
-        if n_ref:
+        if n_cond:
             t_parts.append(torch.maximum(t_val, torch.tensor([visual_cond_noise_aug],
                                                              device=device, dtype=torch.float32)))
         t_all = torch.cat(t_parts) if len(t_parts) > 1 else t_val
@@ -795,7 +944,7 @@ class MiniMaxH3DiT(nn.Module):
                 raise ValueError(f"text_token_tags has {_tt.numel()} rows for {text_len} text rows")
             tags[:text_len] = _tt                    # vision-block rows carry VIDEO_TAG
         row_t_index = torch.full((seq_len,), int(inverse[0]), dtype=torch.long, device=device)
-        if n_ref:                                    # ref rows: video tag (already), cond timestep
+        if n_cond:                                   # cond rows: video tag (already), cond timestep
             row_t_index[text_len:audio_start] = int(inverse[-1])
         if audio_embed is not None:
             tags[audio_start:video_start] = AUDIO_TAG
@@ -805,7 +954,8 @@ class MiniMaxH3DiT(nn.Module):
 
         # rope
         pos = image_position_ids(text_len, lat_h, lat_w, n_audio_latents,
-                                 refs=ref_shapes or None, latent_t=latent_t).to(device)
+                                 refs=ref_shapes or None, latent_t=latent_t,
+                                 keyframes=kf_indices or None).to(device)
         cos, sin = rope_cos_sin(pos, self.rope.inv_freq.to(device))
         cos, sin = cos.to(dtype), sin.to(dtype)
 
@@ -813,13 +963,50 @@ class MiniMaxH3DiT(nn.Module):
         # LoRA training (grads flow through it regardless), so a training-mode gate would
         # silently disable checkpointing for exactly the runs that need it.
         use_ckpt = self._gradient_checkpointing and torch.is_grad_enabled()
+        # TREAD token routing (Krause et al., arXiv 2501.04765; experiment/tread branch): on
+        # a TRAINING forward, a random `ratio` of the VIDEO rows leaves the sequence at block
+        # `start` and rejoins at block `end` in its start-block state (identity), so the
+        # blocks in between process fewer tokens; text / condition / audio rows always stay,
+        # the loss covers every token, and inference (no grad) never routes. Set by the
+        # trainer as dit._tread = (ratio, start, end); None = off. CLIP steps only: a photo
+        # (one latent frame) has no near-duplicate neighbouring frames to lean on, and the
+        # stills are where the sharp identity signal lives, so they always run in full
+        # (Peter, 7 Sep 2026, after seeing the A/B).
+        route = None
+        _tread = getattr(self, "_tread", None) if torch.is_grad_enabled() else None
+        n_video = h.shape[0] - video_start
+        if _tread and latent_t == 1:
+            _tread = None
+        if _tread and n_video > 1:
+            _ratio, _start, _end = float(_tread[0]), int(_tread[1]), int(_tread[2])
+            _end = min(_end, len(self.blocks))
+            if 0.0 < _ratio < 1.0 and 0 <= _start < _end:
+                n_keep = max(1, int(round(n_video * (1.0 - _ratio))))
+                perm = torch.randperm(n_video, device=h.device)
+                keep_vid = perm[:n_keep].sort().values + video_start
+                keep_idx = torch.cat([torch.arange(video_start, device=h.device), keep_vid])
+                route = (_start, _end, keep_idx)
         for i in range(len(self.blocks)):
+            if route is not None and i == route[0]:
+                _full = (h, cos, sin, mod_row)
+                _k = route[2]
+                h, cos, sin, mod_row = h[_k], cos[_k], sin[_k], mod_row[_k]
             if use_ckpt:
                 h = torch.utils.checkpoint.checkpoint(
                     _run_block, self.blocks, i, self._swap_from, h, t_emb, mod_row, cos, sin,
                     use_reentrant=False)
             else:
+                _ev = getattr(self, '_abort_event', None)
+                if _ev is not None and _ev.is_set():
+                    raise ForwardAborted()
                 h = _run_block(self.blocks, i, self._swap_from, h, t_emb, mod_row, cos, sin)
+            if route is not None and i + 1 == route[1]:
+                # rejoin: routed rows come back in their start-block state (identity)
+                h_full, cos, sin, mod_row = _full
+                h_new = h_full.clone()
+                h_new[route[2]] = h
+                h = h_new
+                _full = None
             # H2D streaming: the block's forward is done — free its ring slot and start the
             # copy for the block ring_size ahead, overlapping the next blocks' compute. Sits
             # OUTSIDE the checkpoint call: it must run once per forward pass, not again per
@@ -846,7 +1033,7 @@ class MiniMaxH3DiT(nn.Module):
                        text_embeds: torch.Tensor, audio_rows: torch.Tensor = None,
                        return_audio: bool = False, *,
                        resume_from=None, cached=None, new_cache=None,
-                       cache_device: str = "cpu"):
+                       cache_device: str = "cpu", keyframes=None):
         """Inference forward with per-block activation caching (Repair Studio Turbo Preview).
 
         `resume_from` = the earliest changed main-block index (or None for a full pass). When
@@ -861,6 +1048,11 @@ class MiniMaxH3DiT(nn.Module):
         doesn't use them), and a live H2D offloader disables resume (its ring assumes a walk
         from _swap_from) — the pass silently runs in full instead.
         """
+        if keyframes:
+            # The cache entries key on a fixed sequence layout; a keyframe changes it, and
+            # the resume is off on H3 anyway (measured misleading). Say so, don't guess.
+            raise ValueError("forward_cached does not support keyframe conditioning — "
+                             "use forward()")
         if video_latent.shape[0] != 1:
             raise ValueError("MiniMax H3 inference is batch size 1")
         device = video_latent.device
@@ -958,6 +1150,9 @@ class MiniMaxH3DiT(nn.Module):
         for i in range(start, nblocks):
             if new_cache is not None:
                 new_cache.block_inputs[i] = h.detach().to(cache_device)
+            _ev = getattr(self, '_abort_event', None)
+            if _ev is not None and _ev.is_set():
+                raise ForwardAborted()
             h = _run_block(self.blocks, i, self._swap_from, h, t_emb, mod_row, cos, sin)
             _off = getattr(self, "_h2d_offloader", None)
             if _off is not None and i >= self._swap_from:

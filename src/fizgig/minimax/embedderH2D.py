@@ -2465,6 +2465,18 @@ class MiniMaxH3TextEncoder:
 
         return emb, tags
 
+    @torch.no_grad()
+    def encode_with_items(self, caption: str, items, max_length: int = None):
+        """Numbered references (the pack's Text Encode presentation) on the streamed build:
+        pictures, video blocks and audio labels ahead of the caption -> ([1, L, 5120], tags)."""
+        if not hasattr(self.model, "visual"):
+            raise RuntimeError("encode_with_items needs the vision-capable encoder.")
+        from fizgig.minimax.embedder import build_numbered_reference_tokens
+        ids, tags, pixel_values, grid = build_numbered_reference_tokens(self.tokenizer, caption, items, max_length)
+        emb = self._reference_forward(input_ids=ids, attention_mask=torch.ones_like(ids),
+                                      pixel_values=pixel_values, image_grid_thw=grid)
+        return emb.to(self.compute_dtype), tags
+
     # ------------------------------------------------------------------
     # Batch
     # ------------------------------------------------------------------

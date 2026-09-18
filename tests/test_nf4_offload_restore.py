@@ -117,8 +117,16 @@ def main():
                  '        elif blocks_to_swap > 0:')
     ok &= check("no restore gates .to(device) behind an NF4 elif", exclusive not in src,
                 "an NF4 restore is exclusive again — see issue #17")
-    n = src.count("move_nf4_to_device(dit, device)")
-    ok &= check("all three restore sites present", n == 3, f"found {n}")
+    # Was "exactly three restore sites", which #123 outgrew legitimately by adding a fourth
+    # park/restore pair (the 16 GB preview park for the VAE decode). The invariant issue #17 is
+    # about is that every park comes BACK — so pair them, and keep a floor so the original three
+    # cannot quietly disappear. A park added without its restore still fails here.
+    n_restore = src.count("move_nf4_to_device(dit, device)")
+    n_park = src.count('move_nf4_to_device(dit, "cpu")')
+    ok &= check("every NF4 park has a matching restore", n_restore == n_park,
+                f"{n_park} park(s), {n_restore} restore(s)")
+    ok &= check("  the original three park/restore pairs are still there", n_restore >= 3,
+                f"found {n_restore}")
     # Both sides fixed this independently: it was a source grep for the literal "device=None):",
     # which broke once the signature grew past one line and device stopped being the last kwarg.
     # Upstream widened the grep to a regex; this asks the function itself, which is stricter —
