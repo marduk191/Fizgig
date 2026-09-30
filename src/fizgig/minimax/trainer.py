@@ -372,7 +372,7 @@ def plan_ft_modality_routing(n_blocks, photo_blocks, audio_blocks,
 
     cycle_subset: sorted block list the rotation cycle should span, or None for the full
     model — the UNION of what each modality present in the dataset needs (photos -> the
-    likeness set when given, voice -> the audio zone, clips -> clip_blocks when given,
+    likeness set when given, voice -> audio_blocks when given, clips -> clip_blocks when given,
     full model otherwise). clip_blocks landed 29 Aug from a field result: an overnight
     video run confined to the likeness blocks worked, so "clips -> full model" is now the
     fallback, not the law — the GUI's "Restrict video to likeness blocks" tickbox passes
@@ -622,8 +622,8 @@ def frozen_lora_vram_gb(path: str, bytes_per_elem: int = 2) -> float:
     tensors and are counted here too.
 
     Not a rounding error: the training adapter is on by default in every H3 preset. Fizgig's
-    Preferences download is ostris's v1 (rank 16, 0.155 GB resident); upstream also publishes a
-    v2 at rank 32, which is 0.310 GB if a user points the path at it. This reads whichever file
+    default is Circlestone's (rank 64, 0.62 GB resident); Ostris's v1 is rank 16, 0.155 GB, and
+    his v2 at rank 32 is 0.310 GB if a user points the path at it. This reads whichever file
     is configured rather than assuming either.
     """
     if not path:
@@ -2486,10 +2486,13 @@ def train_minimax(
                                      # confined this way trained perfectly well. Unset = clips
                                      # train the whole model, the original behaviour.
     audio_blocks: str = None,        # Voice routing: audio-only steps update only these blocks
-                                     # (+refiners). The 34-49 recipe (voice core 38-48 + shoulder,
-                                     # RESEARCH_h3_block_map.md): audio gradients outside it
-                                     # measurably corrupt the visual blocks (A/B, 24 Aug —
-                                     # audio-only @34-49 clean, @20-49 damaged visuals).
+                                     # (+refiners). The GUI now passes the SAME spec it gives
+                                     # photo_blocks (18 Sep 2026). It was narrowed to 34-49 (voice
+                                     # core 38-48 + shoulder) because audio gradients outside it
+                                     # measurably corrupted the visual blocks (A/B, 24 Aug); the
+                                     # training adapter and leaving the text token refiner
+                                     # untrained removed that leak, so the voice gets the whole
+                                     # likeness window. Any spec still works here.
     train_adaln: bool = True,        # False = drop adaln_proj from the targets (pruned only)
     train_token_refiner: bool = False,  # True = the text token refiner's Linears join the LoRA
                                      # targets. Off by default (10 Sep 2026): the refiner is the
@@ -2554,7 +2557,7 @@ def train_minimax(
     # output metadata. Not available under rotation fine-tune.
     context_lora_path: str = None,
     context_lora_strength: float = 1.0,
-    # Training adapter (Ostris's assistant LoRA, ostris/minimax_h3_training_adapter): the
+    # Training adapter (Circlestone's by default, or Ostris's assistant LoRA): the
     # same frozen-layer mechanism at a fixed strength of 1.0, stacked UNDER the context
     # LoRA. De-distills the base while the LoRA learns; off for previews like the context.
     training_adapter_path: str = None,
@@ -2590,7 +2593,7 @@ def train_minimax(
     finetune_rotation: int = 0,
     finetune_rotate_every: int = 1,
     finetune_rotation_mode: str = "component",
-    finetune_start_window: int = 0,
+    finetune_start_window: int = None,      # None = the checkpoint's own continuation point
     finetune_fused_backward: bool = True,
     finetune_scope: str = "all",            # "all" | "photo"
     finetune_blocks: str = None,
@@ -2683,6 +2686,21 @@ def train_minimax(
         if ft_epoch_offset:
             logger.info("[h3-ft] continuing from %s — checkpoint numbering starts at "
                         "epoch %d", os.path.basename(dit_path), ft_epoch_offset + 1)
+        if finetune_start_window is None:
+            # #159: every FT checkpoint (cycle save, pause, final) stamps where the rotation
+            # picks back up. Continuing from one without an explicit window resumes there,
+            # not at window 0 - the same as the GUI's Resume, after a restart too.
+            finetune_start_window = 0
+            if ft_epoch_offset:
+                try:
+                    from safetensors import safe_open as _so_sw
+                    with _so_sw(dit_path, framework="pt") as _fsw:
+                        finetune_start_window = int((_fsw.metadata() or {}).get(
+                            "fizgig_next_start_window", 0))
+                except Exception:
+                    finetune_start_window = 0
+                logger.info("[h3-ft] rotation resumes at window %d (recorded in the "
+                            "checkpoint)", finetune_start_window)
         # Structural disarms (each mirrors a Krea FT coercion):
         blocks_to_swap = 0          # the H2D offloader would fight the rotator for qdata
         # Component windows only coexist with an NF4 trunk: one matmul across every block
@@ -3203,13 +3221,12 @@ def train_minimax(
                                    "no blocks")
         # Modality routing. Each modality trains only where it belongs: photos -> the
         # likeness set when ticked (photo gradients into the front trunk are pure prior
-        # damage), voice -> the audio zone (audio gradients OUTSIDE 34-49 measurably
-        # corrupt the visual blocks — A/B, 24 Aug), clips -> full model for now. Two
+        # damage), voice -> audio_blocks, clips -> full model for now. Two
         # mechanisms compose:
         #   cycle tighten — the rotation cycle spans the UNION of what the modalities
         #       present in the dataset need, so a photos+voice dataset never spends an
-        #       epoch on the front trunk and an audio-only dataset tightens to 34-49
-        #       automatically (the validated A/B config, no Blocks typing required);
+        #       epoch on the front trunk and an audio-only dataset tightens to whatever
+        #       audio_blocks says, automatically, with no Blocks typing required;
         #   per-batch freeze — a modality whose set is narrower than the span keeps its
         #       hands off the rest via requires_grad, rebuilt per window in
         #       _ft_rebind_optimizer (component windows span every block, so a window
@@ -3261,8 +3278,7 @@ def train_minimax(
                         photo_blocks)
         if _ft_route["voice"] is not None:
             logger.info("[h3-ft] voice routing: audio batches freeze every block "
-                        "outside %s (the voice zone — audio gradients beyond it "
-                        "corrupt the visual blocks).", audio_blocks)
+                        "outside %s.", audio_blocks)
         if _ft_route["clip"] is not None:
             logger.info("[h3-ft] video routing: clip batches freeze every block "
                         "outside %s (Restrict video to likeness blocks).", clip_blocks)
@@ -4036,8 +4052,7 @@ def train_minimax(
                         "(+refiners, %d of %d tensors frozen on clips)",
                         format_block_spec(sorted(_cb_allowed)),
                         len(_clip_mask_params), len(params))
-    # Voice routing, LoRA mode: audio-only steps update only audio_blocks (the measured
-    # voice zone — audio gradients outside it corrupt the visual blocks). Same mechanism
+    # Voice routing, LoRA mode: audio-only steps update only audio_blocks. Same mechanism
     # as the photo mask, keyed on voice-only optimizer windows.
     _audio_mask_params = []
     if audio_blocks and rotator is None:
@@ -5421,7 +5436,7 @@ def train_minimax(
             # Modality routing (FT): freeze the blocks this batch's modality must not touch
             # for the span of its forward+backward — a component window spans every block,
             # so this per-parameter freeze is the only way to express "photos stay inside
-            # 20-49, voice stays inside 34-49, clips inside clip_blocks when restricted".
+            # 20-49, voice inside audio_blocks, clips inside clip_blocks when restricted".
             # The fused per-tensor hooks never fire for a no-grad param; restored right
             # after the backward (any exception here is fatal to the run anyway).
             _frz = []
@@ -5623,7 +5638,11 @@ def train_minimax(
         if adaptive is not None:
             adaptive.epoch_boundary(epoch, loss_recorder.moving_average, network, optimizer)
         ft_ckpt_saved_this_epoch = False
-        if save_every_n_epochs and (epoch + 1) % save_every_n_epochs == 0 and (epoch + 1) < max_train_epochs:
+        # The WHOLE run's epoch (#159): a fine-tune continued from a pause checkpoint counts
+        # local epochs from the pause, so a local test missed the cycle-boundary save.
+        # ft_epoch_offset is 0 for every other run.
+        _run_epoch = epoch + 1 + ft_epoch_offset
+        if save_every_n_epochs and _run_epoch % save_every_n_epochs == 0 and (epoch + 1) < max_train_epochs:
             ckpt = os.path.join(output_dir, f"{output_name}-{epoch + 1:06d}.safetensors")
             if rotator is not None:
                 # The full checkpoint IS the resumable state under FT (the continuation is
@@ -5674,12 +5693,13 @@ def train_minimax(
         # epoch always previews — its checkpoint is the final save after the loop.
         # Sample-every-N still doesn't apply; the Samples tab still gates previews on/off.
         _ft_saved_this_epoch = bool(save_every_n_epochs
-                                    and (epoch + 1) % save_every_n_epochs == 0
+                                    and _run_epoch % save_every_n_epochs == 0
                                     and (epoch + 1) < max_train_epochs)
         _prev_due = ((_ft_saved_this_epoch or (epoch + 1) >= max_train_epochs)
                      if rotator is not None
                      else bool(sample_every_n_epochs
                                and (epoch + 1) % sample_every_n_epochs == 0))
+        _preview_t0 = time.time()       # the bar's s/it is training speed: preview time is taken back out below
         if do_previews and _prev_due:
             try:
                 # Previews render on the EMA weights when EMA is on — a preview must show what
@@ -5718,6 +5738,7 @@ def train_minimax(
                     do_previews = False
             if network is not None:
                 network.train()
+        progress_bar.start_t += time.time() - _preview_t0
         if os.path.exists(pause_flag):
             # Pause = graceful epoch-end exit with FULL state (regardless of the save-state
             # toggles), so Resume continues exactly here — matching Klein/Krea 2. The final

@@ -145,7 +145,7 @@ installer before download.
 ## Note on model weights
 
 The third-party notices above cover **source code** only. Krea 2 / FLUX.2 model
-weights, the Qwen-Image VAE weights, and the Qwen3-VL text-encoder weights are
-distributed by their respective publishers under their own model licenses, which
+weights, the Qwen-Image VAE weights, the Qwen3-VL text-encoder weights, and the
+MiniMax H3 training adapters (circlestone-labs and Ostris) are distributed by their respective publishers under their own model licenses, which
 the user accepts when downloading them. Fizgig does not redistribute any model
 weights.

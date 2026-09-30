@@ -10,8 +10,8 @@ For each entry:
   - neither ................................... downloads with progress, verifies, populates
 
 Entries: the Krea 2 Turbo LoRA (previews render on RAW + Turbo LoRA, no model swapping) and
-Ostris's two MiniMax H3 training adapters (ai-toolkit's "assistant LoRA" — the Training
-tab's tickbox loads the one matching the selected base). Always fetched when missing,
+the MiniMax H3 training adapters — Circlestone's (the default, one file for both bases) and
+Ostris's two (per base) — which the Training tab's adapter dropdown chooses between. Always fetched when missing,
 whatever family is configured (Peter, 2 Sep 2026: no "not a Krea 2 install" gate, ever).
 The GUI calls ensure_turbo_lora() again at Krea 2 training start as a fallback.
 """
@@ -30,6 +30,11 @@ LORAS = [
      "krea2_turbo_lora_rank_64_bf16.safetensors",
      "diffusion_model.blocks.0.attn.wq.lora_down.weight", 400 * 1024 * 1024,
      "Krea 2 Turbo LoRA (~470 MB)"),
+    ("minimax_circlestone_adapter", "minimax_h3_image_training_adapter.safetensors",
+     "https://huggingface.co/circlestone-labs/MiniMax-H3-Image-Training-Adapter/resolve/main/"
+     "minimax_h3_image_training_adapter.safetensors",
+     "diffusion_model.blocks.0.attn.out_proj.lora_A.weight", 580 * 1024 * 1024,
+     "MiniMax H3 training adapter, Circlestone (~620 MB, the default)"),
     ("minimax_training_adapter", "minimax_h3_training_adapter_v1.safetensors",
      "https://huggingface.co/ostris/minimax_h3_training_adapter/resolve/main/"
      "minimax_h3_training_adapter_v1.safetensors",

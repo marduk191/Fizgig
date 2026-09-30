@@ -1,5 +1,5 @@
 @echo off
-rem Gizmo — cut training clips Fizgig will accept. Tracked in the repo and arrives with an
+rem Gizmo - cut training clips Fizgig will accept. Tracked in the repo and arrives with an
 rem ordinary update: it needs nothing the installer has not already put in the venv.
 rem
 rem This file must never be written by install_fizgig.py. Doing that to run_fizgig.bat once

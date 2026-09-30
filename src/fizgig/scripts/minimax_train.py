@@ -177,10 +177,13 @@ def setup_parser() -> argparse.ArgumentParser:
                         "with --train_blocks.")
     p.add_argument("--audio_blocks", default=None, metavar="SPEC",
                    help="Voice routing: audio-only training steps update only these DiT "
-                        "blocks, and the backward stops at the first of them. '34-49' is the "
-                        "measured voice zone (core 38-48 + shoulder) — audio gradients outside "
-                        "it measurably corrupt the visual blocks (A/B, 24 Aug). Applies under "
-                        "the rotation fine-tune, and in LoRA mode alongside --photo_blocks.")
+                        "blocks, and the backward stops at the first of them. The GUI passes the "
+                        "same spec it gives --photo_blocks, so voice trains what the picture "
+                        "trains. It was narrowed to the voice zone '34-49' until 18 Sep 2026, "
+                        "because audio gradients beyond it corrupted the visual blocks; the "
+                        "training adapter and leaving the text token refiner untrained removed "
+                        "that. Applies under the rotation fine-tune, and in LoRA mode alongside "
+                        "--photo_blocks.")
     p.add_argument("--clip_blocks", default=None, metavar="SPEC",
                    help="Confine VIDEO CLIP training steps to these DiT blocks (LoRA and "
                         "fine-tune alike); the backward stops at the first of them. Optimised "
@@ -250,10 +253,11 @@ def setup_parser() -> argparse.ArgumentParser:
     p.add_argument("--context_lora_strength", type=float, default=1.0,
                    help="Strength the context LoRA rides at (0.0-2.0)")
     p.add_argument("--training_adapter_path", default=None,
-                   help="Training adapter (Ostris, ostris/minimax_h3_training_adapter): a frozen "
-                        "LoRA at 1.0 that de-distills the base while yours learns — on for every "
-                        "training step, off for previews. Use the fl2va or ref2va file to match "
-                        "--dit. Under --finetune_rotation it rides as forward hooks (same "
+                   help="Training adapter: a frozen LoRA at 1.0 that de-distills the base while "
+                        "yours learns — on for every training step, off for previews. Circlestone's "
+                        "file (circlestone-labs/MiniMax-H3-Image-Training-Adapter, the GUI default) "
+                        "works on either base; with Ostris's (ostris/minimax_h3_training_adapter, "
+                        "best for videos) use the fl2va or ref2va file to match --dit. Under --finetune_rotation it rides as forward hooks (same "
                         "contract; the checkpoint never contains it).")
     p.add_argument("--tread_ratio", type=float, default=0.0,
                    help="TREAD token routing: this fraction of the video tokens "
@@ -303,8 +307,9 @@ def setup_parser() -> argparse.ArgumentParser:
                         "matmul (qkv/out/fc1/fc2) across EVERY block per window, on an "
                         "NF4-resident base — full model depth each epoch; the saved "
                         "checkpoint is still exact int8.")
-    p.add_argument("--finetune_start_window", type=int, default=0,
-                   help="Continue a fine-tune mid-cycle (printed at every save)")
+    p.add_argument("--finetune_start_window", type=int, default=None,
+                   help="Continue a fine-tune mid-cycle (printed at every save). Default: the "
+                        "window recorded in the --dit checkpoint, or 0 for a fresh run")
     p.add_argument("--finetune_fused_backward", action="store_true", default=True,
                    help="Free each gradient as it lands (per-tensor optimizers; "
                         "disables grad clipping and accumulation)")

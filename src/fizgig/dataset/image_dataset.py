@@ -129,6 +129,16 @@ BUCKET_RESO_STEPS = {ARCHITECTURE_MINIMAX: 32}
 LATENT_SPATIAL_FACTOR = {"klein9b": 16, "krea2": 8, ARCHITECTURE_MINIMAX: 16}
 
 
+def _described_family(architecture):
+    """A family added through the standard layer (fizgig.families), or None. The tables above keep serving
+    Klein / Krea 2 / H3; described families carry their own bucket step and latent factor."""
+    try:
+        from fizgig.families.registry import by_arch_id
+        return by_arch_id(architecture)
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -547,6 +557,9 @@ class BucketBatchManager:
                 elif key in ("hidden_states", "attention_mask"):
                     # Krea 2 text cache: multi-layer Qwen3-VL stack + validity mask
                     content_key = key
+                elif key.startswith("cond__"):
+                    # standard-layer families (fizgig.families): the driver's own conditioning keys, verbatim
+                    content_key = key
                 else:
                     # Fallback: strip dtype suffix for compatibility with any
                     # legacy keys that might exist in merged caches
@@ -656,16 +669,16 @@ class ImageDirectoryDatasource:
             all_ctrl = set(glob_images(self.control_directory))
 
             for img_path in sorted_by_len:
-                base_no_ext = os.path.splitext(os.path.basename(img_path))[0]
+                base_no_ext = os.path.splitext(os.path.basename(img_path))[0].casefold()   # IMG_1 pairs with img_1
                 matches = [
                     p for p in all_ctrl
-                    if os.path.basename(p).startswith(base_no_ext + ".")
-                    or os.path.basename(p).startswith(base_no_ext + "_")
+                    if os.path.basename(p).casefold().startswith(base_no_ext + ".")
+                    or os.path.basename(p).casefold().startswith(base_no_ext + "_")
                 ]
                 all_ctrl.difference_update(matches)
                 if matches:
                     def _sort_key(path, _base=base_no_ext):
-                        bn = os.path.splitext(os.path.basename(path))[0]
+                        bn = os.path.splitext(os.path.basename(path))[0].casefold()
                         if bn == _base:
                             return 0
                         suffix = bn.rsplit("_", 1)[-1]
@@ -786,9 +799,13 @@ class ImageDataset(torch.utils.data.Dataset):
         debug_dataset: bool = False,
         architecture: str = ARCHITECTURE_KLEIN_9B,
         is_reg: bool = False,
+        clip_megapixels: Optional[float] = None,
         **kwargs,
     ):
         super().__init__()
+        # Clip Target Megapixels (MiniMax H3): a clip is cached and trained at this size or
+        # smaller, so photos can train at 1 MP beside clips at a size that caches and trains fast.
+        self.clip_megapixels = float(clip_megapixels) if clip_megapixels else None
         self.resolution = resolution
         self.caption_extension = caption_extension
         self.batch_size = batch_size
@@ -803,7 +820,8 @@ class ImageDataset(torch.utils.data.Dataset):
         # Regularisation set: a prior anchor, not a subject. The trainer trains it at a fixed
         # reduced LR and keeps the per-image loss watch off it.
         self.is_reg = is_reg
-        self.reso_steps = BUCKET_RESO_STEPS.get(architecture, RESOLUTION_STEPS)
+        _fam = None if architecture in BUCKET_RESO_STEPS else _described_family(architecture)
+        self.reso_steps = _fam.bucket_step if _fam else BUCKET_RESO_STEPS.get(architecture, RESOLUTION_STEPS)
 
         self.seed: Optional[int] = None
         self.current_epoch = 0
@@ -858,6 +876,18 @@ class ImageDataset(torch.utils.data.Dataset):
 
     def get_all_text_encoder_output_cache_files(self) -> list[str]:
         return glob.glob(os.path.join(glob.escape(self.cache_directory), f"*_{self.architecture}_te.safetensors"))
+
+    def _clip_target_bucket(self, image_size, bucket_reso):
+        """A clip's bucket: at Clip Target Megapixels when it is set (its own bucket grid, the way
+        Target Megapixels sizes the photos), else the photos' bucket. The same answer at caching
+        and at training, so the cache matches exactly and --skip_existing keeps it."""
+        if not self.clip_megapixels:
+            return bucket_reso
+        if getattr(self, "_clip_selector", None) is None:
+            side = int(math.sqrt(self.clip_megapixels * 1e6)) // 16 * 16
+            self._clip_selector = BucketSelector((side, side), self.enable_bucket, self.bucket_no_upscale,
+                                                 self.reso_steps)
+        return self._clip_selector.get_bucket_resolution(image_size)
 
     def _plan_clip_bucket(self, bucket_reso, image_key):
         """Cap a clip's bucket to what the VAE can actually encode in the free VRAM.
@@ -979,7 +1009,8 @@ class ImageDataset(torch.utils.data.Dataset):
                 # their clips. Cap the clip rather than fail the run: the stills are unaffected,
                 # and a clip at a size that fits is worth more than a crash at one that does not.
                 if len(images) > 1:
-                    bucket_reso = self._plan_clip_bucket(bucket_reso, image_key)
+                    bucket_reso = self._plan_clip_bucket(self._clip_target_bucket(image_size, bucket_reso),
+                                                         image_key)
                 resized = [resize_image_to_bucket(img, bucket_reso) for img in images]
 
                 resized_controls = None
@@ -1077,6 +1108,9 @@ class ImageDataset(torch.utils.data.Dataset):
         failure mode.
         """
         factor = LATENT_SPATIAL_FACTOR.get(architecture)
+        if factor is None:
+            _fam = _described_family(architecture)
+            factor = _fam.spatial_factor if _fam else None
         if factor is None:
             return None
         try:
@@ -1182,6 +1216,8 @@ class ImageDataset(torch.utils.data.Dataset):
                 bucket_key: Tuple = ("audio",) + AUDIO_SENTINEL_RESO
             else:
                 bucket_reso = bucket_selector.get_bucket_resolution(image_size)
+                if self.clip_megapixels and self.latent_cache_frames(cache_file) > 1:
+                    bucket_reso = self._clip_target_bucket(image_size, bucket_reso)
                 # A cache written at a different Target Megapixels has the SAME filename (it
                 # encodes the original size, not the bucket) — training on it would silently run
                 # at the old resolution. Skip it and tell the user to re-run cache preparation.

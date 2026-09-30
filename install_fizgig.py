@@ -58,6 +58,61 @@ def check_python_version():
     return True
 
 
+def conda_reason():
+    """Why this Python must not build the venv, or None. Conda ships its own Tk that cannot
+    see the system's fonts, so a venv made from it draws the GUI with missing text (#141)."""
+    env = os.environ.get("CONDA_DEFAULT_ENV") or os.environ.get("CONDA_PREFIX")
+    if env:
+        return f"a conda environment is active ({env})"
+    if any(tag in sys.version.lower() for tag in ("conda", "anaconda", "continuum")):
+        return "this Python was built by conda"
+    for prefix in (getattr(sys, "base_prefix", ""), sys.prefix):
+        if prefix and os.path.isdir(os.path.join(prefix, "conda-meta")):
+            return "this Python was built by conda"
+    return None
+
+
+def check_not_conda():
+    """Refuse to build the venv from a conda Python (override: FIZGIG_ALLOW_CONDA=1)."""
+    if os.environ.get("FIZGIG_ALLOW_CONDA"):
+        print("FIZGIG_ALLOW_CONDA set — continuing inside conda (the GUI's fonts may render wrong).")
+        return True
+    reason = conda_reason()
+    if not reason:
+        print("Not a conda Python (OK)")
+        return True
+    print(f"Error: {reason}.")
+    print("Fizgig has to be installed from your system Python, not conda: conda bundles its own")
+    print("Tk, which cannot see the system's fonts, so the app comes up with missing or")
+    print("substituted text. Leave conda, then run the installer again:")
+    print("    conda deactivate")
+    print("    python3 install_fizgig.py      (Windows: py install_fizgig.py)")
+    print("If 'python3' is still conda's after that (conda on your PATH for good), run the")
+    print("system interpreter by its full path instead, e.g. /usr/bin/python3 install_fizgig.py")
+    print("(Windows: a python.org install, then py install_fizgig.py).")
+    print("To go ahead inside conda anyway, set FIZGIG_ALLOW_CONDA=1.")
+    return False
+
+
+def _is_conda_home(home):
+    """Was a venv's pyvenv.cfg `home` a conda Python? Off under FIZGIG_ALLOW_CONDA, or the
+    venv the override just created would be condemned by the health check straight after."""
+    if os.environ.get("FIZGIG_ALLOW_CONDA"):
+        return False
+    h = Path(home)
+    for p in (h, h.parent):
+        if (p / "conda-meta").is_dir():
+            return True
+    # Whole path COMPONENTS only: a parent folder that merely contains the word (a user
+    # called conda-dev, a project dir named conda_tools) must not condemn a plain venv.
+    for part in (p.lower() for p in h.parts):
+        if part in ("conda", "anaconda", "miniconda", "miniforge", "mambaforge") or any(
+                part.startswith(tag) and part[len(tag):].isdigit()
+                for tag in ("anaconda", "miniconda", "miniforge", "mambaforge")):
+            return True
+    return False
+
+
 def venv_health(venv_dir=None):
     """Why an existing venv can't be trusted — None when it's fine, else (kind, reason).
 
@@ -99,6 +154,9 @@ def venv_health(venv_dir=None):
         # executable name inside it would false-positive on Unix layouts where the
         # binary is python3, and a wrongly-condemned venv is worse than a missed one.
         return ("broken", f"it was built from a Python that is no longer installed ({home})")
+    if home and _is_conda_home(home):
+        return ("broken", f"it was built from a conda Python ({home}) — conda's Tk cannot see "
+                          "the system's fonts, so Fizgig needs a venv from the system Python")
 
     try:
         result = subprocess.run(
@@ -503,9 +561,9 @@ def main():
 
     redirect_amd_to_rocm_installer()
 
-    # Step 1: Check Python version
-    print_step(1, "Checking Python version")
-    if not check_python_version():
+    # Step 1: Check Python version, and that it is not conda's (#141)
+    print_step(1, "Checking Python")
+    if not check_python_version() or not check_not_conda():
         sys.exit(1)
 
     # Step 2: Create virtual environment

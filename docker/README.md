@@ -26,6 +26,13 @@ you can terminate freely and attach the same storage to a new pod later. The cat
 region-locked, and the region you create it in may not have the GPU you want — so if you can't find
 a region with both, don't fight it. Take the Volume Disk and just stop rather than terminate.
 
+**Not a Global Volume.** RunPod's newer global volumes are object storage behind a mount, not a real
+filesystem: by RunPod's own documentation they can't set file permission bits, don't support file
+locking or atomic rename, and aren't recommended for workloads that write heavily. Fizgig needs all
+three — git can't even create the checkout there, and training writes a checkpoint every epoch. Mount
+one at `/workspace` and the pod restarts every few seconds with a fresh password in the log each time.
+Use a Volume Disk or a regional Network Volume.
+
 Either way, download the models once and every future session reuses them.
 
 ## Which GPU
@@ -150,7 +157,7 @@ Environment variables, set on the deploy screen under **Edit Template**:
 |---|---|---|
 | `VNC_PASSWORD` | 12+ characters | Desktop *and* file manager. Generated per pod if unset. |
 | `HF_TOKEN` | `hf_…` | Only needed for Klein, which is gated. Krea 2 needs nothing. |
-| `FETCH_MODELS` | `krea2`, `klein`, `tools` — comma-separated | Download at boot instead of clicking the button in Preferences. `tools` is the Florence-2 captioner, the EN→ZH translator for bilingual captions, and the face model the Look Filter uses. |
+| `FETCH_MODELS` | `krea2`, `klein`, `minimax`, `tools` — comma-separated | Download at boot instead of clicking the button in Preferences. `minimax` includes the Circlestone and both Ostris training adapters. `tools` is the Florence-2 captioner, the EN→ZH translator for bilingual captions, and the face model the Look Filter uses. |
 | `FIZGIG_REF` | branch or tag | Which Fizgig to run. Defaults to `master`, so the app updates itself at every pod start. |
 
 Nothing is compulsory — the defaults are the intended setup, and everything here can be done from
@@ -171,6 +178,9 @@ login details.
 - **Downloads fail with "no space left"** — same cause: models are landing on container disk.
 - **Your models vanished** — the pod was *terminated* rather than *stopped*. A Volume Disk goes
   with its pod; stop it instead, or use a Network Volume if you need to terminate.
+- **Restarts every few seconds, a new generated password each time** — `/workspace` is a Global
+  Volume, which git can't clone onto (see Storage above). Switch it for a Volume Disk or a regional
+  Network Volume.
 
 Fizgig's own version and the image's are both shown in **Preferences → RunPod**; quote both if you
 report a problem, since the app updates itself independently of the image.

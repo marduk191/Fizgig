@@ -14,12 +14,14 @@ The PyPI ``amdsmi`` package is stale - AMD SMI ships with ROCm Core SDK / the
 
 from __future__ import annotations
 
+import atexit
 import glob
 import json
 import logging
 import os
 import re
 import subprocess
+import sys
 import threading
 from typing import Optional
 
@@ -46,10 +48,29 @@ def _parse_typeperf_line(line: str) -> Optional[int]:
     return int(max_usage) if max_usage > 0 else None
 
 
+def _torch_ready():
+    """The torch module, only if something else has ALREADY imported it and brought the
+    GPU up — never imports torch, never calls is_available(). The status bar is cosmetic:
+    on the Windows ROCm preview stack, importing torch / initialising HIP in the GUI process
+    beside a training subprocess, then querying it every second, is exactly the kind of
+    load a preview driver falls over on (#145). Before a job has the GPU up this returns
+    None and the bar reads "unavailable"; once a tool in this process has initialised it,
+    the reads are free."""
+    t = sys.modules.get("torch")
+    if t is None:
+        return None
+    try:
+        if t.cuda.is_initialized():
+            return t
+    except Exception:
+        pass
+    return None
+
+
 def _total_vram_from_torch() -> Optional[int]:
     try:
-        import torch
-        if torch.cuda.is_available():
+        torch = _torch_ready()
+        if torch is not None:
             return int(torch.cuda.get_device_properties(0).total_memory)
     except Exception:
         pass
@@ -222,8 +243,8 @@ def _static_vram_total_by_gpu(data) -> dict[int, int]:
 
 def _hip_device_total_bytes() -> Optional[int]:
     try:
-        import torch
-        if torch.cuda.is_available():
+        torch = _torch_ready()
+        if torch is not None:
             return int(torch.cuda.get_device_properties(0).total_memory)
     except Exception:
         pass
@@ -526,11 +547,23 @@ class _TypeperfVramReader:
         finally:
             with self._lock:
                 self._proc = None
+                self._latest_used = None      # a dead stream must not keep reporting its last row
             if proc is not None:
                 try:
                     proc.kill()
                 except Exception:
                     pass
+
+    def stop(self) -> None:
+        """Kill the background typeperf (app close / interpreter exit)."""
+        with self._lock:
+            proc, self._proc = self._proc, None
+            self._failed = True               # no restart after a stop
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     def _ensure_started(self) -> None:
         with self._lock:
@@ -539,36 +572,16 @@ class _TypeperfVramReader:
             self._thread = threading.Thread(target=self._reader_loop, daemon=True)
             self._thread.start()
 
-    def _sample_once(self) -> Optional[int]:
-        try:
-            out = subprocess.run(
-                ["typeperf", _TYPEPERF_COUNTER, "-sc", "1"],
-                capture_output=True, text=True, timeout=10,
-                creationflags=_CREATE_NO_WINDOW,
-            )
-            if out.returncode != 0:
-                return None
-            used = None
-            for line in out.stdout.splitlines():
-                hit = _parse_typeperf_line(line)
-                if hit is not None:
-                    used = hit
-            return used
-        except Exception:
-            return None
-
     def read(self) -> Optional[tuple[int, int]]:
+        """The latest streamed sample, or None. Never blocks: there used to be a synchronous
+        one-shot typeperf here (10 s timeout) on every tick until the stream produced a row —
+        on a machine whose counter never yields one, that was a process spawned every second
+        for the life of the app (#145). Unavailable is a fine answer for a status bar."""
         if self._total is None:
             self._total = _total_vram_from_torch()
         self._ensure_started()
         with self._lock:
             used = self._latest_used
-            failed = self._failed
-        if used is None and not failed:
-            used = self._sample_once()
-            if used is not None:
-                with self._lock:
-                    self._latest_used = used
         if used is None or self._total is None:
             return None
         return used, self._total
@@ -585,10 +598,11 @@ def _is_rocm_backend() -> bool:
 
 
 def _read_vram_torch_fallback() -> Optional[tuple[int, int]]:
-    """Allocator-visible used/total via HIP (less accurate than typeperf/amd-smi)."""
+    """Allocator-visible used/total via HIP (less accurate than typeperf/amd-smi). Only
+    when this process already has the GPU up — see _torch_ready."""
     try:
-        import torch
-        if torch.cuda.is_available():
+        torch = _torch_ready()
+        if torch is not None:
             free_b, total_b = torch.cuda.mem_get_info(0)
             return int(total_b - free_b), int(total_b)
     except Exception:
@@ -609,20 +623,30 @@ def _read_vram_windows_typeperf() -> Optional[tuple[int, int]]:
     return reader.read()
 
 
+def shutdown() -> None:
+    """Stop the background typeperf reader, if one was ever started. Registered with atexit;
+    the GUI also calls it on window close so the child never outlives the app."""
+    global _typeperf_reader
+    with _typeperf_lock:
+        reader, _typeperf_reader = _typeperf_reader, None
+    if reader is not None:
+        reader.stop()
+
+
+atexit.register(shutdown)
+
+
 def read_amd_gpu_vram() -> Optional[tuple[int, int]]:
     """AMD-only VRAM read for the GUI fallback / ROCm installer probes.
 
     Windows: typeperf (then torch). Linux: amd-smi, then rocm-smi, then torch.
     """
     if os.name == "nt":
-        # Prefer typeperf whenever this AMD fallback is invoked. FIZGIG_GPU_BACKEND
-        # from run_fizgig_rocm.bat makes intent explicit; torch is a last resort.
-        hit = _read_vram_windows_typeperf()
-        if hit:
-            return hit
-        if _is_rocm_backend():
-            return _read_vram_torch_fallback()
-        return None
+        # typeperf's stream, or nothing. The HIP fallback that used to sit here ran
+        # torch.cuda.mem_get_info every second whenever the counter gave nothing — on the
+        # Windows ROCm preview stack that is a second process querying the driver beside the
+        # training run, for a cosmetic bar (#145). Unavailable is the right answer.
+        return _read_vram_windows_typeperf()
 
     hit = _read_vram_amd_smi_cli() or _read_vram_rocm_smi()
     if hit:

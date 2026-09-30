@@ -965,6 +965,24 @@ class AdaptiveLR:
         self._snapshot(network, optimizer)
 
 
+def _ft_raw_unfit_reason(raw_path: str):
+    """Why a --dit file cannot be fine-tuned, or None. Header read only — free.
+
+    Two shapes are refused: a pre-quantized fp8 checkpoint (.weight_scale keys — the master
+    would be built from unscaled fp8 weights) and a plain-cast fp8 file (F8 tensor dtypes, no
+    scales — there is no bf16 layout to write a full checkpoint into, and the trained bf16
+    weights would have to be cast down unscaled to fit the file's slots)."""
+    from fizgig.krea2.safetensors_utils import MemoryEfficientSafeOpen
+    with MemoryEfficientSafeOpen(raw_path) as f:          # one header read for both tests
+        keys = f.keys()
+        if any(k.endswith(".weight_scale") for k in keys):
+            return "is a pre-quantized fp8 checkpoint (.weight_scale tensors)"
+        n_f8 = sum(1 for k in keys if str(f.header[k].get("dtype", "")).startswith("F8"))
+    if n_f8:
+        return f"stores {n_f8} tensor(s) in an fp8 dtype"
+    return None
+
+
 def _build_bf16_master(raw_path: str, dit) -> dict:
     """CPU bf16 copy of every fp8-patched block Linear — the source of truth for rotation.
 
@@ -972,8 +990,8 @@ def _build_bf16_master(raw_path: str, dit) -> dict:
     copy: the GPU weights have already been through fp8, so dequantizing them would bake the
     quantization error into the master and we'd fine-tune a degraded model.
     """
-    from safetensors.torch import load_file
     from fizgig.krea2.rotation import is_rotatable_linear
+    from fizgig.krea2.safetensors_utils import MemoryEfficientSafeOpen
 
     # Discovery must match what the rotator will actually target — an NF4 base has no
     # `scale_weight`, so an fp8-only test here would build an EMPTY master and the run
@@ -991,15 +1009,17 @@ def _build_bf16_master(raw_path: str, dit) -> dict:
             if is_rotatable_linear(m):
                 wanted.add(f"txtfusion.{name}.weight")
 
-    sd = load_file(raw_path)          # mmap'd; we copy out only the keys we need
+    # One tensor at a time through the mmap reader. load_file() here used to stand up a
+    # second ~26 GB copy of the RAW beside the master it was building and the DiT being
+    # loaded — the same class of spike that broke the checkpoint save (#143).
     master, missing = {}, []
-    for key in sorted(wanted):
-        t = sd.get(key)
-        if t is None:
-            missing.append(key)
-            continue
-        master[key] = t.to("cpu", dtype=torch.bfloat16).clone()
-    del sd
+    with MemoryEfficientSafeOpen(raw_path) as src:
+        have = set(src.keys())
+        for key in sorted(wanted):
+            if key not in have:
+                missing.append(key)
+                continue
+            master[key] = src.get_tensor(key).to("cpu", dtype=torch.bfloat16).clone()
     gc.collect()
     total_gb = sum(v.numel() * v.element_size() for v in master.values()) / 1e9
     logger.info("[ft-rotation] bf16 master: %d tensors, %.1f GB in CPU RAM%s",
@@ -1014,20 +1034,73 @@ def _save_full_checkpoint(rotator, raw_path: str, path: str, extra_metadata=None
     """Write the fine-tuned model: the RAW checkpoint with trained block weights replaced.
 
     Everything the rotator never touches (norms, embeddings, txtfusion, I/O layers) is copied
-    through from the original, so the result is a complete, loadable Krea 2 checkpoint.
-    """
-    from safetensors.torch import load_file, save_file
+    through from the original, so the result is a complete, loadable Krea 2 checkpoint, in the
+    RAW file's own tensor order.
 
-    sd = load_file(raw_path)
+    Streamed, one tensor at a time (#143). The old shape was load_file(raw) — a second ~26 GB
+    copy of the RAW beside the ~22 GB bf16 master — followed by safetensors' save_file, which
+    turns EVERY tensor into bytes before writing the first one: a third ~26 GB. Peak ~ master +
+    26 + 26 GB, which is what tripped MemoryError on a 96 GB box. Now the header comes from the
+    RAW's own header (no payload read), trained keys are produced from the master and everything
+    else is one get_tensor() read as it is written, so the peak is ~ master + the active window's
+    flushed clones + ONE tensor (the largest in the RAW is ~0.9 GB). Same contract as the H3
+    saver (save_full_checkpoint_h3), same stream_save_file underneath.
+    """
+    from fizgig.krea2.safetensors_utils import MemoryEfficientSafeOpen, stream_save_file
+
+    # Belt and braces (the run-start guard is the real one): an fp8 file has no bf16 layout
+    # to write into, and an F8 source dtype must never be met by a .to(fp8) of an unscaled
+    # bf16 tensor — the _DT map below has no F8 entries on purpose.
+    _why = _ft_raw_unfit_reason(raw_path)
+    if _why:
+        raise RuntimeError(f"[ft-rotation] {os.path.basename(raw_path)} {_why} — a fine-tune "
+                           "checkpoint can only be written over the bf16 RAW it was trained from.")
+
+    # Said up front: the progress bar sits still for the whole save.
+    try:
+        _src_gb = os.path.getsize(raw_path) / 1e9
+    except OSError:
+        _src_gb = 26.0
+    logger.info("[ft-rotation] saving full checkpoint -> %s (~%.0f GB) — this can take a few "
+                "minutes, training resumes when it's done...", os.path.basename(path), _src_gb)
+
     trained = rotator.master_state_dict()
-    replaced = 0
-    for k, v in trained.items():
-        if k in sd:
-            sd[k] = v.to(torch.bfloat16)
-            replaced += 1
-    meta = {"fizgig_finetune": "krea2-rotation", "fizgig_trained_tensors": str(replaced)}
+    with MemoryEfficientSafeOpen(raw_path) as src:
+        header = {k: src.header[k] for k in src.keys()}      # the RAW's own tensor order
+    extra_keys = [k for k in trained if k not in header]
+    if extra_keys:
+        # Never added: the file must load with strict=True, and an unknown key would break that.
+        logger.warning("[ft-rotation] %d trained tensor(s) have no slot in the RAW file and are "
+                       "NOT saved, e.g. %s", len(extra_keys), extra_keys[:3])
+    replaced = sum(1 for k in trained if k in header)
+
+    # The RAW's own metadata is deliberately not carried forward: on a continuation --dit is a
+    # previous Fizgig checkpoint carrying that run's SAI ModelSpec block (title, thumbnail),
+    # which must not be stamped onto this run's epoch checkpoints. Nothing reads inherited keys.
+    meta = {"fizgig_finetune": "krea2-rotation",
+            "fizgig_trained_tensors": str(replaced),
+            "fizgig_source_base": os.path.basename(raw_path)}
     if extra_metadata:
         meta.update({str(k): str(v) for k, v in extra_metadata.items()})
+
+    _DT = {"F64": torch.float64, "F32": torch.float32, "F16": torch.float16,
+           "BF16": torch.bfloat16, "I64": torch.int64, "I32": torch.int32,
+           "I16": torch.int16, "I8": torch.int8, "U8": torch.uint8, "BOOL": torch.bool}
+    _reader = {"f": None}      # one shared handle — an open per tensor re-parses the header
+
+    def make_producer(key):
+        info = header[key]
+        dt, shape = _DT[info["dtype"]], tuple(info["shape"])
+        if key in trained:
+            def _p(key=key, dt=dt, shape=shape):
+                return trained[key].to(dt).reshape(shape)      # bf16 already; defensive
+            return dt, shape, _p
+
+        def _p(key=key):
+            return _reader["f"].get_tensor(key)
+        return dt, shape, _p
+
+    specs = {k: make_producer(k) for k in header}
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     # Write to a temp name and rename on completion. This file is ~24.5 GB and takes minutes;
     # Stop (a hard kill) or a power cut partway through used to leave a TRUNCATED checkpoint
@@ -1037,7 +1110,11 @@ def _save_full_checkpoint(rotator, raw_path: str, path: str, extra_metadata=None
     # leaves only a .tmp you can delete, and the previous checkpoint stays intact.
     tmp = path + ".tmp"
     try:
-        save_file(sd, tmp, metadata=meta)
+        _reader["f"] = MemoryEfficientSafeOpen(raw_path)
+        try:
+            stream_save_file(specs, tmp, metadata=meta)
+        finally:
+            _reader["f"].file.close()
         os.replace(tmp, path)
     except BaseException:
         # BaseException, not Exception: KeyboardInterrupt/SystemExit are exactly the cases
@@ -1050,8 +1127,10 @@ def _save_full_checkpoint(rotator, raw_path: str, path: str, extra_metadata=None
         raise
     size_gb = os.path.getsize(path) / 1e9
     logger.info("[ft-rotation] saved full checkpoint (%d/%d tensors trained, %.1f GB) -> %s",
-                replaced, len(sd), size_gb, path)
-    del sd, trained
+                replaced, len(header), size_gb, path)
+    # specs holds closures over `trained`; without dropping both, the flushed window clones
+    # stay alive until the next save.
+    del trained, specs
     gc.collect()
 
 
@@ -1800,6 +1879,17 @@ def train_krea2(
     ft_rotation = max(0, int(finetune_rotation or 0))
 
     if ft_rotation:
+        # A pre-quantized fp8 file cannot be fine-tuned: the bf16 master would be built from
+        # unscaled fp8 weights (garbage, trained for an hour before anything complained) and
+        # the full checkpoint has no bf16 layout to write into. Header read only — free.
+        _why = _ft_raw_unfit_reason(raw_path)
+        if _why:
+            raise RuntimeError(
+                f"[ft-rotation] --dit {os.path.basename(raw_path)} {_why}. Base-model "
+                "fine-tuning needs the bf16 RAW checkpoint — the trainer builds its bf16 master "
+                "from the file and writes full checkpoints in the file's layout, and neither is "
+                "possible from fp8 weights. Point --dit at the RAW (or at a Fizgig fine-tune "
+                "checkpoint made from it).")
         # Handoff guards, before our first CUDA call: a back-to-back fine-tune can start
         # while the previous trainer process is still tearing down — VRAM (WDDM demotion is
         # sticky) and RAM (the old process hands back a huge commit) both need to settle.
@@ -3339,6 +3429,7 @@ def train_krea2(
                                      "already saved.", type(_se).__name__, _se)
                     prune_state_dirs(output_dir, output_name, keep_last_n_states)
 
+        _preview_t0 = time.time()       # the bar's s/it is training speed: preview time is taken back out below
         if (rotator is not None and do_previews
                 and (ft_ckpt_saved_this_epoch or (epoch + 1) == max_train_epochs)):
             # Fine-tune: previews ride the checkpoint saves (plus the final epoch) — each
@@ -3494,6 +3585,7 @@ def train_krea2(
             dit.train()
             network.train()
 
+        progress_bar.start_t += time.time() - _preview_t0
         # Graceful pause (GUI wrote <output_dir>/.pause_requested): save a full resumable
         # state at this epoch boundary and exit cleanly so the GPU frees. The GUI detects the
         # clean exit, records the paused state, and offers Resume. Same contract as Klein.

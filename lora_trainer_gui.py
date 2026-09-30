@@ -125,6 +125,16 @@ COLORS = {
 # Typography
 FONT_FAMILY = "Segoe UI"
 HINT_FONT = (FONT_FAMILY, 10, "italic")   # the explain text under Training-tab controls (Peter, 11 Sep: one point up from 9)
+
+# Row-list popups (Problem Images, Look Consistency Filter) show this many rows per page.
+# Tk draws nothing past 32,767 px inside a canvas-embedded frame, so a list of every image
+# went blank from row ~256 while the scrollbar kept moving (#140, a 3,500-image dataset).
+ROW_WINDOW_PAGE_SIZE = 200
+# The loss watch's verdict ladder, hardest first — the Problem Images sort/tally order.
+PROBLEM_VERDICT_ORDER = ("excluded", "stuck", "suspect", "watch", "warmup", "exhausted",
+                         "learning", "mid", "easy")
+PROBLEM_VERDICTS = ("excluded", "stuck", "suspect", "watch")      # "Problems only"
+PROBLEM_FILTER_OPTIONS = ("All", "Problems only") + PROBLEM_VERDICT_ORDER
 FONT_MONO = "Consolas"
 
 # Legacy color constants (for backwards compatibility during transition)
@@ -461,6 +471,24 @@ ARCHITECTURES["MiniMax H3 RefMod"] = {
     "supports_samples": False,
 }
 
+# Families added through the standard layer (src/fizgig/families): an entry each, built from the family's
+# description. The GUI reaches them only through the _family_desc() hooks; Klein / Krea 2 / H3 never do.
+def _load_described_families():
+    try:
+        _src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
+        if _src not in sys.path:
+            sys.path.insert(0, _src)
+        from fizgig.families.registry import training_families
+        return {d.gui_label: d for d in training_families()}
+    except Exception as e:          # a broken family must never take the GUI down
+        print(f"[families] described families not loaded: {e}")
+        return {}
+
+
+DESCRIBED_FAMILIES = _load_described_families()
+for _label, _desc in DESCRIBED_FAMILIES.items():
+    ARCHITECTURES[_label] = _desc.architecture_entry()
+
 # Saved configs written before 3.6.1 carry the old label. Every lookup here is a .get() that
 # falls back to Klein, so without an alias a MiniMax preset would silently come back as a Klein
 # one - wrong family, no error. The alias points at the same config; _canon_arch maps it forward
@@ -685,8 +713,8 @@ MINIMAX_FULL_MODEL_BLOCKS = "6-49"
 
 # Training mode (was the Optimised Likeness Learning tickbox until 10 Sep 2026). Two measured
 # recipes and an escape hatch:
-#   fast  — photos and clips 20-49, voice 34-49. The backward stops at the window, so steps are
-#           the quickest of the three. Good on both picture and sound.
+#   fast  — photos, clips AND voice all on 20-49 (the voice zone was 34-49 until 18 Sep 2026).
+#           The backward stops at the window, so steps are the quickest of the three.
 #   ultra — 6-49 for every step type. Better likeness AND better audio by eye and ear, and it
 #           holds the dataset's global traits out of the LoRA far longer (the greyscale test:
 #           monochrome previews from epoch 2 on a full-model run, epoch 49 on 6-49, never on
@@ -694,9 +722,16 @@ MINIMAX_FULL_MODEL_BLOCKS = "6-49"
 #   off   — the blocks are yours to pick below, for experiments.
 # The mode is chosen WITHIN a preset: every preset loads with one selected and the dropdown
 # switches it. Character presets load Fast; Style loads Ultra (11 Sep 2026).
-MINIMAX_MODE_FAST = "Fast · good quality, quickest steps"
-MINIMAX_MODE_ULTRA = "Ultra quality · slower steps"
-MINIMAX_MODE_OFF = "Off · hand-pick the blocks below"
+# Renamed 18 Sep 2026 (Peter). The old names sold these on SPEED — "Fast" against "Ultra
+# quality" — which had people reaching for Ultra expecting a better result and getting a worse
+# one. Fast is not a compromise: it is the versatile recipe, and Peter measured styles training
+# both quicker AND better on it. What actually separates the two is how much of the base model
+# they leave alone, so the names say that now.
+MINIMAX_MODE_FAST = "Default"
+# "More", not "All": blocks 0-5 are trained by NEITHER mode — they deform anatomy and pull
+# the dataset's colour into every render — so a name promising all 50 would be a lie.
+MINIMAX_MODE_ULTRA = "More Blocks"
+MINIMAX_MODE_OFF = "Off · hand-pick the blocks in Other Options"
 MINIMAX_LIKENESS_MODE_OPTIONS = [MINIMAX_MODE_FAST, MINIMAX_MODE_ULTRA, MINIMAX_MODE_OFF]
 
 
@@ -714,20 +749,56 @@ def minimax_mode_from_settings(d):
 
 
 def minimax_likeness_mode(raw):
-    """Dropdown label -> "fast" | "ultra" | "off". Anything unrecognised is fast (the default)."""
+    """Dropdown label -> "fast" | "ultra" | "off". Anything unrecognised is fast (the default).
+
+    Matches on the label rather than a prefix because the names no longer start with the mode:
+    "More Blocks" is ultra. The pre-18-Sep labels ("Fast · …", "Ultra quality · …") still resolve,
+    so a saved preset or a queued run written before the rename picks the same mode it did then.
+    """
     s = str(raw or "").split("·")[0].strip().lower()
-    if s.startswith("ultra"):
+    if s in ("more blocks", "all blocks", "ultra", "ultra quality"):
         return "ultra"
     if s.startswith("off"):
         return "off"
     return "fast"
 
 
-# Voice routing — the block set audio-only steps train. 34-49 per the block map (audio core
-# 38-48 peak 41-42, shoulder 34-37) and Peter's A/B (24 Aug): audio-only trained at 34-49 is
-# clean; at 20-49 the audio training corrupted the visual blocks. Clips still train the full
-# model (pending the same test for video).
-MINIMAX_AUDIO_BLOCKS = "34-49"
+# Training adapter (23 Sep 2026, Peter's A/Bs): Circlestone's image adapter trains clearly better
+# H3 LoRAs on any dataset with stills, on fl2va and ref2va alike (one file for both); Ostris's
+# per-base adapters learn a VIDEO look faster (an all-clips style run got there ~3x sooner), because
+# Circlestone deliberately biases the model toward an image-only distribution. Mixed datasets:
+# choose by whether the photos or the videos are the priority (Peter, 23 Sep).
+MINIMAX_ADAPTER_CIRCLESTONE = "Circlestone — best for photos"
+MINIMAX_ADAPTER_OSTRIS = "Ostris — best for videos"
+MINIMAX_ADAPTER_OFF = "Off"
+MINIMAX_ADAPTER_OPTIONS = (MINIMAX_ADAPTER_CIRCLESTONE, MINIMAX_ADAPTER_OSTRIS, MINIMAX_ADAPTER_OFF)
+MINIMAX_CIRCLESTONE_URL = ("https://huggingface.co/circlestone-labs/MiniMax-H3-Image-Training-Adapter/"
+                           "blob/main/minimax_h3_image_training_adapter.safetensors")
+
+
+def minimax_adapter_choice(raw):
+    """Dropdown label -> "circlestone" | "ostris" | "off". Anything unrecognised is circlestone."""
+    s = str(raw or "").split("—")[0].strip().lower()
+    if s.startswith("ostris"):
+        return "ostris"
+    if s.startswith("off"):
+        return "off"
+    return "circlestone"
+
+
+# Voice routing — the block set audio-only steps train. SAME AS THE PICTURE since 18 Sep 2026
+# (Peter): there is no separate audio zone any more.
+#
+# It was 34-49, from the block map (audio core 38-48, peak 41-42, shoulder 34-37) and an A/B on
+# 24 Aug where audio trained at 20-49 corrupted the visual blocks. That corruption was real, and
+# the two fixes that landed after it have removed the cause: the training adapter de-distills
+# the base while the LoRA learns (5.2.0), and the text token refiner is no longer trained
+# (5.6.1). The refiner was the leak. With both in place the audio gradients no longer damage the
+# picture, so narrowing them only cost the voice the blocks it could have used.
+#
+# Defined as the likeness set rather than repeating "20-49", so the two cannot drift apart
+# silently. Split them again only on a fresh A/B.
+MINIMAX_AUDIO_BLOCKS = MINIMAX_LIKENESS_BLOCKS
 
 # Base Precision — the label the user sees, and the --base_quant value it sends. Auto plans the
 # quantisation and the block-swap count together (see plan_base_quant in minimax/trainer.py);
@@ -1030,14 +1101,15 @@ MINIMAX_BUILT_IN_PRESETS = {
         "MINIMAX_TRAIN_ADALN": False,
         # The text token refiner is not a LoRA target (10 Sep): see the Other Options tick.
         "MINIMAX_TRAIN_REFINER": False,
-        # Training mode ships FAST: photos and clips on the identity blocks (20-49), voice on
-        # the audio zone (34-49). Ultra quality (6-49 everywhere) is the slower, better one and
-        # what the Style preset loads. Either can be picked within any preset.
+        # Training mode ships FAST: photos, clips and voice all on the identity blocks
+        # (20-49). EVERY H3 preset is on Fast since 18 Sep — Style was the last
+        # holdout. More Blocks (6-49 everywhere) is the slower one and stays a dropdown away in
+        # any preset.
         "MINIMAX_LIKENESS_MODE": MINIMAX_MODE_FAST,
-        # Training adapter ships ON (Peter, 2 Sep): measured on the same dataset/seed it hit
-        # 50% likeness seven epochs sooner and peaked higher (61 vs 57). Every H3 preset
-        # inherits this — Style included, the adapter is about the base, not the blocks.
-        "MINIMAX_TRAINING_ADAPTER": True,
+        # Training adapter ships ON (Peter, 2 Sep: the Ostris one reached 50% likeness seven
+        # epochs sooner and peaked higher). Circlestone since 23 Sep — clearly better again on
+        # stills. Every H3 preset inherits it; the dropdown offers Ostris for video-only sets.
+        "MINIMAX_ADAPTER": MINIMAX_ADAPTER_CIRCLESTONE,
         # TREAD token routing ships ON (Peter, 7 Sep, after his A/B): clip steps route half
         # their video tokens around blocks 2-46; photos and clip stills always run in full.
         "MINIMAX_TREAD": True,
@@ -1090,21 +1162,20 @@ MINIMAX_BUILT_IN_PRESETS["✨ MiniMax H3 Fast (LoRA 8, 50 epochs)"] = {
 # --- MiniMax H3 Style -------------------------------------------------------------------------
 # Style needs most of the model, not the identity window — the 19 Aug ablation found a style
 # LoRA's deltas matter nearly everywhere. Until 11 Sep 2026 that meant Off + a hand-picked
-# 0-3, 6-47. It now loads ULTRA (6-49, every step type): the same "whole of the model that
-# matters" recipe that won on likeness and audio, and the measured reason to hold 0-5 out —
-# they deform anatomy and pull the dataset's colour into every render — applies to a style
-# just as much. The mode is a dropdown, so a user who wants the Fast version of Style just
-# switches it.
+# 0-3, 6-47, and from then until 18 Sep it loaded Ultra.
 #
-# ADAMW AND A FLAT 2e-4, deliberately (Peter, 17 Sep 2026), where the character presets moved to
-# Automagic v3: the controller pushes the rate up while the update signs agree, and on a style
-# set — where every image shares the look being learned, so the signs agree for longer — that is
-# exactly the run you do not want driven harder. The measured flat rate stays.
+# FAST, and AUTOMAGIC, both by Peter's call on 18 Sep 2026 — this preset now differs from Fast
+# only in leaving the clips' sharp-face stills out. It replaces two deliberate choices made the
+# day before, that Style hold Ultra and hold adamw at a flat 2e-4 in case a self-adjusting rate
+# drove a style set too hard. It goes the other way now. The mode is a dropdown either way, so
+# whichever a user wants is one switch.
 MINIMAX_BUILT_IN_PRESETS["✨ MiniMax H3 Style (LoRA 8)"] = {
     **MINIMAX_BUILT_IN_PRESETS["✨ MiniMax H3 Fast (LoRA 8, 50 epochs)"],
-    "LEARNING_RATE": 2e-4,
-    "OPTIMIZER_TYPE": "adamw",
-    "MINIMAX_LIKENESS_MODE": MINIMAX_MODE_ULTRA,
+    # 1e-6 is Automagic's STARTING rate, not the rate — the same entry point the character
+    # presets use. An AdamW number like 2e-4 would be far too hot as a start.
+    "LEARNING_RATE": 1e-6,
+    "OPTIMIZER_TYPE": "automagic3",
+    "MINIMAX_LIKENESS_MODE": MINIMAX_MODE_FAST,
     # Style is about the look, not the face: no extra sharp-face stills from the clips.
     "MINIMAX_CLIP_STILL": False,
 }
@@ -1466,10 +1537,11 @@ DEFAULT_PREFS = {
     # Turbo LoRA — optional, previews only: 6-step in-training samples with the community Turbo
     # applied at ~75% on top of the training adapter, exactly how fast ComfyUI inference runs it.
     "minimax_turbo_lora": "",
-    # Training adapters (Ostris, ostris/minimax_h3_training_adapter) — one per base. The
-    # Training tab's tickbox loads the one matching the selected base, frozen at 1.0, on for
-    # every training step and off for previews. Fetched by the updater and the model
+    # Training adapters, picked by the Training tab's "Training adapter" dropdown and loaded
+    # frozen at 1.0 for every training step, off for previews. Circlestone (the default) is one
+    # file for both bases; Ostris ships one per base. Fetched by the updater and the model
     # downloader; never required.
+    "minimax_circlestone_adapter": "",
     "minimax_training_adapter": "",
     "minimax_ref_training_adapter": "",
     # Output directories — relative to repo root, portable across clones/moves.
@@ -1611,6 +1683,12 @@ def _auto_detect_blocks_to_swap() -> int:
     except Exception:
         pass
     return 0  # safe fallback
+
+
+# Model-path prefs of families added through the standard layer, from their descriptions.
+for _desc in DESCRIBED_FAMILIES.values():
+    for _k in _desc.pref_keys:
+        DEFAULT_PREFS.setdefault(_k, "")
 
 
 def load_prefs() -> dict:
@@ -1891,7 +1969,7 @@ class LoRATrainerGUI:
 
     def __init__(self, master):
         self.master = master
-        master.title("Fizgig — Klein 9B & Krea 2 LoRA Studio")
+        master.title("Fizgig — LoRA & Fine-tune Studio")
         master.geometry("1580x1124")  # wide enough that the IDLE/BUSY light clears the last tab ("Preferences") with the Metadata tab in the strip; +130 for the RefMod Studio tab (16 Sep 2026: 105 px of bold 11pt text + 12 px padding each side); +100 height for the bottom status bar
         master.minsize(1310, 900)  # keeps the tab row clear of the status light + tab content not cut off
         master.configure(bg=BG_COLOR)
@@ -1994,6 +2072,8 @@ class LoRATrainerGUI:
         self.dataset_caption_ext_var = tk.StringVar(value=".txt")
         self.dataset_jsonl_file_var = tk.StringVar()
         self.dataset_megapixels_var = tk.StringVar(value="0.25")
+        # MiniMax H3, datasets with clips: clips cache and train at this size or smaller
+        self.clip_megapixels_var = tk.StringVar(value="0.25")
         # Image Prep's target area. Training buckets by AREA and never upscales, so prepping to a
         # longest-edge cap silently pushed every non-square image below the training target and
         # threw away detail training could not get back (issue #44). Defaults to 1.0 MP — NOT the
@@ -2049,7 +2129,8 @@ class LoRATrainerGUI:
                 self.auto_save_dataset_config_silent()
         for _v in (self.image_folder_var, self.dataset_caption_ext_var,
                    self.dataset_megapixels_var, self.dataset_batch_size_var,
-                   self.dataset_enable_bucket_var, self.dataset_no_upscale_var):
+                   self.dataset_enable_bucket_var, self.dataset_no_upscale_var,
+                   self.clip_megapixels_var):
             _v.trace_add("write", _auto_save_ds)
         # Multi Concept adds [[datasets]] blocks, so its toggle and folders have to rewrite the
         # TOML too — they are created later (Training tab), hence the deferred hook-up.
@@ -2102,10 +2183,10 @@ class LoRATrainerGUI:
             # pruned build they were taking ~45% of all weight movement to do it.
             "MINIMAX_TRAIN_ADALN": False,
             "MINIMAX_TRAIN_REFINER": False,
-            # Training mode — Fast by default (photos and clips 20-49, voice 34-49): the
+            # Training mode — Fast by default (photos, clips and voice all 20-49): the
             # measured recipe for the character/voice work H3 is for, and the quickest steps.
             "MINIMAX_LIKENESS_MODE": MINIMAX_MODE_FAST,
-            "MINIMAX_TRAINING_ADAPTER": True,
+            "MINIMAX_ADAPTER": MINIMAX_ADAPTER_CIRCLESTONE,
             "MINIMAX_TREAD": True,         # clip steps route half their video tokens (7 Sep)
             "MINIMAX_CLIP_STILL": True,    # each clip's sharpest face frame trains as a photo
             "MINIMAX_DISTILL": False,      # off = ordinary training
@@ -2357,7 +2438,7 @@ class LoRATrainerGUI:
         self.captioning_stop_flag = False
         self.caption_thumbnails = {}
         self.current_caption_page = 0
-        self.images_per_page = 12
+        self._caption_page_size()
 
         # Load architecture defaults first (populates optimizer / fp8 / timestep
         # fields that the built-in presets don't explicitly set), then overlay
@@ -3111,19 +3192,25 @@ class LoRATrainerGUI:
             return int(m.used), int(m.total)
         except Exception:
             pass
-        try:
-            import subprocess
-            out = subprocess.run(
-                ["nvidia-smi", "-i", str(physical),
-                 "--query-gpu=memory.used,memory.total",
-                 "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=4,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            used, total = out.stdout.strip().splitlines()[0].split(",")
-            return int(used) * 1024 * 1024, int(total) * 1024 * 1024
-        except Exception:
-            pass
+        if not getattr(self, "_nvidia_smi_missing", False):
+            try:
+                import subprocess
+                # [fork] `physical` rather than a second _visible_gpu_index() call: it is resolved
+                # once at the top of this method, and on the unpinned path it can only be resolved
+                # AFTER torch has a context, so the two calls need not agree within one read.
+                out = subprocess.run(
+                    ["nvidia-smi", "-i", str(physical),
+                     "--query-gpu=memory.used,memory.total",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=4,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                used, total = out.stdout.strip().splitlines()[0].split(",")
+                return int(used) * 1024 * 1024, int(total) * 1024 * 1024
+            except FileNotFoundError:
+                self._nvidia_smi_missing = True    # an AMD box: stop spawning it every second
+            except Exception:
+                pass
         try:
             from fizgig.utils.vram_monitor import read_amd_gpu_vram
             return read_amd_gpu_vram()
@@ -3185,6 +3272,21 @@ class LoRATrainerGUI:
             if visible:
                 self._draw_status_segment(self._vram_canvas, u, t, self._vram_peak,
                                           "VRAM", "#3FB950", "#E5534B")  # green → red
+        elif visible and not getattr(self, "_vram_unavailable_drawn", False):
+            # No reader on this box (an AMD card whose counter gives nothing): say so once
+            # rather than leave a stale bar. Cleared the moment a reading arrives.
+            try:
+                c = self._vram_canvas
+                c.delete("all")
+                c.create_rectangle(0, 0, int(c["width"]), int(c["height"]),
+                                   fill=COLORS["bg_deep"], outline="")
+                c.create_text(10, int(c["height"]) // 2, text="VRAM stats unavailable",
+                              anchor="w", fill=COLORS["text_muted"], font=(FONT_FAMILY, 9))
+                self._vram_unavailable_drawn = True
+            except Exception:
+                pass
+        if vram:
+            self._vram_unavailable_drawn = False
         if ram:
             u, t = ram
             self._ram_peak = max(self._ram_peak, u)
@@ -3721,7 +3823,7 @@ class LoRATrainerGUI:
             lbl.bind("<Button-1>", lambda e, u=url: webbrowser.open(u))
 
         heading("Fizgig", 22)
-        tk.Label(pad, text="Klein 9B & Krea 2 LoRA Studio — by Peter Neill",
+        tk.Label(pad, text="LoRA & Fine-tune Studio — by Peter Neill",
                  font=(FONT_FAMILY, 11), fg=COLORS["text_explain"],
                  bg=COLORS["bg_deep"]).pack(anchor=tk.W, pady=(0, 4))
         tk.Label(pad, text=f"Version {_git_describe_version() or 'unknown'}",
@@ -3940,9 +4042,9 @@ class LoRATrainerGUI:
                  font=(FONT_FAMILY, 22, "bold"),
                  fg=COLORS["text_primary"], bg=COLORS["bg_deep"]).pack(anchor=tk.W)
         tk.Label(container,
-                 text="A focused, local trainer and workbench for Flux 2 Klein 9B, Krea 2 and "
-                      "MiniMax H3 LoRAs — train, profile, repair, explore, and extract, all in "
-                      "one place.",
+                 text="A focused, local trainer and workbench for Flux 2 Klein 9B, Krea 2, "
+                      "MiniMax H3 and Qwen Image 2.1 LoRAs — train, profile, repair, explore, and "
+                      "extract, all in one place.",
                  font=(FONT_FAMILY, 11),
                  fg=COLORS["text_secondary"], bg=COLORS["bg_deep"],
                  wraplength=800, justify=tk.LEFT).pack(anchor=tk.W, pady=(4, 24))
@@ -4089,7 +4191,10 @@ class LoRATrainerGUI:
                            for k in ("base_dit", "distilled_dit", "vae", "text_encoder"))
             krea_ok = all(self.prefs_vars[k].get().strip()
                           for k in ("krea2_raw_dit", "krea2_vae", "krea2_text_encoder"))
-            if klein_ok or krea_ok:
+            # standard-layer families count too: any one fully set up satisfies the prompt
+            described_ok = any(all(self.prefs_vars[k].get().strip() for k in _d.required_pref_keys)
+                               for _d in DESCRIBED_FAMILIES.values())
+            if klein_ok or krea_ok or described_ok:
                 self._setup_prompt_frame.pack_forget()
             else:
                 self._setup_prompt_frame.pack(fill=tk.X, pady=(20, 0),
@@ -4097,7 +4202,8 @@ class LoRATrainerGUI:
 
         # Re-check whenever a model path (either family) changes
         for _mk in ("base_dit", "distilled_dit", "vae", "text_encoder",
-                    "krea2_raw_dit", "krea2_vae", "krea2_text_encoder"):
+                    "krea2_raw_dit", "krea2_vae", "krea2_text_encoder",
+                    *[k for _d in DESCRIBED_FAMILIES.values() for k in _d.required_pref_keys]):
             self.prefs_vars[_mk].trace_add("write", _check_model_paths)
 
         # Initial check (deferred so tools_card exists)
@@ -4116,8 +4222,8 @@ class LoRATrainerGUI:
                  "Audio VAE (~605 MB) — train on the sound in video clips, and on voices"),
                 ("minimax_turbo_lora",
                  "Turbo LoRA (~780 MB) — fast 6-step in-training previews"),
-                ("minimax_training_adapter",
-                 "Training adapter (~155 MB) — faster, higher likeness"))
+                ("minimax_circlestone_adapter",
+                 "Training adapter (Circlestone, ~620 MB) — sharper, higher likeness"))
                 if not str(self.prefs.get(key, "") or "").strip()]
             if not missing:
                 return
@@ -4399,7 +4505,7 @@ class LoRATrainerGUI:
             )
             arch_combo.pack(side=tk.LEFT)
             arch_combo.bind("<<ComboboxSelected>>", self._on_architecture_selected)
-            ToolTip(arch_combo, "Model family to train (Klein 9B, Krea 2 or MiniMax H3)")
+            ToolTip(arch_combo, "Model family to train (Klein 9B, Krea 2, MiniMax H3 or Qwen Image 2.1)")
 
             # Training Base (MiniMax only) — which H3 fine-tune the run trains against, right
             # where the family was just chosen. A dedicated var kept OUT of self.entries and
@@ -4431,16 +4537,16 @@ class LoRATrainerGUI:
                 self._minimax_base_frame.pack_forget()
                 self._minimax_base_hint.pack_forget()
 
-            # Previews track likeness honestly but are not the place to compare quality — say
-            # so where the family is chosen, along with the Pause/Resume route that makes
-            # judging in ComfyUI practical on one GPU.
+            # This used to carry a warning that previews tracked likeness but not quality, and
+            # to judge quality in ComfyUI instead. That was true of the old preview path and
+            # stopped being true when the visual (10 Aug) and audio (17 Aug) regimes were fixed
+            # — the previews are the real thing now, so the warning went on 18 Sep 2026. What
+            # is left is the shape of what you get, which is still worth saying here.
             self._minimax_sample_note = tk.Label(
                 model_card,
-                text=("⏱ Previews track LIKENESS, not quality. Judge quality in ComfyUI — Pause "
-                      "frees the GPU, so you can check an epoch there and Resume.\n"
-                      "Defaults are 768×768 56-frame clips with sound; Sample length has "
-                      "stills and other lengths. 📖 Full write-ups in the README."),
-                font=(FONT_FAMILY, 9), fg=COLORS["warning"], bg=COLORS["bg_surface"],
+                text=("Previews default to 768×768 56-frame clips with sound; Sample length "
+                      "has stills and other lengths. 📖 Full write-ups in the README."),
+                font=(FONT_FAMILY, 9), fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
                 wraplength=760, justify=tk.LEFT,
             )
             self._minimax_sample_note.pack(anchor=tk.W, pady=(10, 0))
@@ -4662,8 +4768,8 @@ class LoRATrainerGUI:
         self.entries["LORA_OUTPUT_DIR"].bind("<Return>", lambda e: self._save_last_used_paths())
         self._output_dir_hint = ttk.Label(
             output_content,
-            text="Remembered per model family — Klein, Krea 2 and MiniMax H3 each keep their own "
-                 "folder here. Default: output_loras inside Fizgig.",
+            text="Remembered per model family — Klein, Krea 2, MiniMax H3 and Qwen Image 2.1 each keep their "
+                 "own folder here. Default: output_loras inside Fizgig.",
             foreground=COLORS["text_explain"], font=HINT_FONT, justify=tk.LEFT, wraplength=720)
         self._output_dir_hint.grid(row=2, column=0, columnspan=3, sticky=tk.W, padx=5, pady=(0, 4))
 
@@ -4686,7 +4792,7 @@ class LoRATrainerGUI:
         )
         adaptive_cb.grid(row=2, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(4, 0))
         self._adaptive_cb = adaptive_cb
-        # Shown while automagic3 is the optimizer (Krea 2): the rate is its to set.
+        # Shown while automagic3 is the optimizer (Krea 2, standard-layer families): the rate is its to set.
         self._automagic_note = tk.Label(
             training_content,
             text=("Adaptive LR, per-image adaptive LR and the look warm-up are off: automagic3 sets its "
@@ -4768,7 +4874,8 @@ class LoRATrainerGUI:
         self.entries["LOKR_FACTOR"].pack(side=tk.LEFT)
         self._lokr_factor_hint = tk.Label(
             self._lokr_factor_rowf,
-            text="8 is the sweet spot · 4 = stronger, bigger files · above 8: just use LoRA",
+            text="8 is the sweet spot · 4 = four times the parameters: stronger, a bigger file, "
+                 "and ~5 GB more VRAM with adamw (use adamw8bit) · above 8: just use LoRA",
             font=HINT_FONT, fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
             justify=tk.LEFT)
         self._lokr_factor_hint.pack(side=tk.LEFT, padx=(10, 0))
@@ -4889,12 +4996,43 @@ class LoRATrainerGUI:
                        "example: 512² = 512×512 pixels, or any other width × height with a similar pixel area",
                   foreground=COLORS["text_explain"], font=(FONT_FAMILY, 9), wraplength=620,
                   justify=tk.LEFT).pack(side=tk.LEFT)
-        ttk.Label(training_content,
+        # Row 17 holds the hint and, under it, the Clip Target Megapixels row (MiniMax H3 with clips
+        # in the dataset only; rows 18/19 are Network Type's).
+        _mp_block = ttk.Frame(training_content)
+        _mp_block.grid(row=17, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
+        ttk.Label(_mp_block,
                   text="Images are resized to this area. Any aspect ratio, no additional prep needed "
                        "beyond the Image Prep tab. Higher = more detail, more VRAM per step; 4.2 MP "
                        "wants 24-32 GB.",
-                  foreground=COLORS["text_explain"], font=HINT_FONT, justify=tk.LEFT, wraplength=720).grid(
-            row=17, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
+                  foreground=COLORS["text_explain"], font=HINT_FONT, justify=tk.LEFT, wraplength=720).pack(
+            anchor=tk.W)
+        self._clip_mp_frame = ttk.Frame(_mp_block)
+        self._clip_mp_labelbox = tk.Frame(self._clip_mp_frame, height=1, bg=COLORS["bg_surface"])
+        self._clip_mp_labelbox.pack(side=tk.LEFT, fill=tk.Y)
+        self._clip_mp_labelbox.pack_propagate(False)       # width set to line the box up with Target MP's
+
+        def _clip_mp_align(_e=None):
+            try:
+                px = self._mp_combo.winfo_rootx() - self._clip_mp_frame.winfo_rootx()
+                if px > 0 and px != self._clip_mp_labelbox.winfo_reqwidth():
+                    self._clip_mp_labelbox.configure(width=px)
+            except tk.TclError:
+                pass
+        self._clip_mp_frame.bind("<Map>", lambda e: self._clip_mp_frame.after(20, _clip_mp_align))
+        self._clip_mp_frame.bind("<Configure>", _clip_mp_align)
+        ttk.Label(self._clip_mp_labelbox, text="Clip Target Megapixels:").pack(side=tk.LEFT)
+        ttk.Combobox(self._clip_mp_frame, textvariable=self.clip_megapixels_var,
+                     values=["0.25", "0.37", "0.5", "0.75", "1.0", "1.5", "2.0", "2.4", "3.0", "4.2"],
+                     width=8).pack(side=tk.LEFT)
+        self._clip_mp_hint = ttk.Label(
+            _mp_block,
+            text="The size your video clips are cached and trained at; photos keep the Target Megapixels "
+                 "above. A clip takes far more memory and time than a photo of the same size, so e.g. "
+                 "photos at 1.0 with clips at 0.25 keeps caching and training fast. A clip that would not "
+                 "fit in your card's free memory is cached smaller still.",
+            foreground=COLORS["text_explain"], font=HINT_FONT, justify=tk.LEFT, wraplength=720)
+        for _w in (self._clip_mp_frame, self._clip_mp_hint):
+            _w._fizgig_described_family = "*"   # standard-layer widget: old-family goldens set it aside
 
         # --- Per-image loss watch (Krea 2 only for now — hidden under Klein via
         # _apply_training_arch_visibility). Two tiers sharing one watcher in the trainer:
@@ -5138,8 +5276,8 @@ class LoRATrainerGUI:
         ToolTip(_mfts, "A dataset FILTER, not a mode. All media (default) fine-tunes on "
                        "everything in the folder — photos, clips, voice. Photos only is the "
                        "override for a mixed folder: clips and voice are skipped and the run "
-                       "behaves as if the dataset were photos-only (with Optimised Likeness "
-                       "on, the cycle then tightens to the identity blocks). On a dataset "
+                       "behaves as if the dataset were photos-only (with Training mode on "
+                       "Default, the cycle then tightens to the identity blocks). On a dataset "
                        "that's already just photos this choice changes nothing.")
         ttk.Label(self._minimax_ft_frame, text="Blocks:").pack(side=tk.LEFT, padx=(14, 4))
         self.minimax_ft_blockspec_var = tk.StringVar(
@@ -5210,7 +5348,7 @@ class LoRATrainerGUI:
                 "clips stop under 'Finish one category early' — once subject pressure ends, the "
                 "counter-pressure ends with it. Stills only: they tether the visual prior; the "
                 "audio prior is protected by voice routing instead.\n\n"
-                "With Optimised Likeness on, the anchor pulls only on the likeness blocks — "
+                "With Training mode on Default, the anchor pulls only on the likeness blocks — "
                 "the same territory your subject photos train, which is the point. On an "
                 "audio-only dataset, adding reg stills widens the rotation cycle to include "
                 "the photo blocks (the console prints the new span).")
@@ -5218,7 +5356,7 @@ class LoRATrainerGUI:
         self._minimax_ft_hint = ttk.Label(training_content,
                   text="Trains the base model's own weights, not an adapter — Network Type "
                        "and Blocks to Train hide while this is on (they're LoRA machinery); "
-                       "Optimised Likeness Learning keeps working with its usual meaning. "
+                       "Training mode keeps working with its usual meaning. "
                        "Each window is one matmul (attention qkv/out, MLP fc1/fc2) across "
                        "every block — full model depth per window, 4 windows per cycle, on "
                        "an NF4-resident base (the saved checkpoint is still exact int8). "
@@ -5317,6 +5455,10 @@ class LoRATrainerGUI:
             for _cv in self._concept_folder_vars:
                 _cv.trace_add("write", self._auto_save_ds)
                 _cv.trace_add("write", lambda *_a: self._save_last_used_paths())
+        # Concept folders count toward "is this dataset all clips?" for the adapter advice.
+        self.minimax_multiconcept_var.trace_add("write", lambda *_a: self._refresh_minimax_adapter_hint())
+        for _cv in self._concept_folder_vars:
+            _cv.trace_add("write", lambda *_a: self._refresh_minimax_adapter_hint())
 
         # --- Slow blocks (MiniMax only, experimental): depth-dependent LR -------------------
         self._minimax_slow_label = ttk.Label(training_content, text="Slower LR for blocks:")
@@ -5384,17 +5526,21 @@ class LoRATrainerGUI:
             self._minimax_likeness_frame, values=MINIMAX_LIKENESS_MODE_OPTIONS,
             textvariable=self.entries["MINIMAX_LIKENESS_MODE"], state="readonly", width=34)
         self._minimax_likeness_combo.pack(side=tk.LEFT)
+        # Amber and a point up on the usual hint, not the explain grey: this is the one control
+        # where picking the heavier-sounding option makes the result worse, so the description
+        # has to be read rather than skimmed past.
         self._minimax_likeness_hint = ttk.Label(
             training_content, text="",
-            foreground=COLORS["text_explain"], font=HINT_FONT, justify=tk.LEFT, wraplength=720)
+            foreground=COLORS["warning"], font=(FONT_FAMILY, HINT_FONT[1] + 1, "italic"),
+            justify=tk.LEFT, wraplength=720)
         self._minimax_likeness_hint.grid(row=40, column=0, columnspan=2, sticky=tk.W,
                                          padx=5, pady=(0, 4))
         self._MINIMAX_LIKENESS_HINT_FT = (
-            f"Under fine-tune the mode drives the rotation cycle instead of masking steps: in "
-            f"Fast, photos and clips train the identity blocks ({MINIMAX_LIKENESS_BLOCKS}) and "
-            f"voice the audio zone ({MINIMAX_AUDIO_BLOCKS}). Blocks to Train is adapter-only; the "
+            f"Under fine-tune the mode drives the rotation cycle instead of masking steps: on "
+            f"Default, photos and clips train the identity blocks ({MINIMAX_LIKENESS_BLOCKS}) and "
+            f"voice the same ({MINIMAX_AUDIO_BLOCKS}). Blocks to Train is adapter-only; the "
             f"fine-tune has its own block field. See the MiniMax section of the README.")
-        # Clips are confined with the photos in Fast — LoRA and FT alike. It was a sub-tick
+        # Clips are confined with the photos on Default — LoRA and FT alike. It was a sub-tick
         # (29 Aug, on by default; LoRA too since 2 Sep) until Peter retired the choice on
         # 7 Sep: a confined video run trains just as well and is far lighter. Emitted as
         # --clip_blocks. trace, not command=: preset loads set the var programmatically and
@@ -5405,25 +5551,40 @@ class LoRATrainerGUI:
         self.entries["MINIMAX_LIKENESS_MODE"].trace_add(
             "write", lambda *_a: self._sync_minimax_likeness_state())
 
-        # --- Training adapter (Ostris) — MiniMax LoRA runs only ---------------------------
-        # A BooleanVar in self.entries so presets/queue/last-train carry it. The builder
-        # resolves the FILE from Preferences per the selected base (fl2va/ref2va); the
-        # tickbox greys out with a pointer when that pref is empty. Independent of the
-        # Context LoRA box: adapter first, then the user's context, then the trainable LoRA.
-        self.entries["MINIMAX_TRAINING_ADAPTER"] = tk.BooleanVar(
-            value=bool(self.settings.get("MINIMAX_TRAINING_ADAPTER", True)))
-        self._minimax_adapter_cb = ttk.Checkbutton(
-            training_content, text="Training adapter — de-distills the base while your LoRA learns",
-            variable=self.entries["MINIMAX_TRAINING_ADAPTER"])
-        self._minimax_adapter_cb.grid(row=42, column=0, columnspan=2, sticky=tk.W,
+        # --- Training adapter — MiniMax runs (LoRA and fine-tune) --------------------------
+        # A StringVar in self.entries so presets/queue/last-train carry it. The builder resolves
+        # the FILE from Preferences: Circlestone is one file for both bases, Ostris one per base.
+        # Independent of the Context LoRA box: adapter first, then the user's context, then the
+        # trainable LoRA.
+        self.entries["MINIMAX_ADAPTER"] = tk.StringVar(
+            value=str(self.settings.get("MINIMAX_ADAPTER", MINIMAX_ADAPTER_CIRCLESTONE)))
+        self._minimax_adapter_cb = ttk.Frame(training_content)     # the row: label + dropdown
+        self._minimax_adapter_cb.grid(row=41, column=0, columnspan=2, sticky=tk.W,
                                       padx=5, pady=(8, 0))
+        ttk.Label(self._minimax_adapter_cb, text="Training adapter:").pack(side=tk.LEFT, padx=(0, 8))
+        self._minimax_adapter_combo = ttk.Combobox(
+            self._minimax_adapter_cb, values=list(MINIMAX_ADAPTER_OPTIONS),
+            textvariable=self.entries["MINIMAX_ADAPTER"], state="readonly", width=46)
+        self._minimax_adapter_combo.pack(side=tk.LEFT)
         self._minimax_adapter_hint = ttk.Label(
             training_content,
-            text="Loads the MiniMax H3 training adapter frozen at 1.0 under your LoRA for every "
-                 "training step, and switches it off for previews and in your saved file.",
+            text="De-distills the base while your LoRA learns: frozen at 1.0 for every training "
+                 "step, off for previews and never in your saved file. Circlestone (one file for "
+                 "fl2va and ref2va) trains sharper LoRAs from photos; Ostris learns a video look "
+                 "faster. For mixed datasets, choose by whether the photos or the videos are the "
+                 "priority.",
             foreground=COLORS["text_explain"], font=HINT_FONT, justify=tk.LEFT, wraplength=720)
-        self._minimax_adapter_hint.grid(row=43, column=0, columnspan=2, sticky=tk.W,
-                                        padx=5, pady=(0, 4))
+        self._minimax_adapter_hint.grid(row=42, column=0, columnspan=2, sticky=tk.W,
+                                        padx=5, pady=(0, 0))
+        # Advice only, never a switch: shown when Circlestone is picked for a clips-only dataset.
+        self._minimax_adapter_clips_hint = ttk.Label(
+            training_content, text="",
+            foreground=COLORS["warning"], font=(FONT_FAMILY, HINT_FONT[1] + 1, "italic"),
+            justify=tk.LEFT, wraplength=720)
+        self._minimax_adapter_clips_hint.grid(row=43, column=0, columnspan=2, sticky=tk.W,
+                                              padx=5, pady=(0, 4))
+        self.entries["MINIMAX_ADAPTER"].trace_add(
+            "write", lambda *_a: self._refresh_minimax_adapter_hint())
         # --- TREAD token routing — MiniMax LoRA runs only, ON by default (7 Sep 2026) -----
         self.entries["MINIMAX_TREAD"] = tk.BooleanVar(
             value=bool(self.settings.get("MINIMAX_TREAD", True)))
@@ -5455,6 +5616,183 @@ class LoRATrainerGUI:
             foreground=COLORS["text_explain"], font=HINT_FONT, justify=tk.LEFT, wraplength=720)
         self._minimax_clipstill_hint.grid(row=47, column=0, columnspan=2, sticky=tk.W,
                                           padx=5, pady=(0, 4))
+        # --- Training adapter — standard-layer families (the description names the adapter file) ----
+        self.entries["FAMILY_TRAINING_ADAPTER"] = tk.BooleanVar(
+            value=bool(self.settings.get("FAMILY_TRAINING_ADAPTER", True)))
+        self._family_adapter_cb = ttk.Checkbutton(
+            training_content, text="Training adapter (recommended)",
+            variable=self.entries["FAMILY_TRAINING_ADAPTER"])
+        self._family_adapter_cb.grid(row=48, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(8, 0))
+        self._family_adapter_hint = ttk.Label(
+            training_content, text="", foreground=COLORS["text_explain"], font=HINT_FONT,
+            justify=tk.LEFT, wraplength=720)
+        self._family_adapter_hint.grid(row=49, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(0, 4))
+        # --- Weight averaging (EMA) — standard-layer families (default from the description) ------
+        self._family_ema_label = ttk.Label(training_content, text="Weight averaging (EMA):")
+        self._family_ema_label.grid(row=52, column=0, sticky=tk.W, padx=5, pady=(8, 2))
+        self._family_ema_frame = ttk.Frame(training_content)
+        self._family_ema_frame.grid(row=52, column=1, columnspan=2, sticky=tk.W, padx=5, pady=(8, 2))
+        self.entries["FAMILY_EMA"] = ttk.Combobox(
+            self._family_ema_frame, values=["Off", "0.98 (recommended)", "0.99 (stronger)", "0.995 (long runs only)"], width=22, state="readonly")
+        self.entries["FAMILY_EMA"].set(str(self.settings.get("FAMILY_EMA", "0.98 (recommended)")))
+        self.entries["FAMILY_EMA"].pack(side=tk.LEFT)
+        self._family_ema_hint = ttk.Label(
+            training_content,
+            text="Checkpoints and previews come from a running average of the adapter's recent steps instead of "
+                 "whichever step the epoch ended on. 0.98 measured best on MiniMax H3 and Krea 2; Off is there for "
+                 "an A/B.",
+            foreground=COLORS["text_explain"], font=(FONT_FAMILY, 9, "italic"), justify=tk.LEFT, wraplength=720)
+        self._family_ema_hint.grid(row=53, column=0, columnspan=3, sticky=tk.W, padx=5, pady=(0, 4))
+        # --- Edit LoRA — standard-layer families whose model edits images (description.edit_training) ----
+        self.entries["FAMILY_EDIT"] = tk.BooleanVar(value=bool(self.settings.get("FAMILY_EDIT", False)))
+        self.entries["FAMILY_SLIDER"] = tk.BooleanVar(value=bool(self.settings.get("FAMILY_SLIDER", False)))
+        # Kind of LoRA: one choice, stored as the two flags presets and the builders read
+        self._family_kind_var = tk.StringVar(value=("edit" if self.entries["FAMILY_EDIT"].get() else
+                                                    "slider" if self.entries["FAMILY_SLIDER"].get() else "standard"))
+        self._family_edit_cb = ttk.Frame(training_content)          # the Kind of LoRA row
+        ttk.Label(self._family_edit_cb, text="Kind of LoRA:").pack(side=tk.LEFT, padx=(0, 10))
+        self._family_kind_buttons = {}
+        for _k, _lab in (("standard", "Standard"), ("edit", "Edit (original + edited photo pairs)"),
+                         ("slider", "Slider (a dial between two looks)")):
+            self._family_kind_buttons[_k] = ttk.Radiobutton(self._family_edit_cb, text=_lab, value=_k,
+                                                            variable=self._family_kind_var,
+                                                            command=self._family_kind_chosen)
+            self._family_kind_buttons[_k].pack(side=tk.LEFT, padx=(0, 14))
+        for _flag in ("FAMILY_EDIT", "FAMILY_SLIDER"):                  # presets set the flags
+            self.entries[_flag].trace_add("write", lambda *_: self._family_edit_rows())
+        self._family_edit_cb.grid(row=54, column=0, columnspan=2, sticky=tk.W, padx=5, pady=(10, 0))
+        self._family_edit_hint = ttk.Label(
+            training_content, text="",
+            foreground=COLORS["text_explain"], font=HINT_FONT, justify=tk.LEFT, wraplength=720)
+        self._family_edit_hint.grid(row=55, column=0, columnspan=2, sticky=tk.W, padx=(26, 5), pady=(0, 4))
+        self._family_edit_frame = ttk.Frame(training_content)
+        self._family_edit_frame.grid(row=56, column=0, columnspan=2, sticky=tk.W, padx=(26, 5), pady=(2, 4))
+        _f = self._family_edit_frame
+        _r = [0]
+
+        def _block(head, text):
+            ttk.Label(_f, text=head, font=(FONT_FAMILY, 10, "bold")).grid(
+                row=_r[0], column=0, sticky=tk.W, pady=(8 if _r[0] else 0, 0))
+            lab = ttk.Label(_f, text=text, foreground=COLORS["text_explain"], font=HINT_FONT, justify=tk.LEFT,
+                            wraplength=690)
+            lab.grid(row=_r[0] + 1, column=0, sticky=tk.W, pady=(1, 2))
+            _r[0] += 2
+            return lab
+
+        def _row():
+            row = ttk.Frame(_f)
+            row.grid(row=_r[0], column=0, sticky=tk.W, pady=(0, 2))
+            _r[0] += 1
+            return row
+
+        def _path_row(key, browse):
+            row = _row()
+            if isinstance(key, str):
+                self.entries[key] = ttk.Entry(row, width=60)
+                self.entries[key].insert(0, str(self.settings.get(key, "") or ""))
+                self.entries[key].pack(side=tk.LEFT)
+            else:
+                ttk.Entry(row, textvariable=key, width=60).pack(side=tk.LEFT)
+            ttk.Button(row, text="Browse", command=browse).pack(side=tk.LEFT, padx=(6, 0))
+
+        # the model's own guidance (description.edit_note), filled in by _family_edit_rows
+        self._family_edit_need = _block("What you need", "")
+        _block("1. Originals folder (before editing)", "Your original, unedited photos. No captions needed.")
+        _path_row("FAMILY_EDIT_DIR", self._browse_family_edit_dir)
+        _block("2. Edited folder (after editing)",
+               "The same photos after your edit, with the same file names as the originals. This is the same folder "
+               "as on the Start tab.")
+        _path_row(self.image_folder_var, self._browse_image_folder)
+        _block("3. Captions for the edited photos",
+               "Type what the edit is, e.g. \"Apply my concert grade.\", and press Write captions: it saves that text "
+               "as the caption of every photo in the Edited folder.")
+        _cr = _row()
+        self.entries["FAMILY_EDIT_CAPTION"] = ttk.Entry(_cr, width=60)
+        self.entries["FAMILY_EDIT_CAPTION"].insert(0, str(self.settings.get("FAMILY_EDIT_CAPTION", "") or ""))
+        self.entries["FAMILY_EDIT_CAPTION"].pack(side=tk.LEFT)
+        ttk.Button(_cr, text="Write captions", command=self._family_edit_write_captions).pack(side=tk.LEFT, padx=(6, 0))
+        _block("4. Test photo for previews (optional)",
+               "An original photo that is in neither folder. The previews during training show the edit applied to it. "
+               "Any size: it is fitted to the preview size automatically. Leave empty to use the first original.")
+        _path_row("FAMILY_EDIT_REF", self._browse_family_edit_ref)
+
+        # --- Slider card: where the dial's two ends come from ----------------------------------------------
+        self._family_slider_frame = ttk.Frame(training_content)
+        self._family_slider_frame.grid(row=57, column=0, columnspan=2, sticky=tk.W, padx=(26, 5), pady=(2, 4))
+        _f = self._family_slider_frame
+        _r[0] = 0
+        _block("Where the two ends come from",
+               "Photo pairs: two folders of the same shots, one folder for each end of the dial (e.g. the same "
+               "person smiling, and not smiling). 4 to 10 pairs, each pair framed the same. For a dial about "
+               "people, use a different person in each pair if you can: the dial then learns only the change, "
+               "and works on anyone. A dial about something else (lighting, colour, a scene) works the same way: "
+               "the same subject at both ends of a pair, and a different one in each pair.\n"
+               "Prompts: no photos - you describe the picture and what each end adds. The practice pictures it "
+               "makes are the size Target Megapixels sets (0.5 = 704 x 704).")
+        self.entries["FAMILY_SLIDER_SOURCE"] = tk.StringVar(value=str(self.settings.get("FAMILY_SLIDER_SOURCE",
+                                                                                        "pairs") or "pairs"))
+        self.entries["FAMILY_SLIDER_SOURCE"].trace_add("write", lambda *_: self._family_edit_rows())  # loaded settings
+        _src = _row()
+        for _k, _lab in (("pairs", "Photo pairs"), ("prompts", "Prompts")):
+            ttk.Radiobutton(_src, text=_lab, value=_k, variable=self.entries["FAMILY_SLIDER_SOURCE"],
+                            command=self._family_edit_rows).pack(side=tk.LEFT, padx=(0, 14))
+        self._family_slider_pairs = ttk.Frame(_f)
+        self._family_slider_pairs.grid(row=_r[0], column=0, sticky=tk.W)
+        self._family_slider_prompts = ttk.Frame(_f)
+        self._family_slider_prompts.grid(row=_r[0] + 1, column=0, sticky=tk.W)
+        _f = self._family_slider_pairs
+        _r[0] = 0
+        _block("1. +1 end folder", "Photos showing the +1 end of the dial, e.g. the person smiling. The captions "
+                                   "go in this folder (step 3). This is the same folder as on the Start tab.")
+        _path_row(self.image_folder_var, self._browse_image_folder)
+        _block("2. -1 end folder", "The same shots showing the -1 end, e.g. not smiling, each with the same file "
+                                   "name as its +1 photo. No captions in this folder.")
+        _path_row("FAMILY_SLIDER_DIR", self._browse_family_slider_dir)
+        _block("3. Captions (one line, used for every pair)",
+               "Describe what the two photos of a pair have in common, and leave out the difference. For a smile "
+               "dial, where each +1 photo shows someone smiling and its -1 photo shows the same person not smiling, "
+               "the caption is \"a portrait photo of a person\" - not \"a smiling person\", because the smile is "
+               "the difference the dial learns from the photos. For a dial about something else, describe the "
+               "subject the same way, e.g. \"a photo of a room\" for a lighting dial. Type it and press Write "
+               "captions: the same line is saved as the caption of every photo in the +1 folder, so keep it "
+               "general enough to fit every pair.")
+        _cr = _row()
+        self.entries["FAMILY_SLIDER_CAPTION"] = ttk.Entry(_cr, width=60)
+        self.entries["FAMILY_SLIDER_CAPTION"].insert(0, str(self.settings.get("FAMILY_SLIDER_CAPTION", "") or ""))
+        self.entries["FAMILY_SLIDER_CAPTION"].pack(side=tk.LEFT)
+        ttk.Button(_cr, text="Write captions",
+                   command=lambda: self._family_edit_write_captions(self.entries["FAMILY_SLIDER_CAPTION"])).pack(
+            side=tk.LEFT, padx=(6, 0))
+        _f = self._family_slider_prompts
+        _r[0] = 0
+        for _key, _head, _text, _default in (
+                ("FAMILY_SLIDER_BASE", "1. What the picture is",
+                 "The start of the prompt. Each end's words are added after it with a space, so end this line "
+                 "with a comma if you want one. Two ways to use it:\n"
+                 "One person: describe them, e.g. \"a close-up photo of a young woman with short dark hair,\" - "
+                 "the dial changes the expression and keeps her the same.\n"
+                 "Anyone: keep it general, e.g. \"a close-up photo of a person who is\" - the practice pictures "
+                 "show a different person each time, so the dial learns only the change and works on anyone.",
+                 ""),
+                ("FAMILY_SLIDER_POS", "2. The +1 end adds",
+                 "e.g. \"happy\" - with the general line above the prompt reads \"a close-up photo of a person "
+                 "who is happy\".", ""),
+                ("FAMILY_SLIDER_NEG", "3. The -1 end adds",
+                 "e.g. \"sad\". Words like this can bring more than a face (grey light, rain); if the whole scene "
+                 "changes, try a narrower word such as \"unsmiling\".", ""),
+                ("FAMILY_SLIDER_GUIDANCE", "4. Push strength",
+                 "How hard the ends are pushed apart. Higher gives a stronger dial but changes more than the one "
+                 "thing you asked for (a frown can turn into a different, older man). 2 is a good start.", "2")):
+            _block(_head, _text)
+            _er = _row()
+            self.entries[_key] = ttk.Entry(_er, width=60 if _key != "FAMILY_SLIDER_GUIDANCE" else 8)
+            self.entries[_key].insert(0, str(self.settings.get(_key, _default) or _default))
+            self.entries[_key].pack(side=tk.LEFT)
+        for _w in (self._family_adapter_cb, self._family_adapter_hint, self._family_ema_label,
+                   self._family_ema_frame, self._family_ema_hint, self._family_edit_cb, self._family_edit_frame,
+                   self._family_edit_hint, self._family_slider_frame):
+            _w._fizgig_described_family = "*"   # standard-layer widget: old-family goldens set it aside
+            _w.grid_remove()
 
         # Answers "when do changes take effect?" (issue #40) right where people wonder it.
         ttk.Label(training_content,
@@ -5684,16 +6022,28 @@ class LoRATrainerGUI:
         self.quant_4bit_check.bind("<<ComboboxSelected>>",
                                    lambda e: self._on_quant_4bit_mode_changed())
         self._quant_4bit_hint = tk.Label(memory_content,
-                 text="Auto (recommended) picks the fastest option that fits your FREE VRAM, and sizes block "
-                      "swap to match. INT8 is 8-bit — fastest, and ~7x more accurate than 4-bit, but needs "
-                      "~18 GB free. 4-bit NF4 is the smallest (~5.6 GB base) so it fits 10–12 GB cards with "
-                      "no swap, at a slight quality cost. fp8 is the least compressed of the three and needs "
-                      "the most VRAM, so it swaps blocks to fit. Anything you pick explicitly is planned "
-                      "for — swap is sized for the option that will actually run.",
+                 text=self._KREA2_PRECISION_HINT,
                  font=HINT_FONT, fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
                  wraplength=600, justify=tk.LEFT)
         self._quant_4bit_hint.grid(row=7, column=1, sticky=tk.W, padx=5, pady=(0, 4))
         self._on_quant_4bit_mode_changed()  # derive the boolean + sync dependent locks
+
+        # Base precision for standard-layer families: shares rows 6-7 with Krea 2's control (only one family's is
+        # ever shown). Choices come from the description; Auto is resolved by the trainer from free VRAM at launch.
+        self._family_precision_label = tk.Label(memory_content, text="Base precision:", font=(FONT_FAMILY, 10),
+                                                fg=COLORS["text_secondary"], bg=COLORS["bg_surface"])
+        self._family_precision_label.grid(row=6, column=0, sticky=tk.W, padx=(12, 8), pady=4)
+        self.entries["FAMILY_PRECISION"] = ttk.Combobox(memory_content, state="readonly", width=34,
+                                                        values=list(self._FAMILY_PRECISION_LABELS.values()))
+        self.entries["FAMILY_PRECISION"].set(self._FAMILY_PRECISION_LABELS["auto"])
+        self.entries["FAMILY_PRECISION"].grid(row=6, column=1, sticky=tk.W, padx=5, pady=4)
+        self._family_precision_hint = tk.Label(memory_content, text="", font=HINT_FONT,
+                                               fg=COLORS["text_explain"], bg=COLORS["bg_surface"],
+                                               wraplength=600, justify=tk.LEFT)
+        self._family_precision_hint.grid(row=7, column=1, sticky=tk.W, padx=5, pady=(0, 4))
+        for _w in (self._family_precision_label, self.entries["FAMILY_PRECISION"], self._family_precision_hint):
+            _w._fizgig_described_family = "*"
+            _w.grid_remove()
 
         # Gradient checkpointing — trades compute for VRAM.
         self._grad_checkpoint_label = tk.Label(memory_content, text="Grad Checkpoint:", font=(FONT_FAMILY, 10),
@@ -6268,6 +6618,9 @@ class LoRATrainerGUI:
         """Return the built-in preset dict for an architecture. Krea 2 gets its single
         defaults entry (Klein's block/timestep/adaptive presets don't apply); everything
         else gets the full Klein built-in set."""
+        desc = self._family_desc(arch)
+        if desc is not None:            # standard layer: the family's own presets, from its description
+            return dict(desc.presets)
         cfg = ARCHITECTURES.get(arch, {})
         if cfg.get("is_refmod"):
             return REFMOD_BUILT_IN_PRESETS
@@ -6328,6 +6681,9 @@ class LoRATrainerGUI:
                           # not sit in the box reading as one thing and launching another
                           "MINIMAX_REFMOD_CLIPS", "MINIMAX_REFMOD_CONCEPT", "MINIMAX_REFMOD_TOKEN_CAP",
                           "MINIMAX_REFMOD_AUDIO", "MINIMAX_REFMOD_AUDIO_CONCEPT"}
+    # Variable-driven readonly dropdowns (their entry is the StringVar, not the Combobox) and the
+    # labels they offer — checked by _apply_preset_values the same way.
+    _STRICT_VAR_OPTIONS = {"MINIMAX_ADAPTER": MINIMAX_ADAPTER_OPTIONS}
 
     def _apply_preset_values(self, preset):
         """Apply preset values to the UI (shared by load_default_preset and load_custom_preset)"""
@@ -6370,6 +6726,13 @@ class LoRATrainerGUI:
                     # Some boolean settings (e.g. IMG_IN_TXT_IN_OFFLOADING, PRESERVE_DISTRIBUTION)
                     # are stored in self.entries as BooleanVars — they don't support .delete/.insert.
                     entry.set(bool(value))
+                elif isinstance(entry, tk.Variable) and key in self._STRICT_VAR_OPTIONS \
+                        and str(value) not in self._STRICT_VAR_OPTIONS[key]:
+                    # A variable-driven readonly dropdown: a saved label it no longer offers keeps
+                    # the current choice (same rule as the readonly Comboboxes above).
+                    self.update_console(f"[preset] {key}: saved value {value!r} isn't offered here — "
+                                        f"keeping {entry.get()!r}\n")
+                    continue
                 elif isinstance(entry, tk.Variable):
                     # A StringVar/IntVar entry — e.g. MINIMAX_LIKENESS_MODE, a readonly dropdown
                     # driven by its variable. Without this the fall-through below calls .delete()
@@ -6599,6 +6962,8 @@ class LoRATrainerGUI:
             self.dataset_caption_ext_var.set(preset["DATASET_CAPTION_EXT"])
         if "DATASET_MEGAPIXELS" in preset and hasattr(self, "dataset_megapixels_var"):
             self.dataset_megapixels_var.set(preset["DATASET_MEGAPIXELS"])
+        if "CLIP_MEGAPIXELS" in preset and hasattr(self, "clip_megapixels_var"):
+            self.clip_megapixels_var.set(preset["CLIP_MEGAPIXELS"])
         if "DATASET_BATCH_SIZE" in preset and hasattr(self, "dataset_batch_size_var"):
             self.dataset_batch_size_var.set(preset["DATASET_BATCH_SIZE"])
         # Run card's Enable Cache checkbox
@@ -6874,8 +7239,8 @@ class LoRATrainerGUI:
                     clash = "the run in progress"
             if clash is not None and not messagebox.askyesno(
                     "Same output name",
-                    f"This run writes to the same output folder and LoRA name as {clash} — "
-                    f"its checkpoints, state dirs and samples would be overwritten.\n\n"
+                    f"This isn't a settings check: the Output Name matches {clash}, so this run "
+                    f"would save over its checkpoints, state dirs and samples.\n\n"
                     f"Queue it anyway? (Change the Output Name to keep both.)"):
                 return
         self.training_queue.append(item)
@@ -7070,7 +7435,19 @@ class LoRATrainerGUI:
         name = p.get("LORA_NAME") or os.path.basename(folder) or "(unnamed)"
         bits = [f"{item.get('architecture', '?')}",
                 f"{os.path.basename(folder) or '?'} ({n_imgs} items)"]
-        for label, key in (("LR", "LEARNING_RATE"), ("epochs", "MAX_TRAIN_EPOCHS"),
+        # The rate the run will actually use: Automagic owns it from the LR box's value; Adaptive LR
+        # ignores the box and works between Min and Max (MiniMax retired Adaptive LR in place).
+        _is_mm = ARCHITECTURES.get(item.get("architecture", ""), {}).get("is_minimax")
+        _lr = p.get("LEARNING_RATE")
+        if str(p.get("OPTIMIZER_TYPE") or "").strip().lower() == "automagic3":
+            bits.append(f"Automagic from {_lr}")
+        elif p.get("ADAPTIVE_LR") and not _is_mm:
+            _lo = str(p.get("ADAPTIVE_LR_MIN") or "").split(" ")[0]
+            _hi = str(p.get("ADAPTIVE_LR_MAX") or "").split(" ")[0]
+            bits.append(f"adaptive LR {_lo}–{_hi}")
+        elif _lr not in (None, ""):
+            bits.append(f"LR {_lr}")
+        for label, key in (("epochs", "MAX_TRAIN_EPOCHS"),
                            ("dim", "NETWORK_DIM"), ("type", "NETWORK_TYPE"),
                            ("area", "TARGET_LAYERS")):
             v = p.get(key)
@@ -7329,6 +7706,184 @@ class LoRATrainerGUI:
         "RESUME_TRAINING",
     }
 
+    # Training-tab settings that belong to standard-layer (described) families only.
+    _FAMILY_ENTRY_KEYS = frozenset({"FAMILY_TRAINING_ADAPTER", "FAMILY_EMA", "FAMILY_PRECISION",
+                                    "FAMILY_TURBO_STRENGTH", "FAMILY_EDIT", "FAMILY_EDIT_DIR", "FAMILY_EDIT_REF",
+                                    "FAMILY_EDIT_CAPTION", "FAMILY_SLIDER", "FAMILY_SLIDER_SOURCE",
+                                    "FAMILY_SLIDER_DIR", "FAMILY_SLIDER_CAPTION", "FAMILY_SLIDER_BASE",
+                                    "FAMILY_SLIDER_POS", "FAMILY_SLIDER_NEG", "FAMILY_SLIDER_GUIDANCE"})
+    from fizgig.families.launch import PRECISION_LABELS as _FAMILY_PRECISION_LABELS
+
+    def _family_edit_on(self, desc=None):
+        desc = desc if desc is not None else self._family_desc()
+        return bool(desc is not None and desc.edit_training and self.entries["FAMILY_EDIT"].get())
+
+    def _family_slider_on(self, desc=None, source=None):
+        """Slider mode for a family that offers it; source "pairs" / "prompts" narrows it to one kind."""
+        desc = desc if desc is not None else self._family_desc()
+        on = bool(desc is not None and desc.slider_training and self.entries["FAMILY_SLIDER"].get())
+        if on and source:
+            on = self.entries["FAMILY_SLIDER_SOURCE"].get() == source
+        return on
+
+    def _family_kind_chosen(self):
+        """The Kind of LoRA radio sets the two flags (one at a time); the traces redraw the rows."""
+        k = self._family_kind_var.get()
+        self.entries["FAMILY_EDIT"].set(k == "edit")
+        self.entries["FAMILY_SLIDER"].set(k == "slider")
+
+    def _browse_family_slider_dir(self):
+        path = filedialog.askdirectory(title="Folder of -1 end photos (same names as the +1 photos)")
+        if path:
+            self.entries["FAMILY_SLIDER_DIR"].delete(0, tk.END)
+            self.entries["FAMILY_SLIDER_DIR"].insert(0, path)
+
+    _KIND_HINTS = {
+        "standard": "A normal LoRA: a person, a style or a concept, learned from your captioned photos.",
+        "edit": "Teach the model an edit (a grade, a look, a relight) from pairs of the same photo: the original, "
+                "and your edited version. The LoRA learns to make that edit to new photos.",
+        "slider": "A dial: at strength +1 the LoRA moves a picture toward one look, at -1 toward the other, and "
+                  "anything in between. Previews show -1, 0 and +1 side by side.",
+    }
+
+    def _family_edit_rows(self):
+        """Kind of LoRA: the edit card while Edit is chosen, the slider card (and its pairs or prompts half)
+        while Slider is."""
+        if getattr(self, "_family_edit_hint", None) is None:
+            return                      # a preset set the var before the rows were built
+        desc = self._family_desc()
+        can_edit = bool(desc is not None and desc.edit_training)
+        can_slider = bool(desc is not None and desc.slider_training)
+        if getattr(self, "_family_kind_buttons", None):
+            for k, b in self._family_kind_buttons.items():
+                if k == "edit" and not can_edit or k == "slider" and not can_slider:
+                    b.pack_forget()
+                elif not b.winfo_manager():
+                    b.pack(side=tk.LEFT, padx=(0, 14))
+            if self.entries["FAMILY_EDIT"].get() and can_edit:
+                kind = "edit"
+            elif self.entries["FAMILY_SLIDER"].get() and can_slider:
+                kind = "slider"
+            else:
+                kind = "standard"
+            if self._family_kind_var.get() != kind:
+                self._family_kind_var.set(kind)
+            self._family_edit_hint.configure(text=self._KIND_HINTS[kind])
+            slider_on = kind == "slider"
+            self._set_widget_visible(self._family_slider_frame, slider_on)
+            prompts = self.entries["FAMILY_SLIDER_SOURCE"].get() == "prompts"
+            self._set_widget_visible(self._family_slider_pairs, slider_on and not prompts)
+            self._set_widget_visible(self._family_slider_prompts, slider_on and prompts)
+        can = can_edit or can_slider
+        if can_edit:
+            self._family_edit_need.configure(text=desc.edit_note or "An original and its edited version must have "
+                                                                  "the same crop and shape.")
+        edit_on = can_edit and bool(self.entries["FAMILY_EDIT"].get())
+        if getattr(self, "_sample_edit_note", None) is not None:
+            for w in (self.sample_prompt_text, self._sample_edit_note._prompt_hint):
+                self._set_widget_visible(w, not edit_on)
+            self._set_widget_visible(self._sample_edit_note, edit_on)
+        for w in (self._family_edit_cb, self._family_edit_hint):
+            self._set_widget_visible(w, can)
+        self._set_widget_visible(self._family_edit_frame, can_edit and bool(self.entries["FAMILY_EDIT"].get()))
+
+    def _browse_family_edit_dir(self):
+        path = filedialog.askdirectory(title="Folder of BEFORE images (same names as the Start folder's)")
+        if path:
+            self.entries["FAMILY_EDIT_DIR"].delete(0, tk.END)
+            self.entries["FAMILY_EDIT_DIR"].insert(0, path)
+
+    def _browse_family_edit_ref(self):
+        path = filedialog.askopenfilename(title="Photo the previews edit",
+                                          filetypes=[("Images", "*.png *.jpg *.jpeg *.webp *.bmp"), ("All", "*.*")])
+        if path:
+            self.entries["FAMILY_EDIT_REF"].delete(0, tk.END)
+            self.entries["FAMILY_EDIT_REF"].insert(0, path)
+
+    _EDIT_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+
+    def _family_edit_write_captions(self, entry=None):
+        """Write the typed text (the edit instruction, or a slider's shared description) as the caption (.txt)
+        of every photo in the Start folder."""
+        text = (entry or self.entries["FAMILY_EDIT_CAPTION"]).get().strip()
+        folder = self.image_folder_var.get().strip()
+        if not text:
+            messagebox.showerror("Write captions", "Type the edit instruction first, e.g. \"Apply my concert grade.\"")
+            return
+        if not os.path.isdir(folder):
+            messagebox.showerror("Write captions", "Set the Edited folder first.")
+            return
+        photos = sorted(f for f in os.listdir(folder) if os.path.splitext(f)[1].lower() in self._EDIT_EXTS)
+        if not photos:
+            messagebox.showerror("Write captions", f"No photos in {folder}.")
+            return
+        ext = (getattr(self, "dataset_caption_ext_var", None) and self.dataset_caption_ext_var.get().strip()) or ".txt"
+        existing = [f for f in photos if os.path.exists(os.path.join(folder, os.path.splitext(f)[0] + ext))]
+        if existing and not messagebox.askyesno(
+                "Write captions", f"{len(existing)} of the {len(photos)} photos already have a caption. Replace them "
+                                  f"with \"{text}\"?"):
+            return
+        for f in photos:
+            with open(os.path.join(folder, os.path.splitext(f)[0] + ext), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        self.update_console(f"[edit] wrote the caption \"{text}\" for {len(photos)} photos in {folder}\n")
+        messagebox.showinfo("Write captions", f"Captions written for {len(photos)} photos.")
+
+    def _family_launch_inputs(self, desc):
+        """The plain inputs of a described family's launch plan (fizgig.families.launch): the run's settings, the
+        family's own card values as the widgets hold them now, and what the other tabs contribute."""
+        d = dict(self.settings)
+        # the family card as Start stores it (start_training): the switches only where the family offers them
+        d.update(FAMILY_EDIT=self._family_edit_on(desc), FAMILY_SLIDER=self._family_slider_on(desc),
+                 FAMILY_TRAINING_ADAPTER=bool(self.entries["FAMILY_TRAINING_ADAPTER"].get()),
+                 **{k: str(self.entries[k].get()).strip() for k in (
+                     "FAMILY_EDIT_DIR", "FAMILY_EDIT_REF", "FAMILY_SLIDER_SOURCE", "FAMILY_SLIDER_DIR",
+                     "FAMILY_SLIDER_CAPTION", "FAMILY_SLIDER_BASE", "FAMILY_SLIDER_POS", "FAMILY_SLIDER_NEG",
+                     "FAMILY_SLIDER_GUIDANCE")})
+        keys = {f.pref_key for f in desc.model_files}
+        sp = desc.preview_speed()
+        if sp and sp.pref_key:
+            keys.add(sp.pref_key)
+        if desc.training_adapter:
+            keys.add(desc.training_adapter)
+        d.update(
+            python=self._venv_python(), repo_dir=FIZGIG_DIR,
+            models={k: self._krea2_pref(k) for k in keys},
+            image_folder=self.image_folder_var.get().strip(),
+            caption_ext=(self.dataset_caption_ext_var.get().strip()
+                         if getattr(self, "dataset_caption_ext_var", None) else ".txt"),
+            batch_size=(self.dataset_batch_size_var.get() if hasattr(self, "dataset_batch_size_var") else 1),
+            megapixels=self.dataset_megapixels_var.get(),
+            enable_bucket=bool(self.dataset_enable_bucket_var.get()),
+            no_upscale=bool(self.dataset_no_upscale_var.get()),
+            cache_root=(self.prefs_vars["cache_dir"].get().strip() if "cache_dir" in self.prefs_vars else ""),
+            blocks_swap=self.entries["BLOCKS_SWAP"].get(),
+            enable_cache=bool(self.enable_cache_var.get()),
+            resuming=bool(self.settings.get("RESUME_TRAINING", "").strip() or self._ft_resume_active()),
+            loss_watch={"detect": self.krea2_loss_watch_var.get(), "per_image_lr": self.krea2_per_image_lr_var.get(),
+                        "warmup": self.krea2_warmup_look_var.get(), "recaption": self.krea2_auto_recaption_var.get()},
+            captioner=self._qwen_captioner_path(),
+            caption_trigger=(self.caption_trigger_var.get().strip() if hasattr(self, "caption_trigger_var") else ""),
+            caption_overrides=self._caption_overrides(),
+            samples={"enabled": bool(self.sample_enabled_var.get()),
+                     "every": self.sample_every_n_epochs_var.get().strip(),
+                     "width": self.sample_width_var.get().strip(), "height": self.sample_height_var.get().strip(),
+                     "steps": self.sample_steps_var.get().strip(), "cfg": self.sample_cfg_scale_var.get().strip(),
+                     "negative": (self.sample_negative_var.get().strip()
+                                  if getattr(self, "sample_negative_var", None) else ""),
+                     "seed": self.sample_seed_var.get().strip(),
+                     "at_first": bool(getattr(self, "sample_at_first_var", None) and self.sample_at_first_var.get()),
+                     "prompts": self.sample_prompt_text.get("1.0", tk.END).splitlines()},
+            samples_dir=self.get_samples_dir(),
+            edit_caption=self.entries["FAMILY_EDIT_CAPTION"].get() if "FAMILY_EDIT_CAPTION" in self.entries else "",
+        )
+        return d
+
+    def _generic_validate_paths(self, desc):
+        """Standard layer: what the family's launch plan refuses (pairs, prompts, model files)."""
+        from fizgig.families import launch
+        return launch.problems(desc, self._family_launch_inputs(desc))
+
     def _collect_preset_values(self):
         """Snapshot every user-editable value on the Training tab into a preset dict.
 
@@ -7340,9 +7895,12 @@ class LoRATrainerGUI:
         preset = {}
 
         # Everything in self.entries that's on the Training tab
+        _described = self._family_desc() is not None
         for key, entry in self.entries.items():
             if key in self._NON_TRAINING_ENTRY_KEYS:
                 continue
+            if key in self._FAMILY_ENTRY_KEYS and not _described:
+                continue        # standard-layer settings travel with described families only
             try:
                 if isinstance(entry, (tk.BooleanVar, tk.StringVar, tk.IntVar, tk.DoubleVar)):
                     preset[key] = entry.get()
@@ -7416,6 +7974,8 @@ class LoRATrainerGUI:
         _grab("dataset_no_upscale_var", "BUCKET_NO_UPSCALE")
         _grab("dataset_caption_ext_var", "DATASET_CAPTION_EXT")
         _grab("dataset_megapixels_var", "DATASET_MEGAPIXELS")
+        if self._minimax_dataset_has_clips():
+            _grab("clip_megapixels_var", "CLIP_MEGAPIXELS")
         _grab("dataset_batch_size_var", "DATASET_BATCH_SIZE")
         # Gradient mining
         _grab("gradient_mining_var", "GRADIENT_MINING")
@@ -7942,35 +8502,114 @@ class LoRATrainerGUI:
     # handler can swap them without duplicating the strings inline.
     _MINIMAX_BLOCKS_HINT = ("Train a subset of the 50 blocks. Type ranges and singles, "
                             "comma-separated, like 3-12, 22, 31-33. Measured answers: "
-                            f"{MINIMAX_FULL_MODEL_BLOCKS} for the whole model (what Ultra quality "
-                            f"runs) and {MINIMAX_LIKENESS_BLOCKS} for likeness (Fast). Blocks 0-5 "
+                            f"{MINIMAX_FULL_MODEL_BLOCKS} for the whole model (what More Blocks "
+                            f"runs) and {MINIMAX_LIKENESS_BLOCKS} for likeness (Default). Blocks 0-5 "
                             "are in neither: they deform anatomy and pull the dataset's colour "
                             "into the render.")
     _MINIMAX_BLOCKS_HINT_LOCKED = (f"Owned by the Training mode above: photos and clips "
-                                   f"{MINIMAX_LIKENESS_BLOCKS}, voice {MINIMAX_AUDIO_BLOCKS}. "
+                                   f"{MINIMAX_LIKENESS_BLOCKS}, and voice the same. "
                                    "Set the mode to Off to hand-pick.")
     _MINIMAX_BLOCKS_HINT_ULTRA = (f"Owned by the Training mode above: every step type trains "
                                   f"{MINIMAX_FULL_MODEL_BLOCKS}. Set the mode to Off to hand-pick.")
     # The Training mode hint, one per setting.
     _MINIMAX_MODE_HINTS = {
-        "fast": (f"Photos and clips train blocks {MINIMAX_LIKENESS_BLOCKS}, voice "
-                 f"{MINIMAX_AUDIO_BLOCKS}. The backward stops at the window, so this is the "
-                 "quickest mode, and it is good on both picture and sound."),
-        "ultra": (f"Every step type trains {MINIMAX_FULL_MODEL_BLOCKS} — better likeness and "
-                  "better audio, and the dataset's own quirks stay out of the LoRA far longer. "
-                  "The mode for style and scene work too, which needs more of the model than "
-                  "the identity blocks. Slower per step: the backward covers 44 blocks instead of "
-                  "30. Blocks 0-5 stay out either way; they deform anatomy and colour."),
-        "off": "The blocks are yours to pick below, for experiments.",
+        "fast": (f"High quality, versatile, best at preserving model priors. Photos, clips and "
+                 f"voice all train blocks {MINIMAX_LIKENESS_BLOCKS}, and the backward stops at "
+                 f"the window so the steps are quicker too."),
+        "ultra": (f"Less preservation of model priors, high quality. May help when you are "
+                  f"training a MOTION concept specifically, since it reaches more of the model. "
+                  f"It is not a likeness upgrade — Default reaches higher likeness, sooner, with "
+                  f"quicker steps — and Default may well be enough for motion too. Every step "
+                  f"type trains {MINIMAX_FULL_MODEL_BLOCKS}, at 44 blocks in the backward instead "
+                  f"of 30. Blocks 0-5 stay out either way; they deform anatomy and colour."),
+        "off": ("The blocks are yours to pick, for experiments: Blocks to Train, in the "
+                "Other Options section further down this tab."),
     }
 
     def _minimax_adapter_pref_key(self):
-        """The training-adapter pref that matches the base this run trains on — ref2va when
-        the Training Base dropdown says so or the run is a distillation run (both put --dit
-        on the reference model), fl2va otherwise. Mirrors the --dit choice in the builder."""
-        _ref = bool(self.settings.get("MINIMAX_DISTILL")
-                    or minimax_train_base(self.settings.get("MINIMAX_TRAIN_BASE")) == "ref2va")
+        """The Preferences key for the adapter this run uses, or None when it is Off.
+        Circlestone is one file for both bases. Ostris has one per base: ref2va when the
+        Training Base says so or the run is a distillation run (both put --dit on the reference
+        model), fl2va otherwise — read from the LIVE widgets, so validation (which runs before
+        self.settings is refreshed) checks the base the run will actually use."""
+        _e = self.entries.get("MINIMAX_ADAPTER") if hasattr(self, "entries") else None
+        choice = minimax_adapter_choice(_e.get() if _e is not None
+                                        else self.settings.get("MINIMAX_ADAPTER"))
+        if choice == "off":
+            return None
+        if choice == "circlestone":
+            return "minimax_circlestone_adapter"
+        _bv = getattr(self, "minimax_train_base_var", None)
+        _base = _bv.get() if _bv is not None else self.settings.get("MINIMAX_TRAIN_BASE")
+        _dv = getattr(self, "minimax_distill_var", None)
+        try:
+            _distill = bool(_dv.get()) if _dv is not None else bool(self.settings.get("MINIMAX_DISTILL"))
+        except Exception:
+            _distill = bool(self.settings.get("MINIMAX_DISTILL"))
+        _ref = _distill or minimax_train_base(_base) == "ref2va"
         return "minimax_ref_training_adapter" if _ref else "minimax_training_adapter"
+
+    def _fetch_minimax_adapter_now(self, pref_key, row_label):
+        """Download a missing training adapter into models/ and point its Preferences row at
+        it (idempotent — the updater usually got there first). Returns the path, or None."""
+        try:
+            import sys as _sys
+            _sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+            from fizgig.scripts import fetch_turbo_lora as _ftl
+            entry = next((e for e in _ftl.LORAS if e[0] == pref_key), None)
+            if entry is None:
+                return None
+            self.update_console(f"[adapter] {row_label} not set — downloading it now "
+                                "(one-time)...\n")
+            path = _ftl.ensure_lora(*entry, log=lambda m: self.update_console(f"[adapter] {m}\n"))
+            if path and pref_key in self.prefs_vars:
+                self.prefs_vars[pref_key].set(path)
+            return path
+        except Exception as e:
+            self.update_console(f"[adapter] download failed ({type(e).__name__}: {e})\n")
+            return None
+
+    def _minimax_dataset_media_counts(self):
+        """(stills, clips) across every dataset folder (Start + Multi Concept). Audio ignored."""
+        from fizgig.dataset.image_dataset import IMAGE_EXTENSIONS
+        img = {e.lower() for e in IMAGE_EXTENSIONS}
+        stills = clips = 0
+        for folder in self._dataset_folders():
+            try:
+                for f in os.listdir(folder):
+                    ext = os.path.splitext(f)[1].lower()
+                    if ext in img:
+                        stills += 1
+                    elif ext in self.TRAINING_VIDEO_EXTENSIONS:
+                        clips += 1
+            except (OSError, TypeError):
+                continue
+        return stills, clips
+
+    def _refresh_minimax_adapter_hint(self, *_a):
+        """The clips-only advice under the adapter dropdown: only a clips-only dataset gets the
+        Ostris suggestion; mixed datasets are the user's call (photos or videos first)."""
+        lbl = getattr(self, "_minimax_adapter_clips_hint", None)
+        if lbl is None:
+            return
+        text = ""
+        try:
+            if (self._is_minimax_arch()
+                    and minimax_adapter_choice(self.entries["MINIMAX_ADAPTER"].get()) == "circlestone"):
+                stills, clips = self._minimax_dataset_media_counts()
+                if stills == 0 and clips > 0:
+                    text = ("This dataset is all clips — Ostris usually learns a video look faster.")
+        except Exception:
+            text = ""
+        lbl.configure(text=text)
+        # An empty label still reserves a line, so it only takes grid space while it speaks.
+        try:
+            if text:
+                lbl.grid()
+            else:
+                lbl.grid_remove()
+        except tk.TclError:
+            pass
 
     def _sync_minimax_likeness_state(self):
         """Grey Blocks to Train while the Training mode owns the block choice, and keep both
@@ -8008,6 +8647,11 @@ class LoRATrainerGUI:
 
     def _is_krea2_arch(self) -> bool:
         return ARCHITECTURES.get(self.architecture_var.get(), {}).get("is_krea2", False)
+
+    def _family_desc(self, arch=None):
+        """The FamilyDescription behind the selected (or given) Base Model, or None for Klein / Krea 2 / H3.
+        Every standard-layer hook starts with this, so the old families never enter the generic paths."""
+        return DESCRIBED_FAMILIES.get(arch if arch is not None else self.architecture_var.get())
 
     def _is_minimax_arch(self) -> bool:
         return ARCHITECTURES.get(self.architecture_var.get(), {}).get("is_minimax", False)
@@ -8313,7 +8957,7 @@ class LoRATrainerGUI:
         "GRADIENT_ACCUMULATION": "1",     # fused backward consumes grads as they land
         "MAX_GRAD_NORM": "0",             # global clipping is impossible under fused backward
         "NETWORK_TYPE": "LoRA (standard)",  # FT trains the BASE — reset the adapter selector
-        "MINIMAX_TRAINING_ADAPTER": True,   # rides as forward hooks under FT; on like every LoRA preset
+        "MINIMAX_ADAPTER": MINIMAX_ADAPTER_CIRCLESTONE,   # rides as forward hooks under FT
     }
 
     def _on_minimax_ft_toggle(self):
@@ -8418,6 +9062,15 @@ class LoRATrainerGUI:
             entry = self.entries.get(key)
             if entry is None:
                 continue
+            if isinstance(entry, tk.StringVar):         # a dropdown driven by its variable
+                before = entry.get()
+                if key == "MINIMAX_ADAPTER" and minimax_adapter_choice(before) != "off":
+                    continue                            # a deliberate Circlestone/Ostris pick stays
+                if before != val:
+                    entry.set(val)
+                    self.settings[key] = val
+                    changed.append(f"{key.replace('_', ' ').title()}: {before} -> {val}")
+                continue
             if isinstance(entry, tk.BooleanVar):
                 if bool(entry.get()) != bool(val):
                     entry.set(bool(val))
@@ -8509,14 +9162,16 @@ class LoRATrainerGUI:
                 self._set_widget_visible(w, not on)
         # The training adapter stays visible under FT (it rides as forward hooks there —
         # same contract: on for training, off for previews, never in the checkpoint); the FT
-        # recipe ticks it on, like every LoRA preset (Peter, 15 Sep).
+        # recipe turns Off into Circlestone and leaves an Ostris pick alone (Peter, 15 + 23 Sep).
         _ah = getattr(self, "_minimax_adapter_hint", None)
         if _ah is not None:
             if not hasattr(self, "_minimax_adapter_hint_lora"):
                 self._minimax_adapter_hint_lora = _ah.cget("text")
             _ah.configure(text=(
                 "Under fine-tune: the base trains against the de-distilled forward, off for "
-                "previews, never in the checkpoint (the file you get is a plain H3 fine-tune)."
+                "previews, never in the checkpoint (the file you get is a plain H3 fine-tune). "
+                "Circlestone for photos, Ostris for videos; for mixed datasets, choose by "
+                "whether the photos or the videos are the priority."
                 if on else self._minimax_adapter_hint_lora))
         if hasattr(self, "_network_type_rowf"):
             self._set_widget_visible(self.labels["NETWORK_TYPE"], not on)
@@ -8644,7 +9299,8 @@ class LoRATrainerGUI:
         # samples. `native` = "not Klein" (hide Klein-only); `is_krea2` still gates the Krea-2-only
         # widgets, so MiniMax (is_krea2 False) hides them too.
         is_minimax = self._is_minimax_arch()
-        native = is_krea2 or is_minimax
+        desc = self._family_desc()      # standard-layer family, or None (Klein / Krea 2 / H3)
+        native = is_krea2 or is_minimax or desc is not None
 
         # The single-frame preview caveat belongs to MiniMax only — show it under the Base Model
         # selector when that family is picked, hide it otherwise.
@@ -8705,12 +9361,18 @@ class LoRATrainerGUI:
         for w in widgets:
             self._set_widget_visible(w, not native)
 
-        # Base precision is the inverse: Krea 2 ONLY. Its options (Auto / INT8 / NF4 / fp8) and
-        # the memory strategy behind them are entirely krea2_train's; Klein's trainer has no
-        # INT8 path and no auto strategy, so offering the dropdown there would list options
-        # Klein cannot run. (Klein's --quant_4bit still exists on its CLI.)
+        # Base precision: Krea 2 (Auto / INT8 / NF4 / fp8, planned by krea2_train) and Klein (Auto /
+        # NF4 / fp8 only - Klein's trainer has no INT8 path; its Auto is resolved at launch by
+        # _parse_blocks_swap: 4-bit under 15 GB, fp8 above). Never under MiniMax or a described family.
+        _is_klein = (not is_krea2 and not self._is_minimax_arch() and self._family_desc() is None)
         for w in (self._quant_4bit_label, self.quant_4bit_check, self._quant_4bit_hint):
-            self._set_widget_visible(w, is_krea2)
+            self._set_widget_visible(w, is_krea2 or _is_klein)
+        _keys = ("auto", "int8", "nf4", "fp8") if is_krea2 else ("auto", "nf4", "fp8")
+        self.quant_4bit_check.configure(values=[self._BASE_PRECISION_LABELS[k] for k in _keys])
+        if self._base_precision() not in _keys:
+            self.quant_4bit_mode_var.set(self._BASE_PRECISION_LABELS["auto"])
+            self._on_quant_4bit_mode_changed()
+        self._quant_4bit_hint.configure(text=self._KREA2_PRECISION_HINT if is_krea2 else self._KLEIN_PRECISION_HINT)
         # Weight averaging for Krea 2 lives in Training Parameters (H3's is in Other Options).
         for w in (getattr(self, "_krea2_ema_label", None), getattr(self, "_krea2_ema_frame", None),
                   getattr(self, "_krea2_ema_hint", None)):
@@ -8727,12 +9389,16 @@ class LoRATrainerGUI:
 
         # Krea 2-ONLY controls (inverse of the above): the per-image loss watch toggles are only
         # wired into krea2_train for now — hide them under Klein.
-        for w in (self._krea2_losswatch_frame, self._krea2_perimglr_cb,
-                  self._krea2_autorecap_cb, self._krea2_warmuplook_cb,
-                  self._krea2_losswatch_hint, self._krea2_ft_cb,
+        for w in (self._krea2_ft_cb,
                   # torch.compile is wired into krea2_train only.
                   self._compile_blocks_label, self.compile_blocks_check, self._compile_blocks_hint):
             self._set_widget_visible(w, is_krea2)
+        # The per-image loss watch also runs for standard-layer families (families/loss_watch.py); auto-recaption
+        # only where the family's text encoder can caption images.
+        for w in (self._krea2_losswatch_frame, self._krea2_perimglr_cb, self._krea2_warmuplook_cb,
+                  self._krea2_losswatch_hint):
+            self._set_widget_visible(w, is_krea2 or desc is not None)
+        self._set_widget_visible(self._krea2_autorecap_cb, is_krea2 or self._family_can_caption(desc))
         # The FT sub-controls are gated by the checkbox as well as by the family. Gate on
         # the family, NOT native: each family's FT visibility logic also swaps the Network
         # Type rows, which the other family's logic must never touch. Away from a family,
@@ -8789,6 +9455,8 @@ class LoRATrainerGUI:
         # Blocks to Train greys while Optimised Likeness Learning owns it — arch-dependent, so
         # re-sync on every family switch (a Klein session must not leave it locked).
         self._sync_minimax_likeness_state()
+        # The clips-only adapter advice shows and hides itself (text only under MiniMax).
+        self._refresh_minimax_adapter_hint()
         # The Multi Concept sub-rows are owned by its own toggle handler (they are hidden even
         # under MiniMax until the box is ticked), so route them through it rather than the loop.
         if is_minimax:
@@ -8864,6 +9532,41 @@ class LoRATrainerGUI:
         self._set_training_section_visible("optimizer", "scheduler", True)
         self._set_training_section_visible("timestep", "optimizer", not native)
         self._apply_refmod_visibility()
+        self._generic_training_visibility(desc)
+
+    def _family_can_caption(self, desc):
+        """Whether auto-recaption is available to a described family: every family captions with the shared
+        captioner (Krea 2's Qwen3-VL-4B, as the Captions tab), so it only needs that file set in Preferences."""
+        return desc is not None and bool(self._qwen_captioner_path())
+
+    def _generic_training_visibility(self, desc):
+        """Standard layer: after the shared 'not Klein' hiding above, apply what the family's description
+        declares. A no-op apart from hiding the generic widgets when desc is None (the old families)."""
+        has_adapter = bool(desc is not None and desc.training_adapter)
+        for w in (self._family_adapter_cb, self._family_adapter_hint):
+            self._set_widget_visible(w, has_adapter)
+        if has_adapter:
+            self._family_adapter_hint.config(text=desc.training_adapter_note)
+        has_ema = bool(desc is not None and desc.ema_default)
+        for w in (self._family_ema_label, self._family_ema_frame, self._family_ema_hint):
+            self._set_widget_visible(w, has_ema)
+        many = bool(desc is not None and len(desc.precisions) > 1)
+        for w in (self._family_precision_label, self.entries["FAMILY_PRECISION"], self._family_precision_hint):
+            self._set_widget_visible(w, many)
+        if many:
+            opts = ["auto"] + [p for p in ("bf16", "int8", "nf4") if p in desc.precisions]
+            self.entries["FAMILY_PRECISION"].configure(values=[self._FAMILY_PRECISION_LABELS[p] for p in opts])
+            if self.entries["FAMILY_PRECISION"].get() not in self.entries["FAMILY_PRECISION"].cget("values"):
+                self.entries["FAMILY_PRECISION"].set(self._FAMILY_PRECISION_LABELS["auto"])
+            self._family_precision_hint.config(text=(
+                "Auto (recommended) picks at launch from your FREE VRAM: bf16 if it fits, else INT8 (8-bit, about "
+                "half the size and the fastest), else 4-bit NF4 (smallest, slower). Only when none of those fit does "
+                "it stream blocks between CPU and GPU (Blocks Swap), which is much slower. Blocks Swap on Auto sizes "
+                "the swap for whatever precision runs; NF4 never swaps."))
+        if desc is not None and len(desc.network_types) <= 1:
+            for w in (self.labels["NETWORK_TYPE"], self._network_type_rowf):
+                self._set_widget_visible(w, False)
+        self._family_edit_rows()
 
     def _apply_refmod_visibility(self):
         """MiniMax H3 RefMod: the Training tab is Output + the RefMod card. Every other
@@ -8935,7 +9638,7 @@ class LoRATrainerGUI:
                 if past_output and id(w) not in sec_ids:
                     anchor = w
                     break
-            native = self._is_krea2_arch() or self._is_minimax_arch()
+            native = self._is_krea2_arch() or self._is_minimax_arch() or self._family_desc() is not None
             for key in ("training", "memory", "timestep", "optimizer", "scheduler"):
                 sec = secs.get(key)
                 if sec is None:
@@ -9043,12 +9746,24 @@ class LoRATrainerGUI:
         self._problem_row_ui = {}  # key -> persistent row widgets (in-place refresh; new window = fresh)
         self._problem_last_order = []
         self._problem_img_paths = getattr(self, "_problem_img_paths", {})  # key -> resolved image path
+        self._problem_page = 0
+        self._problem_painted = None   # (page, filter) the rows frame currently shows
 
         head = tk.Frame(win, bg=COLORS["bg_deep"])
         head.pack(fill=tk.X, padx=14, pady=(12, 6))
         tk.Label(head, text="Problem Images", font=(FONT_FAMILY, 15, "bold"),
                  fg=COLORS["text_primary"], bg=COLORS["bg_deep"]).pack(side=tk.LEFT)
         ttk.Button(head, text="Refresh", command=lambda: self._refresh_problem_images(force=True)).pack(side=tk.RIGHT)
+        # What "problem" means here, in plain words: hard images are often the most valuable early
+        # on; only one that has stopped teaching the model gets throttled, recaptioned or set aside.
+        self._problem_explain = tk.Label(
+            win, font=(FONT_FAMILY, 11), fg=COLORS["text_secondary"], bg=COLORS["bg_deep"],
+            justify=tk.LEFT, anchor="w", wraplength=960,
+            text=("Hard images aren't bad images: early on they're often the most valuable in your set. "
+                  "An image only becomes a problem once it stops teaching the model, stuck without improving "
+                  "or already learned. Only then does the trainer ease off it, rewrite its caption, or as a "
+                  "last resort set it aside for the run."))
+        self._problem_explain.pack(fill=tk.X, padx=14, pady=(0, 8))
         self._problem_status = tk.Label(win, text="", font=(FONT_FAMILY, 9),
                                         fg=COLORS["text_muted"], bg=COLORS["bg_deep"],
                                         justify=tk.LEFT, anchor="w")
@@ -9062,7 +9777,27 @@ class LoRATrainerGUI:
             if getattr(self._problem_status, "_wl", None) != wl:
                 self._problem_status._wl = wl
                 self._problem_status.config(wraplength=wl)
+                self._problem_explain.config(wraplength=wl)
         win.bind("<Configure>", lambda e: _status_wrap(e) if e.widget is win else None, add="+")
+
+        # Pages + filter (#140). The bar sits outside the canvas; no tk.Text here, so the
+        # global wheel router still finds the rows canvas under the pointer.
+        bar = tk.Frame(win, bg=COLORS["bg_deep"])
+        bar.pack(fill=tk.X, padx=14, pady=(6, 0))
+        self._problem_prev_btn = ttk.Button(bar, text="<< Prev", command=lambda: self._problem_set_page(-1))
+        self._problem_prev_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self._problem_page_label = tk.Label(bar, text="", font=(FONT_FAMILY, 10),
+                                            fg=COLORS["text_secondary"], bg=COLORS["bg_deep"])
+        self._problem_page_label.pack(side=tk.LEFT, padx=(0, 8))
+        self._problem_next_btn = ttk.Button(bar, text="Next >>", command=lambda: self._problem_set_page(1))
+        self._problem_next_btn.pack(side=tk.LEFT, padx=(0, 24))
+        tk.Label(bar, text="Show:", font=(FONT_FAMILY, 10), fg=COLORS["text_secondary"],
+                 bg=COLORS["bg_deep"]).pack(side=tk.LEFT, padx=(0, 6))
+        self._problem_filter_var = tk.StringVar(value="All")
+        _fc = ttk.Combobox(bar, textvariable=self._problem_filter_var, state="readonly", width=14,
+                           values=list(PROBLEM_FILTER_OPTIONS))
+        _fc.pack(side=tk.LEFT)
+        _fc.bind("<<ComboboxSelected>>", lambda e: self._problem_set_page(None))
 
         holder = tk.Frame(win, bg=COLORS["bg_deep"])
         holder.pack(fill=tk.BOTH, expand=True, padx=14, pady=(6, 12))
@@ -9122,6 +9857,9 @@ class LoRATrainerGUI:
                 w.destroy()
             self._problem_row_ui = {}
             self._problem_last_order = []
+            self._problem_page = 0
+            self._problem_painted = None
+            self._problem_set_page_bar(1, 0, 0, "All")
             self._problem_status.config(text="No data yet. Enable “Detect problem images” on the Training tab, "
                                              "start a Krea 2 run, and give it 3+ epochs of warmup.")
             return
@@ -9207,7 +9945,17 @@ class LoRATrainerGUI:
         # recreating hundreds of widgets on the main thread every epoch boundary — that rebuild
         # was the window's remaining lag source. Only appearing/disappearing images create or
         # destroy widgets, and the list only re-packs when the sort order actually changed.
-        new_keys = [key for key, _ in items]
+        #
+        # Pages + filter (#140): only the current page's rows exist as widgets — the tally and
+        # status above count every image regardless. A row that leaves the page is destroyed;
+        # _problem_thumbs and _problem_img_paths make re-creating it cost only the widgets.
+        _mode = self._problem_filter_var.get() if hasattr(self, "_problem_filter_var") else "All"
+        visible = [(k, v) for k, v in items if self._problem_filter_pass(v.get("verdict", "mid"), _mode)]
+        _per = ROW_WINDOW_PAGE_SIZE
+        total_pages = max(1, -(-len(visible) // _per))
+        self._problem_page = min(max(int(getattr(self, "_problem_page", 0) or 0), 0), total_pages - 1)
+        page_items = visible[self._problem_page * _per:(self._problem_page + 1) * _per]
+        new_keys = [key for key, _ in page_items]
         key_set = set(new_keys)
         for k in list(self._problem_row_ui):
             if k not in key_set:
@@ -9217,15 +9965,18 @@ class LoRATrainerGUI:
                 except Exception:
                     pass
         thumb_jobs = []
-        for key, s in items:
+        for key, s in page_items:
             ui = self._problem_row_ui.get(key)
             if ui is None:
                 ui = self._problem_build_row(key, thumb_jobs)
                 self._problem_row_ui[key] = ui
             self._problem_update_row(ui, key, s, data, queued_keys, applied_info, style)
-        if new_keys != self._problem_last_order:
+        # A page or filter change starts at the top; the 4 s tick keeps the scroll position.
+        _painted = (self._problem_page, _mode)
+        _jump = getattr(self, "_problem_painted", None) != _painted
+        if new_keys != self._problem_last_order or _jump:
             try:
-                scroll_pos = self._problem_canvas.yview()[0]
+                scroll_pos = 0.0 if _jump else self._problem_canvas.yview()[0]
             except Exception:
                 scroll_pos = 0.0
             for key in new_keys:
@@ -9238,8 +9989,43 @@ class LoRATrainerGUI:
                 self._problem_canvas.yview_moveto(scroll_pos)
             except Exception:
                 pass
+        self._problem_painted = _painted
+        self._problem_set_page_bar(total_pages, len(visible), len(items), _mode)
         if thumb_jobs:
             self._load_thumbs_async(thumb_jobs, self._problem_thumbs)
+
+    @staticmethod
+    def _problem_filter_pass(verdict: str, mode: str) -> bool:
+        """Does a verdict show under the Show: filter? An unknown, trainer-added verdict is
+        never hidden by "Problems only" — the filter must not make a new class vanish."""
+        if mode == "All":
+            return True
+        if mode == "Problems only":
+            return verdict in PROBLEM_VERDICTS or verdict not in PROBLEM_VERDICT_ORDER
+        return verdict == mode
+
+    def _problem_set_page(self, delta):
+        """Prev/Next (delta ±1) or a filter change (None → back to page 1); the paint clamps."""
+        if delta is None:
+            self._problem_page = 0
+        else:
+            self._problem_page = max(0, int(getattr(self, "_problem_page", 0) or 0) + int(delta))
+        self._refresh_problem_images(force=True)
+
+    def _problem_set_page_bar(self, total_pages, n_visible, n_all, mode):
+        lbl = getattr(self, "_problem_page_label", None)
+        if lbl is None:
+            return
+        try:
+            text = f"Page {self._problem_page + 1} of {total_pages}  ·  {n_visible} rows"
+            if mode != "All":
+                text += f" of {n_all}"
+            lbl.config(text=text)
+            self._problem_prev_btn.config(state="normal" if self._problem_page > 0 else "disabled")
+            self._problem_next_btn.config(
+                state="normal" if self._problem_page < total_pages - 1 else "disabled")
+        except Exception:
+            pass
 
     def _problem_build_row(self, key, thumb_jobs):
         """Create one persistent Problem Images row (static widgets only — per-refresh state is
@@ -9514,6 +10300,12 @@ class LoRATrainerGUI:
             cfg = ARCHITECTURES.get(self.architecture_var.get(), {})
             if cfg.get("is_krea2"):
                 return self._auto_krea2_strategy()
+            if self._base_precision() == "auto" and not self._is_minimax_arch() and self._family_desc() is None:
+                small = self._klein_small_card()
+                self.quant_4bit_var.set(small)      # Klein Auto: 4-bit below 15 GB, fp8 above
+                if small:
+                    self.update_console("[vram] Klein Auto: 4-bit NF4 base, no block swap (card under 15 GB)\n")
+                    return 0
             return self._auto_training_blocks_swap()
         # Explicit swap value: any INT8 pick from a PREVIOUS auto pass must not leak into
         # this launch (stale --quant_int8 alongside --blocks_to_swap N OOM'd small cards).
@@ -9656,6 +10448,16 @@ class LoRATrainerGUI:
         except Exception:
             pass
         return 20  # safe default for an unknown smaller card
+
+    def _klein_small_card(self) -> bool:
+        """Under 15 GB total VRAM (a 16 GB card reports ~15.9): Klein's Auto base goes 4-bit there."""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3) < 15
+        except Exception:
+            pass
+        return False
 
     def _auto_training_blocks_swap(self) -> int:
         """Pick training block swap based on GPU VRAM."""
@@ -9971,12 +10773,12 @@ class LoRATrainerGUI:
             self.scaled_var.set(False)
 
     def _refresh_automagic_gating(self, *args):
-        """Under Krea 2 with automagic3 picked: Adaptive LR, per-image adaptive LR and the look
-        warm-up are forced off and greyed (they set or scale a rate Automagic owns); the note says
-        why. Anything else: the batch-size rule alone decides, as before."""
+        """Under Krea 2 or a standard-layer family with automagic3 picked: Adaptive LR, per-image
+        adaptive LR and the look warm-up are forced off and greyed (they set or scale a rate Automagic
+        owns); the note says why. Anything else: the batch-size rule alone decides, as before."""
         combo = self.entries.get("OPTIMIZER_TYPE") if hasattr(self, "entries") else None
         try:
-            on = bool(combo is not None and self._is_krea2_arch()
+            on = bool(combo is not None and (self._is_krea2_arch() or self._family_desc() is not None)
                       and str(combo.get()).strip().lower() == "automagic3")
         except tk.TclError:
             on = False
@@ -10046,6 +10848,18 @@ class LoRATrainerGUI:
                     note.grid_remove()
             except Exception:
                 pass
+
+    _KREA2_PRECISION_HINT = (
+        "Auto (recommended) picks the fastest option that fits your FREE VRAM, and sizes block "
+        "swap to match. INT8 is 8-bit — fastest, and ~7x more accurate than 4-bit, but needs "
+        "~18 GB free. 4-bit NF4 is the smallest (~5.6 GB base) so it fits 10–12 GB cards with "
+        "no swap, at a slight quality cost. fp8 is the least compressed of the three and needs "
+        "the most VRAM, so it swaps blocks to fit. Anything you pick explicitly is planned "
+        "for — swap is sized for the option that will actually run.")
+    _KLEIN_PRECISION_HINT = (
+        "Auto (recommended) trains on fp8 on 16 GB cards and up, and on the 4-bit NF4 base below that: "
+        "NF4 trains a Klein LoRA in about 8.5 GB with no block swap, so it fits 10–12 GB cards, at a "
+        "slight quality cost. 4-bit turns block swap off; its weights can't stream.")
 
     # Base precision (Krea 2). Canonical key -> the label shown in the combobox. Stored as the
     # KEY so the saved value stays stable if the wording changes.
@@ -10447,6 +11261,35 @@ class LoRATrainerGUI:
             fg=COLORS["accent"], bg=COLORS["bg_surface"],
             wraplength=760, justify=tk.LEFT)
 
+        # Find: narrow the grid to file names containing the text (#151 - big datasets).
+        find_row = tk.Frame(preview_card, bg=COLORS["bg_surface"])
+        find_row.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(find_row, text="Find:", font=(FONT_FAMILY, 10), fg=COLORS["text_primary"],
+                 bg=COLORS["bg_surface"]).pack(side=tk.LEFT, padx=(0, 6))
+        self.caption_search_var = tk.StringVar(value="")
+        _find = ttk.Entry(find_row, textvariable=self.caption_search_var, width=32)
+        _find.pack(side=tk.LEFT)
+        ttk.Button(find_row, text="Clear", command=lambda: self.caption_search_var.set("")).pack(
+            side=tk.LEFT, padx=(6, 0))
+        tk.Label(find_row, text="shows only files whose name contains this", font=HINT_FONT,
+                 fg=COLORS["text_explain"], bg=COLORS["bg_surface"]).pack(side=tk.LEFT, padx=(10, 0))
+        self._caption_search_after = None
+
+        def _on_find(*_):
+            if self._caption_search_after is not None:
+                try:
+                    self.master.after_cancel(self._caption_search_after)
+                except Exception:
+                    pass
+
+            def _apply():
+                self._caption_search_after = None
+                self.current_caption_page = 0
+                self.refresh_caption_images()
+                self._caption_show_grid_top()
+            self._caption_search_after = self.master.after(300, _apply)
+        self.caption_search_var.trace_add("write", _on_find)
+
         self.caption_grid_frame = tk.Frame(preview_card, bg=COLORS["bg_surface"])
         self.caption_grid_frame.pack(fill=tk.BOTH, expand=True)
         for _c in range(4):
@@ -10460,6 +11303,20 @@ class LoRATrainerGUI:
                                            fg=COLORS["text_secondary"], bg=COLORS["bg_surface"])
         self.caption_page_label.pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(pagination_frame, text="Next >>", command=self.caption_next_page).pack(side=tk.LEFT, padx=(0, 16))
+        tk.Label(pagination_frame, text="Go to page:", font=(FONT_FAMILY, 10), fg=COLORS["text_primary"],
+                 bg=COLORS["bg_surface"]).pack(side=tk.LEFT, padx=(0, 4))
+        self.caption_goto_var = tk.StringVar(value="")
+        _goto = ttk.Entry(pagination_frame, textvariable=self.caption_goto_var, width=5)
+        _goto.pack(side=tk.LEFT)
+        _goto.bind("<Return>", lambda e: self.caption_goto_page())
+        ttk.Button(pagination_frame, text="Go", command=self.caption_goto_page).pack(side=tk.LEFT, padx=(4, 16))
+        tk.Label(pagination_frame, text="Per page:", font=(FONT_FAMILY, 10), fg=COLORS["text_primary"],
+                 bg=COLORS["bg_surface"]).pack(side=tk.LEFT, padx=(0, 4))
+        self.caption_per_page_var = tk.StringVar(value=str(self._caption_page_size()))
+        _per = ttk.Combobox(pagination_frame, textvariable=self.caption_per_page_var, width=5, state="readonly",
+                            values=[str(n) for n in self.CAPTION_PAGE_SIZES])
+        _per.pack(side=tk.LEFT, padx=(0, 16))
+        _per.bind("<<ComboboxSelected>>", lambda e: self.caption_set_per_page())
         ttk.Button(pagination_frame, text="Refresh", command=self.refresh_caption_images).pack(side=tk.LEFT)
 
         # Card 6: Progress
@@ -10588,6 +11445,13 @@ class LoRATrainerGUI:
                    if os.path.splitext(f)[1].lower() in self.TRAINING_AUDIO_EXTENSIONS)
 
     def _refresh_audio_only_ui(self, *_a):
+        try:
+            self._refresh_minimax_adapter_hint()
+        except Exception:
+            pass
+        return self._refresh_audio_only_ui_inner()
+
+    def _refresh_audio_only_ui_inner(self):
         """Grey the image-shaped training controls when the dataset is voice recordings only.
 
         Only what is STRUCTURALLY meaningless goes grey: Target Megapixels (no pixels to
@@ -10626,6 +11490,16 @@ class LoRATrainerGUI:
                         row=27, column=0, columnspan=3, sticky=tk.W, padx=(12, 5), pady=(0, 4))
                 else:
                     self._minimax_structure_voice_note.grid_remove()
+            if hasattr(self, "_clip_mp_frame"):
+                if self._minimax_dataset_has_clips():
+                    if not self._clip_mp_frame.winfo_manager():
+                        self._clip_mp_frame.pack(anchor=tk.W, pady=(8, 2))
+                        self._clip_mp_hint.pack(anchor=tk.W)
+
+
+                else:
+                    self._clip_mp_frame.pack_forget()
+                    self._clip_mp_hint.pack_forget()
             # Per-category retirement rows: only when the dataset is genuinely MIXED — with
             # one category there is nothing to finish separately.
             if hasattr(self, "_mixed_stop_label"):
@@ -10643,6 +11517,32 @@ class LoRATrainerGUI:
                     self._mixed_stop_hint.grid_remove()
         except tk.TclError:
             pass
+
+    def _minimax_dataset_has_clips(self):
+        """MiniMax H3 with at least one video clip in the training folder(s) — when the Clip Target
+        Megapixels row shows and the TOML carries clip_megapixels."""
+        if not self._is_minimax_arch():
+            return False
+        try:
+            folders = self._dataset_folders()
+        except Exception:
+            folders = [self.image_folder_var.get().strip()]
+        for folder in folders:
+            try:
+                if folder and os.path.isdir(folder) and any(
+                        f.lower().endswith(".mp4") for f in os.listdir(folder)):
+                    return True
+            except OSError:
+                pass
+        return False
+
+    def _clip_megapixels(self):
+        """The Clip Target Megapixels value, or None when it is not a number."""
+        try:
+            v = float(str(self.clip_megapixels_var.get()).strip())
+            return v if v > 0 else None
+        except (ValueError, AttributeError):
+            return None
 
     def _minimax_dataset_mixed(self):
         """True when the training folder holds BOTH voice recordings and visuals — the only
@@ -10696,6 +11596,11 @@ class LoRATrainerGUI:
         self.caption_thumbnails.clear()
 
         images = self.get_caption_image_files()
+        _in_folder = len(images)
+        _needle = (self.caption_search_var.get().strip().lower()
+                   if hasattr(self, "caption_search_var") else "")
+        if _needle:
+            images = [p for p in images if _needle in os.path.basename(p).lower()]
         total_images = len(images)
 
         # Audio never enters the grid; count it so the tab explains itself rather than showing
@@ -10722,7 +11627,9 @@ class LoRATrainerGUI:
         self.current_caption_page = max(0, self.current_caption_page)
 
         # Update page label
-        self.caption_page_label.config(text=f"Page {self.current_caption_page + 1} of {total_pages} ({total_images} images)")
+        self.caption_page_label.config(
+            text=(f"Page {self.current_caption_page + 1} of {total_pages} "
+                  + (f"({total_images} of {_in_folder} images match)" if _needle else f"({total_images} images)")))
 
         # Get images for current page
         start_idx = self.current_caption_page * self.images_per_page
@@ -10815,19 +11722,92 @@ class LoRATrainerGUI:
             return
         self.refresh_caption_images()
 
+    def _caption_show_grid_top(self):
+        """After a page change, bring the grid's top into view. The tab's scroll area otherwise
+        keeps the old height and position until the next scroll event, so shrinking from 200
+        cards to 12 left an empty stretch where the old page ended."""
+        c = self.caption_grid_frame
+        while c is not None and not hasattr(c, "yview_moveto"):
+            c = c.master
+        if c is None:
+            return
+        try:
+            # the resize of the inner frame arrives as pending events; the scroll area's own
+            # <Configure> handler must run first or the height measured below is the old page's
+            c.update()
+            box = c.bbox("all")
+            if not box:
+                return
+            c.configure(scrollregion=box)
+            height = max(1, box[3] - box[1])
+            # the grid's y inside the scrolled content (layout offsets, not screen position,
+            # which still reflects the old scroll until the view moves)
+            grid_y, w = 0, self.caption_grid_frame
+            while w is not None and w.master is not c:
+                grid_y += w.winfo_y()
+                w = w.master
+            c.yview_moveto(max(0.0, (grid_y - 90) / height))
+        except tk.TclError:
+            pass
+
     def caption_prev_page(self):
         """Go to previous page of images"""
         if self.current_caption_page > 0:
             self.current_caption_page -= 1
             self.refresh_caption_images()
+            self._caption_show_grid_top()
 
     def caption_next_page(self):
         """Go to next page of images"""
         images = self.get_caption_image_files()
+        _needle = self.caption_search_var.get().strip().lower() if hasattr(self, "caption_search_var") else ""
+        if _needle:
+            images = [p for p in images if _needle in os.path.basename(p).lower()]
         total_pages = max(1, (len(images) + self.images_per_page - 1) // self.images_per_page)
         if self.current_caption_page < total_pages - 1:
             self.current_caption_page += 1
             self.refresh_caption_images()
+            self._caption_show_grid_top()
+
+    # Cards per Captions page. 200 is the ceiling: 50 rows of ~300 px cards stay well inside Tk's
+    # 32,767 px scroll limit alongside the rest of the tab (#140, #151).
+    CAPTION_PAGE_SIZES = (12, 24, 48, 96, 200)
+
+    def _caption_page_size(self):
+        """The remembered cards-per-page (12 unless a valid size was saved). Idempotent: the
+        Captions tab is built before the rest of __init__ runs."""
+        if not hasattr(self, "images_per_page"):
+            try:
+                per = int(self.last_used.get("caption_per_page", 12))
+            except (TypeError, ValueError):
+                per = 12
+            self.images_per_page = per if per in self.CAPTION_PAGE_SIZES else 12
+        return self.images_per_page
+
+    def caption_goto_page(self):
+        """Jump to the typed page number (clamped to the range by the refresh)."""
+        try:
+            n = int(self.caption_goto_var.get().strip())
+        except ValueError:
+            return
+        self.current_caption_page = max(0, n - 1)
+        self.caption_goto_var.set("")
+        self.refresh_caption_images()
+        self._caption_show_grid_top()
+
+    def caption_set_per_page(self):
+        """New page size: keep the first card on screen in view, remember the choice."""
+        try:
+            per = int(self.caption_per_page_var.get())
+        except ValueError:
+            return
+        first = self.current_caption_page * self.images_per_page
+        self.images_per_page = per
+        self.current_caption_page = first // per
+        self.last_used["caption_per_page"] = per
+        self._save_last_used_paths()
+        self.refresh_caption_images()
+        self._caption_show_grid_top()
 
     def show_edit_caption_dialog(self, img_path):
         """Live caption editor: no Save button, no confirmation popups. Edits save themselves
@@ -12290,7 +13270,7 @@ class LoRATrainerGUI:
             )
             samples_arch_combo.pack(side=tk.LEFT)
             samples_arch_combo.bind("<<ComboboxSelected>>", self._on_architecture_selected)
-            ToolTip(samples_arch_combo, "Model family to train (Klein 9B, Krea 2 or MiniMax H3)")
+            ToolTip(samples_arch_combo, "Model family to train (Klein 9B, Krea 2, MiniMax H3 or Qwen Image 2.1)")
             self._samples_arch_combo = samples_arch_combo
 
         # Grid holder — video warning / master checkbox / settings block all row-managed
@@ -12368,12 +13348,24 @@ class LoRATrainerGUI:
         self.sample_prompt_text.bind("<KeyRelease>", lambda e: self._save_last_used_paths())
         # Issue #49: "Multi-line prompt" read as ONE prompt that may contain line breaks — two
         # users only discovered multiple prompts by accident. Say what a line actually does.
-        tk.Label(prompt_card,
-                 text="Each line is a SEPARATE prompt — press Enter to add another sample per "
-                      "epoch. Keep a single prompt on one line (long ones wrap by themselves).",
-                 font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"],
-                 bg=COLORS["bg_surface"], wraplength=520, justify=tk.LEFT).grid(
-            row=1, column=1, columnspan=2, sticky=tk.W, pady=(0, 6))
+        _prompt_hint = tk.Label(
+            prompt_card,
+            text="Each line is a SEPARATE prompt — press Enter to add another sample per "
+                 "epoch. Keep a single prompt on one line (long ones wrap by themselves).",
+            font=(FONT_FAMILY, 9, "italic"), fg=COLORS["text_explain"],
+            bg=COLORS["bg_surface"], wraplength=520, justify=tk.LEFT)
+        _prompt_hint.grid(row=1, column=1, columnspan=2, sticky=tk.W, pady=(0, 6))
+        # Edit LoRA (Training tab): previews apply the edit instruction to the test photo, so no prompts here
+        self._sample_edit_note = tk.Label(
+            prompt_card,
+            text="Edit LoRA is on: each preview applies your edit instruction (Training tab, Captions for the edited "
+                 "photos) to the test photo. The prompts here are not used.",
+            font=(FONT_FAMILY, 10), fg=COLORS["text_primary"], bg=COLORS["bg_surface"], wraplength=520,
+            justify=tk.LEFT)
+        self._sample_edit_note.grid(row=0, column=1, columnspan=2, sticky=tk.W, pady=4)
+        self._sample_edit_note.grid_remove()
+        self._sample_edit_note._prompt_hint = _prompt_hint        # hidden with the prompt box in Edit mode
+        self._sample_edit_note._fizgig_described_family = "*"    # standard-layer widget: old-family goldens set it aside
 
         ttk.Label(prompt_card, text="Width:").grid(row=2, column=0, sticky=tk.W, padx=(0, 10), pady=4)
         self.sample_width_var = tk.StringVar(value=str(self.settings["SAMPLE_WIDTH"]))
@@ -12401,6 +13393,16 @@ class LoRATrainerGUI:
         self.sample_steps_note = tk.Label(_steps_frame, text="Base samples only — Distilled is locked at 4 steps",
                  font=(FONT_FAMILY, 9), fg=COLORS["text_muted"], bg=COLORS["bg_surface"])
         self.sample_steps_note.pack(side=tk.LEFT, padx=(10, 0))
+        # Turbo LoRA strength for standard-layer families' previews (shown only when the family has one set).
+        self._family_turbo_label = tk.Label(_steps_frame, text="Turbo strength:", font=(FONT_FAMILY, 10),
+                                            fg=COLORS["text_secondary"], bg=COLORS["bg_surface"])
+        self.entries["FAMILY_TURBO_STRENGTH"] = ttk.Entry(_steps_frame, width=6)
+        self.entries["FAMILY_TURBO_STRENGTH"].insert(0, str(self.settings.get("FAMILY_TURBO_STRENGTH", "")))
+        ToolTip(self.entries["FAMILY_TURBO_STRENGTH"],
+                "How strongly the turbo LoRA loads for previews. Below 1.0 (around 0.7) with more steps often gives "
+                "cleaner, more detailed previews; 1.0 with the turbo's own step count is the fastest.")
+        for _w in (self._family_turbo_label, self.entries["FAMILY_TURBO_STRENGTH"]):
+            _w._fizgig_described_family = "*"
 
         ttk.Label(prompt_card, text="Seed:").grid(row=5, column=0, sticky=tk.W, padx=(0, 10), pady=4)
         self.sample_seed_var = tk.StringVar(value=str(self.settings["SAMPLE_SEED"]))
@@ -12446,15 +13448,15 @@ class LoRATrainerGUI:
         # picture-and-sound preview is now the honest default heartbeat. Without the audio
         # VAE set it degrades to a silent clip with a console note; Still stays in the
         # dropdown for anyone who wants seconds-per-preview.
+        # Every clip length carries its sound (Peter, 21 Sep 2026). The silent clip entries
+        # that pre-dated the audio decoder sat beside these for a month and were one word
+        # apart — a saved silent pick quietly cost the mp4s. Saved labels are mapped by
+        # frame count in _sample_frames_label, so an old choice lands on the sound entry.
         self.sample_frames_var = tk.StringVar(
-            value=self.last_used.get("sample_frames", "56 frames with sound (~2.3s)"))
+            value=self._sample_frames_label(self.last_used.get("sample_frames", "")))
         self.sample_frames_combo = ttk.Combobox(
             prompt_card, textvariable=self.sample_frames_var, state="readonly", width=34,
-            values=["Still (1 frame)", "22 frames (~1s)", "56 frames (~2.3s)",
-                    "124 frames (~5s — trained minimum)", "141 frames (~6s)",
-                    "22 frames with sound (~1s)",
-                    "56 frames with sound (~2.3s)",
-                    "124 frames with sound (~5s)"])
+            values=list(self.SAMPLE_FRAMES_OPTIONS))
         self.sample_frames_combo.grid(row=8, column=1, columnspan=2, sticky=tk.W, pady=4)
         self.sample_frames_var.trace_add("write", lambda *a: self._save_last_used_paths())
         self._sample_frames_hint = tk.Label(prompt_card,
@@ -12709,7 +13711,10 @@ class LoRATrainerGUI:
         if self.sample_enabled_var.get():
             try:
                 cfg = ARCHITECTURES.get(self.architecture_var.get(), {})
-                self._apply_samples_klein_only(cfg.get("is_krea2", False))
+                if self._family_desc() is not None:
+                    self._generic_samples_ui(self._family_desc())
+                else:
+                    self._apply_samples_klein_only(cfg.get("is_krea2", False))
                 self._on_distilled_samples_toggled()
             except Exception:
                 pass
@@ -12750,6 +13755,27 @@ class LoRATrainerGUI:
             return os.path.exists(self._paused_sidecar_path())
         except Exception:
             return False
+
+    SAMPLE_FRAMES_OPTIONS = ("Still (1 frame)", "22 frames with sound (~1s)",
+                             "56 frames with sound (~2.3s)", "124 frames with sound (~5s)")
+
+    @classmethod
+    def _sample_frames_label(cls, saved) -> str:
+        """The Sample-length entry for a saved label: itself when offered, else the sound entry
+        with the same frame count (a retired silent label), 141 → 124, anything odd → 56."""
+        saved = str(saved or "").strip()
+        if saved in cls.SAMPLE_FRAMES_OPTIONS:
+            return saved
+        head = saved.split(" ")[0]
+        if saved.lower().startswith("still"):
+            return cls.SAMPLE_FRAMES_OPTIONS[0]
+        if head.isdigit():
+            n = int(head)
+            by_count = {int(o.split(" ")[0]): o for o in cls.SAMPLE_FRAMES_OPTIONS[1:]}
+            if n in by_count:
+                return by_count[n]
+            return by_count[min(by_count, key=lambda k: abs(k - n))]
+        return cls.SAMPLE_FRAMES_OPTIONS[2]
 
     def _apply_lora_name_suffix(self, arch: str):
         """Retag the LoRA name for `arch` — myface_k9b -> myface_krea2 and back.
@@ -12964,7 +13990,10 @@ class LoRATrainerGUI:
                 self.sample_cfg_scale_entry.configure(state=tk.NORMAL)
 
             # Grey out / relabel the Klein-only sample controls when Krea 2 is selected.
-            self._apply_samples_klein_only(config.get("is_krea2", False))
+            if self._family_desc() is not None:
+                self._generic_samples_ui(self._family_desc())
+            else:
+                self._apply_samples_klein_only(config.get("is_krea2", False))
             # ...then let MiniMax override the wording that is still Klein's. Runs AFTER, so the
             # Klein/Krea 2 paths above are untouched.
             self._apply_samples_minimax(bool(config.get("is_minimax")))
@@ -13072,6 +14101,12 @@ class LoRATrainerGUI:
         secondary = COLORS["text_secondary"]
         label_fg = muted if is_krea2 else secondary
 
+        # The described families' Turbo strength box (_generic_samples_ui shows it) means nothing here: Klein, Krea 2
+        # and MiniMax set their preview turbo elsewhere, so a box left on screen from Qwen only showed a stale value.
+        for _w in (getattr(self, "_family_turbo_label", None), self.entries.get("FAMILY_TURBO_STRENGTH")):
+            if _w is not None and _w.winfo_manager():
+                _w.pack_forget()
+
         # "Use Distilled model for samples" checkbox — Klein's sample-model choice. Krea 2's
         # equivalent choice is the Preview engine dropdown, shown right below in Krea 2 mode.
         if hasattr(self, "use_distilled_check"):
@@ -13125,6 +14160,108 @@ class LoRATrainerGUI:
             self.cache_sample_model_label.configure(
                 text=("Cache sample model in RAM (Klein only):" if is_krea2 else "Cache sample model in RAM:"),
                 foreground=label_fg)
+
+    def _generic_samples_ui(self, desc):
+        """Standard layer: the Samples tab for a described family. Previews render on the live training model at
+        the family's settings, so Klein's sample-model choices, Krea 2's engine row and the edit-reference picker
+        don't apply."""
+        muted = COLORS["text_muted"]
+        if hasattr(self, "use_distilled_check"):
+            self.use_distilled_check.configure(
+                state=tk.DISABLED, text=f"Use Distilled model for samples — Klein only ({desc.display_name} previews "
+                                        f"run on the model being trained)")
+        sp = desc.preview_speed()
+        speed_on = bool(sp and sp.pref_key and self._krea2_pref(sp.pref_key)
+                        and os.path.exists(self._krea2_pref(sp.pref_key)))
+        sp_steps, sp_strength = desc.preview_speed_defaults() or (None, None)
+        # The Turbo strength box is one widget: each family keeps its own value (last_used["turbo_strengths"]) -
+        # switching stores the box for the family left and shows the one entered, or its default (Qwen's 0 must not
+        # become Krea 2's).
+        if "FAMILY_TURBO_STRENGTH" in self.entries:
+            _e = self.entries["FAMILY_TURBO_STRENGTH"]
+            _map = self.last_used.setdefault("turbo_strengths", {})
+            _prev = getattr(self, "_turbo_strength_family", None)
+            if _prev != desc.key:
+                if _prev:
+                    _map[_prev] = _e.get().strip()
+                _e.delete(0, tk.END)
+                _e.insert(0, _map.get(desc.key) or (f"{sp_strength:g}" if sp_strength is not None else ""))
+                self._turbo_strength_family = desc.key
+                if not getattr(self, "_turbo_strength_bound", False):
+                    def _keep(_ev=None):
+                        _f = getattr(self, "_turbo_strength_family", None)
+                        if _f:
+                            self.last_used.setdefault("turbo_strengths", {})[_f] = _e.get().strip()
+                            self._save_last_used_paths()
+                    _e.bind("<FocusOut>", _keep, add="+")
+                    _e.bind("<KeyRelease>", _keep, add="+")
+                    self._turbo_strength_bound = True
+        want = sp_steps if speed_on else desc.preview_steps
+        other = desc.preview_steps if speed_on else sp_steps
+        # A family's retired turbo defaults (desc.retired_preview_defaults) are replaced too, so settings saved by an
+        # older release move to the current default instead of sticking.
+        _old_steps = {str(s) for s, _ in getattr(desc, "retired_preview_defaults", ())}
+        _old_strengths = {f"{float(v):g}" for _, v in getattr(desc, "retired_preview_defaults", ())}
+        if speed_on and self.sample_steps_var.get().strip() in _old_steps:
+            self.sample_steps_var.set(str(want))
+        if speed_on and hasattr(self, "_family_turbo_label"):
+            _e = self.entries["FAMILY_TURBO_STRENGTH"]
+            try:
+                _cur = f"{float(_e.get().strip()):g}"
+            except ValueError:
+                _cur = ""
+            if _cur in _old_strengths:
+                _e.delete(0, tk.END)
+                _e.insert(0, f"{sp_strength:g}")
+        if hasattr(self, "sample_steps_var") and self.sample_steps_var.get().strip() in ("", str(other)):
+            self.sample_steps_var.set(str(want))       # only switch between the two defaults, never a user value
+        _tag = getattr(desc, "preview_reset", "")
+        _done = self.last_used.setdefault("preview_resets", {})
+        if _tag and _done.get(desc.key) != _tag and hasattr(self, "sample_steps_var"):
+            # the family's one-time reset: saved steps / turbo strength go to the current defaults, once
+            self.sample_steps_var.set(str(want))
+            if "FAMILY_TURBO_STRENGTH" in self.entries and sp_strength is not None:
+                self.entries["FAMILY_TURBO_STRENGTH"].delete(0, tk.END)
+                self.entries["FAMILY_TURBO_STRENGTH"].insert(0, f"{sp_strength:g}")
+            _done[desc.key] = _tag
+            self._save_last_used_paths()
+            self.update_console(f"[samples] {desc.display_name} previews reset to the new default: {want} steps"
+                                + (f", turbo strength {sp_strength:g}" if sp_strength is not None else "") + "\n")
+        if hasattr(self, "_family_turbo_label"):
+            for _w, _kw in ((self._family_turbo_label, {"padx": (14, 4)}), (self.entries["FAMILY_TURBO_STRENGTH"], {})):
+                if speed_on and not _w.winfo_manager():
+                    _w.pack(side=tk.LEFT, before=self.sample_steps_note, **_kw)
+                elif not speed_on:
+                    _w.pack_forget()
+            if speed_on and not self.entries["FAMILY_TURBO_STRENGTH"].get().strip():
+                self.entries["FAMILY_TURBO_STRENGTH"].insert(0, f"{sp_strength:g}")
+        if hasattr(self, "sample_steps_note"):
+            self.sample_steps_note.configure(
+                text=((f"{desc.display_name}: {sp_steps} steps on the plain model by default. For fast previews set "
+                       f"Turbo strength to {sp.strength:g} and steps to {sp.settings.steps} (the {sp.name}, set in "
+                       f"Preferences)" if not sp_strength else
+                       f"{desc.display_name}: the {sp.name} (set in Preferences), default {sp_steps} steps at strength "
+                       f"{sp_strength:g}. At {sp.settings.steps} steps it uses its own schedule, otherwise the model's "
+                       f"standard one") if speed_on else
+                      f"{desc.display_name}: {desc.preview_steps} steps at CFG {desc.preview_cfg:g}"
+                      + (f" - set the {sp.name} in Preferences for {sp_steps}-step previews" if sp else "")))
+        if hasattr(self, "krea2_engine_frame"):
+            self.krea2_engine_frame.grid_remove()
+            self.krea2_engine_note.grid_remove()
+        if hasattr(self, "sample_ref_entry"):
+            self.sample_ref_entry.configure(state=tk.DISABLED)
+        for attr in ("sample_ref_browse_btn", "sample_ref_clear_btn"):
+            w = getattr(self, attr, None)
+            if w is not None:
+                w.configure(state=tk.DISABLED)
+        if hasattr(self, "sample_ref_label"):
+            self.sample_ref_label.configure(foreground=muted)
+        if hasattr(self, "sample_ref_note"):
+            self.sample_ref_note.configure(text=f"Not used for {desc.display_name} previews.")
+        if hasattr(self, "cache_sample_model_combo"):
+            self.cache_sample_model_combo.configure(state=tk.DISABLED)
+        if hasattr(self, "cache_sample_model_label"):
+            self.cache_sample_model_label.configure(text="Cache sample model in RAM (Klein only):", foreground=muted)
 
     def update_sample_output_label(self):
         """Update the sample output path label to show actual path"""
@@ -15311,6 +16448,19 @@ class LoRATrainerGUI:
                                    justify=tk.LEFT, anchor="w", wraplength=820)
         self._ff_status.pack(fill=tk.X, padx=14)
 
+        # Pages (#140): 200 rows a page, marked count for the whole scan so marks on other
+        # pages stay visible. No tk.Text here — the global wheel router keeps working.
+        self._ff_page = 0
+        bar = tk.Frame(win, bg=COLORS["bg_deep"])
+        bar.pack(fill=tk.X, padx=14, pady=(6, 0))
+        self._ff_prev_btn = ttk.Button(bar, text="<< Prev", command=lambda: self._ff_set_page(-1))
+        self._ff_prev_btn.pack(side=tk.LEFT, padx=(0, 8))
+        self._ff_page_label = tk.Label(bar, text="", font=(FONT_FAMILY, 10),
+                                       fg=COLORS["text_secondary"], bg=COLORS["bg_deep"])
+        self._ff_page_label.pack(side=tk.LEFT, padx=(0, 8))
+        self._ff_next_btn = ttk.Button(bar, text="Next >>", command=lambda: self._ff_set_page(1))
+        self._ff_next_btn.pack(side=tk.LEFT)
+
         holder = tk.Frame(win, bg=COLORS["bg_deep"])
         holder.pack(fill=tk.BOTH, expand=True, padx=14, pady=(6, 12))
         canvas = tk.Canvas(holder, bg=COLORS["bg_deep"], highlightthickness=0)
@@ -15324,6 +16474,27 @@ class LoRATrainerGUI:
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(rows_id, width=e.width))
         # Wheel: global router (_route_mousewheel) finds this canvas via the pointer.
         self._ff_rows = rows
+        self._ff_canvas = canvas
+        self._ff_update_page_bar()
+
+    def _ff_set_page(self, delta):
+        self._ff_page = max(0, int(getattr(self, "_ff_page", 0) or 0) + int(delta))
+        self._ff_build_rows()          # clamps the page and starts it at the top
+
+    def _ff_update_page_bar(self):
+        lbl = getattr(self, "_ff_page_label", None)
+        if lbl is None:
+            return
+        try:
+            n = len(getattr(self, "_ff_scores", {}) or {})
+            total_pages = max(1, -(-n // ROW_WINDOW_PAGE_SIZE))
+            page = min(max(int(getattr(self, "_ff_page", 0) or 0), 0), total_pages - 1)
+            lbl.config(text=f"Page {page + 1} of {total_pages}  ·  {n} rows  ·  "
+                            f"{len(self._ff_marked)} marked")
+            self._ff_prev_btn.config(state="normal" if page > 0 else "disabled")
+            self._ff_next_btn.config(state="normal" if page < total_pages - 1 else "disabled")
+        except Exception:
+            pass
 
     def _ff_set_status(self, text):
         win = getattr(self, "_ff_win", None)
@@ -15491,6 +16662,7 @@ class LoRATrainerGUI:
             self._ff_set_status(error)
             return
         self._ff_scores = scores
+        self._ff_page = 0                # a new scan starts on page 1
         self._ff_marked &= set(scores)   # drop marks for files that vanished
         self._ff_suggest_btn.config(state="normal")
         scored = [s for s in scores.values() if s is not None]
@@ -15528,6 +16700,7 @@ class LoRATrainerGUI:
         # and yanked the scroll position back to the top.
         self._ff_update_row(path)
         self._ff_apply_btn.config(state="normal" if self._ff_marked else "disabled")
+        self._ff_update_page_bar()
 
     def _ff_update_row(self, path):
         """Repaint one row's marked/unmarked state without rebuilding the list."""
@@ -15564,8 +16737,9 @@ class LoRATrainerGUI:
                             f"(dataset median {med * 100:.0f}%, cutoff {cutoff * 100:.0f}%). "
                             "Review before moving — it flags statistical drift, not certainty.")
         for p in newly:
-            self._ff_update_row(p)
+            self._ff_update_row(p)       # rows on other pages carry the mark, just not the paint
         self._ff_apply_btn.config(state="normal" if self._ff_marked else "disabled")
+        self._ff_update_page_bar()
 
     def _ff_build_rows(self):
         win = getattr(self, "_ff_win", None)
@@ -15578,7 +16752,12 @@ class LoRATrainerGUI:
         # Worst match first; unscoreable (no face) at the bottom — they're a judgement call.
         items = sorted(self._ff_scores.items(),
                        key=lambda kv: (kv[1] is None, kv[1] if kv[1] is not None else 0.0))
-        for path, sim in items:
+        # One page of rows (#140). The page clamps to the list, so a shorter list after a
+        # move lands on its last page rather than an empty one.
+        _per = ROW_WINDOW_PAGE_SIZE
+        total_pages = max(1, -(-len(items) // _per))
+        self._ff_page = min(max(int(getattr(self, "_ff_page", 0) or 0), 0), total_pages - 1)
+        for path, sim in items[self._ff_page * _per:(self._ff_page + 1) * _per]:
             label, color, blurb = self._ff_verdict(sim)
             marked = path in self._ff_marked
             row = tk.Frame(self._ff_rows, bg=COLORS["bg_surface"],
@@ -15627,6 +16806,12 @@ class LoRATrainerGUI:
         if thumb_jobs:
             self._load_thumbs_async(thumb_jobs, self._ff_thumbs)
         self._ff_apply_btn.config(state="normal" if self._ff_marked else "disabled")
+        try:
+            self._ff_rows.update_idletasks()
+            self._ff_canvas.yview_moveto(0.0)
+        except Exception:
+            pass
+        self._ff_update_page_bar()
 
     def _ff_apply_moves(self):
         """Move marked images (+ their caption .txt) to <folder>/excluded_by_look/. Never deletes."""
@@ -15661,13 +16846,6 @@ class LoRATrainerGUI:
                 moved += 1
                 self._ff_scores.pop(p, None)
                 self._ff_marked.discard(p)
-                # Drop just this row — rebuilding the whole list is slow and loses scroll position.
-                ui = self._ff_row_ui.pop(p, None)
-                if ui is not None:
-                    try:
-                        ui["frame"].destroy()
-                    except Exception:
-                        pass
             except Exception as e:
                 # A failed move can leave a half-state behind (shutil.move falls back to
                 # copy+delete when the source is briefly locked, e.g. mid thumbnail decode;
@@ -15679,6 +16857,17 @@ class LoRATrainerGUI:
                 except Exception:
                     pass
                 self._ff_set_status(f"Could not move {os.path.basename(p)}: {e}")
+        # Re-flow the page: the list is shorter, so the slice shifted and the page may have
+        # emptied. Thumbs are cached, so this is cheap; the scroll position is put back.
+        try:
+            _pos = self._ff_canvas.yview()[0]
+        except Exception:
+            _pos = 0.0
+        self._ff_build_rows()
+        try:
+            self._ff_canvas.yview_moveto(_pos)
+        except Exception:
+            pass
         self._ff_apply_btn.config(state="normal" if self._ff_marked else "disabled")
         self._ff_set_status(f"Moved {moved} image(s) to {dest_dir}. "
                             f"{len(self._ff_scores)} image(s) remain in the dataset.")
@@ -16391,7 +17580,7 @@ class LoRATrainerGUI:
         # Model family selector. Krea 2 explores on the fp8 Turbo (always) and has no ref-strength
         # dial (vision-path reference), so the DiT radio + ref Strength are hidden in Krea 2 mode.
         _xfam = str(self.last_used.get("explorer_family", "klein"))
-        if _xfam not in ("klein", "krea2", "minimax"):
+        if _xfam not in ("klein", "krea2", "minimax") and self._explorer_desc(_xfam) is None:
             _xfam = "klein"
         self.explorer_family_var = tk.StringVar(value=_xfam)
         xfam_card = self._start_section_card(
@@ -16408,6 +17597,11 @@ class LoRATrainerGUI:
                         command=self._on_explorer_family_changed).pack(side=tk.LEFT, padx=(0, 20))
         ttk.Radiobutton(_xf, text="MiniMax H3", variable=self.explorer_family_var, value="minimax",
                         command=self._on_explorer_family_changed).pack(side=tk.LEFT)
+        for _d in self._workbench_families("explorer"):
+            _rb = ttk.Radiobutton(_xf, text=_d.display_name, variable=self.explorer_family_var, value=_d.key,
+                                  command=self._on_explorer_family_changed)
+            _rb._fizgig_described_family = _d.key
+            _rb.pack(side=tk.LEFT, padx=(20, 0))
 
         # Card 1: Setup
         setup_card = self._start_section_card(
@@ -16690,7 +17884,14 @@ class LoRATrainerGUI:
 
     def _explorer_family(self):
         fam = str(getattr(self, "explorer_family_var", None) and self.explorer_family_var.get())
-        return fam if fam in ("klein", "krea2", "minimax") else "klein"
+        return fam if fam in ("klein", "krea2", "minimax") or self._explorer_desc(fam) is not None else "klein"
+
+    def _explorer_desc(self, fam=None):
+        """The FamilyDescription behind the Explorer selector, or None for Klein / Krea 2 / H3."""
+        if fam is None:
+            var = getattr(self, "explorer_family_var", None)
+            fam = var.get() if var is not None else ""
+        return next((d for d in self._workbench_families("explorer") if d.key == fam), None)
 
     def _explorer_is_krea2(self):
         return self._explorer_family() == "krea2"
@@ -16698,6 +17899,8 @@ class LoRATrainerGUI:
     def _explorer_default_state(self):
         from fizgig.repair_studio.state import SliderState
         fam = self._explorer_family()
+        if self._explorer_desc(fam) is not None:
+            return self._repair_default_state_for_desc(self._explorer_desc(fam))
         return (SliderState.default_krea2() if fam == "krea2"
                 else SliderState.default_h3() if fam == "minimax"
                 else SliderState.default_klein9b())
@@ -16715,6 +17918,9 @@ class LoRATrainerGUI:
         """The family a Repair <-> Explorer handoff lands on: the same one. (Used to collapse
         MiniMax H3 to Klein — an H3 LoRA on the Klein engine, review 16 Sep 2026.)"""
         fam = str(fam or "")
+        if any(d.key == fam and d.training_ready and {"repair", "explorer"} <= set(d.workbench)
+               for d in DESCRIBED_FAMILIES.values()):
+            return fam
         return fam if fam in ("krea2", "minimax") else "klein"
 
     def _on_explorer_strength_changed(self):
@@ -16742,7 +17948,7 @@ class LoRATrainerGUI:
         Repair Studio). Klein: the old behaviour, every slider set to it (its engine has no
         load scale)."""
         v = self._explorer_strength()
-        if self._explorer_family() in ("krea2", "minimax"):
+        if self._explorer_family() in ("krea2", "minimax") or self._explorer_desc() is not None:
             state.primary_scale = v
             state.donor_scale = 1.0
         else:
@@ -16753,6 +17959,9 @@ class LoRATrainerGUI:
         """The structural-composition anchor block — never locked/disabled, only inverted/pushed.
         Klein: double_0. Krea 2: block_0. MiniMax H3: h3blk_0 (each family's first block)."""
         fam = self._explorer_family()
+        desc = self._explorer_desc(fam)
+        if desc is not None:
+            return self._repair_block_groups(desc)[0].blocks[0].id   # the family's first block
         return {"krea2": "block_0", "minimax": "h3blk_0"}.get(fam, "double_0")
 
     def _on_explorer_family_changed(self):
@@ -16798,6 +18007,8 @@ class LoRATrainerGUI:
             return self._explorer_ensure_engine_krea2()
         if self._explorer_family() == "minimax":
             return self._explorer_ensure_engine_h3()
+        if self._explorer_desc() is not None:
+            return self._explorer_ensure_engine_family(self._explorer_desc())
 
         dit_choice = self.explorer_dit_var.get()
         dit_pref_key = "base_dit" if dit_choice == "base" else "distilled_dit"
@@ -16836,6 +18047,38 @@ class LoRATrainerGUI:
         except Exception:
             import traceback
             messagebox.showerror("Error", f"Failed to load models:\n{traceback.format_exc()}")
+            self.explorer_status_var.set("Error loading models.")
+            return False
+
+    def _explorer_ensure_engine_family(self, desc):
+        """Standard-layer family: the same WorkbenchEngine as Repair Studio, previews with the family's speed LoRA
+        whenever its file is set in Preferences."""
+        paths = {r: self.prefs_vars.get(desc.pref_for(r), tk.StringVar()).get().strip()
+                 for r in ("dit", "vae", "text_encoder")}
+        labels = {f.role: f.label for f in desc.model_files}
+        for role, p in paths.items():
+            if not p or not os.path.exists(p):
+                messagebox.showerror("Error", f"{labels.get(role, role)} path not set or not found.\n"
+                                              "Configure on Preferences tab.")
+                return False
+        sp = desc.preview_speed()
+        speed_path = self.prefs_vars.get(sp.pref_key, tk.StringVar()).get().strip() if sp is not None else ""
+        from fizgig.families.workbench import WorkbenchEngine
+        if self._explorer_engine is None or not isinstance(self._explorer_engine, WorkbenchEngine) \
+                or self._explorer_engine.desc.key != desc.key:
+            self._explorer_engine = WorkbenchEngine(desc)
+        try:
+            self.explorer_status_var.set(f"Loading {desc.display_name}...")
+            self.master.update_idletasks()
+            self._explorer_engine.ensure_pipeline(
+                dit_path=paths["dit"], vae_path=paths["vae"], text_encoder_path=paths["text_encoder"],
+                speed_lora_path=speed_path if speed_path and os.path.exists(speed_path) else "", device="cuda",
+                **self._family_inference_memory())
+            self.explorer_status_var.set("Models loaded.")
+            return True
+        except Exception:
+            import traceback
+            messagebox.showerror("Error", f"Failed to load {desc.display_name}:\n{traceback.format_exc()}")
             self.explorer_status_var.set("Error loading models.")
             return False
 
@@ -16922,6 +18165,13 @@ class LoRATrainerGUI:
         from fizgig.networks.lora import lora_family_from_file, FAMILY_DISPLAY_NAMES
         detected = lora_family_from_file(path)
         from fizgig.networks.lora import INFERENCE_FAMILIES
+        if detected is None and self._workbench_families("explorer"):
+            from fizgig.families.registry import family_of_lora
+            _dd = family_of_lora(path)
+            if _dd is not None and self._explorer_desc(_dd.key) is not None:
+                detected = _dd.key
+                FAMILY_DISPLAY_NAMES = {**FAMILY_DISPLAY_NAMES, _dd.key: _dd.display_name}
+                INFERENCE_FAMILIES = tuple(INFERENCE_FAMILIES) + (_dd.key,)
         if detected is not None and detected not in INFERENCE_FAMILIES:
             messagebox.showerror(
                 "Unsupported family",
@@ -17619,7 +18869,11 @@ class LoRATrainerGUI:
         from fizgig.repair_studio.bake import save_repaired_lora
         from fizgig.networks.lora import UnsupportedLoRAFormat
         try:
-            summary = save_repaired_lora(primary_path, self._explorer_baseline_state, out)
+            if hasattr(self._explorer_engine, "save_repaired"):     # standard-layer family: family key format
+                summary = self._explorer_engine.save_repaired(out, self._explorer_baseline_state,
+                                                              include_donor=False)
+            else:
+                summary = save_repaired_lora(primary_path, self._explorer_baseline_state, out)
             _fmt_note = ("\n\nSaved natively in LyCORIS format — lossless, no conversion."
                          if summary.get('format_out') == 'lycoris' else "")
             _ps = float(getattr(self._explorer_baseline_state, "primary_scale", 1.0))
@@ -17663,13 +18917,13 @@ class LoRATrainerGUI:
             outer,
             "Extract",
             "Distill an existing LoRA down to a lower rank. Klein: block + timestep targeting, optional "
-            "activation-weighted SVD. Krea 2 and MiniMax H3: pure weight SVD over all blocks (no block map yet).",
+            "activation-weighted SVD. Krea 2, MiniMax H3 and Qwen Image 2.1: pure weight SVD over all blocks.",
         )
 
         # Model family selector. Krea 2 / MiniMax H3 = pure weight SVD over all blocks (no pipeline /
         # prompt / timesteps / block presets), so those cards are hidden for both.
         _efam = str(self.last_used.get("extract_family", "klein"))
-        if _efam not in ("klein", "krea2", "minimax"):
+        if _efam not in ("klein", "krea2", "minimax") and self._extract_desc(_efam) is None:
             _efam = "klein"
         self.extract_family_var = tk.StringVar(value=_efam)
         efam_card = self._start_section_card(
@@ -17685,6 +18939,11 @@ class LoRATrainerGUI:
                         command=self._on_extract_family_changed).pack(side=tk.LEFT, padx=(0, 20))
         ttk.Radiobutton(_ef, text="MiniMax H3", variable=self.extract_family_var, value="minimax",
                         command=self._on_extract_family_changed).pack(side=tk.LEFT)
+        for _d in self._workbench_families("extract"):
+            _rb = ttk.Radiobutton(_ef, text=_d.display_name, variable=self.extract_family_var, value=_d.key,
+                                  command=self._on_extract_family_changed)
+            _rb._fizgig_described_family = _d.key
+            _rb.pack(side=tk.LEFT, padx=(20, 0))
 
         # Card 1: Source & Output
         io_card = self._start_section_card(
@@ -17887,7 +19146,7 @@ class LoRATrainerGUI:
         self._extract_output_path = None
 
         # Apply the persisted family (krea2 hides the Klein-only block/prompt/probe controls).
-        self._apply_extract_family_ui(str(self.extract_family_var.get()) == "krea2")
+        self._apply_extract_family_ui(str(self.extract_family_var.get()) == "krea2" or self._extract_desc() is not None)
 
         self._add_youtube_help_button(outer, "extract")
 
@@ -18086,7 +19345,12 @@ class LoRATrainerGUI:
             try:
                 from fizgig.networks.lora import lora_family_from_file
                 fam = lora_family_from_file(filepath)
-                if fam in ("klein", "krea2", "minimax") and fam != self.extract_family_var.get():
+                if fam is None and self._workbench_families("extract"):
+                    from fizgig.families.registry import family_of_lora
+                    _dd = family_of_lora(filepath)
+                    fam = _dd.key if _dd is not None and self._extract_desc(_dd.key) is not None else None
+                if (fam in ("klein", "krea2", "minimax") or self._extract_desc(fam) is not None) \
+                        and fam != self.extract_family_var.get():
                     self.extract_family_var.set(fam)
                     self._on_extract_family_changed()
             except Exception:
@@ -18111,6 +19375,9 @@ class LoRATrainerGUI:
         """Start extraction in a background thread."""
         if str(self.extract_family_var.get()) in ("krea2", "minimax"):
             self._run_extract_krea2()      # weight-only path; model-agnostic, serves H3 too
+            return
+        if self._extract_desc() is not None:
+            self._run_extract_krea2()      # same controls; the worker writes the family's own key format
             return
 
         source = self.extract_source_var.get()
@@ -18310,9 +19577,16 @@ class LoRATrainerGUI:
 
     # --- Krea 2 extract (weight-only SVD over all blocks; no pipeline / prompt / block map) ---
 
+    def _extract_desc(self, fam=None):
+        """The FamilyDescription behind the Extract selector, or None for Klein / Krea 2 / H3."""
+        if fam is None:
+            var = getattr(self, "extract_family_var", None)
+            fam = var.get() if var is not None else ""
+        return next((d for d in self._workbench_families("extract") if d.key == fam), None)
+
     def _on_extract_family_changed(self):
         fam = str(self.extract_family_var.get())
-        if fam not in ("klein", "krea2", "minimax"):
+        if fam not in ("klein", "krea2", "minimax") and self._extract_desc(fam) is None:
             fam = "klein"
         self.last_used["extract_family"] = fam
         self._save_last_used_paths()
@@ -18349,6 +19623,11 @@ class LoRATrainerGUI:
                     "(208+ Linears, up to 5376 wide). Expect several minutes on a free GPU. "
                     "If the GPU is busy (a training run, ComfyUI, another preview), each SVD "
                     "falls back to the CPU and runs much slower - free up VRAM first.")
+                return
+            if self._extract_desc() is not None:
+                self.extract_time_note_var.set(
+                    f"{self._extract_desc().display_name}: exact low-rank SVD of every module, straight from the "
+                    "file (no model loaded) — a few seconds. The result keeps the family's own key format.")
                 return
             self.extract_time_note_var.set(
                 "⏱ Krea 2 is a 12.9B model — weight SVD runs over all 264 modules, several of "
@@ -18416,6 +19695,8 @@ class LoRATrainerGUI:
 
     def _extract_worker_krea2(self, source, output_path):
         """Background worker: weight-only SVD, model-agnostic (extract_weight_only with all blocks)."""
+        if self._extract_desc() is not None:
+            return self._extract_worker_family(self._extract_desc(), source, output_path)
         try:
             import sys
             sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
@@ -18472,6 +19753,43 @@ class LoRATrainerGUI:
         except Exception:
             import traceback
             error_msg = f"Extraction failed:\n{traceback.format_exc()}"
+            def _show_error():
+                self._extract_log(error_msg)
+                self.extract_progress_var.set("Error")
+                self.extract_run_btn.configure(state="normal")
+            self.master.after(0, _show_error)
+
+    def _extract_worker_family(self, desc, source, output_path):
+        """Standard-layer family: exact weight SVD in the family's own key format (families/extract.py)."""
+        try:
+            from fizgig.families.extract import extract_weight_only
+            rank = int(self.extract_rank_var.get())
+            self.master.after(0, lambda: self._extract_log(
+                f"{desc.display_name} weight-only SVD (all modules), rank={rank}\n"))
+
+            def progress(stage, current, total):
+                self.master.after(0, lambda: self.extract_progress_var.set(f"{stage}: {current + 1}/{total}"))
+            r = extract_weight_only(desc, source, output_path, rank, progress=progress)
+            summary = (f"\nExtraction complete!\n"
+                       f"  Output: {r['output']}\n"
+                       f"  Layers extracted: {r['layers']}"
+                       + (f" ({r['skipped']} skipped: names the block map can't place)" if r["skipped"] else "")
+                       + f"\n  Target rank: {rank}\n"
+                       f"  Energy kept: {100 * r['energy']:.1f}% (mean over layers)\n"
+                       f"  Total params: {r['params']:,}\n"
+                       f"  Time: {r['seconds']:.1f}s\n")
+            self._extract_output_path = output_path
+
+            def _update_ui():
+                self._extract_log(summary)
+                self.extract_progress_var.set("Done!")
+                self.extract_run_btn.configure(state="normal")
+                self.extract_open_btn.configure(state="normal")
+            self.master.after(0, _update_ui)
+        except Exception:
+            import traceback
+            error_msg = f"Extraction failed:\n{traceback.format_exc()}"
+
             def _show_error():
                 self._extract_log(error_msg)
                 self.extract_progress_var.set("Error")
@@ -18872,6 +20190,32 @@ class LoRATrainerGUI:
             self.prefs_vars[k].trace_add("write", _refresh_badge)
         return content, 1
 
+    def _generic_prefs_section(self, parent, d):
+        """Standard layer: a family's model-path section built from its description (rows, Download links,
+        the fetch button) - no per-family Preferences code."""
+        self._PREFS_FAMILY_KEYS = {**self._PREFS_FAMILY_KEYS, d.key: d.required_pref_keys}
+        self._PREFS_FAMILY_NAMES = {**self._PREFS_FAMILY_NAMES, d.key: d.display_name}
+        title = f"{d.display_name}{' (experimental)' if d.experimental else ''} model paths"
+        card, row = self._prefs_family_section(
+            parent, d.key, title,
+            f"The files {d.display_name} training needs. Required rows must be filled; the rest are optional.")
+        _w = card
+        while _w is not None and not isinstance(_w, CollapsibleFrame):
+            _w = _w.master
+        if _w is not None:
+            _w._fizgig_described_family = d.key     # lets the old-family golden snapshots set this section aside
+        for f in d.model_files:
+            hint = ("" if f.required else "OPTIONAL — ") + (f.note or "")
+            url = f"https://huggingface.co/{f.repo}/blob/main/{f.path}" if (f.repo and f.path) else None
+            note = f"~{f.size_gb:g} GB — {f.repo} → {os.path.basename(f.path)}" if url else None
+            row = self._add_pref_row(card, row, f"{f.label}:", f.pref_key, hint, download_url=url,
+                                     download_note=note)
+        total = sum(f.size_gb for f in d.model_files if f.repo)
+        self._add_fetch_models_row(
+            card, row, d.key,
+            f"Fetches every file above (~{total:.0f} GB) and fills in these paths for you, plus the Qwen3-VL "
+            f"captioner the Captions tab uses and the small helper models.")
+
     def create_prefs_tab(self):
         """Create the Preferences tab (Start-tab styled)."""
         scrollable_frame, _ = self.create_scrollable_frame(self.prefs_tab)
@@ -19097,26 +20441,35 @@ class LoRATrainerGUI:
                           "ComfyUI's loras folder)",
         )
         mr = self._add_pref_row(
-            mm_card, mr, "Training adapter (fl2va):", "minimax_training_adapter",
-            "OPTIONAL — the training adapter for the standard fl2va base, switched on by the "
-            "'Training adapter' tickbox on the Training tab. A frozen LoRA that de-distills the base "
-            "while yours learns: in our A/B it reached 50% likeness seven epochs sooner and peaked "
-            "higher. On for every training step, off for previews, never in your saved LoRA. The "
-            "updater fetches it; so does the download button below.",
+            mm_card, mr, "Training adapter (Circlestone):", "minimax_circlestone_adapter",
+            "NEEDED when the Training adapter dropdown says Circlestone (the default) — one "
+            "file for both bases (fl2va and ref2va). "
+            "A frozen LoRA that de-distills the base while yours learns: sharper eyes, cleaner skin "
+            "and better prompt-following than Ostris's on any dataset with stills. On for every "
+            "training step, off for previews, never in your saved LoRA. The updater fetches it; so "
+            "does the download button below.",
+            download_url=MINIMAX_CIRCLESTONE_URL,
+            download_note="~620MB — circlestone-labs/MiniMax-H3-Image-Training-Adapter → "
+                          "minimax_h3_image_training_adapter.safetensors",
+        )
+        mr = self._add_pref_row(
+            mm_card, mr, "Training adapter (Ostris fl2va):", "minimax_training_adapter",
+            "OPTIONAL — Ostris's adapter for the standard fl2va base, used when the Training tab's "
+            "adapter dropdown says Ostris: it learns a video look faster than Circlestone when the "
+            "dataset is clips only.",
             download_url="https://huggingface.co/ostris/minimax_h3_training_adapter/blob/main/minimax_h3_training_adapter_v1.safetensors",
             download_note="~155MB — ostris/minimax_h3_training_adapter → minimax_h3_training_adapter_v1.safetensors",
         )
         mr = self._add_pref_row(
-            mm_card, mr, "Training adapter (ref2va):", "minimax_ref_training_adapter",
-            "OPTIONAL — the same adapter for runs on the Reference (ref2va) base: the tickbox picks "
-            "this one automatically when the Training Base dropdown is on ref2va or the run is a "
-            "distillation run.",
+            mm_card, mr, "Training adapter (Ostris ref2va):", "minimax_ref_training_adapter",
+            "OPTIONAL — Ostris's adapter for the Reference (ref2va) base: picked automatically when "
+            "the dropdown says Ostris and the Training Base is ref2va or the run is a distillation run.",
             download_url="https://huggingface.co/ostris/minimax_h3_training_adapter/blob/main/minimax_h3_ref2va_training_adapter_v1.safetensors",
             download_note="~155MB — ostris/minimax_h3_training_adapter → minimax_h3_ref2va_training_adapter_v1.safetensors",
         )
         self._add_fetch_models_row(
             mm_card, mr, "minimax",
-            "Fetches the DiT, text encoder, both VAEs, the Turbo LoRA and both training adapters above, plus the Krea 2 Qwen3-VL captioning "
+            "Fetches the DiT, text encoder, both VAEs, the Turbo LoRA and the three training adapters above, plus the Krea 2 Qwen3-VL captioning "
             "text encoder (~47 GB all in), and fills in these paths for you — plus the small "
             "helper models (Florence-2 captioner, face model for the Look "
             "Filter and likeness scoring, EN→ZH translator, Gizmo's Whisper transcriber — "
@@ -19125,6 +20478,10 @@ class LoRATrainerGUI:
             "reference DiT is left out unless you tick it above: another 21 GB, and it is only "
             "used by identity mode.",
             optional_label="Include the reference DiT (+21 GB)")
+
+        # Families added through the standard layer: one section each, generated from the description.
+        for _desc in DESCRIBED_FAMILIES.values():
+            self._generic_prefs_section(outer, _desc)
 
         # Card 1b: which GPU. Only when the machine actually has more than one - a chooser with a
         # single entry is noise, and the whole feature is a no-op there.
@@ -19659,8 +21016,8 @@ class LoRATrainerGUI:
             cmd = [sys.executable, "-m", "fizgig.scripts.fetch_models", "--progress",
                    "--family", "tools", "--family", family]
             _opt = getattr(self, f"_fetch_optional_{family}", None)
-            if _opt is not None and _opt.get():
-                cmd.append("--include-optional")
+            if (_opt is not None and _opt.get()) or any(d.key == family for d in DESCRIBED_FAMILIES.values()):
+                cmd.append("--include-optional")      # standard-layer families always fetch their whole list
             env = self._cuda_env_for_subprocess(dict(os.environ))
             env["PYTHONPATH"] = os.path.join(FIZGIG_DIR, "src")
             env["PYTHONUNBUFFERED"] = "1"
@@ -19811,6 +21168,12 @@ class LoRATrainerGUI:
             self.prefs.update(fresh)
         except Exception:
             pass
+        # A freshly downloaded turbo LoRA changes the Samples tab's default steps (standard-layer families).
+        if self._family_desc() is not None:
+            try:
+                self._generic_samples_ui(self._family_desc())
+            except Exception:
+                pass
         status = getattr(self, f"_fetch_status_{family}", None)
         if status:
             status.config(text="done — paths filled in" if ok else "finished with items missing (see console)",
@@ -19900,14 +21263,14 @@ class LoRATrainerGUI:
             outer,
             "Profiler",
             "Analyze a LoRA's per-block signature. Klein: full activation profile (5-bucket report). "
-            "Krea 2 and MiniMax H3: weight-only profile (flat per-block — no block-role map yet). "
+            "Krea 2, MiniMax H3 and Qwen Image 2.1: weight-only profile (flat per-block — no block-role map yet). "
             "All write a sidecar the Repair Studio reads inline.",
         )
 
         # Model family selector. Krea 2 and MiniMax H3 are weight-only profiles — no pipeline,
         # prompt, resolution or stages — so those cards are hidden for both.
         _pfam = str(self.last_used.get("profiler_family", "klein"))
-        if _pfam not in ("klein", "krea2", "minimax"):
+        if _pfam not in ("klein", "krea2", "minimax") and self._profiler_desc(_pfam) is None:
             _pfam = "klein"
         self.profiler_family_var = tk.StringVar(value=_pfam)
         fam_card = self._start_section_card(
@@ -19923,6 +21286,11 @@ class LoRATrainerGUI:
                         command=self._on_profiler_family_changed).pack(side=tk.LEFT, padx=(0, 20))
         ttk.Radiobutton(_pf, text="MiniMax H3", variable=self.profiler_family_var, value="minimax",
                         command=self._on_profiler_family_changed).pack(side=tk.LEFT)
+        for _d in self._workbench_families("profiler"):
+            _rb = ttk.Radiobutton(_pf, text=_d.display_name, variable=self.profiler_family_var, value=_d.key,
+                                  command=self._on_profiler_family_changed)
+            _rb._fizgig_described_family = _d.key
+            _rb.pack(side=tk.LEFT, padx=(20, 0))
 
         # Card 1: Model selection
         model_card = self._start_section_card(
@@ -20020,7 +21388,8 @@ class LoRATrainerGUI:
         """Krea 2 / MiniMax H3 profiling is weight-only — hide the activation-probe cards
         (Model/Prompt/Options). Re-show (Klein) uses before= anchors so the cards land back
         in their canonical order."""
-        krea2 = (self.profiler_family_var.get() in ("krea2", "minimax"))
+        krea2 = (self.profiler_family_var.get() in ("krea2", "minimax")
+                 or self._profiler_desc() is not None)          # standard-layer families: weight-only too
 
         def _show(cont, before):
             try:
@@ -20047,6 +21416,13 @@ class LoRATrainerGUI:
             _show(getattr(self, "_profiler_prompt_container", None), getattr(self, "_profiler_options_container", None))
             _show(getattr(self, "_profiler_model_container", None), getattr(self, "_profiler_lora_container", None))
 
+    def _profiler_desc(self, fam=None):
+        """The FamilyDescription behind the Profiler selector, or None for Klein / Krea 2 / H3."""
+        if fam is None:
+            var = getattr(self, "profiler_family_var", None)
+            fam = var.get() if var is not None else ""
+        return next((d for d in self._workbench_families("profiler") if d.key == fam), None)
+
     def _on_profiler_family_changed(self):
         self._apply_profiler_family_ui()
         try:
@@ -20069,7 +21445,12 @@ class LoRATrainerGUI:
             try:
                 from fizgig.networks.lora import lora_family_from_file
                 fam = lora_family_from_file(filepath)
-                if fam in ("klein", "krea2", "minimax") and fam != self.profiler_family_var.get():
+                if fam is None and self._workbench_families("profiler"):
+                    from fizgig.families.registry import family_of_lora
+                    _dd = family_of_lora(filepath)
+                    fam = _dd.key if _dd is not None and self._profiler_desc(_dd.key) is not None else None
+                if (fam in ("klein", "krea2", "minimax") or self._profiler_desc(fam) is not None) \
+                        and fam != self.profiler_family_var.get():
                     self.profiler_family_var.set(fam)
                     self._on_profiler_family_changed()
             except Exception:
@@ -20109,6 +21490,8 @@ class LoRATrainerGUI:
             return self._run_profiler_krea2(lora_path)
         if self.profiler_family_var.get() == "minimax":
             return self._run_profiler_h3(lora_path)
+        if self._profiler_desc() is not None:
+            return self._run_profiler_family(self._profiler_desc(), lora_path)
 
         prompt = self.profiler_prompt_var.get().strip()
         if not prompt:
@@ -20182,6 +21565,54 @@ class LoRATrainerGUI:
             except Exception:
                 import traceback
                 err = traceback.format_exc()
+                def _fail():
+                    self._profiler_log(err + "\n")
+                    self.profiler_progress_var.set("Error — see results.")
+                    self.profiler_run_btn.configure(state="normal")
+                self.master.after(0, _fail)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _run_profiler_family(self, desc, lora_path):
+        """Standard-layer family: weight-only profile laid out by the driver's block map. No pipeline, fast."""
+        import threading
+        self.profiler_run_btn.configure(state="disabled")
+        self.profiler_open_btn.configure(state="disabled")
+        self.profiler_results.configure(state="normal")
+        self.profiler_results.delete(1.0, tk.END)
+        self.profiler_results.configure(state="disabled")
+        self.profiler_progress_var.set(f"Profiling ({desc.display_name}, weight-only)…")
+
+        def worker():
+            try:
+                from fizgig.families.weight_profile import profile_weight_only
+                profiles_dir = (self.prefs_vars["profiles_dir"].get() if "profiles_dir" in self.prefs_vars
+                                else os.path.join(OUTPUT_LORAS_DIR, "profiles"))
+                os.makedirs(profiles_dir, exist_ok=True)
+                stem = os.path.splitext(os.path.basename(lora_path))[0]
+                html, sidecar = profile_weight_only(
+                    desc, lora_path, os.path.join(profiles_dir, f"{stem}_{desc.lora_name_suffix}_profile.html"))
+                self._profiler_report_path = html
+
+                def _done():
+                    import json as _json
+                    try:
+                        d = _json.load(open(sidecar, encoding="utf-8"))
+                        labels = {b.id: b.label for g in self._repair_block_groups(desc) for b in g.blocks}
+                        lines = [f"{desc.display_name} weight-only profile complete.\n",
+                                 f"Report: {html}\n\nTop blocks by weight:\n"]
+                        for b in d.get("top_active_blocks", []):
+                            lines.append(f"  {labels.get(b['name'], 'Outside the blocks'):<18} {b['pct']:.1f}%\n")
+                        self._profiler_log("".join(lines))
+                    except Exception:
+                        self._profiler_log(f"Profile complete: {html}\n")
+                    self.profiler_progress_var.set("Done.")
+                    self.profiler_run_btn.configure(state="normal")
+                    self.profiler_open_btn.configure(state="normal")
+                self.master.after(0, _done)
+            except Exception:
+                import traceback
+                err = traceback.format_exc()
+
                 def _fail():
                     self._profiler_log(err + "\n")
                     self.profiler_progress_var.set("Error — see results.")
@@ -20418,14 +21849,14 @@ class LoRATrainerGUI:
         try:
             if str(self.last_used.get("repair_family", "klein")) in ("krea2", "minimax"):
                 _fam = str(self.last_used.get("repair_family"))
+            elif self._repair_desc(str(self.last_used.get("repair_family", ""))) is not None:
+                _fam = str(self.last_used.get("repair_family"))
         except Exception:
             pass
         self.repair_family_var = tk.StringVar(value=_fam)
         # Engine + state — lazy
         self.repair_engine = None
-        self.repair_state = (SliderState.default_krea2() if _fam == "krea2"
-                             else SliderState.default_h3() if _fam == "minimax"
-                             else SliderState.default_klein9b())
+        self.repair_state = self._repair_default_state(_fam)
         self.repair_block_vars = {}   # block_id -> dict(primary_chk, primary_scale, primary_lbl, donor_chk, donor_scale, donor_lbl)
         self.repair_thumbnails = {}   # GC-safe ImageTk.PhotoImage refs
         self.repair_pil_images = {"baseline": None, "tweaked": None}  # raw PIL for resize-to-fit
@@ -20561,8 +21992,19 @@ class LoRATrainerGUI:
         families (Krea 2 + MiniMax H3 — the per-block sliders stay as the discovery
         instrument). `krea2` below means "any no-map family" (historical naming)."""
         fam = self.repair_family_var.get()
-        krea2 = fam in ("krea2", "minimax")
-        if fam == "minimax":
+        desc = self._repair_desc(fam)
+        krea2 = fam in ("krea2", "minimax") or desc is not None
+        if desc is not None:
+            # Standard-layer family: previews with its speed LoRA (when set in Preferences) or its default
+            # sampling. Radio values stay distilled / base so the rest of the tab reads them unchanged.
+            sp, ds = desc.preview_speed(), desc.default_sampling()
+            self._repair_dit_radio_a.configure(
+                text=(f"{sp.name.split(' (')[0]} ({sp.settings.steps}-step, default)" if sp else "Default"),
+                state="normal" if sp else "disabled")
+            self._repair_dit_radio_b.configure(text=f"Full ({ds.steps}-step, slow)", state="normal")
+            if not self._repair_dit_radio_b.winfo_manager():
+                self._repair_dit_radio_b.pack(side=tk.LEFT)
+        elif fam == "minimax":
             # H3 has no DiT choice: base precision is auto-planned from free VRAM and the
             # Turbo LoRA (6-step) applies whenever it's set in Preferences.
             self._repair_dit_radio_a.configure(text="Auto (int8/NF4 by VRAM + Turbo LoRA)",
@@ -20629,13 +22071,13 @@ class LoRATrainerGUI:
             try:
                 if _w is None:
                     continue
-                if fam == "minimax":
+                if fam == "minimax" or desc is not None:
                     _w.grid_remove()
                 else:
                     _w.grid()
             except Exception:
                 pass
-        if fam == "minimax" and self.repair_ref_path_var.get().strip():
+        if (fam == "minimax" or desc is not None) and self.repair_ref_path_var.get().strip():
             # A path carried over from a Klein session must not sit invisibly in the state.
             self.repair_ref_path_var.set("")
             self.repair_state.ref_image_path = ""
@@ -20685,7 +22127,7 @@ class LoRATrainerGUI:
                 self._repair_h3_label.grid_remove()
                 self._repair_h3_row.grid_remove()
                 # The load-strength boxes are H3 AND Krea 2 (16 Sep 2026); Klein has none.
-                self._repair_scale_controls(fam == "krea2")
+                self._repair_scale_controls(fam == "krea2" or desc is not None)
                 self._repair_h3_model_label.grid_remove()
                 self._repair_h3_model_combo.grid_remove()
                 self._repair_h3_base_label.grid_remove()
@@ -20942,12 +22384,11 @@ class LoRATrainerGUI:
             pass
         self._repair_swap_wanted = False
         self._repair_family_current = fam
-        self.repair_state = (SliderState.default_krea2() if fam == "krea2"
-                             else SliderState.default_h3() if fam == "minimax"
-                             else SliderState.default_klein9b())
+        self.repair_state = self._repair_default_state(fam)
         # 512 default for Klein/Krea 2 (keeps the Turbo Preview activation cache VRAM-feasible);
         # H3 previews at 768 — its native canvas, rendered as a 22-frame clip's middle frame.
-        self.repair_res_var.set("768" if fam == "minimax" else "512")
+        # Standard-layer families also start at 768 (Qwen 2.1 is a 1 MP+ model).
+        self.repair_res_var.set("768" if fam == "minimax" or self._repair_desc(fam) is not None else "512")
         self._build_repair_slider_panel(self._repair_sliders_parent)
         self._apply_repair_family_ui()
         try:
@@ -20956,8 +22397,9 @@ class LoRATrainerGUI:
         except Exception:
             pass
         from fizgig.networks.lora import FAMILY_DISPLAY_NAMES as _FDN
+        _dd = self._repair_desc(fam)
         self.repair_status_var.set(
-            f"Switched to {_FDN.get(fam, fam)}. Set a LoRA path and click Start.")
+            f"Switched to {_dd.display_name if _dd else _FDN.get(fam, fam)}. Set a LoRA path and click Start.")
 
     def _build_repair_outer_scroll(self, tab):
         """Wrap the Repair Studio tab in a vertical scrolling canvas. Returns the
@@ -21041,6 +22483,11 @@ class LoRATrainerGUI:
                         style="Surface.TRadiobutton", command=self._on_repair_family_changed).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Radiobutton(fam_frame, text="MiniMax H3", variable=self.repair_family_var, value="minimax",
                         style="Surface.TRadiobutton", command=self._on_repair_family_changed).pack(side=tk.LEFT)
+        for _d in self._workbench_families("repair"):
+            _rb = ttk.Radiobutton(fam_frame, text=_d.display_name, variable=self.repair_family_var, value=_d.key,
+                                  style="Surface.TRadiobutton", command=self._on_repair_family_changed)
+            _rb._fizgig_described_family = _d.key
+            _rb.pack(side=tk.LEFT, padx=(12, 0))
         r += 1
         # DiT toggle (relabelled per family — Distilled/Base for Klein, Turbo/RAW for Krea 2)
         ttk.Label(parent, text="DiT:").grid(row=r, column=0, sticky=tk.W, padx=4, pady=2)
@@ -21735,6 +23182,9 @@ class LoRATrainerGUI:
         if getattr(self, "repair_family_var", None) is not None and self.repair_family_var.get() == "minimax":
             self._build_repair_slider_panel_h3(parent)
             return
+        if self._repair_desc() is not None:
+            self._build_repair_slider_panel_family(parent, self._repair_desc())
+            return
         # Scrollable canvas (vertical) holding two columns: double on left, single on right.
         # Bounded height (500px) so the panel stays compact inside the outer scroll
         # and the user can independently scroll all 32 rows without losing the preview.
@@ -21833,6 +23283,45 @@ class LoRATrainerGUI:
             self._build_repair_block_row(col_right, bid, r)
             r += 1
 
+    def _build_repair_slider_panel_family(self, parent, desc):
+        """Standard-layer family: the driver's block map in the model's own names, groups in order, split over two
+        columns at a group or block boundary nearest the middle."""
+        canvas = tk.Canvas(parent, highlightthickness=0, bg=COLORS["bg_surface"], height=500)
+        scroll = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        inner = ttk.Frame(canvas)
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(inner_id, width=e.width))
+        inner.columnconfigure(0, weight=1)
+        inner.columnconfigure(1, weight=1)
+        cols = [ttk.Frame(inner), ttk.Frame(inner)]
+        for i, c in enumerate(cols):
+            c.grid(row=0, column=i, sticky=tk.NSEW, padx=4)
+        groups = self._repair_block_groups(desc)
+        self._repair_family_labels = {b.id: b.label for g in groups for b in g.blocks}
+        half = (sum(len(g.blocks) for g in groups) + 1) // 2
+        rows, col, placed = [0, 0], 0, 0
+        for g in groups:
+            chunks = [g.blocks]
+            if col == 0 and placed < half < placed + len(g.blocks):
+                cut = half - placed                     # a group longer than what is left of the left column
+                chunks = [g.blocks[:cut], g.blocks[cut:]]
+            for ci, blocks in enumerate(chunks):
+                if ci == 1 or (col == 0 and placed >= half):
+                    col = 1
+                first, last = blocks[0].label, blocks[-1].label
+                title = g.label if len(chunks) == 1 else f"{g.label}: {first}–{last}"
+                ttk.Label(cols[col], text=title, font=(FONT_FAMILY, 10, "bold")).grid(
+                    row=rows[col], column=0, padx=0, pady=(8 if rows[col] else 2, 4), sticky=tk.W)
+                rows[col] += 1
+                for b in blocks:
+                    self._build_repair_block_row(cols[col], b.id, rows[col])
+                    rows[col] += 1
+                    placed += 1
+
     def _build_repair_slider_panel_h3(self, parent):
         """MiniMax H3 layout: 50 main blocks (0-25 left, 26-49 right) + the 2 token-refiner
         blocks. Generic per-block (no semantic bucket colouring — that map doesn't exist yet;
@@ -21882,6 +23371,9 @@ class LoRATrainerGUI:
         """(label, colour, category_short_or_None) for a block row. Klein ids are
         category-coloured; Krea 2 (block_N / txt_*) and H3 (h3blk_N / h3_rf_N) ids are
         generic (no semantic bucket map yet) → neutral colour, no category tag."""
+        if self._repair_desc() is not None:
+            return (getattr(self, "_repair_family_labels", {}).get(block_id, block_id),
+                    COLORS["text_secondary"], None)
         if block_id.startswith("h3blk_"):
             return (f"Block {block_id.split('_')[1]}", COLORS["text_secondary"], None)
         if block_id.startswith("h3_rf_"):
@@ -22071,6 +23563,9 @@ class LoRATrainerGUI:
         spin = ttk.Entry(parent, textvariable=var, width=5)
         spin.bind("<Return>", lambda e: self._on_repair_scale_changed())
         spin.bind("<FocusOut>", lambda e: self._on_repair_scale_changed())
+        # Typing applies too, after a short pause: Enter / focus-out alone meant a new strength did nothing until
+        # the user happened to click into another entry (clicking the preview or a slider takes no focus).
+        var.trace_add("write", lambda *_a: self._schedule_repair_scale_change())
         ToolTip(spin, f"Load strength for {who} — the strength it was designed to be used "
                       "at (not always 1.0). The block sliders stay relative to it: a block at "
                       "1.0 is that block at this strength, 0.5 is half of it. The saved file "
@@ -22117,6 +23612,27 @@ class LoRATrainerGUI:
                 lbl.pack_forget()
                 spin.pack_forget()
 
+    def _schedule_repair_scale_change(self):
+        """Debounced strength-box typing: apply 0.6 s after the last keystroke, skipping a half-typed value."""
+        pending = getattr(self, "_repair_scale_after", None)
+        if pending is not None:
+            try:
+                self.master.after_cancel(pending)
+            except Exception:
+                pass
+            self._repair_scale_after = None
+
+        def _apply():
+            self._repair_scale_after = None
+            for which in ("primary", "donor"):
+                var = getattr(self, f"repair_{which}_scale_var", None)
+                try:
+                    float(str(var.get()).strip())
+                except (TypeError, ValueError, AttributeError):
+                    return                    # "", "0.", "-" while typing: wait for a number
+            self._on_repair_scale_changed()
+        self._repair_scale_after = self.master.after(600, _apply)
+
     def _repair_scale(self, which):
         """The primary / donor load strength as a float (1.0 on anything unparseable)."""
         var = getattr(self, f"repair_{which}_scale_var", None)
@@ -22129,7 +23645,7 @@ class LoRATrainerGUI:
     def _on_repair_scale_changed(self):
         """A load strength edited: the state carries it (slider × scale in the engine), the
         baseline is a different render now, so re-render — H3 and Krea 2."""
-        if not (self._repair_is_h3() or self._repair_family_is("krea2")):
+        if not (self._repair_is_h3() or self._repair_family_is("krea2") or self._repair_desc() is not None):
             return
         ps, ds = self._repair_scale("primary"), self._repair_scale("donor")
         if (abs(getattr(self.repair_state, "primary_scale", 1.0) - ps) < 1e-9
@@ -22163,6 +23679,8 @@ class LoRATrainerGUI:
             return self._repair_engine_plan_krea2()
         if self.repair_family_var.get() == "minimax":
             return self._repair_engine_plan_h3()
+        if self._repair_desc() is not None:
+            return self._repair_engine_plan_family(self._repair_desc())
 
         dit_choice = self.repair_dit_choice_var.get()
         dit_pref_key = "base_dit" if dit_choice == "base" else "distilled_dit"
@@ -22200,6 +23718,38 @@ class LoRATrainerGUI:
             blocks_to_swap=self._get_inference_blocks_to_swap(),
             int8=self._get_inference_int8(),
         )
+
+    def _repair_engine_plan_family(self, desc):
+        """Standard-layer family: one WorkbenchEngine over the family's driver. The first DiT radio = previews with
+        the family's speed LoRA (when its file is set in Preferences), the second = its default sampling."""
+        paths = {r: self.prefs_vars.get(desc.pref_for(r), tk.StringVar()).get().strip()
+                 for r in ("dit", "vae", "text_encoder")}
+        labels = {f.role: f.label for f in desc.model_files}
+        for role, p in paths.items():
+            if not p or not os.path.exists(p):
+                messagebox.showerror("Error", f"{labels.get(role, role)} path not set or not found.\n"
+                                              "Configure on Preferences tab.")
+                return False
+        sp = desc.preview_speed()
+        speed_path = ""
+        if sp is not None and self.repair_dit_choice_var.get() != "base":
+            speed_path = self.prefs_vars.get(sp.pref_key, tk.StringVar()).get().strip()
+            if speed_path and not os.path.exists(speed_path):
+                speed_path = ""
+        from fizgig.families.workbench import WorkbenchEngine
+        if self.repair_engine is None or not isinstance(self.repair_engine, WorkbenchEngine) \
+                or self.repair_engine.desc.key != desc.key:
+            self.repair_engine = WorkbenchEngine(desc)
+        steps = sp.settings.steps if speed_path else desc.default_sampling().steps
+        self.repair_status_var.set(f"Loading {desc.display_name} ({steps}-step previews)…")
+        return dict(dit_path=paths["dit"], vae_path=paths["vae"], text_encoder_path=paths["text_encoder"],
+                    speed_lora_path=speed_path, device="cuda", **self._family_inference_memory())
+
+    def _family_inference_memory(self):
+        """The app's inference memory preferences for a standard-layer workbench engine: INT8 when the inference INT8
+        preference is on (else Auto: bf16 with 20 GB+ free, INT8 below), and the inference block swap."""
+        return {"precision": "int8" if self._get_inference_int8() else "auto",
+                "blocks_to_swap": self._get_inference_blocks_to_swap()}
 
     def _repair_engine_plan_krea2(self):
         """Lazy-load the Krea 2 Repair engine. Turbo (8-step, default) or RAW (slow). The DiT
@@ -22298,7 +23848,7 @@ class LoRATrainerGUI:
         # seed slerp / prompt interpolation with the vision-path image as the per-frame anchor
         # (no Klein reference-latent chaining).
         _rfam = str(self.last_used.get("royale_family", "klein"))
-        if _rfam not in ("klein", "krea2", "minimax"):
+        if _rfam not in ("klein", "krea2", "minimax") and self._royale_desc(_rfam) is None:
             _rfam = "klein"
         self.royale_family_var = tk.StringVar(value=_rfam)
         rfam_card = self._start_section_card(
@@ -22314,6 +23864,11 @@ class LoRATrainerGUI:
                         command=self._on_royale_family_changed).pack(side=tk.LEFT, padx=(0, 20))
         ttk.Radiobutton(_rf, text="MiniMax H3", variable=self.royale_family_var, value="minimax",
                         command=self._on_royale_family_changed).pack(side=tk.LEFT)
+        for _d in self._workbench_families("royale"):
+            _rb = ttk.Radiobutton(_rf, text=_d.display_name, variable=self.royale_family_var, value=_d.key,
+                                  command=self._on_royale_family_changed)
+            _rb._fizgig_described_family = _d.key
+            _rb.pack(side=tk.LEFT, padx=(20, 0))
 
         setup = self._start_section_card(outer, "Setup",
                                          "Point at a training output folder. Renders use the Distilled 4-step model.")
@@ -22374,9 +23929,11 @@ class LoRATrainerGUI:
         # They now live in Crossfade, next to the thing they size.
         r += 1
 
-        ttk.Label(setup, text="Reference:").grid(row=r, column=0, sticky=tk.W, padx=(0, 10), pady=4)
+        _rrl = ttk.Label(setup, text="Reference:")
+        _rrl.grid(row=r, column=0, sticky=tk.W, padx=(0, 10), pady=4)
         self.royale_ref_var = tk.StringVar(value=self.last_used.get("royale_ref", ""))
         _rr = tk.Frame(setup, bg=_sbg); _rr.grid(row=r, column=1, columnspan=2, sticky=tk.EW, pady=4)
+        self._royale_ref_rows = {"grid": [_rrl, _rr], "pack": []}
         ttk.Entry(_rr, textvariable=self.royale_ref_var, state="readonly").pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Button(_rr, text="Browse…", command=self._royale_browse_ref).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(_rr, text="Clear", command=lambda: self.royale_ref_var.set("")).pack(side=tk.LEFT, padx=(4, 0))
@@ -22543,6 +24100,7 @@ class LoRATrainerGUI:
                  wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 6))
 
         _trr = tk.Frame(trav, bg=_sbg); _trr.pack(fill=tk.X, pady=(0, 4))
+        self._royale_ref_rows["pack"].append(_trr)
         tk.Label(_trr, text="Reference", bg=_sbg, fg=COLORS["text_muted"], width=10,
                  anchor="w").pack(side=tk.LEFT, padx=(0, 6))
         self.royale_travel_ref_var = tk.StringVar(value=self.last_used.get("royale_travel_ref", ""))
@@ -22560,6 +24118,7 @@ class LoRATrainerGUI:
         self.royale_travel_seq_ref_var = tk.BooleanVar(
             value=bool(self.last_used.get("royale_travel_seq_ref", False)))
         _tru = tk.Frame(trav, bg=_sbg); _tru.pack(anchor=tk.W, pady=(0, 4))
+        self._royale_ref_rows["pack"].append(_tru)
         self._royale_travel_ref_row = _tru
         self._royale_travel_useepoch_cb = ttk.Checkbutton(
             _tru, text="Use the rendered epoch as the reference",
@@ -22749,6 +24308,7 @@ class LoRATrainerGUI:
                  fg=COLORS["accent"], bg=_sbg, wraplength=760, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 8))
 
         _ptr = tk.Frame(ptrav, bg=_sbg); _ptr.pack(fill=tk.X, pady=(0, 4))
+        self._royale_ref_rows["pack"].append(_ptr)
         tk.Label(_ptr, text="Reference", bg=_sbg, fg=COLORS["text_muted"], width=12,
                  anchor="w").pack(side=tk.LEFT, padx=(0, 6))
         self.royale_pt_ref_var = tk.StringVar(value=self.last_used.get("royale_pt_ref", ""))
@@ -22767,6 +24327,7 @@ class LoRATrainerGUI:
         self.royale_pt_seq_ref_var = tk.BooleanVar(
             value=bool(self.last_used.get("royale_pt_seq_ref", False)))
         _ptu = tk.Frame(ptrav, bg=_sbg); _ptu.pack(anchor=tk.W, pady=(0, 4))
+        self._royale_ref_rows["pack"].append(_ptu)
         self._royale_pt_ref_row = _ptu
         self._royale_pt_useepoch_cb = ttk.Checkbutton(
             _ptu, text="Use the rendered epoch as the reference",
@@ -23173,7 +24734,7 @@ class LoRATrainerGUI:
         self._royale_apply_mode()
 
         # Apply the persisted family (krea2 hides the Klein-only reference-latent knobs).
-        self._apply_royale_family_ui(str(self.royale_family_var.get()) == "krea2")
+        self._apply_royale_family_ui(str(self.royale_family_var.get()) == "krea2" or self._royale_desc() is not None)
 
         # Scan the pre-filled output folder so the count shows on first open.
         try:
@@ -23465,7 +25026,14 @@ class LoRATrainerGUI:
 
     def _royale_family(self):
         fam = str(getattr(self, "royale_family_var", None) and self.royale_family_var.get())
-        return fam if fam in ("klein", "krea2", "minimax") else "klein"
+        return fam if fam in ("klein", "krea2", "minimax") or self._royale_desc(fam) is not None else "klein"
+
+    def _royale_desc(self, fam=None):
+        """The FamilyDescription behind the Royale selector, or None for Klein / Krea 2 / H3."""
+        if fam is None:
+            var = getattr(self, "royale_family_var", None)
+            fam = var.get() if var is not None else ""
+        return next((d for d in self._workbench_families("royale") if d.key == fam), None)
 
     def _royale_is_krea2(self):
         return self._royale_family() == "krea2"
@@ -23475,6 +25043,8 @@ class LoRATrainerGUI:
         Krea 2 block_/txt_, H3 h3blk_/h3_rf_)."""
         from fizgig.repair_studio.state import SliderState
         fam = self._royale_family()
+        if self._royale_desc(fam) is not None:
+            return self._repair_default_state_for_desc(self._royale_desc(fam))
         return (SliderState.default_krea2() if fam == "krea2"
                 else SliderState.default_h3() if fam == "minimax"
                 else SliderState.default_klein9b())
@@ -23491,7 +25061,8 @@ class LoRATrainerGUI:
         self.royale_engine = None
         self._apply_royale_family_ui(fam != "klein")
         _names = {"krea2": "Krea 2 (Turbo previews)",
-                  "minimax": "MiniMax H3 (22-frame clip previews)"}
+                  "minimax": "MiniMax H3 (22-frame clip previews)",
+                  **{d.key: d.display_name for d in self._workbench_families("royale")}}
         self.royale_status_var.set(
             f"Switched to {_names.get(fam, 'Klein 9B (Distilled previews)')}. "
             f"Pick a source and render.")
@@ -23529,6 +25100,27 @@ class LoRATrainerGUI:
                 if anchor is not None and anchor.winfo_manager() != "":
                     kw["before"] = anchor
                 w.pack(**kw)
+        _rows = getattr(self, "_royale_ref_rows", None)
+        if _rows is not None:
+            no_ref = self._royale_desc() is not None
+            for w in _rows["grid"]:
+                if no_ref:
+                    w.grid_remove()
+                elif not w.winfo_manager():
+                    w.grid()
+            for w in _rows["pack"]:
+                if no_ref:
+                    if w.winfo_manager():
+                        sl = w.master.pack_slaves()
+                        nxt = sl[sl.index(w) + 1] if sl.index(w) + 1 < len(sl) else None
+                        w._fizgig_restore = (w.pack_info(), nxt)
+                        w.pack_forget()
+                elif not w.winfo_manager() and getattr(w, "_fizgig_restore", None):
+                    info, nxt = w._fizgig_restore
+                    info = {k: v for k, v in info.items() if k != "in"}
+                    if nxt is not None and nxt.winfo_manager() == "pack":
+                        info["before"] = nxt
+                    w.pack(**info)
         # Krea 2 has no sequential latent chain — force the (now-hidden) flags off so each travel
         # frame takes the non-sequential path in _royale_apply_travel_ref (the selected image as a
         # per-frame vision reference) instead of dropping the reference for a prev-latent that the
@@ -23549,6 +25141,8 @@ class LoRATrainerGUI:
             return self._royale_validate_models_krea2()
         if self._royale_family() == "minimax":
             return self._royale_validate_models_h3()
+        if self._royale_desc() is not None:
+            return self._royale_validate_models_family(self._royale_desc())
         dit_path = self.prefs_vars["distilled_dit"].get() if "distilled_dit" in self.prefs_vars else ""
         vae_path = self._get_path("VAE_MODEL")
         te_path = self._get_path("TEXT_ENCODER")
@@ -23570,6 +25164,27 @@ class LoRATrainerGUI:
             fp8_scaled=False if is_fp8 else True,
             blocks_to_swap=self._get_inference_blocks_to_swap(),
             int8=self._get_inference_int8())
+        return True
+
+    def _royale_validate_models_family(self, desc):
+        """Standard-layer family: the WorkbenchEngine, previews with the family's speed LoRA when it is set."""
+        paths = {r: self.prefs_vars.get(desc.pref_for(r), tk.StringVar()).get().strip()
+                 for r in ("dit", "vae", "text_encoder")}
+        labels = {f.role: f.label for f in desc.model_files}
+        for role, p in paths.items():
+            if not p or not os.path.exists(p):
+                messagebox.showerror("Error", f"{labels.get(role, role)} path not set or not found.\n"
+                                              "Configure on Preferences tab.")
+                return False
+        sp = desc.preview_speed()
+        speed = self.prefs_vars.get(sp.pref_key, tk.StringVar()).get().strip() if sp is not None else ""
+        from fizgig.families.workbench import WorkbenchEngine
+        if not isinstance(self.royale_engine, WorkbenchEngine) or self.royale_engine.desc.key != desc.key:
+            self.royale_engine = WorkbenchEngine(desc)
+        self._royale_pipeline_kwargs = dict(
+            dit_path=paths["dit"], vae_path=paths["vae"], text_encoder_path=paths["text_encoder"],
+            speed_lora_path=speed if speed and os.path.exists(speed) else "", device="cuda",
+            **self._family_inference_memory())
         return True
 
     def _royale_validate_models_krea2(self):
@@ -23656,6 +25271,10 @@ class LoRATrainerGUI:
                 continue
             checked.add(path)
             detected = lora_family_from_file(path)
+            if detected is None and self._workbench_families("royale"):
+                from fizgig.families.registry import family_of_lora
+                _dd = family_of_lora(path)
+                detected = _dd.key if _dd is not None and self._royale_desc(_dd.key) is not None else None
             if detected is not None:
                 seen.append((path, detected))
         if not seen:
@@ -23670,6 +25289,9 @@ class LoRATrainerGUI:
                     f"(e.g. {os.path.basename(target_path)}). Pick LoRAs from a single family.")
                 return False
         from fizgig.networks.lora import INFERENCE_FAMILIES
+        if self._royale_desc(target) is not None:
+            INFERENCE_FAMILIES = tuple(INFERENCE_FAMILIES) + (target,)
+            FAMILY_DISPLAY_NAMES = {**FAMILY_DISPLAY_NAMES, target: self._royale_desc(target).display_name}
         if target not in INFERENCE_FAMILIES:
             messagebox.showerror(
                 "Unsupported family",
@@ -25155,6 +26777,16 @@ class LoRATrainerGUI:
         # generic error below, same as before.
         from fizgig.networks.lora import lora_family_from_file, FAMILY_DISPLAY_NAMES, INFERENCE_FAMILIES
         detected = lora_family_from_file(path)
+        if detected is None and self._workbench_families("repair"):
+            # Standard-layer families (asked only when the old detector knows nothing about the file).
+            from fizgig.families.registry import family_of_lora
+            _dd = family_of_lora(path)
+            if _dd is not None and self._repair_desc(_dd.key) is not None:
+                detected = _dd.key
+                FAMILY_DISPLAY_NAMES = {**FAMILY_DISPLAY_NAMES, _dd.key: _dd.display_name}
+                INFERENCE_FAMILIES = tuple(INFERENCE_FAMILIES) + (_dd.key,)
+        if self._repair_desc() is not None:
+            INFERENCE_FAMILIES = tuple(INFERENCE_FAMILIES) + (self.repair_family_var.get(),)
         if detected is not None and detected not in INFERENCE_FAMILIES:
             # Setting the var to a family with no radio leaves all radios blank instead of
             # following it (issue #62). Refuse rather than land on a family this tab has no
@@ -25662,8 +27294,9 @@ class LoRATrainerGUI:
         self.repair_state.preview_width = res
         self.repair_state.preview_height = res
         h3_opts = None
-        if self._repair_family_is("krea2"):
-            # Krea 2 carries the load strengths too (16 Sep 2026): slider × scale in the engine.
+        if self._repair_family_is("krea2") or self._repair_desc() is not None:
+            # Krea 2 carries the load strengths too (16 Sep 2026): slider × scale in the engine. Standard-layer
+            # families the same (the engine multiplies each block by the load strength).
             self.repair_state.primary_scale = self._repair_scale("primary")
             self.repair_state.donor_scale = self._repair_scale("donor")
             self._repair_refresh_baseline_title()
@@ -25840,6 +27473,7 @@ class LoRATrainerGUI:
     def _repair_preview_worker(self, snapshot, h3_opts=None):
         from fizgig.krea2.sampling import SampleAborted
         from fizgig.minimax.sampling import PreviewAborted
+        from fizgig.families.workbench import RenderCancelled
         try:
             if self.repair_engine is None:
                 self._repair_preview_in_flight = False
@@ -25915,7 +27549,7 @@ class LoRATrainerGUI:
             tweaked = self.repair_engine.generate_preview(snapshot)
             print(f"[repair] worker: tweaked done, size={tweaked.size}")
             self.master.after(0, lambda: self._set_repair_preview_images(baseline, tweaked))
-        except (SampleAborted, PreviewAborted):
+        except (SampleAborted, PreviewAborted, RenderCancelled):
             # Cancelled mid-pass by a newer edit — quietly re-fire with the latest state.
             print("[repair] worker: aborted; re-firing with newest state")
             def _refire():
@@ -27929,12 +29563,18 @@ class LoRATrainerGUI:
         from fizgig.repair_studio.bake import save_repaired_lora
         from fizgig.networks.lora import UnsupportedLoRAFormat
         try:
-            summary = save_repaired_lora(
-                self.repair_engine.primary_path,
-                self.repair_state,
-                out,
-                donor_path=donor_path if donor_enabled_bids else None,
-            )
+            if hasattr(self.repair_engine, "save_repaired"):
+                # Standard-layer family: the engine bakes what is live, in the family's own key format.
+                with self._repair_engine_lock:
+                    summary = self.repair_engine.save_repaired(out, self.repair_state,
+                                                               include_donor=bool(donor_enabled_bids))
+            else:
+                summary = save_repaired_lora(
+                    self.repair_engine.primary_path,
+                    self.repair_state,
+                    out,
+                    donor_path=donor_path if donor_enabled_bids else None,
+                )
             msg = (
                 f"Saved: {out}\n\n"
                 f"Keys: {summary['keys_in']} → {summary['keys_out']}\n"
@@ -27997,9 +29637,7 @@ class LoRATrainerGUI:
         # Family-correct layout — the Klein default's block ids match nothing on Krea 2 / H3
         # panels, making Reset All a silent no-op there (same trap as GitHub #12).
         _fam = self.repair_family_var.get() if getattr(self, "repair_family_var", None) else "klein"
-        defaults = (SliderState.default_krea2() if _fam == "krea2"
-                    else SliderState.default_h3() if _fam == "minimax"
-                    else SliderState.default_klein9b())
+        defaults = self._repair_default_state(_fam)
         # Suppress per-block preview spam while bulk-resetting.
         self._repair_master_mutating = True
         try:
@@ -30367,7 +32005,40 @@ class LoRATrainerGUI:
         """Historical name — True for ANY no-block-map family (Krea 2 or MiniMax H3), which
         is what every caller actually means: no category presets, no master sliders."""
         return (getattr(self, "repair_family_var", None) is not None
-                and self.repair_family_var.get() in ("krea2", "minimax"))
+                and (self.repair_family_var.get() in ("krea2", "minimax") or self._repair_desc() is not None))
+
+    def _workbench_families(self, tool):
+        """Standard-layer families a workbench tool offers (the description's `workbench` names the tool)."""
+        return [d for d in DESCRIBED_FAMILIES.values() if d.training_ready and tool in d.workbench]
+
+    def _repair_desc(self, fam=None):
+        """The FamilyDescription behind the Repair Studio selector, or None for Klein / Krea 2 / H3."""
+        if fam is None:
+            var = getattr(self, "repair_family_var", None)
+            fam = var.get() if var is not None else ""
+        return next((d for d in self._workbench_families("repair") if d.key == fam), None)
+
+    def _repair_block_groups(self, desc):
+        """The driver's block map (description-level, no model needed); cached per family."""
+        cache = self.__dict__.setdefault("_repair_block_group_cache", {})
+        if desc.key not in cache:
+            cache[desc.key] = desc.load_driver().block_map()
+        return cache[desc.key]
+
+    def _repair_default_state_for_desc(self, desc):
+        from fizgig.repair_studio.state import BlockState, SliderState
+        return SliderState(blocks={b.id: BlockState() for g in self._repair_block_groups(desc) for b in g.blocks},
+                           preview_width=768, preview_height=768)
+
+    def _repair_default_state(self, fam):
+        """Every slider at its default for the family's blocks."""
+        from fizgig.repair_studio.state import SliderState
+        desc = self._repair_desc(fam)
+        if desc is not None:
+            return self._repair_default_state_for_desc(desc)
+        return (SliderState.default_krea2() if fam == "krea2"
+                else SliderState.default_h3() if fam == "minimax"
+                else SliderState.default_klein9b())
 
     def _repair_preset_list(self) -> list:
         if self._repair_family_is("krea2"):
@@ -30417,9 +32088,7 @@ class LoRATrainerGUI:
         # Family-correct layout: a Klein-shaped state applied to Krea 2 / H3 widgets matches
         # no slider vars and silently does nothing (GitHub #12).
         _fam = self.repair_family_var.get() if getattr(self, "repair_family_var", None) else "klein"
-        s = (SliderState.default_krea2() if _fam == "krea2"
-             else SliderState.default_h3() if _fam == "minimax"
-             else SliderState.default_klein9b())
+        s = self._repair_default_state(_fam)
         s.seed = self.repair_state.seed
         s.prompt = self.repair_state.prompt
         s.preview_width = self.repair_state.preview_width
@@ -30524,12 +32193,8 @@ class LoRATrainerGUI:
         stable per folder and unique across same-named folders, and normalises case and trailing
         slash — which is also why the GUI must treat `C:\\A` and `c:/a/` as the SAME folder when
         validating Multi Concept."""
-        import hashlib
-        norm = image_dir.lower().replace("\\", "/").rstrip("/")
-        h = hashlib.sha1(norm.encode("utf-8")).hexdigest()[:8]
-        nm = "".join(c if (c.isalnum() or c in "-_") else "_"
-                     for c in os.path.basename(image_dir.rstrip("/\\"))) or "dataset"
-        return os.path.join(cache_root, f"{nm}-{h}")
+        from fizgig.families.launch import cache_dir_for
+        return cache_dir_for(cache_root, image_dir)
 
     def _dataset_folders(self) -> list:
         """Every image folder that should become a `[[datasets]]` block, in order.
@@ -30709,6 +32374,14 @@ class LoRATrainerGUI:
             except ValueError:
                 return
 
+            _fdesc = self._family_desc()
+            if _fdesc is not None and not is_jsonl and not is_video:
+                from fizgig.families import launch       # driver-system families: the launch plan's TOML
+                try:
+                    return dataset_name, launch.dataset_toml(_fdesc, self._family_launch_inputs(_fdesc))
+                except (TypeError, ValueError):
+                    return
+
             # Build TOML string
             toml_lines = ["[general]"]
             toml_lines.append(f"resolution = [{res_width}, {res_height}]")
@@ -30721,6 +32394,8 @@ class LoRATrainerGUI:
             toml_lines.append(f"num_repeats = {num_repeats}")
             toml_lines.append(f"enable_bucket = {'true' if self.dataset_enable_bucket_var.get() else 'false'}")
             toml_lines.append(f"bucket_no_upscale = {'true' if self.dataset_no_upscale_var.get() else 'false'}")
+            if self._clip_megapixels() and self._minimax_dataset_has_clips():
+                toml_lines.append(f"clip_megapixels = {self._clip_megapixels():g}")
             toml_lines.append("")
             toml_lines.append("[[datasets]]")
 
@@ -30767,6 +32442,14 @@ class LoRATrainerGUI:
                             toml_lines.append("[[datasets]]")
                         toml_lines.append(
                             f'image_directory = "{_folder.replace(chr(92), "/")}"')
+                        if _i == 0 and self._family_edit_on():
+                            toml_lines.append('control_directory = "'
+                                              + self.entries["FAMILY_EDIT_DIR"].get().strip().replace(chr(92), "/")
+                                              + '"')
+                        elif _i == 0 and self._family_slider_on(source="pairs"):
+                            toml_lines.append('control_directory = "'
+                                              + self.entries["FAMILY_SLIDER_DIR"].get().strip().replace(chr(92), "/")
+                                              + '"')
                         _cd = self._cache_dir_for(_root, _folder) if _root else ""
                         if _cd:
                             toml_lines.append(
@@ -31043,19 +32726,30 @@ class LoRATrainerGUI:
         the field, the preset that gets persisted, the queue entry and --output_name cannot
         disagree about what this run is called. Everything else is refused by name.
         """
+        from fizgig.families.checks import tidy_name
         entry = self.entries.get("LORA_NAME")
         raw = entry.get() if entry is not None else ""
-        name = "".join(c for c in raw if c >= " ").strip().rstrip(".").strip()
+        name, error = tidy_name(raw)
         if entry is not None and name != raw:
             entry.delete(0, tk.END)
             entry.insert(0, name)
-        if not name:
-            return name, "LoRA name cannot be empty"
-        bad = next((c for c in name if c in '<>:"|?*/\\'), None)
-        if bad is not None:
-            return name, (f"LoRA name cannot contain '{bad}' — file names can't include that "
-                          f"character. Use letters, numbers, spaces, - _ or .")
-        return name, None
+        return name, error
+
+    def _check_inputs(self):
+        """The plain values Start's shared checks read (fizgig.families.checks): every Training-tab field as
+        typed, Adaptive LR, and the dataset's Batch Size and Target Megapixels."""
+        v = {}
+        for k, w in self.entries.items():
+            if isinstance(w, tk.Text):
+                continue
+            try:
+                v[k] = w.get()
+            except (tk.TclError, TypeError):
+                pass
+        v["ADAPTIVE_LR"] = bool(hasattr(self, "adaptive_lr_var") and self.adaptive_lr_var.get())
+        v["batch_size"] = self.dataset_batch_size_var.get()
+        v["megapixels"] = self.dataset_megapixels_var.get()
+        return v
 
     def validate_inputs(self):
         """Validate all inputs before starting training"""
@@ -31070,20 +32764,16 @@ class LoRATrainerGUI:
         # launcher, and the Start button just "did nothing forever". Validate them HERE with
         # a message naming the field. Batch Size 0/blank was the sharpest: it reached
         # math.ceil(len(bucket)/batch_size) deep in the dataloader minutes after launch.
+        from fizgig.families import checks
+        v = self._check_inputs()
+
         def _check_num(label, raw, cast, minimum=None):
-            raw = str(raw).strip()
-            try:
-                v = cast(raw)
-            except (TypeError, ValueError):
-                errors.append(f"{label} must be a number (got {raw!r})")
-                return
-            if minimum is not None and v < minimum:
-                errors.append(f"{label} must be at least {minimum} (got {raw})")
+            errors.extend(checks.number(label, raw, cast, minimum))
 
         # Learning Rate box is ignored (and greyed) while Adaptive LR is on — don't let a
         # stale value in a disabled box block Start.
-        if not (hasattr(self, 'adaptive_lr_var') and self.adaptive_lr_var.get()):
-            _check_num("Learning Rate", self.entries["LEARNING_RATE"].get(), float, 0)
+        errors.extend(checks.learning_rate(v))
+        if not v["ADAPTIVE_LR"]:
             if (((config.get("is_minimax") and not config.get("is_refmod")
                   and not (getattr(self, "minimax_finetune_var", None) and self.minimax_finetune_var.get()))
                  or config.get("is_krea2"))
@@ -31095,10 +32785,7 @@ class LoRATrainerGUI:
                 if _lr_v > 1e-3:
                     errors.append(f"Automagic v3 starts at the Learning Rate you give and finds its own rate: "
                                   f"{_lr_v:g} is an AdamW number. Use 1e-6 (its default) or at most 0.001.")
-        _check_num("Network Dim (Rank)", self.entries["NETWORK_DIM"].get(), int, 1)
-        _check_num("Network Alpha", self.entries["NETWORK_ALPHA"].get(), float, 0)
-        if self._network_type_is_lokr():
-            _check_num("LoKR Factor", self.entries["LOKR_FACTOR"].get(), int, 2)
+        errors.extend(checks.network(v, lokr=self._network_type_is_lokr()))
         # Blocks to Train is free text, so a typo is caught HERE rather than after the 21 GB base
         # has streamed in — and a queued run must never fail an hour later on a bad spec.
         if self._is_minimax_arch():
@@ -31129,29 +32816,16 @@ class LoRATrainerGUI:
                     pass
                 _check_num("Slower LR multiplier",
                            self.entries["MINIMAX_SLOW_LR_SCALE"].get(), float, 0)
-        _check_num("Max Train Epochs", self.entries["MAX_TRAIN_EPOCHS"].get(), int, 1)
-        _check_num("Save Every N Epochs", self.entries["SAVE_EVERY_N_EPOCHS"].get(), int, 1)
-        _check_num("Seed", self.entries["SEED"].get(), int)
-        _check_num("LoRA+ LR Ratio", self.entries["LORA_LR_RATIO"].get(), int, 1)
-        _check_num("Gradient Accumulation", self.entries["GRADIENT_ACCUMULATION"].get(), int, 1)
-        _check_num("Max Grad Norm", self.entries["MAX_GRAD_NORM"].get(), float, 0)
-        _check_num("Network Dropout", self.entries["NETWORK_DROPOUT"].get(), float, 0)
-        _check_num("Batch Size (Dataset)", self.dataset_batch_size_var.get(), int, 1)
-        # An unparseable megapixels value makes the TOML auto-saver skip its rewrite
-        # SILENTLY (#98 follow-up) — catch it here with a named error instead of the
-        # launch-time stale-config refusal.
-        _check_num("Target Megapixels (Dataset)", self.dataset_megapixels_var.get(), float, 0)
-        if "KEEP_LAST_N_STATES" in self.entries:
-            _check_num("Keep Last (states)", self.entries["KEEP_LAST_N_STATES"].get(), int, 1)
+        errors.extend(checks.numbers(v))
 
         # Check required paths exist (sources: prefs_vars for model paths, hidden var for dataset)
-        dataset_config = self._get_path("DATASET_CONFIG")
-        if not dataset_config:
-            errors.append("Dataset config file path is empty — set the training image folder on the Start tab")
-        elif not os.path.exists(dataset_config):
-            errors.append(f"Dataset config file does not exist: {dataset_config}")
+        errors.extend(checks.dataset_config(self._get_path("DATASET_CONFIG")))
 
-        if config.get("is_minimax"):
+        _desc = self._family_desc()
+        if _desc is not None:
+            # standard layer: the family's required files come from its description
+            errors.extend(self._generic_validate_paths(_desc))
+        elif config.get("is_minimax"):
             # MiniMax H3 reads its three model paths from Preferences (minimax_*). All are
             # required: the DiT to train (pruned int8 or bf16), the video VAE + Qwen3-VL-32B TE.
             for pref_key, label in (
@@ -31290,33 +32964,25 @@ class LoRATrainerGUI:
         # Validate numeric fields. With Adaptive LR on, the Learning Rate box is IGNORED
         # (the run starts at the geometric midpoint of Min/Max), so only Min < Max matters
         # — the old "starting LR exceeds Max" check no longer applies.
-        _adaptive_on = hasattr(self, 'adaptive_lr_var') and self.adaptive_lr_var.get()
-        if _adaptive_on:
-            try:
-                max_lr_str = self.entries["ADAPTIVE_LR_MAX"].get().split(" ")[0]
-                min_lr_str = self.entries["ADAPTIVE_LR_MIN"].get().split(" ")[0]
-                if float(min_lr_str) >= float(max_lr_str):
-                    errors.append(f"Adaptive Min LR ({min_lr_str}) must be lower than Max LR ({max_lr_str}).")
-            except (ValueError, KeyError):
-                errors.append("Adaptive Min/Max LR must be valid numbers.")
-        else:
-            try:
-                lr = float(self.entries["LEARNING_RATE"].get())
-                if lr <= 0:
-                    errors.append("Learning rate must be positive")
-            except ValueError:
-                errors.append("Learning rate must be a valid number")
+        errors.extend(checks.learning_rate_range(v))
 
-        # Training adapter (MiniMax): needs the pref for the selected base (LoRA and FT alike).
+        # Training adapter (MiniMax): the chosen adapter's file must be set and exist (LoRA and FT).
         _mm_ft_on = bool(getattr(self, "minimax_finetune_var", None) and self.minimax_finetune_var.get())
-        if (self._is_minimax_arch()
-                and bool(self.entries.get("MINIMAX_TRAINING_ADAPTER")
-                         and self.entries["MINIMAX_TRAINING_ADAPTER"].get())):
+        if self._is_minimax_arch() and not self._is_refmod_arch():
             _ak = self._minimax_adapter_pref_key()
-            if not self._krea2_pref(_ak):
-                errors.append("Training adapter is ticked but its file isn't set in Preferences "
-                              f"({'ref2va' if 'ref' in _ak else 'fl2va'}) — run the updater or the "
-                              "MiniMax download button in Preferences, or untick it")
+            if _ak:
+                _ap = self._krea2_pref(_ak)
+                _row = {"minimax_circlestone_adapter": "Training adapter (Circlestone)",
+                        "minimax_training_adapter": "Training adapter (Ostris fl2va)",
+                        "minimax_ref_training_adapter": "Training adapter (Ostris ref2va)"}[_ak]
+                if not _ap or not os.path.isfile(_ap):
+                    # First use after a code update that skipped the updater (pods, Linux, a
+                    # plain git pull): fetch it now, once, like the Krea 2 Turbo LoRA fallback.
+                    _ap = self._fetch_minimax_adapter_now(_ak, _row) or _ap
+                if not _ap or not os.path.isfile(_ap):
+                    errors.append(f"The {_row} file isn't {'set' if not _ap else 'where Preferences says'} "
+                                  "— run the updater or the MiniMax download button in Preferences, "
+                                  "or set Training adapter to Off")
         # Context LoRA validation (all three families; MiniMax refuses it under fine-tune).
         ctx_path = self.entries.get("CONTEXT_LORA_PATH").get().strip() if "CONTEXT_LORA_PATH" in self.entries else ""
         if ctx_path:
@@ -31324,114 +32990,26 @@ class LoRATrainerGUI:
                                                  and self.minimax_finetune_var.get())):
                 errors.append("Context LoRA is not available with MiniMax H3 fine-tuning — "
                               "untick Fine-tune (train a LoRA) or clear the Context LoRA")
-            if not os.path.exists(ctx_path):
-                errors.append(f"Context LoRA file does not exist: {ctx_path}")
-            elif not ctx_path.lower().endswith(".safetensors"):
-                errors.append(f"Context LoRA must be a .safetensors file: {ctx_path}")
-            try:
-                ctx_strength = float(self.entries["CONTEXT_LORA_STRENGTH"].get())
-                if not (0.0 <= ctx_strength <= 2.0):
-                    errors.append(f"Context LoRA Strength ({ctx_strength}) must be between 0.0 and 2.0")
-            except (ValueError, KeyError):
-                errors.append("Context LoRA Strength must be a valid number")
-
-        try:
-            network_dim = int(self.entries["NETWORK_DIM"].get())
-            if network_dim <= 0:
-                errors.append("Network dim must be a positive integer")
-        except ValueError:
-            errors.append("Network dim must be a valid integer")
-
-        try:
-            network_alpha = float(self.entries["NETWORK_ALPHA"].get())
-            if network_alpha < 0:
-                errors.append("Network alpha must be non-negative")
-        except ValueError:
-            errors.append("Network alpha must be a valid number")
-
-        try:
-            epochs = int(self.entries["MAX_TRAIN_EPOCHS"].get())
-            if epochs <= 0:
-                errors.append("Max train epochs must be a positive integer")
-        except ValueError:
-            errors.append("Max train epochs must be a valid integer")
-
-        try:
-            save_epochs = int(self.entries["SAVE_EVERY_N_EPOCHS"].get())
-            if save_epochs <= 0:
-                errors.append("Save every N epochs must be a positive integer")
-            # Per-category retirement epoch: blank = never, else a positive whole number.
-            _rk = self.entries.get("MIXED_STOP_EPOCH")
-            _rv = str(_rk.get() if _rk else "").strip()
-            if _rv and (not _rv.isdigit() or int(_rv) <= 0):
-                errors.append(f"'Finish one category early: after epoch' must be blank or "
-                              f"a positive whole number, not {_rv!r}")
-        except ValueError:
-            errors.append("Save every N epochs must be a valid integer")
+        errors.extend(checks.context_lora(v))
 
         try:
             blocks_swap = self._parse_blocks_swap()
-            if blocks_swap < 0:
-                errors.append("Blocks swap must be non-negative")
-            elif blocks_swap > config["blocks_swap_max"]:
-                errors.append(f"Blocks swap ({blocks_swap}) exceeds maximum for {arch} ({config['blocks_swap_max']})")
         except ValueError:
-            errors.append("Blocks swap must be a valid integer")
-
+            blocks_swap = None
         _name, _name_error = self._tidy_lora_name()
-        if _name_error:
-            errors.append(_name_error)
+        errors.extend(checks.run(v, blocks_swap=blocks_swap, swap_max=config["blocks_swap_max"], arch_label=arch,
+                                 name_error=_name_error))
 
-        # Check output directory
-        output_dir = self.entries["LORA_OUTPUT_DIR"].get()
-        if not output_dir:
-            errors.append("LoRA output directory is empty")
-
-        # Check resume path if specified
-        resume_path = self.entries["RESUME_TRAINING"].get()
-        if resume_path and resume_path.strip() and not os.path.exists(resume_path):
-            errors.append(f"Resume training path does not exist: {resume_path}")
-
-        # Check caption files exist in the dataset folder
-        image_dir = self.image_folder_var.get().strip()
-        caption_ext = self.dataset_caption_ext_var.get().strip()
-        # A SET folder that no longer exists is an error, not a skip: the TOML regenerator
-        # early-returns on a missing folder, so proceeding trains whatever dataset the TOML
-        # last pointed at — silently, under this run's name.
-        if image_dir and not os.path.isdir(image_dir):
-            errors.append(f"Training image folder does not exist: {image_dir}")
-        # A RefMod plain encode (Steps 0) trains nothing and reads no captions — the photos
-        # alone are the references — so the caption check does not apply to it.
-        if image_dir and os.path.isdir(image_dir) and caption_ext and not self._refmod_plain_encode():
-            import glob as _glob
-            # glob.escape is load-bearing here: a folder like "[subject] photos" made this
-            # find zero captions and block training with "No caption files found", while the
-            # Captions tab (os.listdir) read and wrote that same folder perfectly happily.
-            caption_files = _glob.glob(os.path.join(_glob.escape(image_dir), "*" + caption_ext))
-            if not caption_files:
-                errors.append(
-                    f"No caption files (*{caption_ext}) found in {image_dir}. "
-                    f"Use the Captions tab to generate them first."
-                )
-            else:
-                # Some captions but not all: every photo or clip without one is silently left
-                # out of the run, and a whole folder of clips can vanish that way (files renamed
-                # after captioning — Gizmo's numbered segments, say). Name them and refuse.
-                from fizgig.dataset.image_dataset import IMAGE_EXTENSIONS as _IMG_EXT
-                _media_ext = set(e.lower() for e in _IMG_EXT)
-                if config.get("is_minimax"):
-                    _media_ext |= set(self.TRAINING_VIDEO_EXTENSIONS)
-                _cap_stems = {os.path.splitext(os.path.basename(p))[0] for p in caption_files}
-                _uncaptioned = sorted(f for f in os.listdir(image_dir)
-                                      if os.path.splitext(f)[1].lower() in _media_ext
-                                      and os.path.splitext(f)[0] not in _cap_stems)
-                if _uncaptioned:
-                    _shown = ", ".join(_uncaptioned[:6]) + (f" … and {len(_uncaptioned) - 6} more" if len(_uncaptioned) > 6 else "")
-                    errors.append(
-                        f"{len(_uncaptioned)} file(s) in the training folder have no {caption_ext} caption and "
-                        f"would be left out of the run: {_shown}. Caption them on the Captions tab (clips are "
-                        f"captioned from their middle frame), or move them out of the folder."
-                    )
+        # The training folder must exist and its photos (and clips) be captioned. A RefMod plain encode (Steps 0)
+        # and a prompt slider read no captions.
+        from fizgig.dataset.image_dataset import IMAGE_EXTENSIONS as _IMG_EXT
+        _media_ext = set(e.lower() for e in _IMG_EXT)
+        if config.get("is_minimax"):
+            _media_ext |= set(self.TRAINING_VIDEO_EXTENSIONS)
+        _prompt_slider = bool(self._family_desc() is not None and self._family_slider_on(source="prompts"))
+        errors.extend(checks.training_folder(
+            self.image_folder_var.get().strip(), self.dataset_caption_ext_var.get().strip(),
+            check_captions=not self._refmod_plain_encode() and not _prompt_slider, media_exts=_media_ext))
 
         if errors:
             error_message = "Please fix the following issues:\n\n" + "\n".join(f"• {e}" for e in errors)
@@ -31738,7 +33316,21 @@ class LoRATrainerGUI:
             "MINIMAX_LIKENESS_MODE": str(self.entries["MINIMAX_LIKENESS_MODE"].get()),
             "MINIMAX_TRAIN_ADALN": bool(self.entries["MINIMAX_TRAIN_ADALN"].get()),
             "MINIMAX_TRAIN_REFINER": bool(self.entries["MINIMAX_TRAIN_REFINER"].get()),
-            "MINIMAX_TRAINING_ADAPTER": bool(self.entries["MINIMAX_TRAINING_ADAPTER"].get()),
+            "MINIMAX_ADAPTER": str(self.entries["MINIMAX_ADAPTER"].get()),
+            # standard-layer settings ride only with described families
+            **({"FAMILY_TRAINING_ADAPTER": bool(self.entries["FAMILY_TRAINING_ADAPTER"].get()),
+                "FAMILY_EMA": self.entries["FAMILY_EMA"].get(),
+                "FAMILY_PRECISION": self.entries["FAMILY_PRECISION"].get(),
+                "FAMILY_TURBO_STRENGTH": self.entries["FAMILY_TURBO_STRENGTH"].get(),
+                "FAMILY_EDIT": self._family_edit_on(),
+                "FAMILY_EDIT_DIR": self.entries["FAMILY_EDIT_DIR"].get().strip(),
+                "FAMILY_EDIT_REF": self.entries["FAMILY_EDIT_REF"].get().strip(),
+                "FAMILY_EDIT_CAPTION": self.entries["FAMILY_EDIT_CAPTION"].get().strip(),
+                "FAMILY_SLIDER": self._family_slider_on(),
+                **{k: self.entries[k].get().strip() for k in (
+                    "FAMILY_SLIDER_SOURCE", "FAMILY_SLIDER_DIR", "FAMILY_SLIDER_CAPTION", "FAMILY_SLIDER_BASE",
+                    "FAMILY_SLIDER_POS", "FAMILY_SLIDER_NEG", "FAMILY_SLIDER_GUIDANCE")}}
+               if self._family_desc() is not None else {}),
             # experiment/tread: both ticks must be copied here or the builder reads a stale value
             "MINIMAX_TREAD": bool(self.entries["MINIMAX_TREAD"].get()),
             "MINIMAX_CLIP_STILL": bool(self.entries["MINIMAX_CLIP_STILL"].get()),
@@ -31830,8 +33422,10 @@ class LoRATrainerGUI:
         # snapshot; the live TOML belongs to the editor alone.
         # RefMod: the TOML's resolution follows Steps (0.25 MP whenever the optimiser runs),
         # a rule the edit-time writer applies; rewrite once here so the snapshot below
-        # carries it whatever order the last preset/queue item set things in.
-        if self._is_refmod_arch() and not _is_resuming_clear:
+        # carries it whatever order the last preset/queue item set things in. A described family's TOML carries
+        # its Edit / Slider pairs folder, which nothing rewrites the TOML for: without this, pick the training
+        # folder, then Edit and its Originals, and the run launched without its originals.
+        if (self._is_refmod_arch() or self._family_desc() is not None) and not _is_resuming_clear:
             try:
                 self.auto_save_dataset_config_silent()
             except Exception:
@@ -31885,7 +33479,13 @@ class LoRATrainerGUI:
         # original launch. An armed FT continuation counts: it is the same run continuing.
         is_resuming = bool(self.settings.get("RESUME_TRAINING", "").strip()
                            or self._ft_resume_active())
-        if self.enable_cache_var.get() and not is_resuming:
+        _fdesc = self._family_desc()
+        if _fdesc is not None:
+            from fizgig.families import launch as _launch
+            _runs_cache = _launch.caches(_fdesc, self._family_launch_inputs(_fdesc))
+        else:
+            _runs_cache = bool(self.enable_cache_var.get() and not is_resuming)
+        if _runs_cache:
             self.update_console(f"Starting cache preparation for {arch}...\n")
 
             def on_text_encoder_caching_complete():
@@ -32013,6 +33613,8 @@ class LoRATrainerGUI:
         # pause exit-handler: an FT pause leaves a full checkpoint rather than a state dir,
         # and the Tk checkbox can be flipped mid-run, so the truth is recorded at launch.
         self._launched_ft_family = None
+        if (_desc := self._family_desc()) is not None:
+            return self._generic_train_command(_desc)
         if config.get("is_krea2"):
             if bool(getattr(self, "krea2_finetune_var", None) and self.krea2_finetune_var.get()):
                 self._launched_ft_family = "krea2"
@@ -32350,6 +33952,8 @@ class LoRATrainerGUI:
 
     def build_cache_latents_command(self, config):
         """Build the cache latents command based on architecture"""
+        if (_desc := self._family_desc()) is not None:
+            return self._generic_cache_command(_desc, "latents")
         if config.get("is_krea2"):
             return self._build_krea2_cache_command("krea2_cache_latents.py",
                                                    "--vae", self._krea2_pref("krea2_vae"))
@@ -32407,6 +34011,8 @@ class LoRATrainerGUI:
 
     def build_cache_text_command(self, config):
         """Build the cache text encoder command based on architecture"""
+        if (_desc := self._family_desc()) is not None:
+            return self._generic_cache_command(_desc, "text")
         if config.get("is_krea2"):
             return self._build_krea2_cache_command("krea2_cache_text.py",
                                                    "--text_encoder", self._krea2_pref("krea2_text_encoder"))
@@ -32529,6 +34135,35 @@ class LoRATrainerGUI:
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
         return path
+
+    def _generic_cache_command(self, desc, stage):
+        """Standard layer: the launch plan's cache command (families/cache.py)."""
+        from fizgig.families import launch
+        return launch.cache_command(desc, self._family_launch_inputs(desc), stage)
+
+    def _generic_train_command(self, desc):
+        """Standard layer: the launch plan's training command (families/train.py). Its preview prompt files are
+        written here and its console lines shown."""
+        from fizgig.families import launch
+        if self.sample_enabled_var.get():
+            # Re-check the turbo file now: set or downloaded since the Samples tab last refreshed, its default steps
+            # would otherwise be missed (swaps only between the two defaults, never a typed value).
+            try:
+                self._generic_samples_ui(desc)
+                if "FAMILY_TURBO_STRENGTH" in self.entries:     # it may just have run the family's one-time reset
+                    self.settings["FAMILY_TURBO_STRENGTH"] = self.entries["FAMILY_TURBO_STRENGTH"].get()
+            except Exception:
+                pass
+        plan = launch.LaunchPlan()
+        cmd = launch.train_command(desc, self._family_launch_inputs(desc), plan)
+        for line in plan.console:
+            self.update_console(line)
+        for folder in plan.dirs:
+            os.makedirs(folder, exist_ok=True)
+        for path, text in plan.files:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+        return cmd
 
     def _build_krea2_train_command(self):
         """Build the native Krea 2 training command (RAW base, fp8 Turbo previews).
@@ -33114,7 +34749,7 @@ class LoRATrainerGUI:
         if _blocks.lower() != "all" and not _mft_cmd_on:
             cmd += ["--train_blocks", _blocks]
         # Training mode. FAST masks per step type: photos and clips to the identity blocks,
-        # voice to the audio zone (below), and the launch dict left MINIMAX_BLOCKS at "all" so
+        # voice the same (below), and the launch dict left MINIMAX_BLOCKS at "all" so
         # the two never fight. The masks TRAVEL under fine-tune too: the trainer honours the same
         # semantics there (cycle-tighten on photo-only data, per-parameter freezing on mixed).
         # ULTRA is one range for every step type: in LoRA mode the launch dict put 6-49 in
@@ -33132,9 +34767,9 @@ class LoRATrainerGUI:
             cmd += ["--photo_blocks", MINIMAX_FULL_MODEL_BLOCKS,
                     "--clip_blocks", MINIMAX_FULL_MODEL_BLOCKS,
                     "--audio_blocks", MINIMAX_FULL_MODEL_BLOCKS]
-        # Voice routing — audio steps train only the measured voice zone (34-49): outside it
-        # they corrupt the visual blocks (A/B, 24 Aug). Under FT it always travels (the
-        # trainer also tightens the cycle to the union of what the dataset trains); in LoRA
+        # Voice routing — audio steps train the same blocks as the picture since 18 Sep 2026.
+        # The flag still travels because the trainer needs to know the routing exists: under FT
+        # it tightens the rotation cycle to the union of what the dataset trains, and in LoRA
         # mode it is part of Optimised Likeness Learning. Harmless without audio files.
         if (_ft_now or _mode == "fast") and not (_mode == "ultra" and _ft_now):
             cmd += ["--audio_blocks", MINIMAX_AUDIO_BLOCKS]
@@ -33233,9 +34868,9 @@ class LoRATrainerGUI:
                               and self.sample_frames_var.get() or "")
                 _sf = _sf_raw.split(" ")[0]
                 cmd += ["--sample_frames", _sf if _sf.isdigit() else "1"]
-                # "with sound" variants: the samples also carry their generated audio,
-                # decoded through the audio VAE — same file the caching pass uses.
-                if "with sound" in _sf_raw.lower():
+                # Any clip carries its generated audio, decoded through the audio VAE — same
+                # file the caching pass uses. Keyed on the frame count, not the label.
+                if _sf.isdigit() and int(_sf) > 1:
                     _avae = self._krea2_pref("minimax_audio_vae")
                     if _avae:
                         cmd += ["--sample_audio", "--audio_vae", _avae]
@@ -33286,11 +34921,12 @@ class LoRATrainerGUI:
         resume_path = (self.settings.get("RESUME_TRAINING") or "").strip()
         if resume_path:
             cmd += ["--resume", resume_path]
-        # Training adapter — Ostris's frozen de-distillation LoRA at 1.0 under everything else,
-        # the file chosen to match the base this run trains on (validation already checked it
-        # exists). Under fine-tune the trainer rides it as forward hooks.
-        if self.settings.get("MINIMAX_TRAINING_ADAPTER"):
-            _adapter = self._krea2_pref(self._minimax_adapter_pref_key())
+        # Training adapter — a frozen de-distillation LoRA at 1.0 under everything else:
+        # Circlestone (one file, both bases) or Ostris (per base), or none (validation already
+        # checked the file). Under fine-tune the trainer rides it as forward hooks.
+        _ak = self._minimax_adapter_pref_key()
+        if _ak:
+            _adapter = self._krea2_pref(_ak)
             if _adapter:
                 cmd += ["--training_adapter_path", _adapter]
         # TREAD token routing (experiment) — LoRA runs only, half the video tokens, blocks 2-46.
@@ -33842,6 +35478,13 @@ class LoRATrainerGUI:
             pass
         try:
             self._stop_caption_worker(silent=True, wait=False)
+        except Exception:
+            pass
+        # The status loop and its typeperf child (AMD Windows) must not outlive the window.
+        self._status_stop = True
+        try:
+            from fizgig.utils import vram_monitor as _vm
+            _vm.shutdown()
         except Exception:
             pass
         try:
