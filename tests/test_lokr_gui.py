@@ -39,10 +39,22 @@ root = tk.Tk()
 root.withdraw()
 g = G.LoRATrainerGUI(root)
 
-KREA2 = next(k for k in G.ARCHITECTURES if G.ARCHITECTURES[k].get("is_krea2"))
-KLEIN = next(k for k in G.ARCHITECTURES if not G.ARCHITECTURES[k].get("is_krea2"))
+# Every family trains through the driver system now, and every one offers LoKR: the description's
+# network_types is ("lora", "lokr") across Klein, Krea 2, MiniMax H3, Qwen 2.1, SDXL and Anima. So the
+# old premise -- "Klein trains standard only, Network Type hidden there" -- is no longer behaviour to
+# protect, and the "is_krea2" flag, _build_krea2_train_command, KREA2_BUILT_IN_PRESETS and the Krea 2
+# fine-tune toggles it drove are gone. What follows pins the same wiring where it lives now: the shared
+# widgets, the launch plan's command, and the family descriptions' presets. Families are picked by
+# description key rather than display name, which upstream renames.
+from fizgig.families import launch as L  # noqa: E402
+from fizgig.families.registry import training_families  # noqa: E402
 
-# --- 1. widgets + per-family visibility ---------------------------------------------------
+
+def arch_for(key):
+    return next(a for a in G.ARCHITECTURES if getattr(g._family_desc(a), "key", None) == key)
+
+
+# --- 1. widgets + visibility --------------------------------------------------------------
 ck("NETWORK_TYPE and LOKR_FACTOR widgets exist",
    "NETWORK_TYPE" in g.entries and "LOKR_FACTOR" in g.entries)
 ck("  default is standard LoRA (LoKR one pick away)",
@@ -50,99 +62,72 @@ ck("  default is standard LoRA (LoKR one pick away)",
 ck("  default factor is 8", g.entries["LOKR_FACTOR"].get() == "8",
    g.entries["LOKR_FACTOR"].get())
 
-# The combo/entry are packed inside row frames (widget + hint side by side), so the frames
-# are what get shown/hidden — check those.
-g.architecture_var.set(KLEIN)
-g.update_ui_for_architecture()
-root.update()
-ck("Klein: Network Type hidden", not _visible(g._network_type_rowf))
-ck("  Klein: factor hidden, rank/alpha shown",
-   not _visible(g._lokr_factor_rowf) and _visible(g.entries["NETWORK_DIM"]))
+# The combo/entry are packed inside row frames (widget + hint side by side), so the frames are what
+# get shown/hidden -- check those. Every training family offers LoKR, so every one shows the row.
+for d in training_families():
+    g.architecture_var.set(arch_for(d.key))
+    g.update_ui_for_architecture()
+    g.entries["NETWORK_TYPE"].set("LoRA (standard)")
+    g._on_network_type_changed()
+    root.update()
+    ck(f"{d.key}: Network Type shown, standard -> rank/alpha shown, factor hidden",
+       _visible(g._network_type_rowf) and _visible(g.entries["NETWORK_DIM"])
+       and not _visible(g._lokr_factor_rowf))
+    g.entries["NETWORK_TYPE"].set("LoKR (Kronecker)")
+    g._on_network_type_changed()
+    root.update()
+    ck(f"  {d.key}: LoKR -> factor row shown, rank/alpha hidden",
+       _visible(g._lokr_factor_rowf) and not _visible(g.entries["NETWORK_DIM"])
+       and not _visible(g.entries["NETWORK_ALPHA"]))
 
-g.architecture_var.set(KREA2)
-g.update_ui_for_architecture()
-root.update()
-ck("Krea 2: Network Type shown", _visible(g._network_type_rowf))
-ck("  default LoRA -> rank/alpha shown, factor (and its hint) hidden",
-   _visible(g.entries["NETWORK_DIM"]) and not _visible(g._lokr_factor_rowf))
-
-g.entries["NETWORK_TYPE"].set("LoKR (Kronecker)")
-g._on_network_type_changed()
-root.update()
-ck("LoKR selected -> factor row (entry + sweet-spot hint) shown, rank/alpha hidden",
-   _visible(g._lokr_factor_rowf) and not _visible(g.entries["NETWORK_DIM"])
-   and not _visible(g.entries["NETWORK_ALPHA"]))
-
-# Switching to Klein with LoKR selected must restore rank/alpha (Klein trains standard only).
-g.architecture_var.set(KLEIN)
-g.update_ui_for_architecture()
-root.update()
-ck("Klein with LoKR still selected -> rank/alpha back, factor + combo hidden",
-   _visible(g.entries["NETWORK_DIM"]) and not _visible(g._lokr_factor_rowf)
-   and not _visible(g._network_type_rowf))
-g.architecture_var.set(KREA2)
+# --- 2. the launch plan's command ---------------------------------------------------------
+K2 = g._family_desc(arch_for("krea2"))
+g.architecture_var.set(arch_for("krea2"))
 g.update_ui_for_architecture()
 root.update()
 
-# --- 2. command builder -------------------------------------------------------------------
-g.settings.update({"NETWORK_TYPE": "LoKR (Kronecker)", "LOKR_FACTOR": 16,
-                   "NETWORK_DIM": 8, "NETWORK_ALPHA": 8, "DATASET_CONFIG": "x.toml",
-                   "LORA_OUTPUT_DIR": "out", "LORA_NAME": "n", "LEARNING_RATE": 1e-4,
-                   "MAX_TRAIN_EPOCHS": 2, "SAVE_EVERY_N_EPOCHS": 1, "BLOCKS_SWAP": 0,
-                   "SEED": 42})
-cmd = g._build_krea2_train_command()
+
+def k2_cmd(**st):
+    g.settings.update(st)
+    return L.train_command(K2, g._family_launch_inputs(K2), L.LaunchPlan())
+
+
+cmd = k2_cmd(NETWORK_TYPE="LoKR (Kronecker)", LOKR_FACTOR=16, FAMILY_SLIDER=False)
 ck("LoKR -> command carries --network_type lokr --lokr_factor 16",
    "--network_type" in cmd and cmd[cmd.index("--network_type") + 1] == "lokr"
    and cmd[cmd.index("--lokr_factor") + 1] == "16")
-
-g.settings["NETWORK_TYPE"] = "LoRA (standard)"
-cmd = g._build_krea2_train_command()
+cmd = k2_cmd(NETWORK_TYPE="LoRA (standard)")
 ck("standard LoRA -> no network_type flag at all", "--network_type" not in cmd)
+# The launch plan's own exclusion: a slider is always a plain LoRA (its strength is the dial), so
+# LoKR must not reach a slider's command even when it is the selected Network Type.
+_inp = dict(g._family_launch_inputs(K2), NETWORK_TYPE="LoKR (Kronecker)", LOKR_FACTOR=16,
+            FAMILY_SLIDER=True)
+ck("slider on -> LoKR never reaches the command (a slider is a plain LoRA)",
+   L.slider_on(K2, _inp) and "--network_type" not in L.train_command(K2, _inp, L.LaunchPlan()))
+# Retired: "fine-tune on -> --network_type not emitted". Fine-tune moved into the driver's trainer,
+# which never builds a trainable adapter on a fine-tune (families/train.py adds it only outside the
+# FT branch), so the flag is inert there by construction rather than suppressed in the command.
 
-# --- 3. persistence sweep -----------------------------------------------------------------
+# --- 3. persistence sweep + built-in presets ----------------------------------------------
 vals = g._collect_preset_values()
 ck("preset sweep captures NETWORK_TYPE + LOKR_FACTOR",
    "NETWORK_TYPE" in vals and "LOKR_FACTOR" in vals,
    {k: vals.get(k) for k in ("NETWORK_TYPE", "LOKR_FACTOR")})
 ck("NETWORK_TYPE is strict-combo protected (junk can't be .set() onto it)",
    "NETWORK_TYPE" in G.LoRATrainerGUI._STRICT_COMBO_KEYS)
-for name, preset in G.KREA2_BUILT_IN_PRESETS.items():
-    ck(f"  built-in '{name[:30]}...' pins standard LoRA",
-       preset.get("NETWORK_TYPE") == "LoRA (standard)")
+# The built-in presets moved into each family's description. The invariant was Krea 2-only; it now
+# holds for every family, so check them all.
+_presets = [(d.key, n, pr) for d in training_families() for n, pr in d.presets]
+ck("every family ships built-in presets", len(_presets) > 0 and all(d.presets for d in training_families()))
+_bad = [f"{k}: {n}" for k, n, pr in _presets if pr.get("NETWORK_TYPE") != "LoRA (standard)"]
+ck(f"  all {len(_presets)} built-in presets pin standard LoRA", not _bad, _bad[:3])
 
 # Applying a built-in preset resets a LoKR selection back to standard.
 g.entries["NETWORK_TYPE"].set("LoKR (Kronecker)")
-g._apply_preset_values(next(iter(G.KREA2_BUILT_IN_PRESETS.values())))
+g._apply_preset_values(dict(K2.presets[0][1]))
 root.update()
 ck("loading a built-in preset resets Network Type to standard",
    g.entries["NETWORK_TYPE"].get() == "LoRA (standard)", g.entries["NETWORK_TYPE"].get())
-
-# --- 4. fine-tune × LoKR mutual exclusion (ft-rotation branch) ----------------------------
-# FT trains the base; the adapter is inert. LoKR must vanish from the UI and the command.
-if hasattr(g, "krea2_finetune_var"):
-    g.entries["NETWORK_TYPE"].set("LoKR (Kronecker)")
-    g.krea2_finetune_var.set(True)
-    g._apply_krea2_ft_visibility()
-    root.update()
-    ck("FT on -> Network Type row hidden", not _visible(g._network_type_rowf))
-    ck("  FT on -> factor hidden, rank/alpha shown (FT recipe uses them for nothing, "
-       "but Klein parity keeps them)", not _visible(g._lokr_factor_rowf)
-       and _visible(g.entries["NETWORK_DIM"]))
-    g.settings["NETWORK_TYPE"] = "LoKR (Kronecker)"
-    cmd = g._build_krea2_train_command()
-    ck("  FT on -> --network_type NOT emitted even with LoKR selected",
-       "--network_type" not in cmd)
-    ck("  FT on -> FT flags emitted", "--finetune_rotation" in cmd)
-    ck("  FT recipe pins standard LoRA",
-       g.KREA2_FT_DEFAULTS.get("NETWORK_TYPE") == "LoRA (standard)")
-    g.krea2_finetune_var.set(False)
-    g._apply_krea2_ft_visibility()
-    root.update()
-    ck("FT off -> Network Type row back, LoKR wiring restored",
-       _visible(g._network_type_rowf) and _visible(g._lokr_factor_rowf))
-    cmd = g._build_krea2_train_command()
-    ck("  FT off -> --network_type lokr emitted again",
-       "--network_type" in cmd and "--finetune_rotation" not in cmd)
 
 root.destroy()
 print()

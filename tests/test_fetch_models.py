@@ -78,13 +78,41 @@ ck("no manifest key is unknown to the GUI",
    sorted({w.pref_key for fam in F.FAMILIES.values() for w in fam} - set(G.DEFAULT_PREFS)))
 ck("Klein is flagged gated, Krea 2 is not",
    any(w.gated for w in F.FAMILIES["klein"]) and not any(w.gated for w in F.FAMILIES["krea2"]))
-# Nothing in a family is optional any more. "Download models for me" that silently omits a model
-# is the wrong shape: you find out weeks later when Repair Studio will not open, with no obvious
-# link back to a tickbox you did not tick.
-ck("no Krea 2 model is optional — the button gets everything",
-   not any(w.optional for w in F.FAMILIES["krea2"]))
-ck("  including the Turbo DiT the workbench needs",
-   not weight("krea2", "krea2_turbo_dit").optional)
+# The rule here was "nothing in a family is optional": a download button that silently omits a model
+# leaves you finding out weeks later that Repair Studio will not open. Upstream has since made Krea 2's
+# Turbo DiT and Turbo LoRA optional, and the reason the rule existed no longer holds for them: the
+# driver workbench falls back to the Turbo LoRA on the RAW model, then to plain steps, so nothing fails
+# to open without them. So pin what the rule was protecting, for every family, instead:
+#   1. nothing TRAINING needs (the description's dit / vae / text_encoder roles) is optional UNLESS a
+#      required file already carries it. SDXL is the case that defines the exception: its VAE and text
+#      encoders sit inside the checkpoint (ModelFile.inside="sdxl_checkpoint"), and the separate files
+#      are overrides, so leaving them out loses nothing;
+#   2. optional files are only preview accelerators or such carried overrides.
+from fizgig.families.registry import training_families as _tf  # noqa: E402
+
+_CRITICAL = {"dit", "vae", "text_encoder"}
+_mf = {(d.key, mf.pref_key): mf for d in _tf() for mf in d.model_files}
+_required = {(d.key, mf.pref_key) for d in _tf() for mf in d.model_files if mf.required}
+
+
+def _carried(fam, mf):
+    return bool(getattr(mf, "inside", "")) and (fam, mf.inside) in _required
+
+
+_crit_optional = [f"{fam}:{w.pref_key}" for fam, ws in F.FAMILIES.items() for w in ws
+                  if w.optional and (fam, w.pref_key) in _mf
+                  and _mf[(fam, w.pref_key)].role in _CRITICAL
+                  and not _carried(fam, _mf[(fam, w.pref_key)])]
+ck("no family marks a training-critical model optional (unless a required file carries it)",
+   not _crit_optional, _crit_optional)
+ck("  SDXL's optional VAE really is carried by its required checkpoint",
+   _carried("sdxl", _mf[("sdxl", "sdxl_vae")]))
+_k2_opt = {w.pref_key for w in F.FAMILIES["krea2"] if w.optional}
+ck("  Krea 2's optional files are exactly its two preview accelerators",
+   _k2_opt == {"krea2_turbo_dit", "krea2_turbo_lora"}
+   and {_mf[("krea2", k)].role for k in _k2_opt} == {"preview_dit", "speed_lora"}, sorted(_k2_opt))
+ck("  and Krea 2's base, VAE and text encoder are always fetched",
+   not any(weight("krea2", k).optional for k in ("krea2_raw_dit", "krea2_vae", "krea2_text_encoder")))
 
 # --- a user's own choice must survive ------------------------------------------------------
 smaller = os.path.join(BASE, "krea2_raw_fp8_scaled.safetensors")

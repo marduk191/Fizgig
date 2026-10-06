@@ -157,64 +157,106 @@ with tempfile.TemporaryDirectory() as td:
             ok = False
     ck("  reloaded deltas match trained deltas to 1e-6 (scale round-trips)", ok)
 
-# --- 4. comfy-format final save (trainer._save_lora) --------------------------------------
-# The final artifact ships LyCORIS-standard keys (diffusion_model.<dotted>.lokr_*) — the
-# format every ComfyUI LoKR in the wild uses — and must round-trip through our own loader.
-from fizgig.krea2.trainer import _save_lora  # noqa: E402
+# --- 4. comfy-format final save (the driver's FamilyLoRA.save) -----------------------------
+# Krea 2 trains through the driver system now. The native trainer's _save_lora this section used to
+# drive was deleted with it, and the save moved to fizgig.families.lora.FamilyLoRA.save — a separate
+# LoKR implementation from fizgig.networks.lora's, which sections 1-3 cover. The invariant is the same:
+# the final file ships LyCORIS-standard keys (diffusion_model.<dotted>.lokr_*), the format every
+# ComfyUI LoKR in the wild uses, and the workbench's own loader must render it back exactly. Built on
+# the REAL Krea 2 driver, against a toy with Krea 2's block layout, so the target list and the key
+# stems come from the shipped description rather than from this file.
+import torch.nn as nn  # noqa: E402
+from fizgig.families.registry import get as _get_family  # noqa: E402
+from fizgig.families.lora import FamilyLoRA, TRAINABLE  # noqa: E402
 
-net._network_type = "lokr"
-net._lokr_factor = 4
-net._dotted_names = {
-    f"lora_unet_{name.replace('.', '_')}": name
-    for name, m in dit.named_modules() if isinstance(m, torch.nn.Linear)
-}
+_K2 = _get_family("krea2").load_driver()
+
+
+class _K2Attn(nn.Module):
+    def __init__(s, d=16):
+        super().__init__()
+        for n in ("wq", "wk", "wv", "gate", "wo"):
+            setattr(s, n, nn.Linear(d, d, bias=False))
+
+
+class _K2MLP(nn.Module):
+    def __init__(s, d=16):
+        super().__init__()
+        for n in ("gate", "up", "down"):
+            setattr(s, n, nn.Linear(d, d, bias=False))
+
+
+class _K2Block(nn.Module):
+    def __init__(s):
+        super().__init__()
+        s.attn, s.mlp = _K2Attn(), _K2MLP()
+
+
+class Krea2Toy(nn.Module):
+    """Krea 2's block layout (blocks.N.attn.{wq,wk,wv,gate,wo}, blocks.N.mlp.{gate,up,down}) at toy width."""
+
+    def __init__(s, n=2):
+        super().__init__()
+        s.blocks = nn.ModuleList(_K2Block() for _ in range(n))
+
+
+torch.manual_seed(0)
+k2 = Krea2Toy()
+fnet = FamilyLoRA(k2, _K2, device="cpu")
+fnet.add_trainable(4, 4, kind="lokr", factor=4)
+with torch.no_grad():
+    for w in fnet.wrapped.values():
+        a = w.adapters[TRAINABLE]
+        a.lokr_w1.copy_(torch.randn_like(a.lokr_w1))
+        a.lokr_w2.copy_(torch.randn_like(a.lokr_w2))
+k2_ref = {f: w.adapters[TRAINABLE].delta().clone() for f, w in fnet.wrapped.items()}
+ck("driver LoKR wraps every Krea 2 block Linear", len(fnet.wrapped) == 16, len(fnet.wrapped))
 
 with tempfile.TemporaryDirectory() as td:
     p = os.path.join(td, "final.safetensors")
-    _save_lora(net, p, 4, 1.0, torch.float32, comfy_format=True)
-    from safetensors import safe_open
-    with safe_open(p, framework="pt") as f:
-        meta = f.metadata()
+    fnet.save(p, dtype=torch.float32)
     csd = load_file(p)
 
     ck("comfy save: keys are diffusion_model.<dotted>.lokr_*",
-       "diffusion_model.blocks.0.attn.qkv.lokr_w1" in csd
-       and "diffusion_model.blocks.0.attn.qkv.alpha" in csd, sorted(csd.keys())[:3])
+       "diffusion_model.blocks.0.attn.wq.lokr_w1" in csd
+       and "diffusion_model.blocks.0.attn.wq.alpha" in csd, sorted(csd.keys())[:3])
     ck("  no flattened lora_unet_ keys remain", not any(k.startswith("lora_unet_") for k in csd))
-    ck("  metadata records lokr module + factor",
-       meta.get("ss_network_module") == "fizgig.krea2 (lokr, all-Linear)"
-       and meta.get("ss_lokr_factor") == "4", meta)
     ck("  detect_lora_format on the comfy file says lokr", detect_lora_format(csd) == "lokr")
 
+    # The full consumer chain: a driver-trained file -> the workbench loader -> the same deltas.
     back = ensure_kohya_lora_state_dict(dict(csd))
-    native = {k: v for k, v in net.state_dict().items()}
-    ck("  ensure_kohya round-trips comfy keys back to native names",
-       set(back.keys()) == set(native.keys()),
-       sorted(set(back.keys()) ^ set(native.keys()))[:4])
-    ck("  ...with identical tensors",
-       all(torch.equal(back[k], native[k].float()) or torch.allclose(back[k], native[k].to(back[k].dtype))
-           for k in back))
-
-    # And the full consumer chain: comfy file -> inf network -> same deltas as trained.
-    dit3 = ToyDiT()
-    inf3 = create_network_from_weights(None, 1.0, back, None, dit3, for_inference=True)
-    inf3.apply_to(text_encoders=None, unet=dit3, apply_text_encoder=False, apply_unet=True)
+    k2b = Krea2Toy()
+    inf3 = create_network_from_weights(None, 1.0, back, None, k2b, for_inference=True)
+    inf3.apply_to(text_encoders=None, unet=k2b, apply_text_encoder=False, apply_unet=True)
     inf3.load_state_dict(back, strict=False)
-    ok = all(torch.allclose(torch.kron(m._w1(), m._w2()) * m.scale * m.multiplier,
-                            ref_deltas[m.lora_name], atol=1e-6) for m in inf3.unet_loras)
-    ck("  comfy file renders the trained deltas exactly", ok and len(inf3.unet_loras) == 4)
+    _by_name = {m.lora_name: m for m in inf3.unet_loras}
+    ok = len(inf3.unet_loras) == 16
+    for full, ref in k2_ref.items():
+        m = _by_name.get("lora_unet_" + full.replace(".", "_"))
+        if m is None or not torch.allclose(torch.kron(m._w1(), m._w2()) * m.scale * m.multiplier,
+                                           ref, atol=1e-6):
+            ok = False
+    ck("  the workbench loader renders the driver's trained deltas exactly", ok, len(inf3.unet_loras))
 
-# Standard-LoRA regression: comfy_format is a no-op for a normal network.
-dit4 = ToyDiT()
-lora_net = create_network(None, "lora_unet", 1.0, 4, 4.0, None, [], dit4)
-lora_net.apply_to(text_encoders=None, unet=dit4, apply_text_encoder=False, apply_unet=True)
+    # And back into a fresh adapter set (resume / Load Last Train).
+    fnet2 = FamilyLoRA(Krea2Toy(), _K2, device="cpu")
+    fnet2.add_trainable(4, 4, kind="lokr", factor=4)
+    n = fnet2.load_trainable(p)
+    ck("  load_trainable restores every module", n == 16, n)
+    ck("  ...with identical deltas",
+       all(torch.allclose(fnet2.wrapped[f].adapters[TRAINABLE].delta(), r, atol=1e-6)
+           for f, r in k2_ref.items()))
+
+# Standard-LoRA regression: a plain LoRA from the same driver still saves kohya keys.
+snet = FamilyLoRA(Krea2Toy(), _K2, device="cpu")
+snet.add_trainable(4, 4.0, kind="lora")
 with tempfile.TemporaryDirectory() as td:
     p = os.path.join(td, "std.safetensors")
-    _save_lora(lora_net, p, 4, 4.0, torch.float32, comfy_format=True)
+    snet.save(p, dtype=torch.float32)
     ssd = load_file(p)
-    ck("standard LoRA with comfy_format=True still saves kohya keys",
+    ck("standard LoRA from the driver still saves kohya keys",
        any(k.startswith("lora_unet_") and k.endswith(".lora_down.weight") for k in ssd)
-       and detect_lora_format(ssd) == "kohya")
+       and detect_lora_format(ssd) == "kohya", sorted(ssd)[:2])
 
 # --- 4b. Context LoRA under a trainable LoKR ----------------------------------------------
 # The trainer stacks: frozen context (inference net) -> trainable net, both additive forward
@@ -258,12 +300,17 @@ ck("  grads reach the trainable LoKR only",
    and all(p.grad is None or p.grad.abs().sum() == 0 for p in ctx_net.parameters()))
 
 # --- 5. lossless LoKR bake (Repair Studio / Explorer save path) ---------------------------
+# Krea 2's Repair Studio engine was removed with its native trainer (the Krea 2 workbench runs
+# through the driver now), and SliderState.default_krea2 went with it. save_repaired_lora still
+# ships: the MiniMax H3 Repair Studio bakes through it (minimax/workbench.py). H3 shares the raw
+# `lora_unet_blocks_N_` key shape, with block ids h3blk_N, so the same synthetic LoKR file below
+# exercises the identical lossless path through the family that still uses it.
 from fizgig.repair_studio.bake import save_repaired_lora  # noqa: E402
 from fizgig.repair_studio.state import SliderState  # noqa: E402
 
 
 def _mk_lokr_sd():
-    """Two Krea 2-named LoKR modules (out 24 = 4x6, in 16 = 4x4), alpha 1.0."""
+    """Two `lora_unet_blocks_N_` LoKR modules (H3 / formerly Krea 2 naming) (out 24 = 4x6, in 16 = 4x4), alpha 1.0."""
     g = torch.Generator().manual_seed(7)
     sd = {}
     for blk in (0, 1):
@@ -283,7 +330,7 @@ with tempfile.TemporaryDirectory() as td:
     save_file(_mk_lokr_sd(), src)
 
     # THE headline regression: a no-op edit keeps LoKR as LoKR, tensors byte-identical.
-    st = SliderState.default_krea2()
+    st = SliderState.default_h3()
     out1 = os.path.join(td, "noop.safetensors")
     summary = save_repaired_lora(src, st, out1)
     osd = load_file(out1)
@@ -295,16 +342,16 @@ with tempfile.TemporaryDirectory() as td:
        and all(torch.equal(osd[k], v) for k, v in _mk_lokr_sd().items()))
 
     # Multiplier bake: dense delta of the baked module == m x original, with sentinel alpha.
-    st2 = SliderState.default_krea2()
-    st2.blocks["block_0"].primary_strength = 0.6
-    st2.blocks["block_1"].primary_enabled = False
+    st2 = SliderState.default_h3()
+    st2.blocks["h3blk_0"].primary_strength = 0.6
+    st2.blocks["h3blk_1"].primary_enabled = False
     out2 = os.path.join(td, "scaled.safetensors")
     summary2 = save_repaired_lora(src, st2, out2)
     osd2 = load_file(out2)
     ck("scaled bake: still lokr, no SVD",
        detect_lora_format(osd2) == "lokr" and summary2["lycoris_converted"] == 0)
     ck("  disabled block dropped",
-       not any("blocks_1" in k for k in osd2) and "block_1" in summary2["dropped_blocks"])
+       not any("blocks_1" in k for k in osd2) and "h3blk_1" in summary2["dropped_blocks"])
     ref = 0.6 * _dense(_mk_lokr_sd(), 0)
     got = _dense(osd2, 0) * 1.0  # sentinel alpha -> scale 1.0 at load
     ck("  baked dense delta == 0.6 x original",
@@ -325,8 +372,8 @@ with tempfile.TemporaryDirectory() as td:
     }
     src_std = os.path.join(td, "std_src.safetensors")
     save_file(std, src_std)
-    st3 = SliderState.default_krea2()
-    st3.blocks["block_0"].primary_strength = 0.5
+    st3 = SliderState.default_h3()
+    st3.blocks["h3blk_0"].primary_strength = 0.5
     out3 = os.path.join(td, "std_out.safetensors")
     s3 = save_repaired_lora(src_std, st3, out3)
     osd3 = load_file(out3)

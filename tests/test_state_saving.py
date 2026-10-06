@@ -101,11 +101,15 @@ ck("keep-last entry defaults to 2", g.entries["KEEP_LAST_N_STATES"].get() == "2"
    g.entries["KEEP_LAST_N_STATES"].get())
 
 
+# The flag builder moved out of the GUI into the launch plan (fizgig.families.launch._state_flags)
+# when every family started training through the driver system. It now takes the run's settings as a
+# plain dict, so drive it with one built exactly as the GUI's settings would be.
+from fizgig.families import launch as L  # noqa: E402
+
+
 def flags_for(is_krea2, save_state, on_end, keep_n):
-    g.settings["SAVE_STATE"] = save_state
-    g.settings["SAVE_STATE_ON_TRAIN_END"] = on_end
-    g.settings["KEEP_LAST_N_STATES"] = keep_n
-    return g._state_flags()
+    return L._state_flags({"SAVE_STATE": save_state, "SAVE_STATE_ON_TRAIN_END": on_end,
+                           "KEEP_LAST_N_STATES": keep_n})
 
 
 both = flags_for(False, True, True, 2)
@@ -121,40 +125,40 @@ for bad in ("0", "-2", "", "  ", "abc"):
     got = flags_for(False, True, True, bad)
     ck(f"  keep_n={bad!r} never reaches the trainer as < 1", int(got[-1]) >= 1, got[-1])
 
-# The flags must actually appear in each family's real command line. Use the REAL architecture
-# configs — the Klein builder reads train_script off them, so a stubbed dict proves nothing.
-KLEIN_CFG = next(c for n, c in G.ARCHITECTURES.items() if not c.get("is_krea2"))
-KREA_CFG = next(c for n, c in G.ARCHITECTURES.items() if c.get("is_krea2"))
+# The flags must actually appear in each family's real command line. Klein and Krea 2 now both train
+# through the driver system, so their commands come from the launch plan (launch.train_command) fed by
+# the GUI's own _family_launch_inputs -- the exact path Start uses. The old GUI-side builder
+# (build_training_command) and the "is_krea2" architecture flag it keyed on are gone. Families are
+# picked by the description key the plan itself uses, not by display name, which upstream renames.
+
+
+def family_cmd(key):
+    arch = next(a for a in G.ARCHITECTURES if getattr(g._family_desc(a), "key", None) == key)
+    desc = g._family_desc(arch)
+    return L.train_command(desc, g._family_launch_inputs(desc), L.LaunchPlan())
+
 
 g.settings["SAVE_STATE"] = True
 g.settings["SAVE_STATE_ON_TRAIN_END"] = True
 g.settings["KEEP_LAST_N_STATES"] = 2
-try:
-    klein_cmd = g.build_training_command(KLEIN_CFG)
-    ck("Klein command carries --save_state", "--save_state" in klein_cmd)
-    ck("  and --save_state_on_train_end", "--save_state_on_train_end" in klein_cmd)
-    ck("  and --keep_last_n_states 2",
-       klein_cmd[klein_cmd.index("--keep_last_n_states") + 1] == "2")
-    ck("  --save_state appears exactly once (was hardcoded before)",
-       klein_cmd.count("--save_state") == 1, klein_cmd.count("--save_state"))
-except Exception as e:
-    ck("Klein command builds", False, repr(e))
+for label, key in (("Klein", "klein"), ("Krea 2", "krea2")):
+    try:
+        cmd = family_cmd(key)
+        ck(f"{label} command carries --save_state", "--save_state" in cmd)
+        ck("  and --save_state_on_train_end", "--save_state_on_train_end" in cmd)
+        ck("  and --keep_last_n_states 2",
+           cmd[cmd.index("--keep_last_n_states") + 1] == "2")
+        ck("  --save_state appears exactly once (was hardcoded before)",
+           cmd.count("--save_state") == 1, cmd.count("--save_state"))
+    except Exception as e:
+        ck(f"{label} command builds", False, repr(e))
 
-try:
-    krea_cmd = g.build_training_command(KREA_CFG)
-    ck("Krea 2 command carries --save_state", "--save_state" in krea_cmd)
-    ck("  and --save_state_on_train_end", "--save_state_on_train_end" in krea_cmd)
-    ck("  and --keep_last_n_states 2",
-       krea_cmd[krea_cmd.index("--keep_last_n_states") + 1] == "2")
-except Exception as e:
-    ck("Krea 2 command builds", False, repr(e))
-
-# Both off: neither builder emits anything.
+# Both off: neither family's command carries anything.
 g.settings["SAVE_STATE"] = False
 g.settings["SAVE_STATE_ON_TRAIN_END"] = False
-for label, cfg in (("Klein", KLEIN_CFG), ("Krea 2", KREA_CFG)):
+for label, key in (("Klein", "klein"), ("Krea 2", "krea2")):
     try:
-        cmd = g.build_training_command(cfg)
+        cmd = family_cmd(key)
         ck(f"{label}: both off emits no state flags",
            not any(f in cmd for f in ("--save_state", "--save_state_on_train_end",
                                       "--keep_last_n_states")))

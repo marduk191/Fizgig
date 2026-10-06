@@ -28,8 +28,6 @@ import torch.nn as nn
 from fizgig.modules.nf4 import move_nf4_to_device
 
 DEV = "cuda"
-TRAINER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       "..", "src", "fizgig", "krea2", "trainer.py")
 
 
 class FakeNF4Linear(nn.Module):
@@ -107,38 +105,44 @@ def main():
     ok &= check("both-halves restore returns ordinary params", o == {"cuda"}, str(o))
     ok &= check("both-halves restore returns packed weights", p == {"cuda"}, str(p))
 
-    # 4. static guard so the shape can't regress at any of the three park/restore pairs
-    print("trainer restore sites")
-    with open(TRAINER, encoding="utf-8") as f:
-        src = f.read()
-    exclusive = ('if getattr(dit, "_nf4_quantized", False):\n'
-                 '            from fizgig.modules.nf4 import move_nf4_to_device\n'
-                 '            move_nf4_to_device(dit, device)\n'
-                 '        elif blocks_to_swap > 0:')
-    ok &= check("no restore gates .to(device) behind an NF4 elif", exclusive not in src,
-                "an NF4 restore is exclusive again — see issue #17")
-    # Was "exactly three restore sites", which #123 outgrew legitimately by adding a fourth
-    # park/restore pair (the 16 GB preview park for the VAE decode). The invariant issue #17 is
-    # about is that every park comes BACK — so pair them, and keep a floor so the original three
-    # cannot quietly disappear. A park added without its restore still fails here.
-    n_restore = src.count("move_nf4_to_device(dit, device)")
-    n_park = src.count('move_nf4_to_device(dit, "cpu")')
-    ok &= check("every NF4 park has a matching restore", n_restore == n_park,
+    # 4. the production restore. The native Krea 2 trainer that carried issue #17's three hand-written
+    # park/restore pairs was deleted when every family moved to the driver system. The driver folded
+    # the fix into ONE function, fizgig.families.quant.move: dit.to(device) and then the packed
+    # weights, unconditionally. So test that function directly, with the same split model as above,
+    # rather than grepping a file that no longer exists.
+    print("driver restore (fizgig.families.quant.move)")
+    from fizgig.families import quant
+    dit = fresh()
+    park(dit)
+    quant.move(dit, DEV)
+    o, p = devices(dit)
+    ok &= check("quant.move restores ordinary params", o == {"cuda"}, str(o))
+    ok &= check("quant.move restores packed weights", p == {"cuda"}, str(p))
+    dit = fresh()
+    quant.move(dit, "cpu")
+    o, p = devices(dit)
+    ok &= check("quant.move parks BOTH halves to CPU", o == {"cpu"} and p == {"cpu"}, f"{o} / {p}")
+
+    # 5. static guards over the driver, so the #17 shape cannot come back by another route.
+    print("driver park/restore sites")
+    fam = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "fizgig", "families")
+    srcs = {}
+    for name in sorted(os.listdir(fam)):
+        if name.endswith(".py"):
+            with open(os.path.join(fam, name), encoding="utf-8") as f:
+                srcs[name] = f.read()
+    n_park = sum(t.count('quant.move(dit, "cpu")') for t in srcs.values())
+    n_restore = sum(t.count("quant.move(dit, device)") for t in srcs.values())
+    ok &= check("every driver NF4 park has a matching restore", n_park == n_restore and n_park > 0,
                 f"{n_park} park(s), {n_restore} restore(s)")
-    ok &= check("  the original three park/restore pairs are still there", n_restore >= 3,
-                f"found {n_restore}")
-    # Both sides fixed this independently: it was a source grep for the literal "device=None):",
-    # which broke once the signature grew past one line and device stopped being the last kwarg.
-    # Upstream widened the grep to a regex; this asks the function itself, which is stricter —
-    # it sees the real signature after decorators and cannot be satisfied by a comment, a
-    # docstring, or a second def of the same name further down the file. It also pins the DEFAULT,
-    # not just the parameter's presence.
-    import inspect
-    from fizgig.krea2.trainer import compute_loss as _cl
-    _p = inspect.signature(_cl).parameters.get("device")
-    ok &= check("compute_loss takes an explicit device",
-                _p is not None and _p.default is None,
-                f"device param: {_p!r}")
+    # The bug was a restore that moved only ONE half. quant.move moves both, so the way to
+    # reintroduce it is to call move_nf4_to_device on a whole model directly. Only quant.py may.
+    bypass = [n for n, t in srcs.items() if n != "quant.py" and "move_nf4_to_device(dit" in t]
+    ok &= check("nothing outside quant.move restores only the packed half", not bypass, str(bypass))
+    # Retired: "compute_loss takes an explicit device". That guarded the deleted native trainer's
+    # compute_loss, which read its device from the first parameter it found -- a stranded one, in
+    # #17. The function was removed with that trainer and the driver has no compute_loss, so there
+    # is nothing left to pin. Kept as a note rather than a passing check that tests nothing.
 
     print()
     print("all passed" if ok else "FAILURES — see above")

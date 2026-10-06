@@ -5,7 +5,7 @@ RESEARCH_qwen_image_2_1_*.md files). Sources are cited per value. Training entry
 the family is trained through its driver (qwen_image21/driver.py) by the generic cache + train entry points.
 """
 from fizgig.families.description import (
-    FamilyDescription, LoRAFormat, ModelFile, SamplingSettings, SpeedLoRA,
+    GENERAL_NEGATIVE, FamilyDescription, LoRAFormat, ModelFile, SamplingSettings, SpeedLoRA,
 )
 
 _CARD = "https://huggingface.co/Qwen/Qwen-Image-2.1"
@@ -30,6 +30,8 @@ def _preset(rank, lr=1e-4, adaptive=None, epochs=30, edit=False, slider=False):
         "FAMILY_EMA": "0.98 (recommended)",
         "KREA2_LOSS_WATCH": True, "KREA2_PER_IMAGE_LR": False, "KREA2_AUTO_RECAPTION": False,
         "KREA2_WARMUP_LOOK": False,
+        "FAMILY_SLIDER_GUIDANCE": "2",   # a prompt slider's push strength (Krea 2's is 3)
+        "FAMILY_FAST_ID": False,
     }
 
 
@@ -76,7 +78,38 @@ QWEN_IMAGE_21 = FamilyDescription(
     n_blocks=32,                      # transformer/config.json num_layers 32, identical single-stream blocks
     block_prefix="transformer_blocks",
     block_note="Modulation is shared across all blocks (one global Linear), so per-block sliders act "
-               "on attention and MLP only. No block map (style / identity) exists yet.",
+               "on attention and MLP only. Identity sits in blocks 10-14 (measured 2 Oct 2026 with the "
+               "Profiler on two character LoRAs: those five alone give 67-89% of the likeness, leaving them "
+               "out removes 82-84%, block 12 the strongest); the rest shape the picture.",
+
+    # Measured, not guessed (2 Oct 2026, Profiler group + single-block switch-offs, jadelyn / lara character LoRAs,
+    # ArcFace vs the subjects' photos): blocks 10-14 carry the identity (alone 67% / 89% of the likeness, left out
+    # -84% / -82%), 5-9 a little on one LoRA (11-15%), everything else shapes the picture. Bleed sits in 10-14 too.
+    # 15-19 alone gave lara 18% (left out: nothing) - the next place to look if 10-14 ever can't carry a face alone.
+    block_categories=tuple((f"block_{i}", "identity" if 10 <= i <= 14 else "look") for i in range(32)),
+    # Fast Identity Mode (2 Oct 2026, Sydney, 119 photos, 0.25 MP, 30 epochs, ArcFace vs her photos): blocks 10-14
+    # alone 2.90 it/s vs 1.84 for every block (+58%), likeness .507/.587/.620 at epochs 10/20/30 vs .490/.596/.556.
+    # One seed per run; Lara (0.5 MP, 15 epochs) matched at epoch 10 and trailed at 15.
+    # torch.compile (2 Oct 2026, 5090, 40 photos, 0.25 MP, rank 8, checkpoint outside the compiled blocks - no extra
+    # memory): INT8 2.00 -> 2.86 it/s (+43%, settled by epoch 2), bf16 2.04 -> 2.33 (+14%, still rising at epoch 3);
+    # epoch 1 ~0.7 it/s while the blocks compile. Payback ~200 / ~400 steps measured, rounded up.
+    compiles=True,
+    compile_boundary="outside",
+    compile_fullgraph=False,
+    compile_payback_steps={"int8": 300, "bf16": 800},
+    compile_hint=("Auto (recommended) turns torch.compile on only when this run is long enough to repay it. On Qwen "
+                  "Image 2.1 it is measured 1.43x per step on the INT8 base (2.00 -> 2.86 it/s) and about 1.15x on "
+                  "bf16 (2.04 -> 2.33), with no extra memory: the gradient checkpoint stays outside the compiled "
+                  "blocks. The first epoch runs slower while the blocks compile, so Auto waits for runs longer than "
+                  "about 300 steps on INT8 and 800 on bf16; NF4 is not compiled by Auto (On still compiles). Requires "
+                  "Triton and, on Windows, a C++ compiler (VS Build Tools) - both located automatically. Never used "
+                  "with Blocks Swap, since swapping moves weights and compiled graphs assume they stay put."),
+    identity_blocks=tuple(f"block_{i}" for i in range(10, 15)),
+    repair_presets=(
+        ("✨Identity only", tuple((f"block_{i}", 1.0 if 10 <= i <= 14 else 0.0) for i in range(32))),
+        ("✨Look only (no identity)", tuple((f"block_{i}", 0.0) for i in range(10, 15))),
+        ("✨Identity ×0.5", tuple((f"block_{i}", 0.5) for i in range(10, 15))),
+    ),
 
     lora=LoRAFormat(
         key_template="transformer.transformer_blocks.{block}.{module}.{ab}.weight",
@@ -114,6 +147,14 @@ QWEN_IMAGE_21 = FamilyDescription(
     network_types=("lora", "lokr"),
     edit_training=True,             # one checkpoint for text-to-image and edits (up to 10 references)
     slider_training=True,
+    workbench_follows_samples=True,   # Peter, 1 Oct 2026: the workbench previews as the Samples tab says
+    # the reference default is CFG 1 (none); community reports find a little CFG helps 2.1 (1.5-3), higher
+    # oversaturates (Comfy-Org/Qwen-Image-2.1 discussions, comfyui-wiki, Oct 2026)
+    preview_cfg_note="1 = no CFG (the reference default). A little CFG, about 1.5 to 3, gives better previews for "
+                     "many people; higher tends to oversaturate. Above 1 the negative prompt applies.",
+    int8_attention=True,              # workbench renders: comfy-kitchen's INT8 attention
+    activation_cache=True,            # Turbo Preview: step-1 replay, identical to a full render
+    finetune=True,                  # the driver's ft_spec (families/ft.py)
     # measured 28 Sep 2026: 40-48 pairs learned a grade on held-out photos in 6-8 epochs at 0.5 MP
     edit_note=("About 40 pairs (20 at least; more if your photos vary a lot). Each photo 1 MP or larger, e.g. "
                "1200x800; bigger is fine, Fizgig resizes them. An original and its edited version must have the "
@@ -172,6 +213,7 @@ QWEN_IMAGE_21 = FamilyDescription(
     preview_reset="turbo-off-25-steps",
     preview_steps=25,
     preview_cfg=1.0,
+    preview_negative=GENERAL_NEGATIVE,
     preview_width=1024,
     preview_height=1024,
 
@@ -183,6 +225,10 @@ QWEN_IMAGE_21 = FamilyDescription(
         # the best-held skin detail at 0.5 MP. Automagic (lower likeness, softer late) and flat 1e-4 (too slow)
         # both lost to it.
         ("✨ Qwen 2.1 Fast (rank 8, adaptive LR)", _preset(8, adaptive=("2e-4", "4e-4"))),
+        # Fast Identity Mode: Fast's recipe on the identity blocks only, at the 0.25 MP it was measured at (Sydney,
+        # see identity_blocks above): about 1.5x faster, very close to full-model likeness.
+        ("✨ Qwen 2.1 Fast Identity Mode (rank 8) - very close to full-model likeness, ~1.5x faster",
+         {**_preset(8, adaptive=("2e-4", "4e-4")), "DATASET_MEGAPIXELS": "0.25", "FAMILY_FAST_ID": True}),
         # Standard: rank 16 for bigger or mixed datasets. Fast's range at rank 16 overcooked from ~epoch 15 (skin
         # detail 6.4 -> 4.7 by epoch 30), so the range is halved; Peter has run this at rank 16.
         ("✨ Qwen 2.1 Standard (rank 16, adaptive LR)", _preset(16, adaptive=("1e-4", "2e-4"))),

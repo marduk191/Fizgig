@@ -1,9 +1,12 @@
-"""Paired-image (edit-style / temporal-displacement) training path — CPU, tiny DiT.
+"""Krea 2 training-loss paths through the driver — CPU, tiny DiT.
 
-The sequence is [noisy target @ RoPE frame 0 | clean source @ frame 1 | text], loss on target
-tokens only — the krea2_edit ecosystem convention. These tests pin: the plain path unchanged,
-the control path finite with gradients flowing, the source ACTUALLY read (different source →
-different prediction), control-latent caching keys, and the timestep window.
+Krea 2 trains through the driver system now. Its native trainer (compute_loss,
+sample_krea2_timesteps) was deleted, and with it the paired-image / temporal-displacement path
+this file was written for: [noisy target @ frame 0 | clean source @ frame 1 | text]. That was
+REMOVED, not moved - the driver refuses reference latents outright ("Krea 2 has no edit training").
+So the checks that read the paired source are retired rather than faked, and what survives is
+pinned against the driver: position ids, the plain loss, the refusal itself, the image-pair slider
+loss that replaced motion weighting, control-latent caching keys, and the timestep window.
 """
 import os
 import sys
@@ -16,7 +19,7 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 from fizgig.krea2.model import SingleStreamDiT, SingleMMDiTConfig  # noqa: E402
-from fizgig.krea2.trainer import compute_loss, sample_krea2_timesteps  # noqa: E402
+from fizgig.krea2.driver import Krea2Driver  # noqa: E402
 from fizgig.krea2.sampling import patchify_block, prepare  # noqa: E402
 
 FAILS = []
@@ -50,51 +53,48 @@ ck("prepare() unchanged: image ids frame 0, text ids all-zero",
    torch.all(p_pos[:, :tok.shape[1], 0] == 0).item()
    and torch.all(p_pos[:, tok.shape[1]:] == 0).item())
 
-# --- 2. loss paths ------------------------------------------------------------------------
-loss0, _ = compute_loss(dit, latent, hid, mask, device="cpu", dtype=torch.bfloat16)
+# --- 2. loss paths (driver.loss_at: "the original compute_loss's arithmetic") ----------------
+# The loss math needs no loaded model files, so the driver is built without its constructor.
+D = Krea2Driver.__new__(Krea2Driver)
+cond = {"hidden_states": hid, "attention_mask": mask}
+noise = torch.randn(latent.shape)
+t_mid = torch.full((B,), 0.5)
+
+loss0 = D.loss_at(dit, latent, noise, t_mid, cond)
 ck("plain path finite", torch.isfinite(loss0).item(), f"{loss0.item():.4f}")
-
-loss1, _ = compute_loss(dit, latent, hid, mask, device="cpu", dtype=torch.bfloat16,
-                        control_latent=src)
-loss1.backward()
+loss0.backward()
 gsum = sum(p.grad.abs().sum().item() for p in dit.parameters() if p.grad is not None)
-ck("control path finite, grads flow", torch.isfinite(loss1).item() and gsum > 0,
-   f"loss={loss1.item():.4f} grad_sum={gsum:.1f}")
+ck("  grads flow", gsum > 0, f"grad_sum={gsum:.1f}")
+dit.zero_grad()
 
-torch.manual_seed(7)
-lA, _ = compute_loss(dit, latent, hid, mask, device="cpu", dtype=torch.bfloat16,
-                     control_latent=src)
-torch.manual_seed(7)
-lB, _ = compute_loss(dit, latent, hid, mask, device="cpu", dtype=torch.bfloat16,
-                     control_latent=src * 3)
-ck("the source is READ: different source -> different prediction",
-   abs(lA.item() - lB.item()) > 1e-9, f"|d|={abs(lA.item() - lB.item()):.2e}")
+# Paired training was removed for Krea 2. Pin that it is REFUSED, loudly: silently ignoring a
+# reference would train an ordinary LoRA while the user believed they were training on pairs.
+_refused = None
+try:
+    D.training_loss(dit, latent, cond, torch.Generator().manual_seed(0), refs=[src])
+except RuntimeError as e:
+    _refused = str(e)
+ck("paired training is refused, not silently ignored",
+   _refused is not None and "no edit training" in _refused, _refused)
 
-# --- 2b. motion-weighted loss -------------------------------------------------------------
-# Weights come from the CLEAN pair diff, are renormalized to per-sample mean 1, and m=0 is
-# byte-identical to the unweighted path. A fully-static pair must degrade to uniform weights
-# (the renorm rescues (1-m) back to 1), so weighting can never change a no-motion loss.
-torch.manual_seed(11)
-lw0, _ = compute_loss(dit, latent, hid, mask, device="cpu", dtype=torch.bfloat16,
-                      control_latent=src, motion_weight=0.0)
-torch.manual_seed(11)
-lw7, _ = compute_loss(dit, latent, hid, mask, device="cpu", dtype=torch.bfloat16,
-                      control_latent=src, motion_weight=0.7)
-ck("motion weight finite and CHANGES the loss when the pair moves",
+# --- 2b. image-pair slider weighting (the successor to motion-weighted loss) ---------------
+# Same contract the motion weight had: weights come from the CLEAN pair difference, are renormed
+# to per-sample mean 1, and a pair with no difference degrades to uniform weights, so weighting can
+# never change the loss of an identical pair.
+lw0 = D.loss_at(dit, latent, noise, t_mid, cond)
+lw7 = D.loss_at(dit, latent, noise, t_mid, cond, diff_ref=src, diff_weight=0.7)
+ck("difference weight finite and CHANGES the loss when the pair differs",
    torch.isfinite(lw7).item() and abs(lw7.item() - lw0.item()) > 1e-9,
    f"|d|={abs(lw7.item() - lw0.item()):.2e}")
 lw7.backward()
 ck("weighted path grads flow",
    any(p.grad is not None and p.grad.abs().sum() > 0 for p in dit.parameters()))
+dit.zero_grad()
 
-torch.manual_seed(13)
-ls0, _ = compute_loss(dit, latent, hid, mask, device="cpu", dtype=torch.bfloat16,
-                      control_latent=latent.clone(), motion_weight=0.0)
-torch.manual_seed(13)
-ls7, _ = compute_loss(dit, latent, hid, mask, device="cpu", dtype=torch.bfloat16,
-                      control_latent=latent.clone(), motion_weight=0.7)
-ck("static pair: weighted == unweighted (uniform-degrade invariant)",
-   abs(ls7.item() - ls0.item()) < 1e-6, f"|d|={abs(ls7.item() - ls0.item()):.2e}")
+ls0 = D.loss_at(dit, latent, noise, t_mid, cond)
+ls7 = D.loss_at(dit, latent, noise, t_mid, cond, diff_ref=latent.clone(), diff_weight=0.7)
+ck("identical pair: weighted == unweighted (uniform-degrade invariant)",
+   abs(ls7.item() - ls0.item()) < 1e-5, f"|d|={abs(ls7.item() - ls0.item()):.2e}")
 
 # --- 3. control-latent caching ------------------------------------------------------------
 from fizgig.krea2.caching import save_latent_cache_krea2  # noqa: E402
@@ -115,12 +115,13 @@ with tempfile.TemporaryDirectory() as td:
     ck("reso-guard reads the main latent (control excluded)",
        ImageDataset.latent_cache_matches_reso(item.latent_cache_path, (448, 256), "krea2") is True)
 
-# --- 4. timestep window -------------------------------------------------------------------
-torch.manual_seed(1)
-t = sample_krea2_timesteps(2000, 448, "cpu", min_timestep=0.4, max_timestep=1.0)
+# --- 4. timestep window (driver._sample_t, one draw per call) ------------------------------
+g = torch.Generator().manual_seed(1)
+t = torch.cat([D._sample_t(48, g, 0.4, 1.0) for _ in range(2000)])
 ck("window respected", t.min().item() >= 0.4 and t.max().item() <= 1.0,
    f"[{t.min():.3f}, {t.max():.3f}]")
-t2 = sample_krea2_timesteps(2000, 448, "cpu")
+g2 = torch.Generator().manual_seed(1)
+t2 = torch.cat([D._sample_t(48, g2) for _ in range(2000)])
 ck("default window untouched", t2.min().item() < 0.1, f"min={t2.min():.3f}")
 
 print()
