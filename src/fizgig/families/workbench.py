@@ -10,6 +10,16 @@ picks it, else with the family's default sampling. Memory follows the trainer's 
 when a prompt changes, and the DiT parks on CPU while it runs whenever both would not fit; on cards under 20 GB the
 DiT also parks for the VAE decode.
 
+Epoch blend / LoRA mix: several files as one LoRA, each at its own weight and all under that LoRA's block sliders -
+exact, since each file is its own adapter, and the bake rank-concatenates them into one file. The files are a run's
+saved epochs at EMA weights (find_epochs + ema_weights) or any LoRAs of the family at amounts the user sets
+(set_sources, the primary's LoRA mix). They load as a mix first needs them (at most MAX_EPOCHS_LOADED per LoRA stay
+on the card).
+
+Model EQ: a LoRA made from the model's own weights (scripts/extract_model_lora.py, marker ss_fizgig_model_lora) maps
+each block's slider s to (s - 1) x its gain - 1.0 and an unticked block are the stock model. Primary, donor or in a
+mix alike; a save bakes the mapped strengths into an ordinary LoRA without the marker.
+
 Turbo Preview (description.activation_cache, switched by the tab's tick through `turbo_preview`): a slider-only change
 replays the blocks before the earliest changed one from the last render (families/act_cache.py).
 
@@ -21,6 +31,7 @@ import gc
 import json
 import logging
 import os
+import re
 import threading
 from typing import Optional
 
@@ -32,6 +43,26 @@ from fizgig.families.lora import FamilyLoRA
 logger = logging.getLogger(__name__)
 
 PRIMARY, DONOR, SPEED = "primary", "donor", "speed_lora"
+MODEL_EQ_MARKER, MODEL_EQ_GAIN = "ss_fizgig_model_lora", "ss_fizgig_model_lora_gain"
+
+
+def model_eq_gain(path):
+    """A Model EQ LoRA's gain (scripts/extract_model_lora.py writes the marker), or None for any other file."""
+    try:
+        from safetensors import safe_open
+        with safe_open(path, "pt") as f:
+            meta = f.metadata() or {}
+    except Exception:
+        return None
+    if meta.get(MODEL_EQ_MARKER) != "1":
+        return None
+    try:
+        return float(meta.get(MODEL_EQ_GAIN, 0.25))
+    except ValueError:
+        return 0.25
+EPOCH = "epoch_"                    # + the epoch number: one adapter per blended epoch (the primary keeps PRIMARY)
+
+from fizgig.families.epochs import _EPOCH_RE, ema_weights, run_epochs   # noqa: F401 (the workbench's own names)
 
 
 class RenderCancelled(Exception):
@@ -102,6 +133,7 @@ class WorkbenchEngine:
         self.primary_path = self.donor_path = None
         self.primary_block_ids, self.donor_block_ids = set(), set()
         self.primary_hash = None
+        self._clear_blend_state()
 
         self._prompt_cache = {}             # (prompt,) -> conditioning dict on CPU
         self._cancel_event = threading.Event()
@@ -120,6 +152,20 @@ class WorkbenchEngine:
         # negative, turbo (strength; 0 = no speed LoRA). None = the family's fixed preview recipe.
         self.preview_settings = None
         self._speed_path = ""
+        # Prompt B (a driver with supports_prompt_blend): the second prompt and how much of it (0 = prompt A only).
+        # Applies to every render, the Baseline too, so Baseline vs Tweaked still shows only the sliders
+        self.prompt_b = None
+        self.prompt_blend = 0.0
+        # audio to audio (a driver with supports_audio_source): the source file, the denoise (1 = start from noise)
+        # and how much of the render follows its melody (0 = none); a reference recording to sound like
+        self.source_path = None
+        self.source_denoise = 1.0
+        self.source_follow = 0.0
+        self.source_repaint = None          # (start, end) seconds: remake only that section of the source (repaint;
+        self.repaint_strength = 0.5         # past its end = extend), the rest kept; the handler's balanced strength
+        self._source_cache = {}
+        self.reference_path = None
+        self._reference_cache = {}
 
     # ---- the block map ------------------------------------------------------------------------------
     def block_groups(self):
@@ -192,7 +238,17 @@ class WorkbenchEngine:
             raise ValueError(f"{os.path.basename(path)} adapts nothing in {self.desc.display_name} "
                              "(a LoRA for another model?)")
         self.net.move_adapter(name, self.device)
+        gain = model_eq_gain(path)
+        eq = self.__dict__.setdefault("_eq", {})
+        eq.pop(name, None)
+        if gain is not None:
+            eq[name] = gain
+            self.net.set_outside(name, False)          # an EQ acts through its block sliders only
         return n
+
+    def is_model_eq(self, role=PRIMARY):
+        """The role's file is a Model EQ LoRA (its sliders read 1.0 = the stock model)."""
+        return role in getattr(self, "_eq", {})
 
     def load_primary(self, path):
         if self.pipeline is None:
@@ -201,6 +257,7 @@ class WorkbenchEngine:
             raise RuntimeError("Primary already loaded — call reset() to swap.")
         n = self._attach(path, PRIMARY)
         self.primary_network = self.net
+        self._clear_blend_state()
         self.primary_path = path
         self.primary_block_ids = self.net.adapter_blocks(PRIMARY)
         self.primary_hash = self._hash(path)
@@ -221,7 +278,16 @@ class WorkbenchEngine:
             return False
         if n == 0:
             return False
+        self.unload_epochs(PRIMARY)
         self.net.move_adapter(PRIMARY, self.device)
+        gain = model_eq_gain(path)                     # the swapped-in file may (or may not) be a Model EQ
+        eq = self.__dict__.setdefault("_eq", {})
+        eq.pop(PRIMARY, None)
+        if gain is not None:
+            eq[PRIMARY] = gain
+            self.net.set_outside(PRIMARY, False)
+        else:
+            self.net.set_outside(PRIMARY, True)
         self.primary_path = path
         self.primary_block_ids = self.net.adapter_blocks(PRIMARY)
         self.primary_hash = self._hash(path)
@@ -238,6 +304,7 @@ class WorkbenchEngine:
         # The donor comes in through its block sliders only (strength 0 by default); anything it adapts outside
         # the block map stays off, as on the other engines.
         self.net.set_outside(DONOR, False)
+        self._clear_blend_state(DONOR)
         self.donor_network = self.net
         self.donor_path = path
         self.donor_block_ids = self.net.adapter_blocks(DONOR)
@@ -245,6 +312,7 @@ class WorkbenchEngine:
 
     def unload_donor(self):
         if self.donor_network is not None:
+            self.unload_epochs(DONOR)
             self.net.remove(DONOR)
             self.donor_network = None
             self.donor_path = None
@@ -259,18 +327,155 @@ class WorkbenchEngine:
         except Exception:
             return None
 
+    # ---- epoch blend / LoRA mix -------------------------------------------------------------------------
+    # Per LoRA (PRIMARY, DONOR): its sources (key -> file: a run's epochs, or the files of a LoRA mix), the weights
+    # in use, all under that LoRA's block sliders and load strength. Loaded files are kept by path, so switching
+    # between a run's epochs and a mix (or back) reuses what is already on the card.
+    MAX_EPOCHS_LOADED = 12              # per LoRA
+
+    @staticmethod
+    def _np(path):
+        return os.path.normcase(os.path.abspath(path))
+
+    def _clear_blend_state(self, role=None):
+        if role is None or not hasattr(self, "_eb"):
+            self._eb = {}
+            self._eb_seq = 0
+        for r in ((PRIMARY, DONOR) if role is None else (role,)):
+            # files: key -> file (an epoch number, or a mix row); adapters: normalised path -> loaded adapter (the
+            # role's own file is the role's adapter and is not listed); own: the key of the role's own file;
+            # blend: {key: weight} in use, else None; kind: "epochs" / "mix"
+            self._eb[r] = {"files": {}, "adapters": {}, "own": None, "blend": None, "kind": "epochs"}
+
+    def _role_path(self, role):
+        return self.primary_path if role == PRIMARY else self.donor_path
+
+    @property
+    def primary_epoch(self):
+        return self._eb[PRIMARY]["own"]
+
+    def epoch_of(self, role=PRIMARY):
+        """The key of the loaded file among its sources (its epoch in its run; None = unnumbered and alone)."""
+        return self._eb[role]["own"]
+
+    def _set_files(self, role, files, kind):
+        path = self._role_path(role)
+        if not path or not self.net or not self.net.has(role):
+            raise RuntimeError(f"Load the {'primary' if role == PRIMARY else 'donor'} LoRA first.")
+        eb = self._eb[role]
+        eb["files"], eb["kind"], eb["blend"] = dict(files), kind, None
+        own = [k for k, f in eb["files"].items() if self._np(f) == self._np(path)]
+        eb["own"] = own[0] if own else None
+        self._invalidate_baseline_cache()
+        self._invalidate_activation_cache()
+
+    def find_epochs(self, role=PRIMARY):
+        """The run of the primary's (or the donor's) file as its sources: [epochs], oldest first (run_epochs).
+        Nothing loads until a blend needs it."""
+        self._set_files(role, run_epochs(self._role_path(role) or ""), "epochs")
+        return sorted(self._eb[role]["files"])
+
+    def set_sources(self, files, role=PRIMARY):
+        """A LoRA mix: {key: file} (the role's own file among them). Weights come with set_blend."""
+        self._set_files(role, {int(k): f for k, f in files.items()}, "mix")
+
+    def _name_for(self, role, path):
+        if self._np(path) == self._np(self._role_path(role) or ""):
+            return role
+        return self._eb[role]["adapters"].get(self._np(path))
+
+    def _sync_epochs(self):
+        """Attach the files each mix weights, and drop unused ones past MAX_EPOCHS_LOADED (renders call it; the
+        engine is theirs)."""
+        for role, eb in self._eb.items():
+            if not eb["blend"] or not self.net or not self.net.has(role):
+                continue
+            wanted = set()
+            for k in sorted(eb["blend"]):
+                f = eb["files"].get(k)
+                if f is None:
+                    continue
+                wanted.add(self._np(f))
+                if self._name_for(role, f) is None:
+                    self._eb_seq += 1
+                    name = f"{EPOCH}{'d' if role == DONOR else 'p'}{self._eb_seq}"
+                    self._attach(f, name)
+                    if role == DONOR:
+                        self.net.set_outside(name, False)     # as the donor itself: its blocks only
+                    eb["adapters"][self._np(f)] = name
+            spare = [np_ for np_ in eb["adapters"] if np_ not in wanted]
+            while len(eb["adapters"]) > self.MAX_EPOCHS_LOADED and spare:
+                self.net.remove(eb["adapters"].pop(spare.pop(0)))
+
+    def _drop_epoch_adapters(self, role):
+        for name in list(self._eb[role]["adapters"].values()):
+            if self.net is not None and self.net.has(name):
+                self.net.remove(name)
+        self._eb[role]["adapters"] = {}
+
+    def unload_epochs(self, role=PRIMARY):
+        self._drop_epoch_adapters(role)
+        self._clear_blend_state(role)
+        self._invalidate_baseline_cache()
+        self._invalidate_activation_cache()
+
+    def set_blend(self, weights, role=PRIMARY):
+        """{key: weight} over the role's sources (ema_weights for a run, the user's amounts for a mix), or None for
+        its file alone. Takes effect at the next render; the Baseline follows it too (the mix, sliders at 1)."""
+        eb = self._eb[role]
+        weights = {int(k): float(w) for k, w in (weights or {}).items() if int(k) in eb["files"]} or None
+        if weights != eb["blend"]:
+            eb["blend"] = weights
+            self._invalidate_baseline_cache()
+            self._invalidate_activation_cache()
+
+    def _blend_sig(self):
+        return tuple((r, eb["kind"], tuple(sorted((self._np(eb["files"][k]), round(w, 5))
+                                                  for k, w in eb["blend"].items())))
+                     for r, eb in sorted(self._eb.items()) if eb["blend"]) or None
+
+    def _role_names(self, role):
+        """(adapter, weight) pairs that LoRA's sliders and load strength drive: its mix, or its file alone."""
+        eb = self._eb[role]
+        out = {role: 0.0}
+        out.update({n: 0.0 for n in eb["adapters"].values()})
+        if not eb["blend"]:
+            out[role] = 1.0
+        else:
+            for k, w in eb["blend"].items():
+                name = self._name_for(role, eb["files"][k])
+                if name is not None:
+                    out[name] = out.get(name, 0.0) + w
+        return list(out.items())
+
+    def blend_record(self, role=PRIMARY):
+        """What a saved file records of the mix: {epoch: weight} for a run, {file name: amount} for a LoRA mix."""
+        eb = self._eb[role]
+        if not eb["blend"]:
+            return None
+        if eb["kind"] == "mix":
+            return {os.path.basename(eb["files"][k]): round(w, 5) for k, w in sorted(eb["blend"].items())}
+        return {str(k): round(w, 5) for k, w in sorted(eb["blend"].items())}
+
     # ---- slider state -------------------------------------------------------------------------------
     def apply_state(self, state):
         """Per-block strength / on-off and each LoRA's load strength, live (no reload)."""
         if self.primary_network is None:
             return
-        for name, who in ((PRIMARY, "primary"), (DONOR, "donor")):
+        targets = []
+        for role, who in ((PRIMARY, "primary"), (DONOR, "donor")):
+            scale = float(getattr(state, f"{who}_scale", 1.0))
+            targets += [(n, who, scale * w) for n, w in self._role_names(role)]
+        eq = getattr(self, "_eq", {})
+        for name, who, strength in targets:
             if not self.net.has(name):
                 continue
+            mult = {b: float(getattr(bs, f"{who}_strength")) for b, bs in state.blocks.items()}
+            if name in eq:                               # Model EQ: 1.0 = stock
+                mult = {b: (m - 1.0) * eq[name] for b, m in mult.items()}
             self.net.set_blocks(
-                name, mult={b: float(getattr(bs, f"{who}_strength")) for b, bs in state.blocks.items()},
-                enabled={b: bool(getattr(bs, f"{who}_enabled")) for b, bs in state.blocks.items()})
-            self.net.set_strength(name, float(getattr(state, f"{who}_scale", 1.0)))
+                name, mult=mult, enabled={b: bool(getattr(bs, f"{who}_enabled")) for b, bs in state.blocks.items()})
+            self.net.set_strength(name, strength)
 
     def mark_blocks_changed(self, blocks):
         pass                                # the activation cache compares slider values itself
@@ -352,7 +557,7 @@ class WorkbenchEngine:
         while the encoder runs when both would not fit."""
         kind = self.reference_kind if ref else ""
         tag = ((ref, round(float(ref_mp), 4)) if kind == "vision" else
-               (ref, int(size[0]), int(size[1])) if kind == "edit" else ())
+               (ref, int(size[0]), int(size[1])) if kind == "edit" else ()) + tuple(self.driver.text_cache_key())
         need = [p for p in prompts if (p,) + tag not in self._prompt_cache]
         if need:
             te_gb = os.path.getsize(self.te_path) / 1024 ** 3 if os.path.exists(self.te_path) else 0.0
@@ -415,7 +620,8 @@ class WorkbenchEngine:
 
     def _settings_key(self):
         ps = self.preview_settings
-        return None if ps is None else (ps.get("steps"), ps.get("cfg"), ps.get("negative"), ps.get("turbo"))
+        opts = tuple(sorted((self.driver.options or {}).items())) if self.driver is not None else ()
+        return (None if ps is None else (ps.get("steps"), ps.get("cfg"), ps.get("negative"), ps.get("turbo"))), opts
 
     def sampling(self):
         """(steps, cfg, sigmas, options) previews use."""
@@ -442,7 +648,80 @@ class WorkbenchEngine:
         return s.steps, s.cfg, s.sigmas, s.options
 
     @torch.no_grad()
-    def render(self, cond, width, height, seed, *, steps=None, noise=None, refs=None, neg_cond=None):
+    def _prompt_b_live(self):
+        return bool(self.prompt_b and float(self.prompt_blend or 0) > 0
+                    and getattr(self.driver, "supports_prompt_blend", False))
+
+    def _prompt_b_key(self):
+        return (self.prompt_b, round(float(self.prompt_blend or 0), 4)) if self._prompt_b_live() else None
+
+    def _source_live(self):
+        return bool(self.source_path and (float(self.source_denoise) < 1.0 or float(self.source_follow or 0) > 0
+                                          or self.source_repaint is not None)
+                    and getattr(self.driver, "supports_audio_source", False))
+
+    @staticmethod
+    def _file_stamp(path):
+        try:
+            return os.path.getsize(path), int(os.path.getmtime(path))
+        except OSError:
+            return None
+
+    def _source_key(self):
+        if not self._source_live():
+            return None
+        rp = self.source_repaint
+        return (self.source_path, self._file_stamp(self.source_path), round(float(self.source_denoise), 4),
+                round(float(self.source_follow or 0), 4),
+                None if rp is None else (round(float(rp[0]), 3), round(float(rp[1]), 3),
+                                         round(float(self.repaint_strength), 4)))
+
+    def _source_latent(self, seconds):
+        key = (self._source_key()[:2], round(float(seconds), 3))
+        if key not in self._source_cache:
+            if self.lowmem:
+                self.vae.to(self.device)
+            try:
+                self._source_cache = {key: self.driver.encode_source(self.vae, self.source_path, seconds)}
+                self._source_wave = None
+            finally:
+                if self.lowmem:
+                    self.vae.to("cpu")
+        return self._source_cache[key]
+
+    def _source_wave_at(self, seconds):
+        """The source's own waveform at the render's length (a repaint's splice), torch (2, n), cached."""
+        key = (self._source_key()[:2], round(float(seconds), 3))
+        if getattr(self, "_source_wave", None) is None or self._source_wave[0] != key:
+            import torch as _t
+            self._source_wave = (key, _t.from_numpy(self.driver.source_wave(self.source_path, seconds)))
+        return self._source_wave[1]
+
+    def _reference_live(self):
+        return bool(self.reference_path and getattr(self.driver, "supports_audio_source", False))
+
+    def _reference_key(self):
+        return (self.reference_path, self._file_stamp(self.reference_path)) if self._reference_live() else None
+
+    def _reference_latent(self):
+        key = self._reference_key()
+        if key not in self._reference_cache:
+            if self.lowmem:
+                self.vae.to(self.device)
+            try:
+                self._reference_cache = {key: self.driver.encode_reference(self.vae, self.reference_path)}
+            finally:
+                if self.lowmem:
+                    self.vae.to("cpu")
+        return self._reference_cache[key]
+
+    def _audio_key(self):
+        """What the audio inputs (source + reference) add to a render's cache keys; None without either."""
+        s, r = self._source_key(), self._reference_key()
+        return None if s is None and r is None else (s, r)
+
+    def render(self, cond, width, height, seed, *, steps=None, noise=None, refs=None, neg_cond=None, cond_b=None,
+               blend=0.0, source=None, refer=None):
         """One image from conditioning with the adapters as currently set (refs: an edit's reference latents;
         neg_cond: the negative, used when the CFG is above 1)."""
         d_steps, cfg, sigmas, options = self.sampling()
@@ -471,25 +750,38 @@ class WorkbenchEngine:
                 raise RenderCancelled()
 
         from fizgig.modules import int8_attention as _i8a
+        meter = self._start_meter()
 
         def _generate():
             with _i8a.renders(self.int8_attention):
                 return self.driver.generate(self.dit, self._cond_to_device(cond), width, height, steps=steps,
                                             seed=int(seed), cfg=cfg, sigmas=sigmas, options=options, noise=noise,
                                             on_step=_step, **({"neg_cond": neg_cond} if neg_cond is not None else {}),
+                                            **({"cond_b": self._cond_to_device(cond_b), "prompt_blend": float(blend)}
+                                               if cond_b is not None else {}),
+                                            **({"source": source, "denoise": float(self.source_denoise),
+                                                "follow": float(self.source_follow or 0)}
+                                               if source is not None else {}),
+                                            **({"repaint": tuple(self.source_repaint),
+                                                "repaint_strength": float(self.repaint_strength)}
+                                               if source is not None and self.source_repaint is not None else {}),
+                                            **({"refer": refer} if refer is not None else {}),
                                             **({"refs": [r.to(self.device) for r in refs]} if refs else {}))
-        if act is None:
-            lat = _generate()
-        else:
-            try:
-                with act.render(self.dit, self._act_modules, key, sig):
-                    lat = _generate()
-            except torch.OutOfMemoryError:
-                # the cache's share of the card was the difference: give it back and render plainly
-                logger.warning("Turbo Preview: out of memory with the cache - rendering without it")
-                self._invalidate_activation_cache()
-                act = None
+        try:
+            if act is None:
                 lat = _generate()
+            else:
+                try:
+                    with act.render(self.dit, self._act_modules, key, sig):
+                        lat = _generate()
+                except torch.OutOfMemoryError:
+                    # the cache's share of the card was the difference: give it back and render plainly
+                    logger.warning("Turbo Preview: out of memory with the cache - rendering without it")
+                    self._invalidate_activation_cache()
+                    act = None
+                    lat = _generate()
+        finally:
+            activity = self._stop_meter(meter)
         if getattr(self.desc, "reference_strength", False):
             self._last_frame_latent = lat[0].detach().to("cpu")     # the next travel frame may edit this one
         if self.lowmem:
@@ -497,17 +789,51 @@ class WorkbenchEngine:
             self.vae.to(self.device)
         try:
             try:
-                return self.driver.decode(self.vae, lat, width, height)
+                out = self.driver.decode(self.vae, lat, width, height)
             except torch.OutOfMemoryError:
                 if self._act is None or not self._act.out:
                     raise
                 logger.warning("Turbo Preview: out of memory decoding beside the cache - cache dropped")
                 self._invalidate_activation_cache()
-                return self.driver.decode(self.vae, lat, width, height)
+                out = self.driver.decode(self.vae, lat, width, height)
+            if source is not None and self.source_repaint is not None:
+                # the handler's waveform splice: outside the section, the source's own audio
+                out.wave = self.driver.splice_source(out.wave, self._source_wave_at(width), self.source_repaint,
+                                                     self.repaint_strength)
+            if activity is not None:
+                try:
+                    out.activity = activity
+                except AttributeError:
+                    pass
+            return out
         finally:
             if self.lowmem:
                 self.vae.to("cpu")
                 self._park_dit(self.device)
+
+    def _start_meter(self):
+        """Block activity (description block_activity): tag each wrapped Linear with its block - only those along
+        the output's sequence (driver.activity_axis) - and start a BlockMeter. None for other families."""
+        if not getattr(self.desc, "block_activity", False) or self.net is None:
+            return None
+        from fizgig.families import lora as _lora
+        for full, mod in self.net.wrapped.items():
+            mod._meter_block = self.driver.block_of(full) if self.driver.activity_axis(full) else None
+        meter = _lora.BlockMeter(skip=(SPEED,))
+        _lora.METER.on = meter
+        return meter
+
+    @staticmethod
+    def _stop_meter(meter):
+        """-> {block id: push along the sequence} (numpy), or None."""
+        if meter is None:
+            return None
+        from fizgig.families import lora as _lora
+        _lora.METER.on = None
+        try:
+            return meter.result() or None
+        except Exception:
+            return None
 
     def generate_preview(self, state, *, seed=None, prompt=None, width=None, height=None, steps=None,
                          seed_b=None, travel_t=0.0, override_ctx=None, override_neg_ctx=None,
@@ -517,6 +843,7 @@ class WorkbenchEngine:
         ignored). The state's reference picture (ref_image_path, ref_megapixels) reaches the prompt the family's way;
         for an edit family with reference_strength it is scaled by state.ref_strength, and prev_latent (the previous
         travel frame's clean latent) joins as a second reference at prev_latent_strength."""
+        self._sync_epochs()
         self.apply_state(state)
         seed = state.seed if seed is None else seed
         width = int(width or state.preview_width)
@@ -529,6 +856,11 @@ class WorkbenchEngine:
                                size=(width, height))[0]
         refs = self._edit_refs(state, ref, width, height, prev_latent, prev_latent_strength) \
             if self.reference_kind == "edit" else None
+        source = self._source_latent(width) if self._source_live() else None
+        refer = self._reference_latent() if self._reference_live() else None
+        cond_b = None
+        if override_ctx is None and self._prompt_b_live():
+            cond_b = self.encode([self.prompt_b], ref=ref, ref_mp=ref_mp, size=(width, height))[0]
         noise = None
         if seed_b is not None:
             noise = _slerp(float(travel_t or 0.0), self.driver.initial_noise(seed, width, height),
@@ -536,7 +868,8 @@ class WorkbenchEngine:
         neg = None
         ps = self.preview_settings
         try:
-            if ps is not None and float(ps.get("cfg") or 1.0) > 1.0:
+            if ps is not None and float(self.sampling()[1] or 1.0) > 1.0:     # the CFG this render uses (a preview
+                #                                                          checkpoint has its own: Qwen's Turbo, CFG 1)
                 # the Samples tab's negative, seen the same way as the prompt (an edit's reference included)
                 neg = self.encode([str(ps.get("negative") or "")], ref=("" if override_ctx is not None else ref),
                                   ref_mp=ref_mp, size=(width, height))[0]
@@ -544,14 +877,17 @@ class WorkbenchEngine:
             neg = None
         self._act_ctx = None
         if override_ctx is None and noise is None and prev_latent is None and not self._act_bypass:
-            self._act_ctx = ((id(self.dit), self.primary_path, self.primary_hash, self.donor_path, self._speed_path,
-                              self._settings_key(), round(float(getattr(state, "primary_scale", 1.0)), 4),
+            self._act_ctx = ((id(self.dit), self.primary_path, self.primary_hash, self._blend_sig(), self.donor_path,
+                              self._speed_path,
+                              self._settings_key(), self._prompt_b_key(), self._audio_key(),
+                              round(float(getattr(state, "primary_scale", 1.0)), 4),
                               round(float(getattr(state, "donor_scale", 1.0)), 4),
                               prompt if prompt is not None else state.prompt, ref, round(float(ref_mp), 4),
                               round(float(getattr(state, "ref_strength", 1.0) or 0.0), 4),
                               int(seed), width, height), self._cache_sig(state))
         try:
-            return self.render(cond, width, height, seed, steps=steps, noise=noise, refs=refs, neg_cond=neg)
+            return self.render(cond, width, height, seed, steps=steps, noise=noise, refs=refs, neg_cond=neg,
+                               cond_b=cond_b, blend=float(self.prompt_blend or 0), source=source, refer=refer)
         finally:
             self._act_ctx = None
 
@@ -592,7 +928,9 @@ class WorkbenchEngine:
     def generate_baseline(self, state):
         """The primary with every slider at 1.0 (at its load strength), donor off. Cached until the prompt, seed,
         size or load strength changes."""
-        key = (self.primary_path, state.seed, state.prompt, state.preview_width, state.preview_height,
+        key = (self.primary_path, self._blend_sig(), self._prompt_b_key(), self._audio_key(), state.seed,
+               state.prompt,
+               state.preview_width, state.preview_height,
                round(float(getattr(state, "primary_scale", 1.0)), 4), self._state_reference(state),
                round(float(getattr(state, "ref_strength", 1.0) or 0.0), 4),
                self._settings_key())
@@ -670,9 +1008,11 @@ class WorkbenchEngine:
         if not blended:
             flat.primary_scale = flat.donor_scale = 1.0
         use_at = 1.0 if blended else float(getattr(state, "primary_scale", 1.0))
+        self._sync_epochs()
         self.apply_state(flat)
         try:
-            names = [PRIMARY] + ([DONOR] if use_donor else [])
+            names = [n for n, w in self._role_names(PRIMARY) if w] + \
+                ([n for n, w in self._role_names(DONOR) if w] if use_donor else [])
             sd, ranks = self.net.bake(names)
         finally:
             self.apply_state(state)
@@ -681,13 +1021,18 @@ class WorkbenchEngine:
                 metadata = {str(k): str(v) for k, v in (f.metadata() or {}).items()}
         except Exception:
             metadata = {}
-        for stale in ("sshs_model_hash", "sshs_legacy_hash", "modelspec.hash_sha256"):
-            metadata.pop(stale, None)
+        for stale in ("sshs_model_hash", "sshs_legacy_hash", "modelspec.hash_sha256", MODEL_EQ_MARKER, MODEL_EQ_GAIN):
+            metadata.pop(stale, None)              # a baked Model EQ is an ordinary LoRA, used at 1.0
         if ranks:
             metadata["ss_network_dim"] = str(max(ranks.values()))
             metadata["ss_network_alpha"] = str(float(max(ranks.values())))
         metadata["ss_repair_studio_config"] = json.dumps(state.to_json(), separators=(",", ":"))
         metadata["ss_repair_studio_use_at"] = f"{use_at:g}"
+        for role, who in ((PRIMARY, ""), (DONOR, "donor_")):
+            rec = self.blend_record(role)
+            if rec and (role == PRIMARY or use_donor):
+                kind = "lora_mix" if self._eb[role]["kind"] == "mix" else "epoch_blend"
+                metadata[f"ss_repair_studio_{who}{kind}"] = json.dumps(rec, separators=(",", ":"))
         if use_donor:
             metadata["ss_repair_studio_donor_path"] = os.path.basename(self.donor_path)
             combined = {m: r for m, r in ranks.items() if self.driver.block_of(m) in blended}
@@ -730,6 +1075,8 @@ class WorkbenchEngine:
         self.primary_path = self.donor_path = None
         self.primary_block_ids, self.donor_block_ids = set(), set()
         self.primary_hash = None
+        self._clear_blend_state()
+        self._eq = {}
         self._prompt_cache = {}
         self._invalidate_baseline_cache()
         self._invalidate_activation_cache()

@@ -68,7 +68,7 @@ Headless, there is no Preferences tab: **model locations are passed as flags on 
 | Turbo LoRA | [krea2_turbo_lora_rank_64_bf16.safetensors](https://huggingface.co/Comfy-Org/Krea-2/blob/main/loras/krea2_turbo_lora_rank_64_bf16.safetensors) | 8-step previews (`--speed_lora`) |
 | VAE `qwen_image_vae.safetensors` | [Krea-2 → vae](https://huggingface.co/Comfy-Org/Krea-2/blob/main/vae/qwen_image_vae.safetensors) | `--vae` (cache step: `--model`) |
 | Text encoder `qwen3vl_4b_fp8_scaled.safetensors` | [Krea-2 → text_encoders](https://huggingface.co/Comfy-Org/Krea-2/blob/main/text_encoders/qwen3vl_4b_fp8_scaled.safetensors) | `--text_encoder` (cache step: `--model`); the bf16 file works too |
-| Turbo DiT (fp8) | [krea2_turbo_fp8_scaled.safetensors](https://huggingface.co/Comfy-Org/Krea-2/blob/main/diffusion_models/krea2_turbo_fp8_scaled.safetensors) | GUI only: the Repair Studio, Explorer and Royale previews |
+| Turbo DiT (fp8) | [krea2_turbo_fp8_scaled.safetensors](https://huggingface.co/Comfy-Org/Krea-2/blob/main/diffusion_models/krea2_turbo_fp8_scaled.safetensors) | GUI only: the Repair Studio and Royale previews |
 
 **MiniMax H3:**
 
@@ -90,8 +90,9 @@ Headless, there is no Preferences tab: **model locations are passed as flags on 
 | DiT (bf16) | [qwen_image_2.1_bf16.safetensors](https://huggingface.co/Comfy-Org/Qwen-Image-2.1/blob/main/diffusion_models/qwen_image_2.1_bf16.safetensors) | training (`--dit`); quantised to INT8 or NF4 at load when `--precision` asks |
 | VAE | [Qwen-Image-2.1 → vae/diffusion_pytorch_model.safetensors](https://huggingface.co/Qwen/Qwen-Image-2.1/blob/main/vae/diffusion_pytorch_model.safetensors) | `--vae` (cache step: `--model`) — Qwen 2.1's own VAE, not the Krea 2 / Qwen-Image one |
 | Text encoder `qwen3vl_8b_bf16.safetensors` | [Qwen-Image-2.1 → text_encoders](https://huggingface.co/Comfy-Org/Qwen-Image-2.1/blob/main/text_encoders/qwen3vl_8b_bf16.safetensors) | `--text_encoder` (cache step: `--model`); loaded 8-bit automatically on cards under ~20 GB free |
-| Fizgig training adapter *(recommended)* | [fizgig_qwen_image_2.1_training_adapter.safetensors](https://huggingface.co/ShootTheSound/Fizgig-Qwen-Image-2.1-Training-Adapter) | `--training_adapter` |
-| Viggle turbo LoRA *(optional)* | [Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors](https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo) | fast previews (`--speed_lora`) |
+| Fizgig training adapter *(recommended)* | [fizgig_qwen_image_2.1_training_adapter_v2.safetensors](https://huggingface.co/ShootTheSound/Fizgig-Qwen-Image-2.1-Training-Adapter) | `--training_adapter` |
+| Turbo LoRA | [qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors](https://huggingface.co/Comfy-Org/Qwen-Image-2.1/blob/main/loras/qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors) | fast previews on the model being trained (`--speed_lora`) |
+| Turbo DiT (int8) | [qwen_image_2.1_turbo_int8_convrot.safetensors](https://huggingface.co/Comfy-Org/Qwen-Image-2.1/blob/main/diffusion_models/qwen_image_2.1_turbo_int8_convrot.safetensors) | the workbench tabs' previews; training previews with `--preview_checkpoint` |
 
 The quickest way to get every file is the fetcher the Preferences download button runs — `python -m fizgig.scripts.fetch_models --family qwen_image21 --include-optional` (from the repo root with `src` on `PYTHONPATH`). It also caches the tokenizer files so training works offline.
 
@@ -158,7 +159,7 @@ Re-running a cache step is cheap: pass `--skip_existing` to only encode new imag
 
 ## Dataset config (TOML)
 
-The dataset config is a small TOML file. The GUI writes one automatically (`dataset/Fizgig_train.toml`); headless you write it yourself:
+The dataset config is a small TOML file. The GUI writes one for each run (in `user_data/dataset/`); headless you write it yourself:
 
 ```toml
 [general]
@@ -177,6 +178,7 @@ cache_directory = "/data/my_subject/cache"
 Field notes:
 
 - **`resolution`** — `[width, height]`. With bucketing enabled this is the *area* target: each image is assigned to the nearest aspect-ratio bucket of roughly `width × height` pixels, so mixed portrait/landscape/square datasets train at their natural aspect ratios. `[1024, 1024]` ≈ 1 MP is the sweet spot for both Klein and Krea 2; `[768, 768]` trains faster on smaller cards at some quality cost.
+- **`batch_size`** — keep it at 1: Fizgig trains one image a step. For a larger effective batch, pass `--gradient_accumulation_steps N` to the trainer: the same averaged gradient, at the memory of batch 1.
 - **`num_repeats`** — multiplies how often each image appears per epoch. Leave at 1 and train more epochs instead, unless you're balancing multiple `[[datasets]]` blocks against each other.
 - **`cache_directory`** — where latents and text embeddings are stored. **Give every dataset its own cache directory.** The training set is built from the cache, and a shared cache directory can mix a previous dataset's images into your run. (Fizgig cross-checks the cache against `image_directory` and skips orphans with a warning, but a dedicated directory per dataset is the clean way.)
 - **Multiple `[[datasets]]` blocks** are supported — each with its own `image_directory`, `cache_directory`, and optional per-dataset overrides of any `[general]` key (e.g. a different `num_repeats` to weight one folder more heavily).
@@ -340,7 +342,7 @@ The non-obvious flags (`--help` lists them all):
 
 - `--log_per_image_loss` — tracks every image's loss residual against its timestep bucket, classifies each image at every epoch boundary (`easy` / `suspect` / `stuck` / `exhausted` / `excluded`), and writes:
   - `<output_dir>/loss_log/per_image_loss.jsonl` — the raw per-step log
-  - `<output_dir>/loss_log/problem_images.json` — current verdicts + trends (the GUI's Problem Images window reads this; it's plain JSON, perfectly greppable headless)
+  - `<output_dir>/loss_log/problem_images.json` — current verdicts + trends (the per-image loss view in Runs & outputs reads this; it's plain JSON, perfectly greppable headless)
   - a **plateau banner** in the console when ≤~5% of images are still improving, with a best-checkpoint epoch estimate — your "you're done" signal.
 - `--per_image_lr` — acts on the verdicts: stuck images get throttled (×0.5 → ×0.25 → ×0.125), mined-out images ease off (×0.6), the healthy cohort gets a gentle boost (×1.1). Batch size 1 makes this a true per-image learning rate.
 - `--auto_recaption` — between epochs, confirmed-stuck images get their captions rewritten by Qwen3-VL from what's actually visible, the text cache is re-encoded, and the image gets a fresh start. Two failed attempts and a still-stuck image is excluded from the run entirely. Requires `--text_encoder`. Pass `--trigger_word` so rewritten captions keep your trigger (appended as `, <trigger>`).
@@ -420,7 +422,7 @@ H3's own settings are `--family_option name=value` pairs (the GUI's Training-tab
 
 ## Qwen Image 2.1 training
 
-Qwen Image 2.1 is the first model on Fizgig's driver system: one cache script and one trainer (`src/fizgig/families/`) serve it, selected with `--family qwen_image21`. You need the files from the [download table](#model-files-where-they-come-from-where-they-go): the bf16 DiT, the VAE and the Qwen3-VL-8B text encoder, plus the training adapter and the Viggle turbo LoRA, which are optional but both in the default recipe. The dataset TOML is the same as the other families'. 10 GB is the smallest card Qwen trains on.
+Qwen Image 2.1 is the first model on Fizgig's driver system: one cache script and one trainer (`src/fizgig/families/`) serve it, selected with `--family qwen_image21`. You need the files from the [download table](#model-files-where-they-come-from-where-they-go): the bf16 DiT, the VAE and the Qwen3-VL-8B text encoder, plus the training adapter and the Turbo LoRA, which are optional but both in the default recipe. The dataset TOML is the same as the other families'. 10 GB is the smallest card Qwen trains on.
 
 ### Full example
 
@@ -442,12 +444,12 @@ python src/fizgig/families/train.py \
   --optimizer_type adamw8bit \
   --precision auto --blocks_to_swap -1 \
   --ema_decay 0.98 \
-  --training_adapter /models/fizgig_qwen_image_2.1_training_adapter.safetensors \
+  --training_adapter /models/fizgig_qwen_image_2.1_training_adapter_v2.safetensors \
   --log_per_image_loss \
   --save_state --save_state_on_train_end --keep_last_n_states 2 \
   --vae /models/qwen_image_2.1_vae_diffusers.safetensors \
   --text_encoder /models/qwen3vl_8b_bf16.safetensors \
-  --speed_lora /models/Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors \
+  --speed_lora /models/qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors --sample_steps 8 \
   --sample_prompts sample_prompts.txt \
   --sample_every_n_epochs 1 --sample_at_first \
   --sample_width 1024 --sample_height 1024 --sample_seed 1234
@@ -492,7 +494,7 @@ The other two presets change only a few flags. **Standard** is `--network_dim 16
 
 **MiniMax H3** prompt files are plain prompts too. Previews are clips: `--sample_frames` sets the length on the model's 17n+5 frame grid (1 = a still, 56 ≈ 2.3 s, 124 = the trained minimum of ~5 s; off-grid values snap down), `--sample_audio` with `--audio_vae` decodes the clip's generated sound to a `.wav` beside the `.mp4`, and `--turbo_lora_path` with `--sample_steps 6` renders on the Turbo LoRA at `--turbo_lora_strength 0.75` (20 steps without it, matching ComfyUI's shipped template). `--sample_width/height` default to H3's native 768. The training adapter is switched off for previews; a Context LoRA stays on. Rendering a 56-frame clip every epoch costs more than the epoch's training on a small dataset — set `--sample_every_n_epochs` higher, or preview stills, when speed is the point.
 
-**Qwen Image 2.1** prompt files are plain prompts; `--sample_width/height/seed` set the rest. With `--speed_lora` the previews render with the Viggle turbo LoRA at strength 1.0 for 6 steps, on its own schedule (`--speed_lora_strength` and `--sample_steps` override; other step counts use the model's standard schedule). Without it they render at 25 steps. `--sample_cfg_scale` above 1 applies with or without the turbo LoRA, with `--sample_negative`; no turbo, `--sample_steps 20 --sample_cfg_scale 3` works very well, at roughly twice the time per preview. The training adapter is off for previews and a Context LoRA stays on. `--sample_at_first` renders an epoch-0 preview.
+**Qwen Image 2.1** prompt files are plain prompts; `--sample_width/height/seed` set the rest. With `--speed_lora` the previews render with the Turbo LoRA at strength 1.0 for 8 steps at CFG 1, on the Turbo checkpoint's own schedule (`--speed_lora_strength` and `--sample_steps` override; other step counts use the model's standard schedule). `--preview_checkpoint <Turbo DiT>` renders them on the Turbo DiT instead (8 steps, CFG 1), with the training model parked beside it. Without either they render on the plain model at `--sample_steps 25 --sample_cfg_scale 3` with `--sample_negative`; `--sample_cfg_scale 1` turns CFG off, at roughly half the time per preview. The training adapter is off for previews and a Context LoRA stays on. `--sample_at_first` renders an epoch-0 preview.
 
 Samples are written to `<output_dir>/sample/` with the epoch number in the filename. Prefer ~1024×1024 on Klein and Krea 2 — sub-1024 previews degrade anatomy and undersell the checkpoint.
 

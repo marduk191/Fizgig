@@ -7,7 +7,7 @@ writes the paths into prefs.json for you.
     python -m fizgig.scripts.fetch_models --family krea2      # ~45 GB, no HF account needed
     python -m fizgig.scripts.fetch_models --family klein      # ~39 GB, needs an HF token
     python -m fizgig.scripts.fetch_models --family minimax    # ~47 GB, no HF account needed
-    python -m fizgig.scripts.fetch_models --family qwen_image21 --include-optional   # ~38 GB, no HF account needed
+    python -m fizgig.scripts.fetch_models --family qwen_image21    # ~41 GB, no HF account needed
     python -m fizgig.scripts.fetch_models --family tools      # ~1.6 GB helper models
     python -m fizgig.scripts.fetch_models --all
 
@@ -41,7 +41,8 @@ EMIT_PROGRESS = False
 class Weight:
     """One .safetensors file: where it lives on HF, where it goes, which pref points at it."""
 
-    def __init__(self, pref_key, repo, path_in_repo, gb, note, optional=False, gated=False, local_name=None):
+    def __init__(self, pref_key, repo, path_in_repo, gb, note, optional=False, gated=False, local_name=None,
+                 replaces=()):
         self.pref_key = pref_key
         self.repo = repo
         self.path_in_repo = path_in_repo
@@ -50,6 +51,7 @@ class Weight:
         self.note = note
         self.optional = optional
         self.gated = gated
+        self.replaces = tuple(replaces)          # earlier versions of this file: a pref on one moves to this one
 
 
 # The Captions tab captions ANY dataset with the Krea 2 Qwen3-VL text encoder — it follows an
@@ -135,7 +137,8 @@ def _described_families():
         if not d.training_ready:
             continue
         ws = [Weight(f.pref_key, f.repo, f.path, f.size_gb, f.label + (" — " + f.note if f.note else ""),
-                     optional=f.fetch_is_optional, gated=f.gated, local_name=f.local_name or None)
+                     optional=f.fetch_is_optional, gated=f.gated, local_name=f.local_name or None,
+                     replaces=f.replaces)
               for f in d.model_files if f.repo and f.path]
         out[d.key] = ws + ([] if any(w.pref_key == _CAPTION_TE.pref_key for w in ws) else [_CAPTION_TE])
     return out
@@ -293,6 +296,9 @@ def fetch_weight(w, models_dir, prefs, token=None, log=print, dry_run=False):
     # every one of those would have been "too small", silently re-downloaded, and the user's
     # path overwritten with ours.
     current = str(prefs.get(w.pref_key) or "").strip()
+    if current and os.path.basename(current) in w.replaces:
+        log(f"  [new]  {w.pref_key}: {os.path.basename(current)} has a newer version, {w.filename}")
+        current = ""                             # an earlier version of ours: fetch the new one and point at it
     if current and os.path.isfile(current):
         if os.path.basename(current) != w.filename:
             log(f"  [keep] {w.pref_key} -> {os.path.basename(current)} (your own choice, not replacing it)")
@@ -407,8 +413,11 @@ def fetch_tool(spec, log=print, dry_run=False):
 def fetch(families, models_dir=None, repo_dir=REPO_DIR, token=None, include_optional=False,
           log=print, dry_run=False):
     """Fetch every asset for the named families. Returns True if nothing failed."""
-    models_dir = os.path.abspath(models_dir or os.path.join(repo_dir, "models"))
-    prefs_file = os.path.join(repo_dir, "prefs.json")
+    models_dir = os.path.abspath(models_dir or os.path.join(repo_dir, "user_data", "models"))
+    if os.path.normcase(os.path.abspath(repo_dir)) == os.path.normcase(REPO_DIR):
+        from fizgig import user_data
+        user_data.migrate()
+    prefs_file = os.path.join(repo_dir, "user_data", "prefs.json")
     if not dry_run:
         os.makedirs(models_dir, exist_ok=True)
     prefs = _load_prefs(prefs_file)
@@ -462,8 +471,8 @@ def main():
                    help="Repeatable. Krea 2 needs no HF account; Klein is gated.")
     p.add_argument("--all", action="store_true", help="Every family, including the helper models.")
     p.add_argument("--include-optional", action="store_true",
-                   help="Also fetch the optional files (Krea 2 Turbo DiT ~13 GB, "
-                        "MiniMax ref2va DiT ~21 GB).")
+                   help="Also fetch the optional files (Krea 2 Turbo DiT ~13 GB, MiniMax ref2va DiT ~21 GB, "
+                        "SDXL's separate VAE, Anima's Turbo LoRA).")
     p.add_argument("--models-dir", default=None, help="Default: <repo>/models")
     p.add_argument("--token", default=None, help="HuggingFace token for gated repos (or HF_TOKEN).")
     p.add_argument("--dry-run", action="store_true", help="Show what would be fetched.")

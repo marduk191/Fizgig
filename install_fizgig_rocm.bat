@@ -1,6 +1,6 @@
 @echo off
 REM Fizgig ROCm Windows installer.
-REM Uses detect_gpu.py (GPL-3.0, from comfyui-rocm - see THIRD_PARTY_NOTICES.md)
+REM Uses detect_gpu.py (GPL-3.0, from comfyui-rocm - see docs/THIRD_PARTY_NOTICES.md)
 REM and ROCm-wheel install patterns adapted from comfyui-rocm install.bat:
 REM   https://github.com/patientx/comfyui-rocm
 setlocal enabledelayedexpansion
@@ -128,13 +128,14 @@ python -m pip install --upgrade uv
 echo.
 echo Detecting AMD GPU architecture...
 set "arch="
-if not exist "detect_gpu.py" (
-    echo ERROR: detect_gpu.py not found in %~dp0
+if not exist "src\install\detect_gpu.py" (
+    echo ERROR: src\install\detect_gpu.py not found in %~dp0
     pause
     exit /b 1
 )
 
-for /f "delims=" %%A in ('python detect_gpu.py 2^>"%~dp0gpu_detect_debug.log"') do (
+if not exist "%~dp0user_data" mkdir "%~dp0user_data"
+for /f "delims=" %%A in ('python src\install\detect_gpu.py 2^>"%~dp0user_data\gpu_detect_debug.log"') do (
     if not "%%A"=="" set "arch=%%A"
 )
 
@@ -242,7 +243,7 @@ echo.
 echo ============================================================
 echo   Installation complete!
 echo.
-echo   Launch with: run_fizgig_rocm.bat
+echo   Start Fizgig with: Launch Fizgig AMD.bat
 echo   ^(sets ROCm tuning env vars before starting the GUI^)
 echo ============================================================
 goto :end

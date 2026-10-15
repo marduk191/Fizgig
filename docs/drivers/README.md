@@ -1,6 +1,6 @@
 # Adding a model to Fizgig: the driver system
 
-Every model Fizgig trains — Klein 9B, MiniMax H3, Krea 2, Qwen Image 2.1, SDXL and Anima — runs through one shared layer in `src/fizgig/families/`. A model is added as a **family**, and a family is three pieces:
+Every model Fizgig trains — Klein 9B, MiniMax H3, Krea 2, Qwen Image 2.1, Z-Image Turbo, SDXL and Anima — runs through one shared layer in `src/fizgig/families/`. A model is added as a **family**, and a family is three pieces:
 
 | Piece | Where | What it holds |
 |---|---|---|
@@ -13,7 +13,7 @@ Register the description in `src/fizgig/families/registry.py`. That is the only 
 - the caching and training entry points (`families/cache.py`, `families/train.py`), on the command line and from the GUI
 - the GUI: the Base Model picker, its Preferences section and download buttons, the Training and Samples tabs, presets, validation and the training queue
 - previews during training, LoRA saving in the family's own key format, resume and pause
-- the workbench tabs: Repair Studio, LoRA the Explorer, Profiler, Extract and LoRA Royale
+- the workbench tabs: Repair Studio, Profiler, Extract and LoRA Royale
 
 You don't edit the GUI, the trainer or the tools. If your model needs something the layer doesn't have yet, see [When the layer is missing something](#when-the-layer-is-missing-something).
 
@@ -29,6 +29,7 @@ Adding a model (or fine-tuning for a model Fizgig already has) starts with a pos
 4. **[Abilities](ABILITIES.md)**: the optional features a description switches on, and what each one asks of the driver.
 5. **[Fine-tuning](FINETUNE.md)**: optional. Full fine-tuning of the base model, which you, the maintainer or anyone else can add after the family ships.
 6. **[Before you ship](CHECKLIST.md)**: the checks a new family must pass, and what a finished family includes (research, parity, fast presets, compile, INT8 attention, default negative and more).
+7. **[Driver excerpts](EXCERPTS.md)**: real code from Qwen Image 2.1 (stills) and MiniMax H3 (clips and sound) at the places new drivers most often go wrong, kept identical to the source by `src/fizgig/families/doc_excerpts.py --check`.
 
 The existing families are the best reference. Read them side by side:
 
@@ -73,7 +74,7 @@ Pause, resume, EMA, Adaptive LR, gradient clipping, the per-image loss watch, Lo
 
 ### 3. The workbench — `families/workbench.py`
 
-Repair Studio, the Explorer and Royale share one engine (`WorkbenchEngine`):
+Repair Studio and Royale share one engine (`WorkbenchEngine`):
 
 - **Load:** the same base-model load as training (forward only), `load_vae`, the LoRA over `lora_target_names`, and the preview speed LoRA if the family has one.
 - **Sliders:** one per block in `block_map(dit)`; `block_of(module)` maps each LoRA module to its slider.

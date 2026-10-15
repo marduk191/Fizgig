@@ -1,0 +1,1667 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="fizgig-token" content="__FIZGIG_TOKEN__">
+  <title>Fizgig</title>
+  <link rel="icon" href="/icon.png">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/icon-192.png">
+  <meta name="theme-color" content="#12161D">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Fizgig">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="window-titlebar">
+    <div class="window-title-left">
+      <img src="/icon.png" class="window-title-icon" alt="" onerror="this.style.display='none'">
+      <span class="window-title-text">Fizgig — LoRA &amp; Fine-tune Studio</span>
+    </div>
+  </header>
+
+  <div class="app-window-body">
+    <main class="notebook-container">
+      <aside class="tab-strip-row">
+        <div class="side-brand"><img src="/icon.png" alt="" onerror="this.style.display='none'">
+          <span>Fizgig<small>LoRA &amp; Fine-tune Studio</small></span></div>
+        <button class="tabs-toggle" id="tabsToggle" aria-expanded="false" aria-controls="tabs"
+          title="The tabs"><span class="tabs-toggle-icon">☰</span><span id="tabsToggleName">1. Start</span>
+          <span class="tabs-toggle-caret">▾</span></button>
+        <nav class="tab-bar-scroller" id="tabs">
+          <div class="side-label">Train</div>
+          <button class="tab-item active" data-tab="start"><i></i><span>1. Start</span></button>
+          <button class="tab-item" data-tab="prep"><i></i><span>2. Image Prep</span></button>
+          <button class="tab-item" data-tab="captions"><i></i><span>3. Captions</span></button>
+          <button class="tab-item" data-tab="samples"><i></i><span>4. Samples</span></button>
+          <button class="tab-item" data-tab="training"><i></i><span>5. Training</span></button>
+          <div class="side-label">After</div>
+          <button class="tab-item" data-tab="outputs"><i></i><span>Runs &amp; outputs</span></button>
+          <button class="tab-item" data-tab="profiler"><i></i><span>Profiler</span></button>
+          <button class="tab-item" data-tab="studio"><i></i><span>Studio</span></button>
+          <button class="tab-item" data-tab="royale"><i></i><span>LoRA Royale</span></button>
+          <button class="tab-item" data-tab="refmod"><i></i><span>RefMod Toolkit</span></button>
+          <button class="tab-item" data-tab="extract"><i></i><span>Extract</span></button>
+          <button class="tab-item" data-tab="metadata"><i></i><span>Metadata</span></button>
+          <button class="tab-item" data-tab="prefs"><i></i><span>Preferences</span></button>
+          <button class="tab-item" data-tab="pods" id="podsTabBtn" style="display:none"><i></i><span>Pods</span></button>
+        </nav>
+        <button class="side-run" id="sideRun" data-goto="training" title="The run - open the Training tab">
+          <span class="side-run-top"><span class="run-badge" id="runBadge"></span><span id="sideRunName"></span></span>
+          <span class="run-bar"><span id="sideRunBar"></span></span>
+          <span class="side-run-text" id="sideRunText"></span>
+        </button>
+        <div class="side-queue" id="sideQueue" role="button" tabindex="0" title="The queue - open it on the Training tab"
+          style="display:none">
+          <div class="side-queue-head"><span class="side-queue-title">Up next</span><span class="run-badge" id="sideQueueBadge"></span></div>
+          <div class="side-queue-list" id="sideQueueList"></div>
+          <div class="side-queue-held" id="sideQueueHeld"></div>
+          <button class="btn btn-sm btn-primary" id="sideQueueStart" style="display:none">Start queue</button>
+        </div>
+        <div class="gpu-monitor" id="statusBar"></div>
+        <a class="runpod-btn" id="sideDeploy" href="https://console.runpod.io/deploy?type=GPU&amp;gpu=RTX+5090&amp;count=1&amp;template=bdrdew7hxw&amp;ref=vkb387ep"
+          target="_blank" rel="noopener" title="Run Fizgig on a rented GPU: RunPod's Fizgig template, ready to train"><i></i><span>Deploy on RunPod</span></a>
+        <a class="runpod-btn files-btn" id="sideFiles" target="_blank" rel="noopener" style="display:none"><i></i><span>File manager</span></a>
+        <button class="about-btn" id="aboutBtn" title="About Fizgig"><i></i><span>About</span></button>
+        <a class="coffee-btn" href="https://buymeacoffee.com/lorasandlenses" target="_blank" rel="noopener"
+          title="Fizgig is free: a coffee keeps it going"><i></i><span>Buy me a coffee</span></a>
+      </aside>
+
+      <div class="notebook-pane">
+        <div class="section-card warning-card pod-stop-bar" id="podStopBar" style="display:none">
+          <div class="card-content"><b>Training finished.</b> <span id="podStopText"></span>
+            <button class="btn btn-primary" id="podStopKeep">Keep the pod running</button>
+            <div class="field-hint">Your LoRA and everything else under /workspace stays on the volume for next time.</div></div>
+        </div>
+        <div class="section-card warning-card" id="outdatedBanner" style="display:none">
+          <div class="card-content">Fizgig was updated while this web UI kept running: restart the web UI (close and reopen
+            the Fizgig window, or Fizgig in browser), then reload this page. Until then some
+            new parts won't work.</div>
+        </div>
+        <section id="tab-start" class="tab-panel active">
+          <div class="tab-banner">
+            <h1>Welcome to Fizgig</h1>
+            <p>Train LoRAs and fine-tunes: pick a model and your training folder, set the previews,
+              then start a run and watch it here.</p>
+          </div>
+          <div class="section-card accent-card">
+            <div class="card-title">Model</div>
+            <div class="card-desc">What you're training. The Samples, Training and Preferences tabs follow it (Samples and
+              Training have the same picker).</div>
+            <div class="card-content">
+              <div class="field-row"><span class="field-label">Model:</span>
+                <select id="familySelect" class="w-combo-lg family-pick"></select></div>
+              <div class="field-hint" id="familyNotes"></div>
+            </div>
+          </div>
+          <div class="section-card accent-card">
+            <div class="card-title">Training folder</div>
+            <div class="card-desc">The pictures (or clips, or songs) to train on, each with a caption file beside it.
+              Captions and Training read from here.</div>
+            <div class="card-content">
+              <div class="field-row"><span class="field-label">Folder:</span>
+                <input type="text" id="imageFolder" class="w-path" placeholder="/workspace/datasets/my_subject">
+                <button class="btn btn-primary" data-pick="imageFolder" data-dir="1"
+                  title="Pick a folder on the machine running Fizgig">Choose…</button></div>
+              <div class="field-hint" id="folderSummary"></div>
+            </div>
+          </div>
+          <div class="section-card" id="datasetsCard">
+            <div class="card-title"><span>Your training data</span>
+              <button class="btn btn-sm" id="datasetsReload">Reload</button></div>
+            <div class="card-desc" id="datasetsDesc">The folders in your training data folder. Click one to train on it.</div>
+            <div class="card-content">
+              <div class="field-row" id="datasetsSearchRow" style="display:none"><span class="field-label">Search:</span>
+                <input type="text" id="datasetsSearch" class="w-path" placeholder="folder name"></div>
+              <div class="dataset-grid" id="datasetsGrid"></div>
+            </div>
+          </div>
+          <div class="section-card accent-card" id="podLocalCard" style="display:none">
+            <div class="card-title"><span>From this computer</span>
+              <div class="card-title-tools"><select id="podLocalSort" class="w-combo-md" title="Order of the folders">
+                  <option value="new">Newest first</option><option value="old">Oldest first</option>
+                  <option value="az">Name A-Z</option><option value="za">Name Z-A</option>
+                  <option value="big">Largest first</option><option value="many">Most files first</option>
+                </select><button class="btn btn-sm" id="podLocalReload">Refresh</button></div></div>
+            <div class="card-desc" id="podLocalDesc">The training folders on the computer you're at. Send one here and it trains here: it
+              goes up with its captions, picks up where it left off if the connection drops, and skips what's already
+              here. Then it's the training folder.</div>
+            <div class="card-content">
+              <div class="dataset-grid" id="podLocalGrid"></div>
+              <div class="field-hint" id="podLocalStatus"></div>
+            </div>
+          </div>
+          <div class="section-card" id="uploadCard">
+            <div class="card-title">Upload a training folder</div>
+            <div class="card-desc">The folder above is on the machine running Fizgig. If your training data (pictures, clips or
+              songs) is on the computer you're using now, upload it here, with the caption .txt files (a .zip works too).</div>
+            <div class="card-desc">On the computer running Fizgig? There's no need to use this: Choose… above picks
+              your folder directly.</div>
+            <div class="card-content" id="uploadBody">
+              <div class="field-row"><span class="field-label">New folder name:</span>
+                <input type="text" id="uploadName" class="w-combo-lg" placeholder="my_subject"></div>
+              <div class="upload-drop" id="uploadDrop">Drop a folder or files here, or
+                <label class="btn" title="From the device you're using now, sent to the machine running Fizgig. On the computer running Fizgig itself there's no need: Choose… picks it directly.">Upload a folder…<input type="file" id="uploadDir" webkitdirectory hidden></label>
+                <label class="btn" title="From the device you're using now, sent to the machine running Fizgig. On the computer running Fizgig itself there's no need: Choose… picks it directly.">Upload files…<input type="file" id="uploadFiles" multiple hidden
+                  accept="image/*,.mp4,audio/*,.m4a,.txt,.caption,.json,.zip"></label></div>
+              <div class="field-hint" id="uploadWhere"></div>
+              <div class="field-hint" id="uploadStatus"></div>
+              <div class="field-hint" id="uploadFm" style="display:none">A big dataset? Drag the folder into this pod's
+                <a class="fm-link" target="_blank" rel="noopener">file manager</a> instead, into
+                <code>/workspace/training_data</code>.</div>
+            </div>
+          </div>
+          <div class="section-card warning-card" id="modelWarning" style="display:none">
+            <div class="card-title">Model files needed</div>
+            <div class="card-desc" id="modelWarningText"></div>
+            <div class="card-content"><button class="btn btn-primary" data-goto="prefs">Open Preferences</button></div>
+          </div>
+          <div class="section-card" id="phoneCard" style="display:none">
+            <div class="card-title">Open on your phone</div>
+            <div class="card-desc">Scan the code with your phone's camera: it opens this Fizgig already logged in, and
+              the phone stays logged in for 30 days, so you can keep an eye on a run from anywhere.</div>
+            <div class="card-content phone-row">
+              <div class="phone-qr" id="phoneQr"></div>
+              <div class="phone-side"><div class="field-hint" id="phoneNote"></div>
+                <div class="field-row" id="phoneBtns"></div></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="tab-prep" class="tab-panel">
+          <div class="tab-banner">
+            <h1>Image Prep</h1>
+            <p>Resize, convert to PNG, and optionally face-crop your training images. Optional: skip straight to
+              Captions if your images are already prepared.</p>
+          </div>
+          <div class="section-card" id="gizmoCard" style="display:none">
+            <div class="card-title">Working from video or audio?</div>
+            <div class="card-desc">Gizmo cuts training clips, voice segments and song sections. Video: scrub to a moment, pick a
+              length, save - frame rate, frame count, sizing and sound all come out on spec. Audio: open a recording, scrub the
+              waveform, caption the voice (with optional Whisper transcription) and export ready training segments. Still images
+              need none of this.</div>
+            <div class="card-content">
+              <div class="field-row"><button class="btn btn-primary" id="gizmoOpen">🎬🎙 Open Gizmo</button>
+                <span class="field-hint" id="gizmoNote">opens in its own window on this computer - Fizgig keeps running</span></div>
+            </div>
+          </div>
+          <div class="section-card">
+            <div class="card-title">Training folder</div>
+            <div class="card-desc">Everything below happens inside the training folder from the Start tab: prepared
+              images land there, ready for the Captions tab and training.</div>
+            <div class="card-content"><div class="field-hint" id="prepFolder"></div></div>
+          </div>
+          <div class="section-card" id="gizmoAway" style="display:none">
+            <div class="card-title">Working from video or audio?</div>
+            <div class="card-desc">Gizmo cuts training clips and voice segments: frame rate, frame count, sizing and
+              sound come out on spec, with optional Whisper transcription for voice. It opens in its own window on the
+              computer running Fizgig, so it isn't offered on this page: use it in Fizgig on your own computer (Image
+              Prep, Open Gizmo), then upload what it makes. Still images need none of this.</div>
+          </div>
+          <div class="section-card" id="prepAudioOnly" style="display:none">
+            <div class="card-desc">🎙 Audio-only training set: this tab prepares images, and voice recordings need none
+              of it. Segments are cut, captioned and sized in Gizmo's audio tab; your files here are
+              already ready to train.</div>
+          </div>
+          <div id="prepMain">
+            <div class="section-card">
+              <div class="card-title">1 · What to do</div>
+              <div class="card-content">
+                <label class="radio-label"><input type="radio" name="prepMode" value="Auto Prep (Face Crops)">
+                  Resize + face close-ups — recommended for people</label>
+                <div class="field-hint radio-hint">Every photo is resized and saved as PNG, plus a zoomed-in copy of
+                  the face saved beside it: more detail shots for better likeness. 💡 Works best on high-res
+                  originals: if your photos are already shrunk to training size, the face close-ups come out soft.
+                  Start from the biggest versions you have.</div>
+                <label class="radio-label"><input type="radio" name="prepMode" value="Resize Only"> Resize only</label>
+                <div class="field-hint radio-hint">Just resize and convert to PNG. Use for styles, objects, or
+                  already-cropped sets.</div>
+                <label class="radio-label"><input type="radio" name="prepMode" value="Face Crop Only">
+                  Face close-ups only</label>
+                <div class="field-hint radio-hint">Keep only the cropped face from each photo: the full shot is not
+                  kept.</div>
+                <div class="field-row prep-opts">
+                  <span class="field-label">Target megapixels:</span><select id="prepMp" class="w-combo"></select>
+                  <span class="field-hint">MP (larger images shrink to fit; smaller are left alone)</span>
+                </div>
+                <div class="field-row prep-opts prep-face">
+                  <span class="field-label">Face:</span><select id="prepFace" class="w-combo"></select>
+                  <span class="field-label">Padding:</span>
+                  <input type="text" id="prepPadding" class="w-num" value="20">
+                  <span class="field-hint">% around the face</span>
+                </div>
+                <div class="field-hint" id="prepNoFaces" style="display:none">Face detection isn't installed on the
+                  Fizgig computer: run install_fizgig.py there to add it. Resize only still works.</div>
+                <div class="field-hint">Sizing is by target area (megapixels), not longest side: this matches how
+                  training buckets your images, so prepping costs you no resolution. Aspect ratio is kept; nothing is
+                  cropped.</div>
+                <div class="problems" id="prepMpWarn"></div>
+              </div>
+            </div>
+            <div class="section-card">
+              <div class="card-title">2 · Your originals</div>
+              <div class="card-content">
+                <label class="radio-label"><input type="radio" name="prepReplace" value="0" checked>
+                  Keep them safe — moved to an 'originals' subfolder</label>
+                <label class="radio-label"><input type="radio" name="prepReplace" value="1">
+                  Replace them ⚠ originals are gone after this</label>
+              </div>
+            </div>
+            <div class="section-card accent-card">
+              <div class="card-title">📋 What will happen</div>
+              <div class="card-content"><div class="prep-summary" id="prepSummary"></div></div>
+            </div>
+            <div class="section-card">
+              <div class="card-title">3 · Run it</div>
+              <div class="card-content">
+                <div class="field-row"><button class="btn btn-primary" id="prepRun">✨ Prepare Images Now</button>
+                  <span class="field-hint" id="prepState"></span></div>
+                <div class="field-row"><span class="field-hint">Want to check first?</span>
+                  <button class="btn btn-sm" id="prepTest">Test face detection on one photo…</button>
+                  <span class="field-hint">optional and safe: shows the crop, writes nothing</span></div>
+                <div id="prepTestResult"></div>
+              </div>
+            </div>
+            <div class="section-card">
+              <div class="card-title">Output log</div>
+              <div class="card-content"><pre class="console-terminal prep-log" id="prepLog"></pre></div>
+            </div>
+          </div>
+          <div class="section-card" id="lookCard">
+            <div class="card-title">Final step: Look Consistency Filter (faces)</div>
+            <div class="card-desc">Run this last, after every other prep stage: it scores the finished training
+              folder. Pick three baseline pictures that nail the look you want; every picture's face is scored against
+              all three and averaged (ArcFace similarity), so no one photo's angle, expression or light sets the bar.
+              It finds pictures that drifted off-look, the near-misses a loss curve can't see. Click pictures to mark
+              them, or let Auto-Suggest flag the outliers, then move the marked ones out in one go (to an
+              excluded_by_look subfolder; nothing is deleted). The scores are saved with the dataset, so low scorers
+              you keep can ease in with the Training tab's "Warm up look outliers".</div>
+            <div class="card-content">
+              <div class="field-row">
+                <button class="btn" id="lookPick">Choose 3 baselines…</button>
+                <span class="look-bases" id="lookBases"></span>
+                <button class="btn btn-primary" id="lookScan" disabled>Scan folder</button>
+              </div>
+              <div class="field-hint" id="lookStatus">Each score is the average similarity to your 3 baselines. The
+                same person typically lands at 30–70%, the baselines included (each is scored against the other two
+                as well as itself).</div>
+              <div id="lookPicker" class="look-grid" style="display:none"></div>
+              <div class="field-row" id="lookTools" style="display:none">
+                <button class="btn" id="lookSuggest">Auto-Suggest drift</button>
+                <button class="btn btn-danger" id="lookMove" disabled>Move marked out of the dataset</button>
+                <span class="field-hint" id="lookCount"></span>
+              </div>
+              <div id="lookConfirm"></div>
+              <div class="field-row" id="lookPages" style="display:none">
+                <button class="btn btn-sm" id="lookPrev">‹ Previous</button>
+                <span class="field-hint" id="lookPageInfo"></span>
+                <button class="btn btn-sm" id="lookNext">Next ›</button>
+              </div>
+              <div id="lookRows" class="look-grid"></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="tab-captions" class="tab-panel">
+          <div class="tab-banner">
+            <h1>Captions</h1>
+            <p>Write a caption for every file in the training folder with an AI model, a trigger word or the words
+              every song shares; translate them, find and replace, and read or edit each one below.</p>
+          </div>
+          <div class="section-card">
+            <div class="card-title">Settings</div>
+            <div class="card-content">
+              <div class="field-hint" id="capFolder"></div>
+              <div class="field-row"><span class="field-label">Trigger word:</span>
+                <input type="text" id="capTrigger" class="w-combo" placeholder="e.g. ohwx">
+                <span class="field-hint">Put at the start of every caption.</span></div>
+              <div class="field-row"><span class="field-label">Model:</span>
+                <select id="capModel" class="w-combo-lg"></select></div>
+              <div class="field-hint" id="capModelHint"></div>
+              <div class="field-row"><span class="field-label">Task:</span>
+                <select id="capTask" class="w-combo-lg"></select>
+                <button class="btn" id="capEditInstr">Edit instructions…</button></div>
+              <div id="capInstrBox" style="display:none">
+                <div class="field-hint" id="capInstrHint"></div>
+                <textarea id="capInstr" rows="8"></textarea>
+                <div class="field-row"><button class="btn btn-primary" id="capInstrSave">Save instructions</button>
+                  <button class="btn" id="capInstrReset">Back to the shipped text</button>
+                  <span class="field-hint" id="capInstrStatus"></span></div>
+              </div>
+              <div class="field-row"><span class="field-label">Max tokens:</span>
+                <input type="number" id="capTokens" class="w-num" value="120">
+                <span class="field-hint">How long a caption may be.</span></div>
+              <label class="checkbox-label"><input type="checkbox" id="capOverwrite" checked>
+                Overwrite existing captions (untick to caption only the files without one)</label>
+            </div>
+          </div>
+          <div class="section-card accent-card">
+            <div class="card-title">Generate captions</div>
+            <div class="card-desc">Caption All writes a caption for each picture (and clip) with the model above.
+              Static gives every file just the trigger word. The model stays loaded for quick re-captions; Unload
+              frees its memory (it unloads itself before a run starts).</div>
+            <div class="card-content">
+              <div class="field-row">
+                <button class="btn btn-primary" id="capAll">Caption All (AI)</button>
+                <button class="btn" id="capStatic">Static Caption All</button>
+                <button class="btn btn-warning" id="capStop">Stop</button>
+                <button class="btn" id="capUnload">Unload Model</button></div>
+              <div class="fetch-bar"><div id="capBar" style="width:0%"></div></div>
+              <div class="field-hint" id="capStatus"></div>
+            </div>
+          </div>
+          <div class="section-card" id="capSongCard" style="display:none">
+            <div class="card-title">Caption every song</div>
+            <div class="card-desc">Gives every song the same caption: the trigger word, then the words that describe the whole
+              set - genre, instruments, mood, vocals. Use the same words in your sample prompts. The Overwrite tick above decides
+              whether songs that already have a caption are rewritten.</div>
+            <div class="card-content">
+              <div class="field-row"><span class="field-label">Words every song shares:</span>
+                <input type="text" id="capSongWords" class="w-path"></div>
+              <div class="field-row"><button class="btn btn-primary" id="capSongs">Caption every song</button></div>
+            </div>
+          </div>
+          <div class="section-card">
+            <div class="card-title">Bilingual (English + Chinese)</div>
+            <div class="card-desc">Adds a Chinese translation to each caption (not songs' lyrics), as "english - chinese", keeping the
+              trigger word first. Uses Helsinki-NLP/opus-mt-en-zh (about 300 MB, downloaded the first time).</div>
+            <div class="card-content">
+              <label class="checkbox-label"><input type="checkbox" id="capSkipCjk" checked>
+                Skip captions that already contain Chinese</label>
+              <div class="field-row"><button class="btn" id="capTranslate">Translate captions</button></div>
+            </div>
+          </div>
+          <div class="section-card">
+            <div class="card-title">Find &amp; Replace</div>
+            <div class="card-desc">Across every .txt caption in the training folder (not songs' .lyrics.txt), ignoring upper and lower case.
+              Preview shows each change first; nothing is written until Replace.</div>
+            <div class="card-content">
+              <div class="field-row"><span class="field-label">Find:</span>
+                <input type="text" id="frFind" class="w-path"></div>
+              <div class="field-row"><span class="field-label">Replace with:</span>
+                <input type="text" id="frReplace" class="w-path"></div>
+              <div class="field-row"><button class="btn" id="frPreview">Preview</button>
+                <button class="btn btn-primary" id="frApply">Replace in all captions</button>
+                <span class="field-hint" id="frStatus"></span></div>
+              <div id="frChanges" class="checkpoint-list"></div>
+            </div>
+          </div>
+          <div class="section-card">
+            <div class="card-title"><span>The captions</span>
+              <button class="btn btn-sm" id="captionsReload" title="Read the captions from the folder again (while captioning runs they also fill in by themselves)">↻ Refresh captions</button></div>
+            <div class="card-content">
+              <div class="field-row"><span class="field-label">Caption extension:</span>
+                <input type="text" id="captionExt" class="w-num" value=".txt">
+                <a class="btn" id="dsZip" title="The training folder's pictures, clips and songs with their captions, in one zip">⬇ Folder (.zip)</a>
+                <a class="btn" id="dsZipCaps" title="Just the caption files, in one zip">⬇ Captions only (.zip)</a></div>
+              <div class="field-row"><span class="field-label">Search:</span>
+                <input type="text" id="capSearch" class="w-path" placeholder="file name or caption text"></div>
+              <div class="field-row"><span class="field-label">Sort:</span>
+                <select id="capSort" class="w-combo" title="Smallest first finds pictures too small to train on.">
+                  <option value="name">By file name</option><option value="small">By size, smallest first</option>
+                  <option value="large">By size, largest first</option></select></div>
+              <div class="field-row"><span class="field-label">Per page:</span>
+                <select id="capPerPage" class="w-combo"><option>12</option><option>24</option><option>48</option>
+                  <option>96</option><option>200</option></select></div>
+              <div class="field-row"><button class="btn btn-sm" id="capPrev">‹ Prev</button>
+                <span class="field-hint" id="captionsSummary"></span>
+                <button class="btn btn-sm" id="capNext">Next ›</button>
+                <span class="field-label">Go to page:</span><input type="text" id="capGoto" class="w-num">
+                <button class="btn btn-sm" id="capGo">Go</button></div>
+            </div>
+          </div>
+          <div class="captions-grid" id="captionsGrid"></div>
+          <div class="section-card">
+            <div class="card-title">Log</div>
+            <div class="card-content"><pre class="console-terminal" id="capLog"></pre></div>
+          </div>
+        </section>
+
+        <section id="tab-samples" class="tab-panel">
+          <div class="tab-banner">
+            <h1>Samples</h1>
+            <p>Previews made while the model trains, so you can watch it learn and pick the best checkpoint.</p>
+          </div>
+          <div class="section-card model-strip">
+            <div class="card-content"><div class="field-row"><span class="field-label">Model:</span>
+              <select class="w-combo-lg family-pick"></select>
+              <span class="field-hint">The same choice as the Start tab's: change it here or there.</span></div></div>
+          </div>
+          <div id="samplesForm"></div>
+          <div class="section-card" id="galleryCard">
+            <div class="card-title">Previews so far</div>
+            <div class="card-desc" id="galleryInfo">The newest first, from the current run's output folder.</div>
+            <div class="card-content">
+              <div class="field-row gallery-controls" id="galleryControls" style="display:none">
+                <span class="field-label">Run:</span><select id="galleryRun" class="w-combo"></select>
+                <span class="seg" id="galleryView">
+                  <button class="btn btn-sm" data-view="list">Newest first</button>
+                  <button class="btn btn-sm" data-view="grid">Prompt × epoch</button></span>
+                <button class="btn btn-sm" id="likBtn" title="Score every preview's face against three photos of your subject from the training images (ArcFace, on the CPU - training keeps the GPU). Identity likeness only: overbaking and skin still need your eyes.">🎯 Likeness…</button>
+                <button class="btn btn-sm" id="rvBtn" title="Scrub this run epoch by epoch, one prompt at a time; play it, save a frame or a clip">🎞 Visualiser</button>
+                <span class="field-hint" id="likStatus"></span>
+              </div>
+              <div class="lik-panel" id="likPanel" style="display:none">
+                <div class="lik-run" id="likRun"></div>
+                <canvas id="likChart" height="150"></canvas>
+              </div>
+              <div class="gallery" id="gallery"></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="tab-training" class="tab-panel">
+          <div class="tab-banner">
+            <h1>Training</h1>
+            <p>Pick a preset, adjust what you need, and start the run. Settings are read at launch.</p>
+          </div>
+          <div class="section-card model-strip">
+            <div class="card-content"><div class="field-row"><span class="field-label">Model:</span>
+              <select class="w-combo-lg family-pick"></select>
+              <span class="field-hint">The same choice as the Start tab's: change it here or there.</span></div></div>
+          </div>
+          <div class="section-card">
+            <div class="card-title">Presets</div>
+            <div class="card-content"><div class="field-row preset-row">
+              <select id="presets" class="w-combo preset-select"></select>
+              <span class="field-hint" id="presetNote"></span>
+              <button class="btn" id="presetSave">Save preset…</button>
+              <span class="field-hint">Ready-made settings for this model, then any you saved: picking one fills
+                the form below.</span>
+            </div><div id="presetSaveRow"></div></div>
+          </div>
+          <div id="trainingForm"></div>
+          <div class="section-card accent-card run-card">
+            <div class="card-title"><span>Run</span><span class="run-badge" id="runCardBadge"></span></div>
+            <div class="card-content">
+              <div class="run-head"><span class="run-name" id="runName"></span>
+                <span class="field-hint" id="runWhen"></span></div>
+              <div class="run-bar run-bar-lg"><span id="runBar"></span></div>
+              <div class="run-tiles" id="runTiles"></div>
+              <div id="runLoss"></div>
+              <div class="field-row">
+                <button class="btn" id="btnCheck" title="Runs Start's checks without starting: lists anything missing or wrong, else the stages a run would go through">Check settings</button>
+                <button class="btn btn-primary" id="btnStart">Start Training</button>
+                <button class="btn" id="btnQueue" title="Checked like Start, then lined up: it starts when the runs before it finish">Add to queue</button>
+                <button class="btn btn-sm" id="btnQueueCancel" style="display:none">Cancel edit</button>
+                <button class="btn btn-warning" id="btnPause">Pause</button>
+                <button class="btn" id="btnSampleNow" style="display:none" title="Make the previews now, after the current training step, without waiting for the epoch to end">Sample now</button>
+                <button class="btn" id="btnSaveNow" style="display:none" title="Save the LoRA as it is now, after the current training step (as name-stepNNNNNNN.safetensors)">Save now</button>
+                <button class="btn btn-primary" id="btnResume">Resume</button>
+                <button class="btn btn-danger" id="btnStop">Stop</button>
+                <span class="field-hint" id="runStatus"></span>
+              </div>
+              <div class="field-row resume-choice" id="resumeChoice" style="display:none"></div>
+              <div class="field-hint" id="runNowSay"></div>
+              <div class="slider-live" id="sliderLive" style="display:none">
+                <div class="slider-live-head"><b>Slider prompts</b><span class="field-hint">Steer the slider while it
+                  trains: new prompts take over at the next epoch, from where it has got to.</span></div>
+                <label class="slider-live-row"><span>What it is</span><input type="text" id="slBase"
+                  title="The base: each end's words are added after it with a space, as at the start"></label>
+                <label class="slider-live-row"><span>+1 end adds</span><input type="text" id="slPos"></label>
+                <label class="slider-live-row"><span>−1 end adds</span><input type="text" id="slNeg"></label>
+                <div class="slider-live-row"><span>Push strength</span>
+                  <div class="slider-live-actions"><input type="text" id="slGuidance" class="w-port">
+                  <button class="btn btn-primary btn-sm" id="slApply">Apply at the next epoch</button>
+                  <button class="btn btn-sm" id="slReset" title="Put back what the slider is training on now">Undo edits</button>
+                  <span class="field-hint" id="slSay"></span></div></div>
+              </div>
+              <div id="problems" class="problems"></div>
+              <div class="run-upnext" id="runUpNext" style="display:none"></div>
+              <pre class="console-terminal" id="console"></pre>
+            </div>
+          </div>
+          <div class="section-card" id="webQueueCard" style="display:none">
+            <div class="card-title"><span>Queue</span><span class="run-badge" id="webQueueBadge"></span></div>
+            <div class="card-desc">Runs lined up here, in order. Each starts when the one before it finishes; one that
+              fails, is stopped or pauses holds the queue until you press Start queue.</div>
+            <div class="card-content">
+              <div class="field-hint" id="webQueueState"></div>
+              <div id="webQueueList" class="checkpoint-list"></div>
+              <div class="field-row"><button class="btn btn-primary" id="webQueueStart">Start queue</button>
+                <button class="btn" id="webQueueHold">Hold</button>
+                <button class="btn" id="webQueueClear" title="Take every queued run off the queue (a run training now carries on)">Clear queue</button></div>
+            </div>
+          </div>
+          <div class="section-card">
+            <div class="card-title">Checkpoints</div>
+            <div class="card-desc" id="checkpointsInfo">The LoRAs and checkpoints this run has saved, newest first.
+              Download any of them to this computer.</div>
+            <div class="card-content"><div id="checkpoints" class="checkpoint-list"></div></div>
+          </div>
+          <div class="section-card">
+            <div class="card-title">Previews</div>
+            <div class="card-desc">The previews this run makes, epoch by epoch, are on the Samples tab.</div>
+            <div class="card-content"><button class="btn btn-primary" id="btnViewPreviews">View the previews →</button></div>
+          </div>
+        </section>
+
+        <section id="tab-studio" class="tab-panel">
+          <div class="tab-banner">
+            <h1>Studio</h1>
+            <p>Tweak a finished LoRA block by block and see it live: the baseline beside your change, rendered on the
+              Fizgig machine. Save the result as a new LoRA.</p>
+          </div>
+          <div class="section-card">
+            <div class="card-title"><span>Setup</span><span class="run-badge" id="stBadge"></span></div>
+            <div class="card-content">
+              <div class="field-row"><span class="field-label">Model:</span><select id="stFamily" class="w-combo"></select>
+                <span class="field-hint" id="stDitNote"></span></div>
+              <div class="field-row" id="stDitRow"><span class="field-label">Preview with:</span>
+                <label class="radio-label"><input type="radio" name="stDit" value="fast" checked> <span id="stDitFast"></span></label>
+                <label class="radio-label"><input type="radio" name="stDit" value="full"> <span id="stDitFull"></span></label></div>
+              <div class="field-row"><span class="field-label">Primary LoRA:</span>
+                <input type="text" id="stPrimary" class="w-path" placeholder="the LoRA to repair (.safetensors)">
+                <button class="btn" id="stPrimaryPick">Choose…</button>
+                <span class="field-label" title="The strength this LoRA is meant to be used at (not always 1.0). The block sliders are relative to it: a block at 1.0 is that block at this strength, 0.5 is half of it. The saved file keeps the LoRA's own scale, so use it at this strength and it looks exactly like the preview.">at strength</span><input type="text" id="stPScale" class="w-num" value="1" title="The strength this LoRA is meant to be used at (not always 1.0). The block sliders are relative to it: a block at 1.0 is that block at this strength, 0.5 is half of it. The saved file keeps the LoRA's own scale, so use it at this strength and it looks exactly like the preview.">
+                <button class="btn" id="stEqP" style="display:none" title="Model EQ Mode: this row becomes the model's own weights (the Model EQ LoRA set in Preferences) at strength 1 - every block slider then reads 1.0 = the stock model, below 1 turns that block's main directions down, above 1 up. Press it again for your own LoRA back.">Model EQ Mode</button></div>
+              <div id="stMixRows" style="display:none">
+                <div class="field-row"><span class="field-label">Mix:</span>
+                  <label class="radio-label" title="The primary file alone."><input type="radio" name="stMixMode" value="off" checked> Off</label>
+                  <label class="radio-label" title="The saved epochs beside the primary, mixed as a moving average: Up to = the newest epoch in it, History = how much of the earlier ones comes with it. Block sliders apply to the whole mix; Save bakes it into one LoRA."><input type="radio" name="stMixMode" value="epochs"> Epochs of this run</label>
+                  <label class="radio-label" title="The primary plus any LoRAs of this model, each at its own amount - e.g. funk 1.0 + synthwave 0.5 - then shaped with the block sliders. Save bakes it into one LoRA."><input type="radio" name="stMixMode" value="mix"> LoRA mix</label></div>
+                <div class="field-row" id="stMixEpochs" style="display:none"><span class="field-label"></span>
+                  <span class="st-inline" title="Mixes the saved epochs of the primary's run (the files beside it) as an exponential moving average, live. Up to: the newest epoch in the mix. History: how much of the earlier epochs comes with it (0 = that epoch alone). The primary's block sliders apply to the whole mix, and Save bakes it into the LoRA.">
+                    <span class="field-hint">Up to</span><input type="range" id="stMixUpto" min="0" max="1" step="1" value="1">
+                    <span class="field-hint st-mix-txt" id="stMixUptoTxt"></span>
+                    <span class="field-hint">History</span><input type="range" id="stMixHist" min="0" max="0.95" step="0.05" value="0.5">
+                    <span class="field-hint st-mix-txt" id="stMixHistTxt"></span></span></div>
+                <div id="stMixList" style="display:none"><div id="stMixListRows"></div>
+                  <div class="field-row"><span class="field-label"></span><button class="btn btn-sm" id="stMixAdd">+ Add LoRA…</button></div></div>
+                <div class="field-row"><span class="field-label"></span><span class="field-hint" id="stMixInfo"></span></div>
+              </div>
+              <div class="field-row"><span class="field-label">Donor LoRA:</span>
+                <input type="text" id="stDonor" class="w-path" placeholder="optional: a second LoRA to mix in, block by block">
+                <button class="btn" id="stDonorPick">Choose…</button>
+                <button class="btn" id="stDonorUnload">Unload donor</button>
+                <span class="field-label" title="The strength this LoRA is meant to be used at (not always 1.0). The block sliders are relative to it: a block at 1.0 is that block at this strength, 0.5 is half of it. The saved file keeps the LoRA's own scale, so use it at this strength and it looks exactly like the preview.">at strength</span><input type="text" id="stDScale" class="w-num" value="1" title="The strength this LoRA is meant to be used at (not always 1.0). The block sliders are relative to it: a block at 1.0 is that block at this strength, 0.5 is half of it. The saved file keeps the LoRA's own scale, so use it at this strength and it looks exactly like the preview.">
+                <button class="btn" id="stEqD" style="display:none" title="Model EQ Mode: this row becomes the model's own weights (the Model EQ LoRA set in Preferences) at strength 1 - every block slider then reads 1.0 = the stock model, below 1 turns that block's main directions down, above 1 up. Press it again for your own LoRA back.">Model EQ Mode</button></div>
+              <div id="stDmixRows" style="display:none">
+                <div class="field-row"><span class="field-label">Donor epoch blend:</span>
+                  <label class="checkbox-label"><input type="checkbox" id="stDmixOn"> Blend the donor's epochs</label>
+                  <span class="st-inline" title="Mixes the saved epochs of the donor's run (the files beside it) as an exponential moving average, live. Up to: the newest epoch in the mix. History: how much of the earlier epochs comes with it (0 = that epoch alone). The donor's block sliders apply to the whole mix, and Save bakes it into the LoRA.">
+                    <span class="field-hint">Up to</span><input type="range" id="stDmixUpto" min="0" max="1" step="1" value="1">
+                    <span class="field-hint st-mix-txt" id="stDmixUptoTxt"></span>
+                    <span class="field-hint">History</span><input type="range" id="stDmixHist" min="0" max="0.95" step="0.05" value="0.5">
+                    <span class="field-hint st-mix-txt" id="stDmixHistTxt"></span></span></div>
+                <div class="field-row"><span class="field-label"></span><span class="field-hint" id="stDmixInfo"></span></div>
+              </div>
+              <div class="field-row"><span class="field-label">Prompt:</span>
+                <textarea id="stPrompt" rows="2" placeholder="Include the LoRA's trigger word"></textarea></div>
+              <div id="stAudioRows" style="display:none">
+                <div class="field-row"><span class="field-label"></span>
+                  <label class="checkbox-label"><input type="checkbox" id="stPbOn"> Blend in a Prompt B</label>
+                  <label class="checkbox-label"><input type="checkbox" id="stSrcOn"> Start from a song (audio to audio)</label>
+                  <label class="checkbox-label" title="The model hears a recording (30 s of it: a piece from the start, middle and end) and makes the song sound like it - the voice, the instruments, the mix. Works with or without a song to start from."><input type="checkbox" id="stSndOn"> Sound like a recording (reference)</label></div>
+                <div id="stPbRows" style="display:none">
+                  <div class="field-row"><span class="field-label">Prompt B:</span>
+                    <textarea id="stPromptB" rows="2" placeholder="e.g. jazz trio, upright bass, brushed drums, warm"></textarea></div>
+                  <div class="field-row"><span class="field-label"></span>
+                    <span class="st-inline" title="Every step runs the model with both prompts and mixes the two: 0 = Prompt A alone, 1 = Prompt B alone. Baseline gets the same blend, so Baseline vs Tweaked still shows only the sliders. Keep Prompt A's lyrics: Prompt B changes the style while A's words are sung.">
+                      <span class="field-hint">A</span><input type="range" id="stPbBlend" min="0" max="1" step="0.05" value="0.5">
+                      <span class="field-hint">B</span><span class="field-hint" id="stPbReadout"></span>
+                      <label class="checkbox-label"><input type="checkbox" id="stPbKeep" checked> Keep Prompt A's lyrics</label></span></div>
+                </div>
+                <div id="stSrcRows" style="display:none">
+                  <div class="field-row"><span class="field-label">Source:</span>
+                    <input type="text" id="stSrcPath" class="w-path" placeholder="a song - any audio or video file"><span id="stSrcBtns"></span></div>
+                  <div class="field-row"><span class="field-label">Use:</span>
+                    <select id="stSrcMode" class="w-combo" title="Whole song: the render follows the song and/or starts from its sound (Follow, Denoise). Repaint the loop section: only the section you drag across the Tweaked waveform is made new - the rest of the song stays exactly as it is. Extend to the Length: the song carries on past its end, up to the Length setting.">
+                      <option value="song">Whole song</option><option value="repaint">Repaint the loop section</option>
+                      <option value="extend">Extend to the Length</option></select></div>
+                  <div class="field-row" id="stSrcWhole"><span class="field-label"></span>
+                    <span class="st-inline" title="Follow: how much of the render follows the song's melody, timing and structure - but not its sound, so the prompt and LoRA choose the voice and instruments (ACE-Step's cover mode). 0 = off; lower lets the song wander in the last steps. Denoise: start from the song's actual sound with noise added, running only the rest of the steps. Lower keeps more of the real recording; 1.0 = start from noise. They work together or alone.">
+                      <span class="field-hint">Follow</span><input type="range" id="stSrcFollow" min="0" max="1" step="0.05" value="1">
+                      <span class="field-hint" id="stSrcFollowNote"></span>
+                      <span class="field-hint">Denoise</span><input type="range" id="stSrcDenoise" min="0.05" max="1" step="0.05" value="1">
+                      <span class="field-hint" id="stSrcDenoiseNote"></span></span></div>
+                  <div class="field-row" id="stSrcRep"><span class="field-label"></span>
+                    <span class="st-inline" title="How freely the new section is made. Lower holds it closer to the song around it and blends the joins more gently; higher lets it go its own way, with shorter joins. 0.5 is ACE-Step's default. Outside the section you always hear the song exactly as it was.">
+                      <span class="field-hint">Strength</span><input type="range" id="stSrcStrength" min="0" max="1" step="0.05" value="0.5">
+                      <span class="field-hint" id="stSrcRepNote"></span></span></div>
+                </div>
+                <div id="stSndRows" style="display:none">
+                  <div class="field-row"><span class="field-label">Sound like:</span>
+                    <input type="text" id="stSndPath" class="w-path" placeholder="a recording"><span id="stSndBtns"></span></div>
+                </div>
+              </div>
+              <div class="field-row"><span class="field-label">Seed:</span><input type="text" id="stSeed" class="w-num" value="42">
+                <button class="btn btn-sm" id="stSeedNew" title="A random seed">↻</button>
+                <span class="field-label" id="stResLabel">Res:</span><select id="stRes" class="w-combo st-small-select"></select>
+                <label class="checkbox-label" id="stTurboRow" title="It keeps the unchanged blocks' results in VRAM to replay them: turn it off if VRAM is tight."><input type="checkbox" id="stTurbo" checked> Turbo Preview
+                  (late-block changes render almost at once; the same picture as a full render)</label></div>
+              <div id="stVideoRows" style="display:none">
+                <div class="field-row"><span class="field-label">Model:</span><select id="stH3Model" class="w-combo st-small-select" title="The Reference model takes up to two photos (Frames below): say &lt;Picture 1&gt; / &lt;Picture 2&gt; in the prompt for them. Switching reloads the model at the next Start / Update (about 25 s)."></select>
+                  <span class="field-label">Base:</span><select id="stH3Base" class="w-combo st-small-select"></select></div>
+                <div class="field-row"><span class="field-label">Clip:</span>
+                  <span class="st-inline"><select id="stH3Len" class="w-combo st-small-select"></select>
+                    <span class="field-hint">W</span><select id="stH3W" class="w-combo st-small-select"></select>
+                    <span class="field-hint">H</span><select id="stH3H" class="w-combo st-small-select"></select>
+                    <span class="field-hint">Render size</span><select id="stH3Scale" class="w-combo st-small-select"></select></span></div>
+                <div class="field-row"><span class="field-label"></span>
+                  <span class="st-inline"><span class="field-hint">Steps</span><input type="text" id="stH3Steps" value="4" title="Sampling steps for the clip. With Turbo at 1.0, 4 steps is the fast loop; Turbo 0 needs about 20.">
+                    <span class="field-hint">Turbo</span><input type="text" id="stH3Turbo" value="1" title="Strength of the built-in Turbo LoRA: 1.0 for the fast loop, 0.75 matches the in-training previews. 0 switches it off - the render is the base plus your LoRAs at the steps set. That is how you edit a Turbo LoRA: load it as the primary and set this to 0.">
+                    <label class="checkbox-label"><input type="checkbox" id="stH3Sound" checked> Sound</label>
+                    <label class="checkbox-label" title="Also render the same seed, prompt and photos with no LoRA at all, shown on the left. Rendered once per setup: a slider move doesn't re-render it."><input type="checkbox" id="stH3NoLora"> No-LoRA clip</label>
+                    <label class="checkbox-label" title="Put up the pass-2 estimate in the Tweaked pane while the remaining passes run"><input type="checkbox" id="stH3Early" checked> Show early</label></span></div>
+              </div>
+              <div class="field-row" id="stNegRow"><span class="field-label">Negative:</span>
+                <textarea id="stNeg" rows="2"></textarea></div>
+              <div class="field-row" id="stRefRow"><span class="field-label">Reference:</span>
+                <input type="text" id="stRef" class="w-path" placeholder="optional: a reference picture">
+                <button class="btn" id="stRefPick">Choose…</button><button class="btn" id="stRefClear">Clear</button>
+                <span class="st-inline"><span class="field-hint">MP</span><select id="stRefMp" class="w-combo st-small-select"><option>0.25</option><option>0.5</option>
+                  <option selected>1.0</option><option>2.0</option></select>
+                  <span class="field-hint" id="stRefStrLabel">Strength</span><input type="text" id="stRefStr" value="1"></span></div>
+              <div class="field-row"><button class="btn btn-primary" id="stStart">Start</button>
+                <button class="btn" id="stUnload">Unload model</button>
+                <span class="field-hint" id="stStatus">Choose a LoRA and press Start: the model loads on the Fizgig machine
+                  (the first time takes a minute).</span></div>
+              <div class="run-bar"><span id="stBar" style="width:0"></span></div>
+              <div class="field-row st-setups"><span class="field-label">Setup:</span>
+                <select id="stSetupList" class="w-combo" title="Restores a saved setup exactly - switching model if needed, loading its LoRAs and rendering.">
+                  <option value="">Load a setup…</option></select>
+                <input type="text" id="stSetupName" class="w-num st-setup-name" placeholder="name">
+                <button class="btn" id="stSetupSave" title="Saves everything on this tab - the LoRAs, every slider and tick, the prompt, seed, length, photos and source - to one file you can load back later or share.">Save setup</button>
+                <span class="field-hint" id="stSetupMsg"></span></div>
+            </div>
+          </div>
+          <div class="section-card" id="stFrames" style="display:none">
+            <div class="card-title" id="stFramesTitle">First / Last Frame</div>
+            <div class="card-desc" id="stFramesDesc">Optional: photos the clip starts and ends on. Each is cropped to the
+              clip's shape from its middle.</div>
+            <div class="card-content" id="stFrameSlots"></div>
+          </div>
+          <div class="section-card" id="stProfile" style="display:none">
+            <div class="card-title">Profile found for this LoRA</div>
+            <div class="card-content"><div class="field-hint" id="stProfileLine"></div><div class="st-pills" id="stPills"></div>
+              <a class="btn btn-sm" id="stReport" target="_blank" rel="noopener">📊 Open full report</a></div>
+          </div>
+          <div class="section-card">
+            <div class="card-title">Preview</div>
+            <div class="card-content">
+              <div class="st-preview" id="stPreview">
+                <figure class="gallery-item st-pane" id="stNolPane" style="display:none"><img id="stNol" alt=""><video id="stNolVid" controls loop muted playsinline preload="auto"
+                  style="display:none"></video><audio id="stNolAud" controls style="display:none"></audio>
+                  <figcaption id="stNolCap">No LoRA (base model, same seed)</figcaption></figure>
+                <figure class="gallery-item st-pane"><img id="stBase" alt=""><video id="stBaseVid" controls loop muted playsinline preload="auto"
+                  style="display:none"></video><audio id="stBaseAud" controls style="display:none"></audio>
+                  <figcaption id="stBaseCap">Baseline (LoRA at default 1.0)</figcaption></figure>
+                <figure class="gallery-item st-pane"><div class="st-region" id="stRegion"></div><img id="stTweak" alt=""><video id="stTweakVid" controls loop muted playsinline preload="auto"
+                  style="display:none"></video><audio id="stTweakAud" controls style="display:none"></audio>
+                  <figcaption>Tweaked (current sliders)</figcaption></figure>
+              </div>
+              <div class="field-hint" id="stPreviewHint">Click either picture to see both full size (← → switches between them).</div>
+              <div class="st-metrics" id="stMetrics" style="display:none" title="Paired numbers for the two renders on screen (same seed and prompt, only the blocks differ - where such measures are honest). Likeness: ArcFace similarity to your reference photo. Grid: the model's patch lattice showing through (rising = overbake). Detail: face texture energy (down = plastic, up = fried). Clipped: blown pixels. Sat: saturation.">
+                <button class="btn btn-sm" id="stMetRefPick">📷 Reference…</button><span class="field-hint" id="stMetRefName">(none)</span>
+                <button class="btn btn-sm" id="stMetRefClear" title="No reference photo">✕</button>
+                <span class="st-chip" id="stMetLike"></span><span class="st-chip" id="stMetGrid"></span>
+                <span class="st-chip" id="stMetTex"></span><span class="st-chip" id="stMetClip"></span><span class="st-chip" id="stMetSat"></span>
+              </div>
+              <div class="field-row" id="stPlayBoth" style="display:none"><button class="btn btn-sm" id="stPlayBothBtn">▶ Play together</button></div>
+              <div class="field-row" id="stDownloads" style="display:none">
+                <a class="btn btn-sm" id="stDlBase" title="The Baseline as rendered: the LoRA at its load strength, before your slider changes">💾 Download original</a>
+                <a class="btn btn-sm" id="stDlTweak" title="The Tweaked render as it is now, with your slider changes">💾 Download tweaked</a></div>
+              <div class="st-song" id="stSong" style="display:none">
+                <div class="field-row st-song-btns">
+                  <button class="btn btn-sm" id="stSongBaseline" data-side="baseline">▶ Baseline</button>
+                  <button class="btn btn-sm" id="stSongTweaked" data-side="tweaked">▶ Tweaked</button>
+                  <label class="checkbox-label" title="The song repeats - the section when one is set, else the whole song"><input type="checkbox" id="stSongLoop"> 🔁 Loop</label>
+                  <label class="checkbox-label" title="Each new Tweaked render plays from the top (off: the song carries on at the same moment in its new version)"><input type="checkbox" id="stSongRestart"> ⏮ Restart on tweak</label>
+                  <button class="btn btn-sm" id="stSongNolora" data-side="nolora">▶ No LoRA</button>
+                  <button class="btn btn-sm" id="stSongPause">⏸ Pause</button>
+                  <a class="btn btn-sm" id="stSongSave" title="The whole Tweaked song as rendered (48 kHz WAV)">💾 Save Tweaked WAV</a>
+                  <span id="stSongTools">
+                    <button class="btn btn-sm" id="stKeepBtn" title="The Tweaked song becomes the song to start from, set to Repaint: drag across the waveform to choose a section to make new (the rest stays exactly as it is), or switch Use to Extend.">⤵ Use as source</button></span>
+                  <span class="st-song-time" id="stSongTime">0:00 / 0:00</span>
+                </div>
+                <canvas id="stSongBar" class="st-song-bar" height="72"></canvas>
+                <div class="field-row"><span class="field-hint" id="stRegionNote"></span>
+                  <button class="btn btn-sm" id="stRegionClear">Whole song</button></div>
+              </div>
+            </div>
+          </div>
+          <div class="section-card" id="stMasters" style="display:none">
+            <div class="card-title">Master controls</div>
+            <div class="card-content">
+              <div class="field-row"><span class="field-label">Masters affect:</span>
+                <label class="radio-label"><input type="radio" name="stTarget" value="primary" checked> Primary</label>
+                <label class="radio-label"><input type="radio" name="stTarget" value="donor" id="stTargetDonor" disabled> Donor</label></div>
+              <div id="stMasterRows"></div>
+            </div>
+          </div>
+          <div class="section-card">
+            <div class="card-title"><span>Blocks</span>
+              <span><button class="btn btn-sm" id="stUndo" title="Undo (Ctrl+Z)">↶ Undo</button>
+                <button class="btn btn-sm" id="stRedo" title="Redo (Ctrl+Y)">↷ Redo</button></span></div>
+            <div class="card-desc">One slider per block of the model. A greyed row is a block the loaded LoRA doesn't train, so moving it changes nothing.</div>
+            <div class="card-content">
+              <div class="field-row st-bulk">
+                <select id="stPreset" class="w-combo preset-select"></select>
+                <button class="btn btn-sm" id="stPresetSave">Save preset…</button>
+                <button class="btn btn-sm" data-bulk="reset">Reset all</button>
+                <button class="btn btn-sm" data-bulk="off">All off</button>
+                <button class="btn btn-sm st-detail-only" style="display:none" data-bulk="alternate" title="The main blocks alternate: block 0 on, 1 off, 2 on and so on (even on, odd off); the rest untouched. Invert for the other half. Strengths are kept.">Alternate</button>
+                <button class="btn btn-sm st-detail-only" style="display:none" data-bulk="detail" title="The detail end of the model (H3: blocks 46-49) all on or all off together. Strengths are kept.">Toggle detail blocks</button>
+                <button class="btn btn-sm" data-bulk="on">All on</button>
+                <button class="btn btn-sm" data-bulk="invert">Invert</button>
+                <span class="st-lucky"><button class="btn btn-sm" data-bulk="lucky">🎲 I'm feeling lucky</button>
+                  <span class="st-lucky-label">Min</span><input type="text" id="stLuckyLo" value="0">
+                  <span class="st-lucky-label">Max</span><input type="text" id="stLuckyHi" value="1.5">
+                  <label class="checkbox-label" id="stLuckyHoldBox" style="display:none" title="A lucky roll gives every block a strength anywhere between Min and Max, evenly (a negative Min allows inverted blocks). Hold keeps this model's structure and tidy-up bands near 1; untick it to roll every block across Min-Max."><input type="checkbox" id="stLuckyHold" checked> Hold structure + tidy-up</label></span>
+                <button class="btn btn-sm st-donor-only" data-bulk="donor_on">Donor: all on</button>
+                <button class="btn btn-sm st-donor-only" data-bulk="donor_off">Donor: all off</button>
+              </div>
+              <div id="stPresetSaveRow"></div>
+              <div id="stBlocks"></div>
+            </div>
+          </div>
+          <div class="section-card">
+            <div class="card-title">Save</div>
+            <div class="card-content">
+              <div class="field-row"><span class="field-label">Save as:</span>
+                <input type="text" id="stOut" class="w-path" placeholder="the repaired LoRA's file (.safetensors)">
+                <button class="btn btn-primary" id="stSave">Save repaired LoRA</button></div>
+              <div id="stSaveMsg"></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="tab-profiler" class="tab-panel">
+          <div class="tab-banner">
+            <h1>Profiler</h1>
+            <p>See what a LoRA actually does: which blocks carry the likeness, which cause bleed, and how much rank it
+              really uses. Studio shows every report inline when it loads the same LoRA.</p>
+          </div>
+          <div class="section-card">
+            <div class="card-title">LoRA File</div>
+            <div class="card-content">
+              <div class="field-row"><span class="field-label">Model:</span><select id="pfFamily" class="w-combo"></select>
+                <span class="field-hint">Choosing a LoRA switches to its model.</span></div>
+              <div class="field-row"><span class="field-label">LoRA:</span>
+                <input type="text" id="pfLora" class="w-path" placeholder="the LoRA to profile (.safetensors)"><span id="pfLoraBtns"></span></div>
+            </div>
+          </div>
+          <div class="section-card">
+            <div class="card-title">What to measure</div>
+            <div class="card-desc">Find out what each block of the LoRA does: it renders the LoRA, then again with each block
+              group switched off, and reports how much each changes the picture, carries the likeness and causes bleed
+              (other people starting to look like your subject). Weights only is instant and shows how much rank the LoRA
+              really uses.</div>
+            <div class="card-content">
+              <div class="field-row"><span class="field-label">Mode:</span>
+                <label class="radio-label"><input type="radio" name="pfMode" value="weights"> Weights only (instant)</label>
+                <label class="radio-label"><input type="radio" name="pfMode" value="quick" checked> Quick (1 seed)</label>
+                <label class="radio-label"><input type="radio" name="pfMode" value="thorough"> Thorough (2 seeds, steadier)</label></div>
+              <div id="pfRender">
+                <div class="field-row"><span class="field-label">Prompt:</span><input type="text" id="pfPrompt" class="w-path"
+                  placeholder='with the trigger word, e.g. "zwxem, a portrait photo of a woman"'></div>
+                <div class="field-row"><span class="field-label">Bleed check:</span><input type="text" id="pfClass" class="w-path"
+                  placeholder="optional: the same prompt WITHOUT the trigger"></div>
+                <div class="field-hint pf-hint">With the LoRA loaded the bleed check should still look like anyone; the report
+                  shows which blocks pull it toward your subject.</div>
+                <div class="field-row"><span class="field-label">Subject photos:</span><span id="pfPhotos"></span>
+                  <span id="pfPhotoBtns"></span><button class="btn btn-sm" id="pfPhotosClear">Clear</button></div>
+                <div class="field-hint pf-hint">Optional, for a person LoRA: three photos of the subject turn on the likeness
+                  and bleed scores (face recognition). Taken from the run's sample gallery when it has them.</div>
+                <div class="field-row"><span class="field-label">Size:</span>
+                  <select id="pfSize" class="w-combo st-small-select"><option>512</option><option selected>768</option><option>1024</option></select></div>
+              </div>
+            </div>
+          </div>
+          <div class="section-card">
+            <div class="card-title"><span>Run</span><span class="run-badge" id="pfBadge"></span></div>
+            <div class="card-content">
+              <div class="field-row"><button class="btn btn-primary" id="pfRun">Profile LoRA</button>
+                <button class="btn" id="pfStop" disabled>Stop</button>
+                <a class="btn" id="pfReport" target="_blank" rel="noopener" style="display:none">📊 Open report</a>
+                <button class="btn" id="pfStudio" style="display:none">Open in Studio</button>
+                <span class="field-hint" id="pfStatus"></span></div>
+              <div class="run-bar"><span id="pfBar" style="width:0"></span></div>
+              <pre class="console-terminal" id="pfLog"></pre>
+            </div>
+          </div>
+        </section>
+
+        <section id="tab-royale" class="tab-panel">
+          <div class="tab-banner">
+            <h1>LoRA Royale</h1>
+            <p>Render every epoch of a training run on one seed, then crossfade between them to find the sweet spot.</p>
+          </div>
+          <div class="section-card">
+            <div class="card-title"><span>Setup</span><span class="run-badge" id="rySBadge"></span></div>
+            <div class="card-desc">Point at a training output folder. Renders use the model's preview model (its Turbo /
+              distilled checkpoint when set).</div>
+            <div class="card-content">
+              <div class="field-row"><span class="field-label">Model:</span><select id="ryFamily" class="w-combo"></select>
+                <span class="field-hint">Follows the checkpoints' own model.</span></div>
+              <div class="field-row"><span class="field-label">Source:</span>
+                <label class="radio-label"><input type="radio" name="rySource" value="folder" checked> Training folder (compare epochs)</label>
+                <label class="radio-label"><input type="radio" name="rySource" value="single"> Single LoRA</label></div>
+              <div class="field-row ry-folder-only"><span class="field-label">Checkpoint folder:</span>
+                <input type="text" id="ryFolder" class="w-path"><button class="btn" id="ryFolderPick">Choose…</button></div>
+              <div class="field-hint ry-folder-only" id="ryScan"></div>
+              <div class="field-row ry-single-only"><span class="field-label">LoRA file:</span>
+                <input type="text" id="rySingle" class="w-path"><span id="rySingleBtns"></span></div>
+              <div class="field-row"><span class="field-label">Prompt:</span><input type="text" id="ryPrompt" class="w-path"
+                placeholder="include your trigger word"></div>
+              <div class="field-row"><span class="field-label">Seed:</span><input type="text" id="rySeed" class="w-num" value="42">
+                <span class="field-hint">shared by the crossfade, prompt travel and strength travel</span></div>
+              <div class="field-row" id="ryRefRow"><span class="field-label">Reference:</span>
+                <input type="text" id="ryRef" class="w-path" placeholder="optional: a reference picture">
+                <button class="btn" id="ryRefPick">Choose…</button><button class="btn" id="ryRefClear">Clear</button>
+                <span class="st-inline" id="ryRefStrBox" title="How strongly the reference anchors each epoch render. 1.0 = full edit-model anchor (the reference holds the composition while each epoch's LoRA renders the prompt), lower lets the prompt vary more, 0 = off.">
+                  <span class="field-hint">Strength</span><input type="text" id="ryRefStr" class="w-num" value="1.0"></span></div>
+              <div class="field-row"><span class="field-label">Save to:</span><input type="text" id="ryOut" class="w-path"
+                title="Where clips, stills, sheets and promoted LoRAs go">
+                <button class="btn" id="ryOutPick">Choose…</button></div>
+            </div>
+          </div>
+          <div class="ry-tabs" id="ryTabs">
+            <button class="ry-tab ry-folder-only" data-ry="epochs">Epochs</button>
+            <button class="ry-tab" data-ry="seed">Seed travel</button>
+            <button class="ry-tab" data-ry="prompt">Prompt travel</button>
+            <button class="ry-tab" data-ry="strength">Strength travel</button>
+            <button class="ry-tab" data-ry="sheet">Comparison sheet</button>
+          </div>
+          <div data-ry="epochs" class="section-card ry-folder-only">
+            <div class="card-title">Crossfade</div>
+            <div class="card-desc">Drag to blend between consecutive epochs - stop where it looks best.</div>
+            <div class="card-content">
+              <div class="field-row"><span class="field-label">Size:</span>
+                <select id="ryW" class="w-combo st-small-select"><option>384</option><option>512</option><option>768</option><option>1024</option><option>1280</option><option>1536</option><option>2048</option></select><span class="field-hint">×</span>
+                <select id="ryH" class="w-combo st-small-select"><option>384</option><option>512</option><option>768</option><option>1024</option><option>1280</option><option>1536</option><option>2048</option></select>
+                <span class="field-hint">Max renders</span>
+                <select id="ryMax" class="w-combo st-small-select"><option>All</option><option>6</option><option>8</option>
+                  <option>10</option><option selected>12</option><option>16</option><option>20</option></select>
+                <span class="field-hint">how many epochs to render, spread across the run</span></div>
+              <div class="field-row"><button class="btn btn-primary" id="ryRender">Render epochs</button>
+                <button class="btn" id="ryStop" disabled>Stop</button>
+                <button class="btn" id="ryUnload" title="Free the GPU: the model leaves the card (the next render loads it again).">Unload model</button><span class="field-hint" id="ryStatus">Pick a folder, set a
+                  prompt, then render.</span></div>
+              <div class="run-bar"><span id="ryBar" style="width:0"></span></div>
+              <div class="ry-stage" id="ryStage"><img id="ryA" alt=""><img id="ryB" alt=""></div>
+              <div class="ry-label" id="ryLabel"></div>
+              <input type="range" id="ryScrub" min="0" max="0" step="0.01" value="0" class="ry-scrub">
+            </div>
+          </div>
+          <div data-ry="epochs" class="section-card ry-folder-only">
+            <div class="card-title">All epochs</div>
+            <div class="card-desc">Click a thumbnail to jump the crossfade there.</div>
+            <div class="card-content"><div class="ry-grid" id="ryGrid"></div></div>
+          </div>
+          <div data-ry="epochs" class="section-card ry-folder-only">
+            <div class="card-title">Likeness score</div>
+            <div class="card-desc">Pick a training image of your subject - Fizgig scores each epoch's face against it
+              (ArcFace, on the CPU) and highlights the closest match in gold.</div>
+            <div class="card-content">
+              <div class="field-row"><span class="field-label">Subject image:</span>
+                <input type="text" id="ryLikeRef" class="w-path"><button class="btn" id="ryLikePick">Choose…</button>
+                <button class="btn" id="ryLikeClear">Clear</button></div>
+              <div class="field-row"><button class="btn btn-primary" id="ryScore">Score likeness</button>
+                <button class="btn" id="ryBest" disabled>Jump to best</button>
+                <button class="btn" id="ryLikeExport" title="Score likeness first, then export a side-by-side clip: your subject image next to each epoch with its likeness score, morphing epoch by epoch. Uses the Format / Speed / Loop / Fizgig-tag settings below.">Export likeness clip</button>
+                <span class="field-hint" id="ryLikeStatus"></span></div>
+            </div>
+          </div>
+          <div data-ry="epochs" class="section-card ry-folder-only">
+            <div class="card-title">Export the morph</div>
+            <div class="card-desc">Save the crossfade as a looping clip - face resolving epoch by epoch, with a
+              Fizgig · LoRA Royale tag. Made to share.</div>
+            <div class="card-content">
+              <div class="field-row"><span class="field-label">Format:</span>
+                <select id="ryFmt" class="w-combo st-small-select" title="MP4 is full colour, smaller, faster to write, and autoplays on X / Reddit / Instagram. GIF embeds anywhere but is limited to 256 colours (slight banding on faces), takes longer to export, and makes a larger file."><option>MP4</option><option>GIF</option></select>
+                <span class="field-hint">Speed</span><select id="rySpeed" class="w-combo st-small-select"><option>Slow</option>
+                  <option selected>Normal</option><option>Fast</option></select>
+                <label class="checkbox-label"><input type="checkbox" id="ryLoop" checked> Loop (ping-pong)</label>
+                <label class="checkbox-label"><input type="checkbox" id="ryTicker" checked> Epoch ticker</label>
+                <label class="checkbox-label"><input type="checkbox" id="ryTag" checked> Fizgig tag</label></div>
+              <div class="field-row"><button class="btn btn-primary" id="ryExport">Export clip</button>
+                <button class="btn" id="ryStills" title="Save every rendered epoch still as a full-size PNG (named by epoch so they sort in order).">Save all stills</button>
+                <span class="field-hint" id="ryExportStatus"></span></div>
+            </div>
+          </div>
+          <div data-ry="seed" class="section-card">
+            <div class="card-title">Seed travel</div>
+            <div class="card-desc">Take the epoch on the crossfade (or the single LoRA) and morph it smoothly between seeds
+              (slerp through noise space) - shows the LoRA's range, saved as a clip.</div>
+            <div class="card-content">
+              <div class="field-row"><span class="field-label">Preset:</span><select id="rySPreset" class="w-combo"
+                title="One-click recipes for the mechanics (reference / anchor / journey length / identity lock). They don't touch the prompt - seed travel uses the Setup prompt."><option value="">(choose)</option></select></div>
+              <div class="field-row"><span class="field-label">Seeds:</span><input type="text" id="rySA" class="w-num" value="42">
+                <span class="field-hint">→</span><input type="text" id="rySB" class="w-num" value="4242">
+                <button class="btn btn-sm" id="rySDice" title="New Start and End seeds">🎲</button>
+                <span class="field-hint" title="Seeds in the journey. 2 = a straight Start→End morph; more = a tour through extra seeds in between, all slerped. The in-betweens derive from the Start seed, so the journey is reproducible.">Waypoints</span>
+                <select id="rySWay" class="w-combo st-small-select"><option>2</option><option>3</option><option>4</option><option>5</option>
+                  <option>6</option><option>8</option></select><span class="field-hint" title="Each frame is a fresh render - more frames = smoother but slower.">Frames</span><select id="rySFrames" class="w-combo st-small-select"><option>16</option><option selected>24</option><option>36</option><option>48</option><option>64</option><option>96</option><option>128</option><option>192</option><option>256</option></select></div>
+              <div class="field-row ry-ref"><span class="field-label">Reference:</span>
+                <input type="text" id="rySRef" class="w-path" placeholder="optional - falls back to the Setup reference">
+                <button class="btn" id="rySRefPick">Choose…</button><button class="btn" id="rySRefClear">Clear</button></div>
+              <div class="field-row ry-ref"><span class="field-label"></span>
+                <label class="checkbox-label ry-folder-only"><input type="checkbox" id="rySUseEpoch"> Use the rendered epoch as the reference</label>
+                <span class="st-inline ry-refstr"><span class="field-hint">Strength</span><input type="text" id="rySRefStr" class="w-num" value="0.25" title="How strongly the reference holds each frame. Seed travel wants a light anchor, about 0.1-0.4: higher locks every frame to the reference and the travel stops moving."></span>
+                <label class="checkbox-label ry-refstr" title="Feedback chain: frame 1 uses your reference, each later frame edits the previous one. Keep Strength low (about 0.4) with this on - high strength compounds every frame."><input type="checkbox" id="rySSeq"> Sequential reference</label>
+                <span class="st-inline" title="Reference encode resolution cap (megapixels), 0.05-1.0. Higher carries more detail at a little more VRAM."><span class="field-hint">Max MP</span><input type="text" id="rySMp" class="w-num" value="0.2"></span></div>
+              <div class="field-row"><span class="field-label">Size:</span><span class="field-hint">W</span><select id="rySW" class="w-combo st-small-select"><option>384</option><option>512</option><option>768</option><option>1024</option><option>1280</option><option>1536</option><option>2048</option></select><span class="field-hint">H</span><select id="rySH" class="w-combo st-small-select"><option>384</option><option>512</option><option>768</option><option>1024</option><option>1280</option><option>1536</option><option>2048</option></select></div>
+              <div class="field-row"><span class="field-label">Clip:</span>
+                <span class="field-hint">Speed</span><select id="rySSpeed" class="w-combo st-small-select"><option>Slow</option>
+                  <option selected>Normal</option><option>Fast</option></select>
+                <label class="checkbox-label"><input type="checkbox" id="rySLoop" checked> Loop (ping-pong)</label>
+                <label class="checkbox-label"><input type="checkbox" id="rySBadge" checked> Epoch badge</label>
+                <label class="checkbox-label"><input type="checkbox" id="rySTag" checked> Fizgig tag</label>
+                <span class="field-hint" title="Timelapse-style luminance deflicker (post-process). Normal removes frame-to-frame jitter and keeps the intended slow brightness arc; Strong flattens harder.">Deflicker</span>
+                <select id="rySDeflicker" class="w-combo st-small-select"><option>None</option><option>Normal</option><option>Strong</option></select></div>
+              <div class="field-row"><button class="btn btn-primary" id="rySGo">Render seed travel</button>
+                <span class="field-hint" id="rySStatus"></span></div>
+              <div class="ry-sc" data-mode="seed" id="rySSc" style="display:none">
+                <div class="ry-stage"><img alt=""></div><div class="ry-label"></div>
+                <input type="range" class="ry-scrub" min="0" max="0" step="1" value="0">
+                <div class="field-row ry-sc-save"><button class="btn btn-sm" data-fmt="MP4">Save MP4</button>
+                  <button class="btn btn-sm" data-fmt="GIF">Save GIF</button><button class="btn btn-sm" data-fmt="frame">Save frame</button>
+                  <span class="field-hint ry-sc-msg"></span></div>
+                <div class="field-hint">Render once, scrub to review, then save - Speed, Loop, the badge, the tag and Deflicker apply at
+                  save, so you can save again in either format without rendering again.</div>
+              </div>
+            </div>
+          </div>
+          <div data-ry="prompt" class="section-card">
+            <div class="card-title">Prompt travel</div>
+            <div class="card-desc">Morph the epoch through a series of prompt variations on a fixed seed - it interpolates
+              the text embedding, so the same subject flows (e.g. dawn → night). Saved as a clip.</div>
+            <div class="card-content">
+              <div class="field-row"><span class="field-label">Preset:</span><select id="ryPPreset" class="w-combo"
+                title="Starting points tuned from real runs: each fills the whole card and builds a prompt you can edit. image 1 = your original reference, image 2 = the previous frame."><option value="">(choose)</option></select>
+                <span class="field-hint">Subject</span><select id="ryPSubject" class="w-combo st-small-select"></select></div>
+              <div class="field-row"><span class="field-label">Prompt:</span><input type="text" id="ryPPrompt" class="w-path"
+                placeholder="a portrait of sks man, {x}"><button class="btn btn-sm" id="ryPSlot">Insert {x}</button></div>
+              <div class="field-hint pf-hint">Type {x} where the travel word goes - no {x}? the word is added at the end.</div>
+              <div class="field-row"><span class="field-label">Custom words:</span><input type="text" id="ryPCustom" class="w-path"
+                placeholder="comma-separated - used when the preset is Custom words"></div>
+              <div class="field-row"><span class="field-label">Travel:</span><select id="ryPStart" class="w-combo st-small-select"></select>
+                <span class="field-hint">→</span><select id="ryPEnd" class="w-combo st-small-select"></select>
+                <span class="field-hint" title="Each frame is a fresh render - more frames = smoother but slower.">Frames</span><select id="ryPFrames" class="w-combo st-small-select"><option>24</option><option selected>32</option><option>48</option><option>64</option><option>96</option><option>128</option><option>192</option><option>256</option></select></div>
+              <div class="field-hint" id="ryPWords"></div>
+              <div class="field-row ry-ref"><span class="field-label">Reference:</span>
+                <input type="text" id="ryPRef" class="w-path" placeholder="optional - falls back to the Setup reference">
+                <button class="btn" id="ryPRefPick">Choose…</button><button class="btn" id="ryPRefClear">Clear</button></div>
+              <div class="field-row ry-ref"><span class="field-label"></span>
+                <label class="checkbox-label ry-folder-only"><input type="checkbox" id="ryPUseEpoch"> Use the rendered epoch as the reference</label>
+                <span class="st-inline ry-refstr"><span class="field-hint">Strength</span><input type="text" id="ryPRefStr" class="w-num" value="1.0" title="How strongly the reference holds each frame. Prompt travel wants the full 1.0: the model edits the reference as the prompts ask. Lower lets the frames drift away from it."></span>
+                <label class="checkbox-label ry-refstr" title="Feedback chain: frame 1 uses your reference, each later frame edits the previous one. Keep Strength low (about 0.4) with this on - high strength compounds every frame."><input type="checkbox" id="ryPSeq"> Sequential reference</label>
+                <span class="st-inline" title="Reference encode resolution cap (megapixels), 0.05-1.0. Higher carries more detail at a little more VRAM."><span class="field-hint">Max MP</span><input type="text" id="ryPMp" class="w-num" value="0.2"></span>
+                <label class="checkbox-label" title="Every frame also references the ORIGINAL image at the Anchor strength alongside the previous frame, so the feedback chain can't drift."><input type="checkbox" id="ryPAnchor" checked> Anchor to original</label>
+                <span class="st-inline ry-refstr"><span class="field-hint">Anchor str</span><input type="text" id="ryPAnchorStr" class="w-num" value="1.0"></span></div>
+              <div class="field-row"><span class="field-label">Size:</span><span class="field-hint">W</span><select id="ryPW" class="w-combo st-small-select"><option>384</option><option>512</option><option>768</option><option>1024</option><option>1280</option><option>1536</option><option>2048</option></select><span class="field-hint">H</span><select id="ryPH" class="w-combo st-small-select"><option>384</option><option>512</option><option>768</option><option>1024</option><option>1280</option><option>1536</option><option>2048</option></select>
+                <span class="field-hint" title="Linear: the original. Norm-preserved: holds the conditioning strength constant for flatter brightness. Slerp: a constant-speed spherical glide - the smoothest morph.">Interpolation</span>
+                <select id="ryPInterp" class="w-combo st-small-select"><option>Linear</option><option>Norm-preserved</option><option>Slerp</option></select>
+                <span class="field-hint" title="Slerps the noise from the base seed toward a second one across the sweep, so the prompt takes hold (0 = off, 0.1-0.3 gentle, 0.5-1.0 strong). Only with Vary seed off.">Seed drift</span>
+                <input type="text" id="ryPDrift" class="w-num" value="0.0">
+                <label class="checkbox-label" title="Each frame its own seed (base, base+1, ...) so the prompt expresses more strongly; reproducible. Turns Seed drift off."><input type="checkbox" id="ryPVary"> Vary seed</label></div>
+              <div class="field-row"><span class="field-label">Clip:</span>
+                <span class="field-hint">Speed</span><select id="ryPSpeed" class="w-combo st-small-select"><option>Slow</option>
+                  <option selected>Normal</option><option>Fast</option></select>
+                <label class="checkbox-label"><input type="checkbox" id="ryPLoop" checked> Loop (ping-pong)</label>
+                <label class="checkbox-label"><input type="checkbox" id="ryPBadge" checked> Word badge</label>
+                <label class="checkbox-label"><input type="checkbox" id="ryPTag" checked> Fizgig tag</label>
+                <span class="field-hint" title="Timelapse-style luminance deflicker (post-process). Normal removes frame-to-frame jitter and keeps the intended slow brightness arc; Strong flattens harder.">Deflicker</span>
+                <select id="ryPDeflicker" class="w-combo st-small-select"><option>None</option><option>Normal</option><option>Strong</option></select></div>
+              <div class="field-row"><button class="btn btn-primary" id="ryPGo">Render prompt travel</button>
+                <span class="field-hint" id="ryPStatus"></span></div>
+              <div class="ry-sc" data-mode="prompt" id="ryPSc" style="display:none">
+                <div class="ry-stage"><img alt=""></div><div class="ry-label"></div>
+                <input type="range" class="ry-scrub" min="0" max="0" step="1" value="0">
+                <div class="field-row ry-sc-save"><button class="btn btn-sm" data-fmt="MP4">Save MP4</button>
+                  <button class="btn btn-sm" data-fmt="GIF">Save GIF</button><button class="btn btn-sm" data-fmt="frame">Save frame</button>
+                  <span class="field-hint ry-sc-msg"></span></div>
+                <div class="field-hint">Render once, scrub to review, then save - Speed, Loop, the badge, the tag and Deflicker apply at
+                  save, so you can save again in either format without rendering again.</div>
+              </div>
+            </div>
+          </div>
+          <div data-ry="strength" class="section-card">
+            <div class="card-title">LoRA strength travel</div>
+            <div class="card-desc">Hold the prompt and seed fixed and ramp the LoRA's strength - watch the effect fade in (0
+              = base model) through to full strength and beyond. Saved as a clip.</div>
+            <div class="card-content">
+              <div class="field-row"><span class="field-label">Strength:</span><input type="text" id="ryLA" class="w-num" value="0.0">
+                <span class="field-hint">→</span><input type="text" id="ryLB" class="w-num" value="1.0"><span class="field-hint" title="Each frame is a fresh render - more frames = smoother but slower.">Frames</span><select id="ryLFrames" class="w-combo st-small-select"><option>16</option><option selected>24</option><option>36</option><option>48</option><option>64</option><option>96</option><option>128</option><option>192</option><option>256</option></select></div>
+              <div class="field-hint pf-hint">0 = base model (no LoRA); 1.0 = trained strength; above 1 over-drives it. Uses the Setup
+                prompt and seed.</div>
+              <div class="field-row"><span class="field-label">Size:</span><span class="field-hint">W</span><select id="ryLW" class="w-combo st-small-select"><option>384</option><option>512</option><option>768</option><option>1024</option><option>1280</option><option>1536</option><option>2048</option></select><span class="field-hint">H</span><select id="ryLH" class="w-combo st-small-select"><option>384</option><option>512</option><option>768</option><option>1024</option><option>1280</option><option>1536</option><option>2048</option></select></div>
+              <div class="field-row"><span class="field-label">Clip:</span>
+                <span class="field-hint">Speed</span><select id="ryLSpeed" class="w-combo st-small-select"><option>Slow</option>
+                  <option selected>Normal</option><option>Fast</option></select>
+                <label class="checkbox-label"><input type="checkbox" id="ryLLoop" checked> Loop (ping-pong)</label>
+                <label class="checkbox-label"><input type="checkbox" id="ryLBadge" checked> Strength badge</label>
+                <label class="checkbox-label"><input type="checkbox" id="ryLTag" checked> Fizgig tag</label>
+                <span class="field-hint" title="Timelapse-style luminance deflicker (post-process). Normal removes frame-to-frame jitter and keeps the intended slow brightness arc; Strong flattens harder.">Deflicker</span>
+                <select id="ryLDeflicker" class="w-combo st-small-select"><option>None</option><option>Normal</option><option>Strong</option></select></div>
+              <div class="field-row"><button class="btn btn-primary" id="ryLGo">Render strength travel</button>
+                <span class="field-hint" id="ryLStatus"></span></div>
+              <div class="ry-sc" data-mode="strength" id="ryLSc" style="display:none">
+                <div class="ry-stage"><img alt=""></div><div class="ry-label"></div>
+                <input type="range" class="ry-scrub" min="0" max="0" step="1" value="0">
+                <div class="field-row ry-sc-save"><button class="btn btn-sm" data-fmt="MP4">Save MP4</button>
+                  <button class="btn btn-sm" data-fmt="GIF">Save GIF</button><button class="btn btn-sm" data-fmt="frame">Save frame</button>
+                  <span class="field-hint ry-sc-msg"></span></div>
+                <div class="field-hint">Render once, scrub to review, then save - Speed, Loop, the badge, the tag and Deflicker apply at
+                  save, so you can save again in either format without rendering again.</div>
+              </div>
+            </div>
+          </div>
+          <div data-ry="sheet" class="section-card">
+            <div class="card-title">Comparison sheet</div>
+            <div class="card-desc">The share image people post for a new LoRA: one row per prompt, one column per condition,
+              the same seed across a row so only the LoRA changes. Saved as one labelled PNG.</div>
+            <div class="card-content">
+              <div class="field-hint pf-hint">Without / with LoRA: two columns on the current LoRA (Single LoRA, or the epoch on the
+                crossfade) - fill in Trigger so the no-LoRA column drops it. Every epoch: one column per epoch of the render at the
+                top (render it first); Epochs keeps it readable - blank = all, "every 4", or "4,8,12". Every cell is a fresh render, so 3
+                prompts across 5 epochs is 15 renders: keep the prompt list short the first time.</div>
+              <div class="field-row"><span class="field-label">Prompts:</span><textarea id="ryCPrompts" rows="4"
+                placeholder="one per line - each becomes a row"></textarea></div>
+              <div class="field-row"><span class="field-label">Columns:</span><select id="ryCMode" class="w-combo">
+                <option>Without / with LoRA</option><option>Every epoch</option></select>
+                <span class="field-hint">Epochs</span><input type="text" id="ryCEpochs" class="w-num" placeholder="all">
+                <span class="field-hint">Trigger</span><input type="text" id="ryCTrigger" class="w-num"></div>
+              <div class="field-row"><span class="field-label">Seed:</span><input type="text" id="ryCSeed" class="w-num" value="42">
+                <span class="field-hint">W</span><select id="ryCW" class="w-combo st-small-select"><option>384</option><option>512</option><option>768</option><option>1024</option><option>1280</option><option>1536</option><option>2048</option></select><span class="field-hint">H</span><select id="ryCH" class="w-combo st-small-select"><option>384</option><option>512</option><option>768</option><option>1024</option><option>1280</option><option>1536</option><option>2048</option></select>
+                <label class="checkbox-label"><input type="checkbox" id="ryCRows" checked> Row captions</label>
+                <label class="checkbox-label"><input type="checkbox" id="ryCTag" checked> Fizgig tag</label></div>
+              <div class="field-row"><button class="btn btn-primary" id="ryCGo">Render comparison sheet</button>
+                <span class="field-hint" id="ryCStatus"></span></div>
+              <div id="ryCSheet" style="display:none"><img id="ryCImg" class="ry-sheet" alt="comparison sheet">
+                <div class="field-row"><button class="btn btn-sm" id="ryCSave">Save sheet</button><span class="field-hint" id="ryCMsg"></span></div></div>
+            </div>
+          </div>
+          <div data-ry="epochs" class="section-card ry-folder-only">
+            <div class="card-title">Promote winner</div>
+            <div class="card-desc">Copy the epoch currently shown on the crossfade to a new .safetensors you can drop
+              straight into ComfyUI (into the Save to folder).</div>
+            <div class="card-content">
+              <div class="field-row"><button class="btn btn-primary" id="ryPromote">Promote current epoch</button>
+                <input type="text" id="ryPromoteName" class="w-path" placeholder="name (leave empty for run-epochN-pick)">
+                <span class="field-hint" id="ryPromoteStatus"></span></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="tab-refmod" class="tab-panel">
+          <div class="tab-banner">
+            <h1>RefMod Toolkit</h1>
+            <p>Try RefMods and ReFLoRAs before ComfyUI: a still or a short clip with them and without them, side by side
+              on the same seed. Every dial here is a setting on the ComfyUI nodes, so what works here is what to type there.</p>
+          </div>
+          <div class="section-card">
+            <div class="card-title"><span>Setup</span></div>
+            <div class="card-desc">A RefMod is a few reference pictures of a person or a style packed into a small file;
+              ComfyUI's RefMod nodes (ComfyUI-MiniMaxH3Mod) add it to a render with no training. A ReFLoRA is a LoRA and
+              its RefMods in one file (ComfyUI-MiniMaxH3RefLoRA). The model files come from Preferences; the first
+              Render loads the model.</div>
+            <div class="card-content">
+              <div class="field-row" id="rmFamRow"><span class="field-label">Model:</span><select id="rmFamily" class="w-combo"></select></div>
+              <div class="field-row"><span class="field-label">RefMod folder:</span><input type="text" id="rmFolder" class="w-path"
+                title="ComfyUI reads models/refmods; Fizgig writes new mods to the RefMod model's Output folder on the Training tab - point both at the same place.">
+                <button class="btn" id="rmFolderPick">Choose…</button>
+                <button class="btn" id="rmRescan" title="Look for new mods (one you have just made, say)">↻ Refresh</button></div>
+              <div class="field-hint rm-hint" id="rmScanNote"></div>
+              <div class="field-row"><span class="field-label">Checkpoint:</span><select id="rmModel" class="w-combo"
+                title="Which H3 the mods run on. A mod does best on the model it was made for; pick the one you use in ComfyUI."></select></div>
+              <div class="field-row"><span class="field-label">Base:</span><select id="rmBase" class="w-combo"
+                title="int8 on big cards, streamed blocks for long clips, NF4 for the smallest footprint."></select>
+                <button class="btn" id="rmUnload" title="Free the GPU: the model leaves the card (the next Render loads it again).">Unload model</button></div>
+              <div class="field-row"><span class="field-label">LoRA or ReFLoRA:</span><input type="text" id="rmLora" class="w-path"
+                placeholder="optional">
+                <button class="btn" id="rmLoraPick">Choose…</button><button class="btn" id="rmLoraClear">Clear</button></div>
+              <div class="field-hint rm-hint rm-accent" id="rmLoraInfo"></div>
+            </div>
+          </div>
+          <div class="section-card">
+            <div class="card-title"><span>Mods</span><span class="rm-tokens" id="rmTokens"
+              title="Reference tokens the model attends to on every step: each mod's T × (H/2) × (W/2), times its copies. The pack caps a mod at 5 120; a bundle well over that slows every step and starves the prompt.">Tokens: 0</span></div>
+            <div class="card-desc">One mod per row; untick a row to leave it out. <b>Strength</b>: 0 off, 1 as stored.
+              <b>Copies</b>: how many times it rides in the bundle - more pull harder, each costs its tokens. A second row
+              shows two mods together, the way two loader slots run them in ComfyUI. Nothing here edits a mod file.</div>
+            <div class="card-content">
+              <datalist id="rmModList"></datalist>
+              <div id="rmRows"></div>
+              <div class="field-row"><button class="btn" id="rmAddRow">+ Add a mod row</button></div>
+            </div>
+          </div>
+          <div class="section-card">
+            <div class="card-title"><span>Apply</span></div>
+            <div class="card-desc">How the mods are applied while the picture renders - each control is a setting on the
+              pack's Apply and Step Curve nodes (named in brackets), so what you find here is what you type into ComfyUI.</div>
+            <div class="card-content">
+              <div class="rm-warn" id="rmNumNote" style="display:none">Numbered references is on, so the render takes the
+                pack's Text Encode path: each row's Strength only. Retention, the fades, Shuffle and the Step Curve are not
+                applied, because that ComfyUI graph has no Apply or Step Curve node.</div>
+              <div class="field-row"><span class="field-label">Strength:</span>
+                <input type="range" id="rmRet" min="0" max="1" step="0.01" value="1" class="rm-slider">
+                <input type="text" id="rmRetNum" class="w-num" value="1.00"><span id="rmRetPresets" class="st-inline"></span></div>
+              <div class="field-hint rm-hint">(Apply's Retention) How much of the references reaches the picture: 1.0 as
+                stored, 0.4 keeps the look and frees the scene, 0 off. It multiplies every row's own strength.</div>
+              <div class="field-row"><span class="field-label">Shuffle seed:</span><input type="text" id="rmScramble" class="w-num" value="-1">
+                <button class="btn btn-sm" id="rmScrRand">🎲 Random</button><button class="btn btn-sm" id="rmScrOff">Off</button></div>
+              <div class="field-hint rm-hint">(Apply's Scramble seed) -1 keeps your row order; any seed shuffles the bundle
+                and keeps a random half or more, so a different reference leads. Only matters with more than one entry.</div>
+              <div class="field-row"><span class="field-label">Fade across clip:</span>
+                <span class="field-hint">where</span><select id="rmFcDir" class="w-combo st-small-select"></select>
+                <span class="field-hint">shape</span><select id="rmFcShape" class="w-combo st-small-select"></select>
+                <span class="field-hint">amount</span><input type="range" id="rmFcVal" min="0" max="1" step="0.01" class="rm-slider-sm">
+                <span class="st-chip" id="rmFcValNum"></span></div>
+              <div class="field-hint rm-hint">(Apply's Frame curve - video mods only) How strongly a video mod's frames
+                apply along its length; a still mod has one frame and ignores it.</div>
+              <div class="field-row"><span class="field-label">Change during render:</span>
+                <label class="checkbox-label"><input type="checkbox" id="rmScOn"> On</label>
+                <span class="field-hint">where</span><select id="rmScDir" class="w-combo st-small-select"></select>
+                <span class="field-hint">shape</span><select id="rmScShape" class="w-combo st-small-select"></select>
+                <span class="field-hint">amount</span><input type="range" id="rmScVal" min="0" max="1" step="0.01" class="rm-slider-sm">
+                <span class="st-chip" id="rmScValNum"></span></div>
+              <div class="field-hint rm-hint">(the Step Curve node) Off: the same strength at every step. concept_at_start
+                keeps the references strong while the structure forms, then eases off for the texture steps.</div>
+              <canvas id="rmCurves" width="560" height="150" class="rm-curves"></canvas>
+              <div class="field-row"><span class="field-label">Curve presets:</span><select id="rmCurvePreset" class="w-combo st-small-select"></select>
+                <input type="text" id="rmCurveName" class="w-num rm-name" placeholder="name">
+                <button class="btn btn-sm" id="rmCurveSave">Save</button><button class="btn btn-sm" id="rmCurveDel">Delete</button></div>
+              <div class="field-row"><span class="field-label">ComfyUI graph preset:</span><select id="rmGraph" class="w-combo st-small-select"></select>
+                <button class="btn btn-sm" id="rmGraphUse">Use for the fade</button>
+                <button class="btn btn-sm" id="rmGraphImport" title="A graph preset kept anywhere else: a .png (or .json) the pack's Apply node saved">Import…</button><span class="field-hint" id="rmGraphNote"></span></div>
+            </div>
+          </div>
+          <div class="section-card">
+            <div class="card-title"><span>Render</span></div>
+            <div class="card-desc">The left picture is your setup; the right is the same seed without it (rendered once and
+              kept while its settings hold). Click a still to see it full size.</div>
+            <div class="card-content">
+              <div class="field-row rm-top"><span class="field-label">Prompt:</span><textarea id="rmPrompt" rows="3" class="w-path rm-prompt"></textarea>
+                <button class="btn btn-sm" id="rmHints" title="Append every active mod's 'concept_type: description' - the Loader node's prompt_hint output">+ mod hints</button></div>
+              <div class="field-row"><span class="field-label"></span>
+                <label class="checkbox-label" title="Each active mod is shown to the text encoder as a numbered picture or video, the way the pack's H3 RefMod Text Encode node does, so the prompt can say 'the woman in <Picture 1>'. Costs a decode per mod."><input type="checkbox" id="rmNumbered"> Numbered references (Text Encode node)</label>
+                <span class="field-hint" id="rmRefMap"></span><button class="btn btn-sm" id="rmLabels">+ labels</button></div>
+              <div class="field-row"><span class="field-label">Seed:</span><input type="text" id="rmSeed" class="w-num" value="300">
+                <button class="btn btn-sm" id="rmSeedRand">🎲</button>
+                <span class="field-hint">Length</span><select id="rmLength" class="w-combo st-small-select"></select>
+                <span class="field-hint">Size</span><select id="rmW" class="w-combo st-small-select"></select><span class="field-hint">×</span>
+                <select id="rmH" class="w-combo st-small-select"></select></div>
+              <div class="field-row"><span class="field-label">Steps:</span><input type="text" id="rmSteps" class="w-num" value="4">
+                <span class="field-hint">Turbo</span><input type="text" id="rmTurbo" class="w-num" value="1.0"
+                  title="Turbo LoRA strength: 6 steps at 0.75 is the training-preview regime, 4 at 1.0 the fast dial, 0 = off (20 steps, slow).">
+                <label class="checkbox-label" title="Decode the clip's soundtrack (needs the audio VAE in Preferences)"><input type="checkbox" id="rmSound" checked> Sound</label>
+                <label class="checkbox-label" title="Put up the pass-2 estimate while the remaining passes run"><input type="checkbox" id="rmEarly" checked> Show early</label></div>
+              <div class="field-row"><button class="btn btn-primary" id="rmRender">▶ Render</button>
+                <button class="btn" id="rmCancel" disabled>Cancel</button>
+                <span class="st-inline" id="rmCompareBox" style="display:none"><span class="field-hint">Right-hand picture</span>
+                  <select id="rmCompare" class="w-combo st-small-select"
+                    title="What the right-hand picture leaves out: the mods (the LoRA alone), the LoRA (the mods alone), or both (the base model)."></select></span></div>
+              <div class="field-row"><button class="btn" id="rmSweep" title="The current setup as a row of short clips with ONE dial stepped through its useful values - the quickest way to see what a control does to this mod.">▶ Render sweep</button>
+                <span class="field-hint">of</span><select id="rmSweepKind" class="w-combo st-small-select"></select></div>
+              <div class="field-row"><span class="rm-status" id="rmStatus">Set up your mods, then Render.</span></div>
+              <div class="run-bar"><span id="rmBar" style="width:0"></span></div>
+              <div class="st-preview rm-preview">
+                <figure class="gallery-item st-pane"><img id="rmTweak" alt=""><video id="rmTweakVid" controls loop muted playsinline preload="auto" style="display:none"></video>
+                  <figcaption id="rmTweakCap">With mods</figcaption></figure>
+                <figure class="gallery-item st-pane"><img id="rmBaseImg" alt=""><video id="rmBaseVid" controls loop muted playsinline preload="auto" style="display:none"></video>
+                  <figcaption id="rmBaseCap">No mod (base, same seed)</figcaption></figure>
+              </div>
+              <div class="field-row" id="rmPlayBoth" style="display:none"><button class="btn btn-sm" id="rmPlayBothBtn">▶ Play together</button></div>
+              <div id="rmSweepBox" style="display:none">
+                <div class="rm-sub">Sweep <span class="field-hint" id="rmSweepName"></span>
+                  <button class="btn btn-sm" id="rmStrip">💾 Save strip</button></div>
+                <div class="rm-strip" id="rmChips"></div>
+              </div>
+              <div id="rmHistBox" style="display:none">
+                <div class="rm-sub">History <span class="field-hint">(last 12 - click one to put it back on the left)</span></div>
+                <div class="rm-strip" id="rmHist"></div>
+              </div>
+            </div>
+          </div>
+          <div class="section-card">
+            <div class="card-title"><span>Actions</span></div>
+            <div class="card-desc">Take the result to ComfyUI. <b>ComfyUI settings</b>: the node values that give the same
+              render with the mod files as they are. <b>Bake</b> is the one thing here that writes a mod: one row's mod
+              with its Strength, the master Strength, its Copies and the fade folded in, so it loads at 1.0 with no curve
+              (one mod per file - two mods together are two loader slots). Shuffle and the step curve act at render time
+              and cannot be baked.</div>
+            <div class="card-content">
+              <div class="field-row"><span class="field-label">Save to:</span><input type="text" id="rmOut" class="w-path"
+                title="Where Save preview and Save strip put their files"><button class="btn" id="rmOutPick">Choose…</button>
+                <button class="btn" id="rmSavePrev">💾 Save preview</button></div>
+              <div class="field-row"><span class="field-label">Setup:</span><select id="rmSetup" class="w-combo st-small-select"></select>
+                <button class="btn btn-sm" id="rmSetupLoad">Load</button>
+                <input type="text" id="rmSetupName" class="w-num rm-name" placeholder="name">
+                <button class="btn btn-sm" id="rmSetupSave">Save</button>
+                <span class="field-hint">this whole tab</span></div>
+              <div class="field-row"><span class="field-label">ComfyUI:</span><button class="btn" id="rmReadoutBtn">📋 ComfyUI settings</button>
+                <button class="btn btn-sm" id="rmReadoutCopy" style="display:none">Copy</button></div>
+              <pre class="rm-readout" id="rmReadout" style="display:none"></pre>
+              <div class="field-row"><span class="field-label">Bake:</span><select id="rmBakeRow" class="w-combo st-small-select"></select>
+                <input type="text" id="rmBakeName" class="w-path rm-name-l" placeholder="new mod name (beside the source)">
+                <button class="btn" id="rmBake">🧪 Bake as new RefMod</button></div>
+              <div class="field-row" id="rmRflRow" style="display:none"><span class="field-label">ReFLoRA:</span>
+                <input type="text" id="rmRflName" class="w-path rm-name-l" placeholder="file name (beside the LoRA)">
+                <button class="btn" id="rmRfl" title="The LoRA and the references of the ticked rows, as they are, in one file for ComfyUI's Load H3 RefLoRA node">📦 Save as ReFLoRA</button></div>
+              <div class="field-hint rm-hint" id="rmActStatus"></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="tab-extract" class="tab-panel">
+          <div class="tab-banner">
+            <h1>Extract</h1>
+            <p>Make a LoRA from a LoRA or from a full fine-tune: exact weight SVD, straight from the files - no model loaded.</p>
+          </div>
+          <div class="ry-tabs" id="exModes">
+            <button class="ry-tab" data-exmode="lora" title="A LoRA reduced to a lower rank, or to some of its blocks">From a LoRA</button>
+            <button class="ry-tab" data-exmode="ft" title="A full fine-tune as ordinary LoRAs: its difference from the base it started from">From a fine-tune</button>
+          </div>
+          <div class="section-card" data-exmode="ft">
+            <div class="card-title">Fine-tune to LoRA</div>
+            <div class="card-desc">Turn a full fine-tuned checkpoint into ordinary LoRAs you can share and stack, by extracting its
+              difference from the base it started from. Both files must be the same model. The base is whatever the fine-tune
+              started from: if you continued a run, it's the checkpoint you continued from.</div>
+            <div class="card-content">
+              <div class="field-row"><span class="field-label">Base checkpoint:</span>
+                <input type="text" id="exFtBase" class="w-path" placeholder="the model the fine-tune started from"><span id="exFtBaseBtns"></span></div>
+              <div class="field-row"><span class="field-label">Trained checkpoint:</span>
+                <input type="text" id="exFtTuned" class="w-path" placeholder="the fine-tune's checkpoint"><span id="exFtTunedBtns"></span></div>
+              <div class="field-row"><span class="field-label">Ranks:</span><span id="exFtRanks" class="st-inline"></span></div>
+              <div class="field-hint ex-ft-hint">One LoRA per ticked rank, all from a single SVD pass - four ranks cost about what one
+                does. Higher ranks stay closer to the fine-tune and make bigger files; on a three-subject Krea 2 run, 64 was
+                indistinguishable from the fine-tune. It runs on the GPU: free it first if a training run or a Studio preview is
+                using the card.</div>
+              <div class="field-row"><span class="field-label">Name:</span>
+                <input type="text" id="exFtName" class="w-path" value="extracted">
+                <span class="field-hint">saved as &lt;name&gt;_&lt;time&gt;_r&lt;rank&gt;.safetensors</span></div>
+              <div class="field-row"><span class="field-label">Output folder:</span>
+                <input type="text" id="exFtOut" class="w-path"><button class="btn" id="exFtOutPick">Choose…</button></div>
+            </div>
+          </div>
+          <div class="section-card" data-exmode="lora">
+            <div class="card-title">Source &amp; Output</div>
+            <div class="card-content">
+              <div class="field-row"><span class="field-label">Model:</span><select id="exFamily" class="w-combo"></select>
+                <span class="field-hint">Choosing a LoRA switches to its model.</span></div>
+              <div class="field-row"><span class="field-label">Source LoRA:</span>
+                <input type="text" id="exSource" class="w-path" placeholder="the LoRA to reduce (.safetensors)"><span id="exSourceBtns"></span></div>
+              <div class="field-row"><span class="field-label">Output name:</span>
+                <input type="text" id="exName" class="w-path" placeholder="name.safetensors"></div>
+              <div class="field-row"><span class="field-label">Output folder:</span>
+                <input type="text" id="exOutDir" class="w-path"><button class="btn" id="exOutPick">Choose…</button></div>
+            </div>
+          </div>
+          <div class="section-card" id="exPresetCard" data-exmode="lora">
+            <div class="card-title">Preset</div>
+            <div class="card-desc">Which blocks to keep. Custom picks them one by one.</div>
+            <div class="card-content">
+              <div class="field-row"><span class="field-label">Extract preset:</span><select id="exPreset" class="w-combo"></select></div>
+              <div id="exCustom" style="display:none"></div>
+            </div>
+          </div>
+          <div class="section-card" data-exmode="lora">
+            <div class="card-title">Options</div>
+            <div class="card-desc">Target rank: the rank the extracted LoRA keeps (its strongest directions).</div>
+            <div class="card-content">
+              <div class="field-row"><span class="field-label">Target rank:</span>
+                <select id="exRank" class="w-combo st-small-select"><option>1</option><option>2</option><option selected>4</option>
+                  <option>8</option><option>16</option></select></div>
+            </div>
+          </div>
+          <div class="section-card">
+            <div class="card-title"><span>Run</span><span class="run-badge" id="exBadge"></span></div>
+            <div class="card-content">
+              <div class="field-row"><button class="btn btn-primary" id="exRun">Extract LoRA</button>
+                <span class="field-hint" id="exStatus"></span><span id="exDone"></span></div>
+              <div class="run-bar"><span id="exBar" style="width:0"></span></div>
+              <pre class="console-terminal" id="exLog"></pre>
+            </div>
+          </div>
+        </section>
+
+        <section id="tab-metadata" class="tab-panel">
+          <div class="tab-banner">
+            <h1>Metadata</h1>
+            <p>View and edit the SAI ModelSpec metadata in a .safetensors file - title, author, description, trigger
+              phrase, thumbnail and anything else ComfyUI's model browser reads. Any .safetensors file, not just ones
+              Fizgig trained.</p>
+          </div>
+          <div class="section-card">
+            <div class="card-title">File</div>
+            <div class="card-content">
+              <div class="field-row"><span class="field-label">File:</span>
+                <input type="text" id="mdPath" class="w-path" placeholder="any .safetensors file"><span id="mdPathBtns"></span></div>
+              <div class="field-hint" id="mdStatus">No file loaded.</div>
+            </div>
+          </div>
+          <div class="section-card">
+            <div class="card-title">Standard Fields</div>
+            <div class="card-desc">The fields ComfyUI's model browser (and other spec-aware tools) show specially.</div>
+            <div class="card-content" id="mdStandard"></div>
+          </div>
+          <div class="section-card">
+            <div class="card-title">Thumbnail</div>
+            <div class="card-desc">The picture ComfyUI shows as card art. Fizgig embeds the latest training sample when it
+              trains a LoRA - replace or clear it here for any file.</div>
+            <div class="card-content">
+              <div id="mdThumb" class="md-thumb field-hint">(no thumbnail)</div>
+              <div class="field-row"><span id="mdThumbBtns"></span><button class="btn" id="mdThumbClear">Clear</button></div>
+            </div>
+          </div>
+          <div class="section-card">
+            <div class="card-title">Custom Fields</div>
+            <div class="card-desc">Anything else in the file - kept as it is unless you change it here, so nothing is dropped
+              on save. Add your own keys too; tools that don't know them just ignore them.</div>
+            <div class="card-content"><div id="mdCustom"></div>
+              <div class="field-row"><button class="btn btn-sm" id="mdAdd">+ Add field</button></div></div>
+          </div>
+          <div class="section-card">
+            <div class="card-title">Save</div>
+            <div class="card-content">
+              <div class="field-row"><button class="btn btn-primary" id="mdSave">Save</button>
+                <span class="field-hint">or save a copy as</span>
+                <input type="text" id="mdDest" class="w-path" placeholder="another .safetensors path">
+                <button class="btn" id="mdSaveAs">Save as</button></div>
+              <div class="field-hint" id="mdSaveMsg"></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="tab-outputs" class="tab-panel">
+          <div class="tab-banner">
+            <h1>Runs &amp; outputs</h1>
+            <p>Every run you've started, newest first: how it went, its previews and
+              checkpoints, and its settings to start again with. Below, every LoRA and fine-tune saved in Fizgig's
+              output folders. Download sends a file to
+              the device you're using now. Very large fine-tunes come off faster another way: on a pod, through its
+              <a class="fm-link fm-text" target="_blank" rel="noopener">file manager</a>; on your own server, with scp or rsync
+              from the folder shown.</p>
+          </div>
+          <div class="section-card">
+            <div class="card-title"><span>Runs</span><button class="btn btn-sm" id="runsReload">Reload</button></div>
+            <div class="card-content"><div id="runsList" class="runs-list"></div></div>
+          </div>
+          <div class="section-card">
+            <div class="card-title"><span>Saved files</span>
+              <button class="btn btn-sm" id="outToggle">Show</button></div>
+            <div class="card-desc" id="outFolded">Every LoRA and fine-tune in Fizgig's output folders, the runs above
+              included, to search and download. Press Show to list them.</div>
+            <div class="card-content" id="outBody" style="display:none">
+              <div class="field-row"><span class="field-label">Search:</span>
+                <input type="text" id="outSearch" class="w-path" placeholder="run name or folder">
+                <button class="btn" id="outReload">Reload</button></div>
+              <div class="field-row"><span class="field-label">Saved:</span>
+                <select id="outWhen" class="w-combo">
+                  <option value="any">Any time</option><option value="1">In the last 24 hours</option>
+                  <option value="7">In the last 7 days</option><option value="30">In the last 30 days</option>
+                  <option value="custom">Between two dates…</option></select></div>
+              <div class="field-row" id="outRange" style="display:none"><span class="field-label">From / to:</span>
+                <input type="date" id="outFrom"> <input type="date" id="outTo"></div>
+              <label class="checkbox-label"><input type="checkbox" id="outFizgigOnly" checked>
+                Only Fizgig's outputs (untick to also see other LoRAs kept in the same folders)</label>
+              <div class="field-hint" id="outSummary"></div>
+            </div>
+          </div>
+          <div id="outRuns" style="display:none"></div>
+        </section>
+        <section id="tab-pods" class="tab-panel">
+          <div class="tab-banner">
+            <h1>Pods</h1>
+            <p>Train on a rented GPU from here. A pod runs Fizgig in the cloud; open it and it's this same app, on a
+              bigger card, while your own computer stays free. Closing it doesn't stop a run.</p>
+          </div>
+          <div class="section-card">
+            <div class="card-title"><span>Your pods</span><button class="btn btn-sm" id="podsReload">Reload</button></div>
+            <div class="card-content">
+              <div id="podsList" class="pods-list"></div>
+              <div class="field-hint" id="podsNote"></div>
+            </div>
+          </div>
+          <div class="section-card">
+            <div class="card-title">Add a pod</div>
+            <div class="card-desc">Paste the pod's ID (the code under its name on RunPod's Pods page) or its address. The
+              address of a Fizgig on another computer on your network works too.</div>
+            <div class="card-content">
+              <div class="field-row"><input type="text" id="podAddText" class="w-path" placeholder="e.g. lx6csscwpfdfvd" spellcheck="false">
+                <input type="text" id="podAddName" class="w-combo-md" placeholder="name (optional)">
+                <button class="btn btn-primary" id="podAdd">Add</button></div>
+              <div class="field-hint" id="podAddNote"></div>
+            </div>
+          </div>
+          <div class="section-card">
+            <div class="card-title">RunPod API key (optional)</div>
+            <div class="card-desc">With your key, your Fizgig pods are listed here by themselves (nothing to paste), and
+              you can start and stop them without opening RunPod. Make one at RunPod &gt; Settings &gt; API Keys. It is
+              saved on this computer only, in prefs.json.</div>
+            <div class="card-content">
+              <div class="field-row"><input id="podKey" type="password" class="w-path" autocomplete="off"
+                  placeholder="rpa_..." spellcheck="false">
+                <button class="btn" id="podKeySave">Save</button><button class="btn" id="podKeyClear">Remove</button>
+                <a class="btn" href="https://console.runpod.io/user/settings" target="_blank" rel="noopener">Get a key</a></div>
+              <div class="field-hint" id="podKeyNote"></div>
+            </div>
+          </div>
+          <div class="section-card pods-rent">
+            <div class="card-title">Rent a pod</div>
+            <div class="card-desc">Fizgig's RunPod template is ready to train, with nothing to install. With your API key,
+              this lists the cards RunPod has free right now, their price, and roughly what a run costs on each. Deploy
+              opens RunPod's page with that card and the template chosen: give it a 100 GB+ volume and press Deploy
+              there. Once it has started it shows above by itself (with your key), or paste its ID.</div>
+            <div class="card-content">
+              <div class="pick-row">
+                <label>Memory <select id="pickVram" title="32 GB trains Krea 2 with no block swap; a smaller card swaps blocks and runs slower">
+                  <option value="24">24 GB+</option><option value="32" selected>32 GB+</option>
+                  <option value="48">48 GB+</option><option value="80">80 GB+</option></select></label>
+                <label class="pick-live">Cloud <select id="pickCloud" title="Secure Cloud: RunPod's own data centres. Community Cloud: vetted hosts, cheaper">
+                  <option value="any">Either</option><option value="secure">Secure</option>
+                  <option value="community">Community</option></select></label>
+                <label class="pick-live">Up to $<input id="pickMax" type="number" step="0.1" min="0" placeholder="any">/hr</label>
+                <label class="pick-live" title="How long your run takes on an RTX 5090: each card's cost is worked out from it">A run of
+                  <input id="pickHours" type="number" value="2" step="0.5" min="0.5"> h on a 5090</label>
+                <label id="pickVolWrap" hidden title="Only the cards free in your volume's data centre">Volume
+                  <select id="pickVol"></select></label>
+              </div>
+              <div class="pods-list" id="pickList"></div>
+              <div class="field-hint" id="pickNote"></div>
+              <div class="field-hint">Every Deploy link here is a referral one: it supports Fizgig's development at no
+                extra cost to you. <a href="https://github.com/shootthesound/Fizgig/blob/master/docker/README.md"
+                target="_blank" rel="noopener">The pod guide</a></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="tab-prefs" class="tab-panel">
+          <div class="tab-banner">
+            <h1>Preferences</h1>
+            <p>Where each model's files are on this machine. A path saves when you leave its box.</p>
+          </div>
+          <div id="prefsForm"></div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+
+  <div class="modal-backdrop" id="rvModal">
+    <div class="modal-window rv-window">
+      <div class="modal-header"><span>Training Run Visualiser <span class="field-hint" id="rvRun"></span></span>
+        <button class="btn" data-close="rvModal">✕</button></div>
+      <div class="modal-body">
+        <div class="field-row"><span class="field-hint">Prompt</span><select id="rvSlot" class="w-combo st-small-select"></select>
+          <button class="btn btn-sm" id="rvPlay">▶ Play</button>
+          <span class="field-hint">Speed</span><select id="rvSpeed" class="w-combo st-small-select">
+            <option value="600">Slow</option><option value="350" selected>Normal</option><option value="180">Fast</option></select>
+          <label class="checkbox-label"><input type="checkbox" id="rvPing" checked> Loop (ping-pong)</label>
+          <label class="checkbox-label"><input type="checkbox" id="rvTicker" checked> Epoch ticker</label>
+          <label class="checkbox-label"><input type="checkbox" id="rvTag" checked> Fizgig tag</label></div>
+        <div class="rv-stage"><img id="rvImg" alt=""><div class="rv-epoch" id="rvEpoch"></div></div>
+        <input type="range" id="rvSlider" min="0" max="0" value="0" class="rv-slider">
+        <div class="field-row"><button class="btn btn-sm" id="rvClip">⬇ Save clip (WebM)</button>
+          <button class="btn btn-sm" id="rvFrame">⬇ Save frame (PNG)</button>
+          <span class="field-hint" id="rvStatus">← → step, space plays. LoRA Royale renders any epoch on any prompt and saves MP4 or GIF.</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="likModal">
+    <div class="modal-window" style="width: 860px;">
+      <div class="modal-header"><span>Likeness: pick 3 photos of your subject</span>
+        <button class="btn" data-close="likModal">✕</button></div>
+      <div class="modal-body">
+        <div class="field-hint">From the training images (<span id="likFolder"></span>). Pick clear, typical shots of the
+          face: each preview is scored against all three and the mean shown, so one odd photo can't skew it.</div>
+        <div class="lik-grid" id="likGrid"></div>
+        <div class="field-row"><button class="btn btn-primary" id="likStart" disabled>Start scoring</button>
+          <button class="btn" id="likClear">Stop and clear scores</button>
+          <span class="field-hint" id="likPickStatus">0/3 selected</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="pickerModal">
+    <div class="modal-window" style="width: 640px;">
+      <div class="modal-header"><span id="pickerTitle">Choose</span>
+        <button class="btn" data-close="pickerModal">✕</button></div>
+      <div class="modal-body">
+        <div class="field-hint">On the machine running Fizgig.</div>
+        <div class="picker-places" id="pickerPlaces"></div>
+        <div class="field-row"><button class="btn" id="pickerUp">Up</button>
+          <input type="text" id="pickerPath" class="w-path">
+          <button class="btn" id="pickerNew">New folder…</button></div>
+        <div class="field-row" id="pickerNewRow" style="display:none"><span class="field-label">New folder name:</span>
+          <input type="text" id="pickerNewName" class="w-path" placeholder="my_new_folder">
+          <button class="btn btn-primary" id="pickerNewMake">Create</button>
+          <button class="btn" id="pickerNewCancel">Cancel</button></div>
+        <div class="field-hint" id="pickerNewMsg"></div>
+        <div id="pickerList" class="picker-list"></div>
+      </div>
+      <div class="modal-footer"><span class="field-hint upload-status" id="pickerUpMsg"></span>
+        <label class="btn" id="pickerUpload" style="display:none"
+          title="A LoRA (or picture, clip or song) from the device you're using now, sent up to the machine running Fizgig and picked">
+          Upload from this device…<input type="file" id="pickerUpFile" hidden accept=".safetensors,image/*,.mp4,audio/*,.m4a"></label>
+        <button class="btn btn-primary" id="pickerChoose">Use this folder</button></div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="cropModal">
+    <div class="modal-window crop-window">
+      <div class="modal-header"><span id="cropTitle">Crop to the clip's shape</span>
+        <button class="btn" id="cropX">✕</button></div>
+      <div class="modal-body">
+        <div class="field-hint">Drag the box to move it, drag a corner to resize. The box keeps the clip's shape; what's
+          inside becomes the frame.</div>
+        <canvas id="cropCanvas"></canvas>
+        <div class="field-hint" id="cropSize"></div>
+      </div>
+      <div class="modal-footer"><button class="btn" id="cropCentre">Centre</button>
+        <button class="btn" id="cropCancel">Cancel</button><button class="btn btn-primary" id="cropOk">Use this crop</button></div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="aboutModal">
+    <div class="modal-window about-window">
+      <div class="modal-header"><span>About Fizgig</span>
+        <button class="btn" data-close="aboutModal">✕</button></div>
+      <div class="modal-body about-body">
+        <h2>Fizgig</h2>
+        <div class="about-sub">LoRA &amp; Fine-tune Studio — by Peter Neill</div>
+        <div class="about-version" id="aboutVersion"></div>
+        <div class="about-update" id="aboutUpdate"></div>
+        <div class="about-release" id="aboutRelease"></div>
+        <p><button class="btn btn-sm" id="aboutCheck">Check for updates</button> <span class="field-hint" id="aboutCheckSay"></span></p>
+        <p>By trade I'm a photographer and videographer — mostly live music, portraits, and a bit of teaching — and an
+          AI tinkerer by night. I build a lot of open-source tooling for ComfyUI and Klein/Flux workflows.</p>
+        <p class="about-links"><a href="https://shootthesound.com" target="_blank" rel="noopener">Photography —
+          shootthesound.com</a><br><a href="https://github.com/shootthesound" target="_blank" rel="noopener">Code &amp;
+          ComfyUI nodes — github.com/shootthesound</a></p>
+        <p class="about-muted">(Realtime-LoRA, LongLook, Angelo, mesh and a couple of dozen more — Fizgig grew out of
+          that world.)</p>
+        <hr>
+        <p class="about-note">A quiet note: a lot of this got built in the small hours. The last year has been a hard one
+          for our family — one of my children has been facing some serious health challenges — and honestly, losing
+          myself in making and obsessing over tools like this is how I carve out a little headspace. It keeps my hands
+          busy and my head somewhere steady.</p>
+        <p>Fizgig is free and always will be. If it's useful to you and you'd like to drop a coffee in the tip jar, it
+          genuinely means a lot right now — but it's in no way an obligation. Using it and enjoying it is more than
+          enough. Thank you for being here.</p>
+        <p class="about-links"><a href="https://github.com/shootthesound/Fizgig/releases/latest" target="_blank"
+          rel="noopener">📖 Release notes</a></p>
+      </div>
+      <div class="modal-footer"><button class="btn btn-primary" data-close="aboutModal">Close</button></div>
+    </div>
+  </div>
+
+  <!-- Fizgig 8's welcome: on this computer's own page, until Don't show this again -->
+  <div class="modal-backdrop" id="welcomeModal">
+    <div class="modal-window welcome-window">
+      <div class="modal-header"><span>Welcome to Fizgig 8</span>
+        <button class="btn btn-sm" id="welcomeX" title="Close">✕</button></div>
+      <div class="modal-body welcome-body">
+        <video id="welcomeVideo" src="/welcome.mp4" muted loop playsinline controls preload="auto"></video>
+        <div class="welcome-text">
+          <p><b>The steps haven't changed.</b> Start → Image Prep → Captions → Samples → Training, numbered down the
+            left instead of across the top. The tools you use afterwards (Runs &amp; outputs, Studio, Profiler and the
+            rest) sit below them.</p>
+          <p><b>Its own window, or your browser.</b> <code>Launch Fizgig.bat</code> opens it in its own window,
+            <code>Launch Fizgig in browser.bat</code> in your browser: the same app either way.</p>
+          <p class="welcome-new">New in Fizgig 8:</p>
+          <ul>
+            <li><b>Up next</b> in the sidebar: what's training and what's queued, from any tab.</li>
+            <li><b>Pods</b>: use your other computers' GPUs on your network, or a RunPod pod, right here.</li>
+            <li><b>Runs &amp; outputs</b>: every run, with its files and its settings to start again.</li>
+            <li><b>Your phone</b>: set a password in Preferences → Web UI and watch a run from it.</li>
+          </ul>
+          <p class="field-hint">Coming from Fizgig 7? Your folders, settings, presets and queued runs came across.</p>
+          <p class="welcome-guides">Guides:
+            <a href="https://github.com/shootthesound/Fizgig/blob/master/docs/WEB_UI.md#your-other-computers-use-ones-gpu-from-another" target="_blank" rel="noopener">Your other computers</a> ·
+            <a href="https://github.com/shootthesound/Fizgig/blob/master/docker/README.md" target="_blank" rel="noopener">Pods on RunPod</a> ·
+            <a href="https://github.com/shootthesound/Fizgig/blob/master/docs/WEB_UI.md#on-your-phones-home-screen" target="_blank" rel="noopener">Your phone</a> ·
+            <a href="https://github.com/shootthesound/Fizgig/blob/master/docs/WEB_UI.md" target="_blank" rel="noopener">Everything else</a></p>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <label class="checkbox-label welcome-never"><input type="checkbox" id="welcomeNever"> Don't show this again</label>
+        <button class="btn btn-primary" id="welcomeClose">Get started</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal-backdrop" id="loginModal">
+    <div class="modal-window" style="width: 380px;">
+      <div class="modal-header"><span>Log in</span></div>
+      <div class="modal-body">
+        <div class="card-desc">Fizgig's password. On a RunPod pod it's the FIZGIG_PASSWORD (or VNC_PASSWORD) set in the
+          template, or, if none was set, the one printed in the pod's logs. On your own computer it's the one in
+          Preferences &gt; Web UI. No user name is needed.</div>
+        <div class="field-row"><input type="password" id="loginPassword" class="w-path" autocomplete="current-password">
+          <button class="btn btn-primary" id="loginButton">Log in</button></div>
+        <label class="checkbox-label login-remember"><input type="checkbox" id="loginRemember" checked> Keep me logged in on this device
+          (30 days)</label>
+        <div class="field-hint" id="loginError"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- a picture shown big: click a preview or a Captions picture; click, Esc or the cross closes, arrows step -->
+  <div class="lightbox" id="lightbox" style="display:none">
+    <button class="btn lightbox-close" id="lightboxClose" title="Close (Esc)">✕</button>
+    <button class="btn lightbox-step" id="lightboxPrev" title="Previous (←)">‹</button>
+    <figure class="lightbox-figure"><img id="lightboxImg" alt=""><figcaption id="lightboxName"></figcaption>
+      <div class="lightbox-cap" id="lightboxCap" style="display:none">
+        <textarea id="lightboxCapText" rows="3" spellcheck="true"></textarea>
+        <div class="lightbox-cap-row"><button class="btn btn-primary btn-sm" id="lightboxCapSave"
+          title="Save the caption (Ctrl+Enter)">Save</button>
+          <button class="btn btn-sm" id="lightboxCapRecap" title="Write this file's caption again with the model and task on the Captions tab">Re-caption</button>
+          <button class="btn btn-sm" id="lightboxCapSpeech" style="display:none" title="Whisper this clip's speech and add it to the end of the caption">🎤 Append speech</button>
+          <button class="btn btn-sm" id="lightboxCapRemove" title="Take it out of the training set: it and its caption move into the folder's removed subfolder (nothing is deleted).">Remove</button>
+          <span class="field-hint" id="lightboxCapNote"></span></div>
+      </div></figure>
+    <button class="btn lightbox-step" id="lightboxNext" title="Next (→)">›</button>
+  </div>
+
+  <script src="/qrcode.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

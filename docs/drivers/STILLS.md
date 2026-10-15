@@ -12,6 +12,7 @@ Three rules make it fit the layer:
 
 - **Plain `nn.Linear` layers** for everything a LoRA should reach. The LoRA wraps Linears by dotted name, and INT8 / NF4 quantise the same ones.
 - **The text encoder only encodes.** Captioning is shared (Krea 2's Qwen3-VL-4B for every family), so leave out an LM head or vision tower if encoding doesn't need it. It fits smaller cards that way.
+- **Files loaded by name must work offline.** A tokenizer, processor or config fetched from a Hugging Face repo by name goes in the description's `helper_files` (the model downloader fetches those up front) and is loaded with the driver's `self.from_pretrained(cls, repo, ...)`, or `self.helper_dir(repo)` for loaders that want a folder (diffusers' `from_single_file(config=...)`). Plain `from_pretrained` asks the Hub on every call, so a fully cached setup still fails offline, or when the Hub rate-limits the machine. `families/offline_check.py --family <key>` proves it (see the [checklist](CHECKLIST.md)).
 - **Block swap is optional.** If your blocks sit in an `nn.ModuleList` and your forward can call the shared offloader around each block (`wait_for_block` / `submit_move_blocks_forward`, as Qwen's model does), you get block swap and fine-tune streaming on small cards. Without it the family trains without swap.
 
 ## 2. The description
@@ -26,7 +27,7 @@ MYMODEL = FamilyDescription(
     key="mymodel",                    # used by the workbench, presets and the CLI's --family
     arch_id="mymodel10",              # cache file names and LoRA metadata: change it and old caches are ignored
     display_name="My Model 1.0",
-    gui_label="My Model 1.0 (experimental)",
+    gui_label="My Model 1.0",          # the Base Model picker's name - never "experimental"; it keys saved settings
     lora_name_suffix="mym10",
     hidden=True,                      # not in the GUI yet
 
@@ -63,7 +64,7 @@ MYMODEL = FamilyDescription(
     implementation="https://github.com/org/my-model",
 
     sampling=(SamplingSettings("Reference", steps=30, cfg=4.0, source="the model card"),),
-    workbench=("repair", "explorer", "profiler", "extract", "royale"),
+    workbench=("repair", "profiler", "extract", "royale"),
 )
 ```
 
@@ -195,11 +196,14 @@ train_memory={
 
 Measure them with short training runs at two resolutions. The trainer logs the peak each epoch. With `train_memory` empty, Auto takes the first precision and doesn't swap.
 
+Then run the plans on small cards: `FIZGIG_SIM_VRAM_GB=12` (or 16, 24) makes the planner and the allocator behave as that card. The [checklist](CHECKLIST.md#small-cards) lists the runs every family needs: Auto LoRA plans at 12 and 16 GB, block swap forced on, fine-tune plans at 16 and 24 GB, and a workbench render at 12 GB.
+
 ## 5. Presets and samples
 
 - **`presets`**: built-in Training-tab presets, `((name, {setting key: value}), ...)`. The first is applied on a user's first visit to the family. Copy Qwen's `_preset()` helper to start, then tune it on real runs. Ship only presets you've trained.
 - **`preview_steps`, `preview_cfg`, `preview_width`, `preview_height`**: the Samples tab's defaults for in-training previews.
 - **`preview_negative`**: the Samples tab's default negative prompt for the family. Each family keeps the user's own edit. Leave it `None` if the family's previews take no negative (CFG-free or distilled); the box then greys out.
+- **Changing the previews mid-run** (the Samples tab's tick for the run going now: prompts, seed, size) comes free: the shared trainer reads it before each preview round, encodes the prompt with your `encode_text` and renders it with your `generate`, so a family needs no code for it. It never applies to slider runs, whose previews always show the slider's own prompt across strengths.
 - **`speed_loras` + `preview_speed_lora`**: a Turbo / Lightning / DMD LoRA with the settings it wants (steps, CFG, sigmas). Previews and the workbench use it when its file is set in Preferences, which makes the workbench fast on a slow model. See [ABILITIES.md](ABILITIES.md#fast-previews).
 
 ## 6. Run it from the command line

@@ -1,47 +1,42 @@
-"""The Start tab's button row: right labels, right colours, working links.
+"""The sidebar's link buttons (Fizgig 8 web UI): right labels, right colours, working links — headless, no browser.
 
-A Tk button with a broken command builds perfectly and only fails when someone clicks it, so
-this walks the widget tree and actually INVOKES each one with webbrowser.open stubbed. That is
-the whole point: the failure mode being guarded against here is a dead button, not a missing one.
+The desktop's Start tab had a button row (Tutorial / Buy me a coffee / Deploy on RunPod / About) and this walked the
+Tk tree INVOKING each one, because a button with a broken command builds fine and only fails when clicked. In
+Fizgig 8 those links live in the web UI's sidebar (index.html <aside>) as plain <a href target=_blank> links, plus
+an About button that app.js wires up. A dead link here is a wrong or drifted href, so that is what is pinned:
+  1. Deploy on RunPod: exactly one, RunPod's violet, its href the same deploy link pods.py builds (Fizgig's
+     template, the referral tag) so the two cannot drift; hidden on a pod; every per-GPU deploy link carries it too;
+  2. Buy me a coffee: the real page, in a new tab;
+  3. the sidebar's order, and the About button is wired;
+  4. the app window sends these links to the browser (pywebview would otherwise open them inside itself).
+
+Retired with the desktop: the per-tab YouTube Tutorial buttons. Fizgig 8 has none; check 0 pins that no
+"Get help on YouTube" leftover came back with them.
 
 Run: venv/Scripts/python.exe tests/test_start_buttons.py
 """
 import os
+import re
 import sys
-import tkinter as tk
-import webbrowser
+import urllib.parse
+from html.parser import HTMLParser
 
-os.environ["FIZGIG_NO_PERSIST"] = "1"          # traced vars auto-save; never touch real prefs
-# Repo root, derived from this file's location -- was hardcoded to one machine's
-# absolute path, which made the whole suite unrunnable anywhere else.
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, REPO)
+# src only. The repo root holds Fizgig 8's fizgig.py, which would shadow the fizgig package.
 sys.path.insert(0, os.path.join(REPO, "src"))
-os.chdir(REPO)
-from lora_trainer_gui import LoRATrainerGUI      # noqa: E402
+_UD = os.path.join(REPO, "user_data")
+_had_ud = os.path.isdir(_UD)
+from fizgig.web import pods  # noqa: E402
+if not _had_ud and os.path.isdir(_UD) and not os.listdir(_UD):
+    os.rmdir(_UD)
 
-opened = []
-webbrowser.open = lambda u, *a, **k: opened.append(u)
+STATIC = os.path.join(REPO, "src", "fizgig", "web", "static")
+HTML = open(os.path.join(STATIC, "index.html"), encoding="utf-8").read()
+JS = open(os.path.join(STATIC, "app.js"), encoding="utf-8").read()
+CSS = open(os.path.join(STATIC, "style.css"), encoding="utf-8").read()
+APPWIN = open(os.path.join(REPO, "src", "fizgig", "web", "app_window.py"), encoding="utf-8").read()
 
-root = tk.Tk()
-root.withdraw()
-gui = LoRATrainerGUI(root)
-
-buttons = []
-
-
-def walk(w):
-    for c in w.winfo_children():
-        if isinstance(c, tk.Button):
-            try:
-                buttons.append((c.cget("text"), c.cget("bg"), c))
-            except Exception:
-                pass
-        walk(c)
-
-
-walk(root)
-
+sys.stdout.reconfigure(errors="replace")   # the sidebar holds glyphs (the tabs toggle) a cp1252 console lacks
 fails = []
 
 
@@ -51,44 +46,90 @@ def ck(label, cond, detail=""):
         fails.append(label)
 
 
-texts = [t for t, _, _ in buttons]
+class _Side(HTMLParser):
+    """The <a> and <button> elements directly inside the first <aside> (the sidebar), in order, with their text."""
 
-# --- the tutorial button on every tab ---------------------------------------------------------
-ck("no 'Get help on YouTube' left anywhere", not any("Get help on YouTube" in t for t in texts))
-tut = [b for b in buttons if b[0].endswith("Tutorial")]
-ck("a Tutorial button on every tab", len(tut) >= 10, f"{len(tut)} found")
-ck("  still YouTube red", all(bg == "#CC0000" for _, bg, _ in tut), {bg for _, bg, _ in tut})
-ck("  still carries the play glyph", all(t.startswith("\u25b6") for t, _, _ in tut))
+    def __init__(self):
+        super().__init__()
+        self.depth, self.done, self.items, self.cur = 0, False, [], None
 
-# --- the Start row ------------------------------------------------------------------------------
-start_rp = [b for b in buttons if b[0].strip() == "\u26a1  Deploy on RunPod"]
-ck("one Deploy on RunPod button on the Start row", len(start_rp) == 1, f"{len(start_rp)} found")
-ck("  RunPod's violet, not a Fizgig accent", start_rp[0][1] == "#7C3AED", start_rp[0][1])
+    def handle_starttag(self, tag, attrs):
+        if self.done:
+            return
+        if tag == "aside":
+            self.depth += 1
+            return
+        if self.depth and tag in ("a", "button") and self.cur is None:
+            self.cur = {"tag": tag, **dict(attrs), "text": ""}
 
-# The Preferences card carries its own deploy button (the desktop-side advert). Two in the app
-# is correct; this pins that number so a third does not appear unnoticed.
-all_rp = [b for b in buttons if "Deploy on RunPod" in b[0]]
-ck("two app-wide: the Start row and the Preferences advert", len(all_rp) == 2, len(all_rp))
+    def handle_endtag(self, tag):
+        if self.done:
+            return
+        if tag == "aside" and self.depth:
+            self.depth -= 1
+            self.done = not self.depth
+        elif self.cur is not None and tag == self.cur["tag"]:
+            self.cur["text"] = self.cur["text"].strip()
+            self.items.append(self.cur)
+            self.cur = None
 
-sibs = [c.cget("text") for c in start_rp[0][2].master.winfo_children() if isinstance(c, tk.Button)]
-ck("row order is Tutorial / coffee / RunPod / About",
-   [s.strip().split("  ")[-1] for s in sibs]
-   == ["Tutorial", "Buy me a coffee", "Deploy on RunPod", "About"], sibs)
+    def handle_data(self, data):
+        if self.cur is not None:
+            self.cur["text"] += data
 
-# --- every link actually fires -------------------------------------------------------------------
-for want, frag in (("Tutorial", "youtube"),
-                   ("Buy me a coffee", "buymeacoffee"),
-                   ("\u26a1  Deploy on RunPod", "console.runpod.io")):
-    b = [x for x in buttons if want in x[0]][0]
-    opened.clear()
-    b[2].invoke()
-    ck(f"{want.strip()} opens {frag}", len(opened) == 1 and frag in opened[0], opened)
 
-opened.clear()
-start_rp[0][2].invoke()
-ck("the RunPod link carries the referral tag",
-   f"ref={gui.RUNPOD_REFERRAL}" in opened[0], opened[0])
+p = _Side()
+p.feed(HTML)
+side = p.items
+by_text = {i["text"]: i for i in side}
 
-root.destroy()
+# --- 0. the retired tutorial button left nothing behind --------------------------------------------
+ck("no 'Get help on YouTube' left anywhere", "Get help on YouTube" not in HTML + JS)
+
+# --- 1. Deploy on RunPod -----------------------------------------------------------------------------
+ck("exactly one Deploy on RunPod in the UI", (HTML + JS).count("Deploy on RunPod") == 1,
+   (HTML + JS).count("Deploy on RunPod"))
+dep = by_text.get("Deploy on RunPod")
+ck("  it is in the sidebar", dep is not None, f"{len(side)} sidebar links and buttons")
+if dep:
+    ck("  its href is pods.deploy_url(), so the two can't drift", dep.get("href") == pods.deploy_url(),
+       (dep.get("href"), pods.deploy_url()))
+    q = urllib.parse.parse_qs(urllib.parse.urlsplit(dep.get("href", "")).query)
+    ck("  carries the referral tag and Fizgig's template",
+       q.get("ref") == [pods.REF] and q.get("template") == [pods.TEMPLATE], q)
+    ck("  opens in a new tab, without handing the page an opener",
+       dep.get("target") == "_blank" and "noopener" in (dep.get("rel") or ""))
+    ck("  hidden on a pod (nothing to deploy from one)",
+       re.search(r'\$\("' + dep.get("id", "?") + r'"\)\.style\.display = S\.onPod \? "none" : ""', JS) is not None)
+# the last .runpod-btn rule that sets a background (later rules win; the phone layout's only re-spaces it)
+_rp = [m.group(1) for m in re.finditer(r"\.runpod-btn\s*\{([^}]*)\}", CSS) if "background" in m.group(1)]
+ck("  RunPod's violet, not a Fizgig accent",
+   bool(_rp) and re.search(r"background:\s*#7C3AED", _rp[-1], re.I) is not None, _rp[-1][:120] if _rp else None)
+for gpu in ("RTX 5090", "RTX 4090", "H100 80GB HBM3"):
+    q = urllib.parse.parse_qs(urllib.parse.urlsplit(pods.deploy_url(gpu)).query)
+    ck(f"the Pods tab's deploy link for {gpu} carries the referral and that GPU",
+       q.get("ref") == [pods.REF] and q.get("gpu") == [gpu] and q.get("template") == [pods.TEMPLATE], q)
+
+# --- 2. Buy me a coffee ----------------------------------------------------------------------------
+cof = by_text.get("Buy me a coffee")
+ck("Buy me a coffee is in the sidebar", cof is not None)
+if cof:
+    u = urllib.parse.urlsplit(cof.get("href", ""))
+    ck("  opens buymeacoffee.com/lorasandlenses over https",
+       u.scheme == "https" and u.netloc == "buymeacoffee.com" and u.path == "/lorasandlenses", cof.get("href"))
+    ck("  in a new tab, noopener", cof.get("target") == "_blank" and "noopener" in (cof.get("rel") or ""))
+
+# --- 3. order, and About is wired --------------------------------------------------------------------
+_order = [i["text"] for i in side if i["text"] in ("Deploy on RunPod", "File manager", "About", "Buy me a coffee")]
+ck("sidebar order is Deploy on RunPod / File manager / About / Buy me a coffee",
+   _order == ["Deploy on RunPod", "File manager", "About", "Buy me a coffee"], _order)
+ab = by_text.get("About")
+ck("the About button is wired in app.js",
+   ab is not None and f'$("{ab.get("id")}").addEventListener("click"' in JS, ab and ab.get("id"))
+
+# --- 4. the app window opens them in the browser ------------------------------------------------------
+ck("the app window sends external links to the browser",
+   'webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True' in APPWIN)
+
 print("\n" + ("ALL PASS" if not fails else f"{len(fails)} FAILURE(S): " + ", ".join(fails)))
 sys.exit(1 if fails else 0)

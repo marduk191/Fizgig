@@ -28,7 +28,7 @@ ANIMA = FamilyDescription(
     key="anima",
     arch_id="anima",
     display_name="Anima",
-    gui_label="Anima (experimental)",
+    gui_label="Anima",
     lora_name_suffix="anima",
     aliases=("anima",),
     experimental=True,
@@ -136,10 +136,9 @@ ANIMA = FamilyDescription(
         ),
     ),
     preview_speed_lora="Anima Turbo LoRA v0.2",
-    # With the Turbo LoRA file set, previews still default to the plain model (strength 0), so its steps are the plain
-    # model's 20, not the turbo's own 10
-    preview_speed_steps=20,
-    preview_speed_strength=0.0,       # previews on the base by default; raise Turbo strength for speed
+    # With the Turbo LoRA file set, previews render on it by default (strength 1, CFG 1) at its card's 10 steps (Peter,
+    # 13 Oct: down from 20)
+    preview_speed_steps=10,
     preview_steps=20,
     preview_cfg=4.5,
     preview_negative=("worst quality, low quality, score_1, score_2, score_3, artist name, blurry, jpeg artifacts, "
@@ -157,8 +156,8 @@ ANIMA = FamilyDescription(
         ("✨ Anima Character (rank 16, 1e-4)", _preset(16, 1e-4, epochs=50)),
         ("✨ Anima Style (rank 16, 5e-5)", _preset(16, 5e-5)),
         ("✨ Anima Official (rank 32, 2e-5)", _preset(32, 2e-5)),
-        # Slider: Qwen's slider recipe (rank 4, 2e-4, 30 epochs). Not yet measured on Anima
-        ("✨ Anima Slider (rank 4, 2e-4)", _preset(4, 2e-4, slider=True)),
+        # Slider: Qwen's slider recipe (rank 8, 2e-4, 30 epochs). Not yet measured on Anima
+        ("✨ Anima Slider (rank 8, 2e-4)", _preset(8, 2e-4, slider=True)),
         # full fine-tune at the shared fine-tune rate (Peter), and at OneTrainer's
         ("✨ Anima Fine-tune (1e-5)", {**_preset(16, 1e-5), "FAMILY_FT": True, "FAMILY_FT_ROTATIONS": "10"}),
         # OneTrainer's Anima fine-tune rate ("#anima Finetune.json": 1e-6, Adafactor, the

@@ -35,7 +35,7 @@ KREA2 = FamilyDescription(
     display_name="Krea 2",
     gui_label="Krea 2",
     lora_name_suffix="krea2",
-    experimental=True,
+    experimental=False,
 
     model_files=(
         ModelFile("krea2_raw_dit", "Krea 2 RAW DiT", True, _COMFY, "diffusion_models/krea2_raw_bf16.safetensors",
@@ -48,7 +48,7 @@ KREA2 = FamilyDescription(
                   "bf16, virtually identical output.", role="text_encoder"),
         ModelFile("krea2_turbo_lora", "Turbo LoRA (previews)", False, _COMFY,
                   "loras/krea2_turbo_lora_rank_64_bf16.safetensors", 0.47,
-                  "Optional: 8-step previews on the training model.", role="speed_lora"),
+                  "8-step previews on the training model.", role="speed_lora", fetch_optional=False),
         ModelFile("krea2_turbo_dit", "Turbo DiT (fp8, workbench previews)", False, _COMFY,
                   "diffusion_models/krea2_turbo_fp8_scaled.safetensors", 13.1,
                   "Optional: Repair Studio, LoRA the Explorer and LoRA Royale preview on it by default (8-step, "
@@ -114,7 +114,7 @@ KREA2 = FamilyDescription(
     # the text-fusion boosts (15 Sep 2026, #137): the four text-fusion blocks at x2 / x3, everything else untouched.
     # Measured across several LoRAs, x3 lifted the detail metric ~72 -> ~77 and likeness 2-7 points on every LoRA but
     # an overtrained one, composition unchanged
-    repair_presets=tuple((f"✨Text fusion ×{m} (experimental)",
+    repair_presets=tuple((f"✨Text fusion ×{m}",
                           tuple((f"txt_{s}_{i}", float(m)) for s in ("lw", "rf") for i in range(2)))
                          for m in (2, 3)),
     # The original's measured 0.25 MP peaks (utils/capabilities.py: 5090, batch 1, rank 32; 0.42 GB saved per swapped
@@ -122,7 +122,10 @@ KREA2 = FamilyDescription(
     # +2.9 GB (15.3 -> 18.2 GB whole-GPU; the original grows +2.6 on the same data), NF4 13.3 GB at 1 MP under a
     # 16 GB card. The original's +0.25 GB/MP under-plans 1 MP: INT8 + 16 swapped blocks ran out on a 12 GB card.
     # bf16: measured on the driver, rank 8, 0.25 MP, 26.0 GB; its 1 MP point carries INT8's growth.
-    train_memory={"int8": (((0.25, 16.2), (1.0, 19.1)), 0.42), "nf4": (((0.25, 11.4), (1.0, 13.4)), 0.0),
+    # NF4 at 1 MP is 15.0: rank 16 with previews on peaked 14.9 training / 15.2 previewing on a simulated 16 GB card
+    # (#185, 11 Oct 2026) - the old 13.4 (rank 8, previews off) put 16 GB cards on NF4 at 1 MP and filled them;
+    # INT8 + 16 swapped blocks peaked 12.7 / 12.9 on the same run
+    train_memory={"int8": (((0.25, 16.2), (1.0, 19.1)), 0.42), "nf4": (((0.25, 11.4), (1.0, 15.0)), 0.0),
                   "bf16": (((0.25, 26.0), (1.0, 28.9)), 0.84)},
     optimizers=("adamw8bit", "adamw"),
     # the original's Automagic setup (Peter, 17 Sep 2026): the 264 Linears converge at very different speeds, and the
@@ -159,6 +162,8 @@ KREA2 = FamilyDescription(
         ),
     ),
     preview_speed_lora="Krea 2 Turbo LoRA (8-step)",
+    preview_speed_steps=10,
+    preview_speed_strength=0.7,       # Samples previews: Turbo 0.7, 10 steps, CFG 1 (Peter's setup)
     preview_steps=8,
     preview_cfg=1.0,
     preview_negative=GENERAL_NEGATIVE,
@@ -169,10 +174,10 @@ KREA2 = FamilyDescription(
         ("✨ Krea 2 Ultra Fast (rank 8, adaptive LR)", _preset(8, adaptive=("2e-4", "4e-4"))),
         ("✨ Krea 2 Standard (rank 32, full model)", _preset(32, epochs=64)),
         ("✨ Krea 2 Style (rank 16, gentle LR)", _preset(16, adaptive=("5e-5", "2e-4"), epochs=64)),
-        # Slider: hot and short, as Qwen's and the experiment/slider-training branch's Krea 2 Slider (rank 4, 2e-4,
+        # Slider: hot and short, as Qwen's and the experiment/slider-training branch's Krea 2 Slider (rank 8, 2e-4,
         # 0.5 MP). The loss watch and Adaptive LR are switched off for sliders by the trainer. 20 epochs: a happy/sad
         # prompt slider (16 practice pictures, guidance 2) was right at 20 and had turned +1 into an illustration by 25.
-        ("✨ Krea 2 Slider (rank 4, 2e-4)", _preset(4, lr=2e-4, epochs=20, slider=True, mp="0.5")),
+        ("✨ Krea 2 Slider (rank 8, 2e-4)", _preset(8, lr=2e-4, epochs=20, slider=True, mp="0.5")),
     ),
     notes=(
         ("Timesteps: logit-normal with a resolution-dependent shift (mu 0.5 at 256 image tokens to 1.15 at 6400), "

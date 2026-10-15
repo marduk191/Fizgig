@@ -84,8 +84,8 @@ def _load_image_list(list_file: str) -> list[str]:
     return out
 
 
-def _write_caption(path: str, caption: str, trigger: str) -> None:
-    cap_path = os.path.splitext(path)[0] + ".txt"
+def _write_caption(path: str, caption: str, trigger: str, ext: str = ".txt") -> None:
+    cap_path = os.path.splitext(path)[0] + (ext or ".txt")
     text = f"{trigger}, {caption}" if trigger else caption
     with open(cap_path, "w", encoding="utf-8") as f:
         f.write(text)
@@ -233,7 +233,7 @@ def _run_job(state: CaptionState, job: dict) -> bool:
             if not caption:
                 print(f"FAIL: {base} (empty caption)", flush=True)
                 continue
-            _write_caption(path, caption, trigger)
+            _write_caption(path, caption, trigger, job.get("caption_ext") or ".txt")
             print(f"OK: {base}", flush=True)
         except Exception as exc:
             print(f"FAIL: {base} ({exc})", flush=True)

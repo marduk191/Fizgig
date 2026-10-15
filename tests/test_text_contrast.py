@@ -1,22 +1,33 @@
-"""Explanatory text stays readable — headless, no GPU.
+"""Explanatory text stays readable in the Fizgig 8 web UI — headless, no browser.
 
-Users reported the Preferences tab as "grey on grey". Measured, the muted grey scored 2.54:1 on a
-card, failing WCAG AA (4.5) and even the relaxed large-text bar (3.0). This locks in the fix and,
-more usefully, guards the boundary: prose belongs on text_explain, while genuinely de-emphasised
-UI (disabled controls, one-word captions beside widgets) stays on text_muted. A future "tidy-up"
-that collapses the two back together should fail here.
+Users once reported the desktop Preferences tab as "grey on grey": the muted grey scored 2.54:1 on a card, failing
+WCAG AA (4.5:1) and even the relaxed large-text bar (3:1). The fix moved prose onto its own brighter colour,
+text_explain, and kept text_muted for genuinely de-emphasised bits (disabled controls, one-word captions beside a
+widget). This file guarded that boundary in the desktop's Tk source.
+
+Fizgig 8 is a web app, and the same palette lives as CSS custom properties in src/fizgig/web/static/style.css.
+So the checks now read that stylesheet, resolving the cascade the way the browser does: a later :root block
+overrides an earlier one, and the "web look" block (12 Oct) redefines the backgrounds and the secondary and muted
+greys. What is pinned:
+  1. text_explain clears 7:1 on both backgrounds, and still reads as secondary to headings;
+  2. the prose classes (card descriptions, tab banners) are drawn in text_explain;
+  3. the help under each form field (.field-hint, drawn in text_secondary) clears WCAG AA on a card. It measured
+     6.35:1, below the desktop's 7:1 for prose but nowhere near the old 2.54:1. Upstream chose that tone in its
+     web restyle, so the bar here is the accessibility standard, not a stricter house rule;
+  4. text_muted (which fails AA for body text) is never the colour of any of that prose.
+
+Retired with the desktop app: the Tk source sweeps (every tk.Label call's colour and point size), which have no
+counterpart in a stylesheet.
 
 Run: venv/Scripts/python.exe tests/test_text_contrast.py
 """
-import io
 import os
 import re
 import sys
 
-# Repo root, derived from this file's location -- was hardcoded to one machine's
-# absolute path, which made the whole suite unrunnable anywhere else.
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, REPO)
+CSS_PATH = os.path.join(REPO, "src", "fizgig", "web", "static", "style.css")
+CSS = open(CSS_PATH, encoding="utf-8").read()
 
 fails = []
 
@@ -27,135 +38,70 @@ def ck(label, cond, detail=""):
         fails.append(label)
 
 
-def _lum(h):
-    h = h.lstrip("#")
-    c = [int(h[i:i + 2], 16) / 255 for i in (0, 2, 4)]
-    c = [v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4 for v in c]
-    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
-
-
-def contrast(fg, bg):
-    a, b = sorted([_lum(fg), _lum(bg)], reverse=True)
-    return (a + 0.05) / (b + 0.05)
-
-
-os.environ["FIZGIG_NO_PERSIST"] = "1"
-import lora_trainer_gui as G  # noqa: E402
-
-C = G.COLORS
-
-# --- 1. contrast ------------------------------------------------------------------------------
-for bg_name in ("bg_surface", "bg_deep"):
-    r = contrast(C["text_explain"], C[bg_name])
-    ck(f"text_explain on {bg_name} clears 7:1", r >= 7.0, f"{r:.2f}")
-
-ck("text_explain still reads as secondary to headings",
-   1.2 <= contrast(C["text_primary"], C["text_explain"]) <= 2.0,
-   f"{contrast(C['text_primary'], C['text_explain']):.2f}x")
-
-# The old value is deliberately still in the palette for disabled/caption use — it is only
-# unreadable when used for prose, which is what this whole change is about.
-ck("text_muted unchanged (still the muted tier)", C["text_muted"] == "#5A6B7E", C["text_muted"])
-
-# --- 2. the sweep was complete, and no wider than intended ------------------------------------
-SRC = io.open(os.path.join(REPO, "lora_trainer_gui.py"), encoding="utf-8").read()
-
-
-def label_calls(src, needle="tk.Label("):
-    out, i = [], 0
-    while True:
-        j = src.find(needle, i)
-        if j < 0:
-            break
-        d, k = 0, j + len(needle) - 1
-        while k < len(src):
-            if src[k] == "(":
-                d += 1
-            elif src[k] == ")":
-                d -= 1
-                if d == 0:
-                    break
-            k += 1
-        out.append(src[j:k + 1])
-        i = k + 1
+def tokens(css):
+    """The colour custom properties as the browser resolves them: :root blocks in order, later ones win."""
+    out = {}
+    for block in re.findall(r":root\s*\{([^}]*)\}", css):
+        for k, v in re.findall(r"--([a-z0-9-]+)\s*:\s*(#[0-9A-Fa-f]{6})\b", block):
+            out[k] = v.upper()
     return out
 
 
-calls = label_calls(SRC)
-muted = [c for c in calls if "text_muted" in c]
-
-# wraplength is the tell: you only set it on multi-line explanatory copy. Widget captions
-# ("seed", "W", "H", "Ref") never do.
-# The detail has to survive text= being a VARIABLE, not a literal — the one real failure this
-# ever caught was `text=line`, and the regex returning None turned a legible FAIL into a
-# traceback that hid which label was at fault.
-def _snippet(c):
-    m = re.search(r'text="([^"]{0,40})', c)
-    return m.group(1) if m else " ".join(c.split())[:60]
+def _lum(h):
+    c = [int(h[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+    c = [x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4 for x in c]
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
 
 
-# ...but wraplength alone over-reaches. The training queue renders one summary line per queued
-# job (`text=summary`, `text=summary.split("\n")[0]`) and wraps it so a long job name truncates
-# inside the card. That is RUNTIME DATA being displayed, not authored explanatory copy, and the
-# muted tier is the right home for a secondary data line. Authored prose is always written as a
-# literal in the source, so require that too — otherwise every wrapped data label in a card gets
-# dragged onto the bright explanatory tier, which is not what the v2.12.0 sweep was about.
-def _is_authored_prose(c):
-    return "wraplength" in c and re.search(r'text=(f?")', c) is not None
+def contrast(a, b):
+    hi, lo = sorted((_lum(a), _lum(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
 
 
-prose_left = [c for c in muted if _is_authored_prose(c)]
+def rule_color(selector):
+    """The colour token a selector's LAST rule sets (later rules win), e.g. 'text-explain', or None."""
+    found = None
+    # Leaf blocks only ("sel { decls }"): a selector list cannot hold a brace, so a rule nested in @media matches
+    # from after the @media's "{". Comments go first, since they may hold braces of their own.
+    css = re.sub(r"/\*.*?\*/", "", CSS, flags=re.S)
+    for m in re.finditer(r"([^{}]+)\{([^{}]*)\}", css):
+        sels = [s.strip() for s in m.group(1).split(",")]
+        if selector in sels:
+            c = re.search(r"(?<![-\w])color\s*:\s*var\(--([a-z0-9-]+)\)", m.group(2))
+            if c:
+                found = c.group(1)
+    return found
 
-ck("no authored prose left on text_muted", len(prose_left) == 0,
-   [_snippet(c) for c in prose_left[:3]] if prose_left else "")
-# Lower bound, not equality: the point is that the sweep did not drag captions onto the bright
-# tier, and new one-word captions get added over time. A DROP here means something was swept up.
-ck("widget captions were NOT swept up", len([c for c in muted if "wraplength" not in c]) >= 93,
-   len([c for c in muted if "wraplength" not in c]))
-ck("explanatory labels moved across", len([c for c in calls if "text_explain" in c]) >= 34,
-   len([c for c in calls if "text_explain" in c]))
 
-# --- 3. the helpers that render most of it ----------------------------------------------------
-for helper, marker in (("_start_section_card", "wraplength=760"),
-                       ("_add_pref_row", "hint_text"),
-                       ("_add_fetch_models_row", "blurb")):
-    i = SRC.find(f"def {helper}")
-    body = SRC[i:i + 3000] if i >= 0 else ""
-    ck(f"{helper} renders prose on text_explain",
-       "text_explain" in body and "text_muted" not in body.split("def ")[1][:2000])
+T = tokens(CSS)
+ck("the palette tokens are all defined",
+   all(k in T for k in ("bg-surface", "bg-deep", "text-primary", "text-secondary", "text-explain", "text-muted")),
+   sorted(T))
 
-# --- 4. sizes went up a point, none left at the old smallest --------------------------------
-explain_fonts = re.findall(r'font=\(FONT_FAMILY, (\d+)(?:, "([a-z]+)")?\)[^)]*?text_explain'
-                           r'|text_explain[^)]*?font=\(FONT_FAMILY, (\d+)(?:, "([a-z]+)")?\)',
-                           SRC, re.S)
-sizes = sorted(int(a or c) for a, _b, c, _d in explain_fonts if (a or c))
+# --- 1. text_explain ---------------------------------------------------------------------------
+for bg in ("bg-surface", "bg-deep"):
+    r = contrast(T["text-explain"], T[bg])
+    ck(f"text-explain on {bg} clears 7:1", r >= 7.0, f"{r:.2f}")
+r = contrast(T["text-primary"], T["text-explain"])
+ck("text-explain still reads as secondary to headings", 1.2 <= r <= 2.0, f"{r:.2f}x")
 
-# The original rule was "8pt is gone entirely". That held while text_explain lived only on card
-# and banner prose, which the v2.12.0 sweep took to 9pt+. Since then text_explain has also been
-# adopted for the Training tab's inline hints (the "when do changes take effect" note, the queue
-# window's explainer), and that surface has its own established house style of 8pt italic -- see
-# _krea2_losswatch_hint, which sits directly beside them at 8pt. Forcing those two to 9pt would
-# make them inconsistent with the hint they are stacked against.
-#
-# So the floor moves to 8pt rather than 9, and a second assertion carries the weight the first
-# one used to: the 9pt+ tier must still dominate. A wholesale shrink of card prose back to the
-# old smallest size fails that, which is the regression the check exists to catch.
-ck("no explanatory text below 8pt", min(sizes) >= 8, sizes[:6])
-ck("9pt+ is still the dominant explanatory tier",
-   len([s for s in sizes if s >= 9]) >= 50, len([s for s in sizes if s >= 9]))
+# --- 2. the prose classes use it ---------------------------------------------------------------
+for sel in (".card-desc", ".tab-banner p"):
+    ck(f"{sel} is drawn in text-explain", rule_color(sel) == "text-explain", rule_color(sel))
 
-# --- 5. it all still builds -------------------------------------------------------------------
-import tkinter as tk  # noqa: E402
+# --- 3. the per-field help ---------------------------------------------------------------------
+_hint = rule_color(".field-hint")
+ck(".field-hint has a palette colour", _hint in T, _hint)
+if _hint in T:
+    r = contrast(T[_hint], T["bg-surface"])
+    ck(f"  .field-hint ({_hint}) clears WCAG AA (4.5:1) on a card", r >= 4.5, f"{r:.2f}")
 
-G.LAST_USED_FILE = os.path.join(os.environ["TEMP"], "nope", ".last_used.json")
-root = tk.Tk()
-root.withdraw()
-try:
-    g = G.LoRATrainerGUI(root)
-    ck("GUI builds with every tab", len(g.notebook.tabs()) >= 11, len(g.notebook.tabs()))
-except Exception as e:
-    ck("GUI builds with every tab", False, repr(e))
-root.destroy()
+# --- 4. text_muted stays off prose -------------------------------------------------------------
+r = contrast(T["text-muted"], T["bg-surface"])
+ck("text-muted is still the muted tier (below AA, so it must never carry prose)", r < 4.5, f"{r:.2f}")
+_prose = (".card-desc", ".tab-banner p", ".field-hint")
+ck("  no prose class is drawn in text-muted", all(rule_color(s) != "text-muted" for s in _prose),
+   {s: rule_color(s) for s in _prose})
 
 print("\n" + ("ALL PASS" if not fails else f"{len(fails)} FAILURE(S): " + ", ".join(fails)))
 sys.exit(1 if fails else 0)

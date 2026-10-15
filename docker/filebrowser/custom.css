@@ -1,0 +1,54 @@
+/* The pod's file manager (filebrowser, port 8080) in Fizgig's colours: the web app's own palette
+   (src/fizgig/web/static/style.css), rounded cards and buttons, its font. The pod's entrypoint points
+   filebrowser's --branding.files at this folder, read from the checkout, so a change here needs no new image. */
+:root.dark, :root {
+  --blue: #3B82F6;
+  --dark-blue: #60A5FA;
+  --background: #12161D;
+  --surfacePrimary: #1A2029;
+  --surfaceSecondary: #252D3A;
+  --textPrimary: #93A3B5;
+  --textSecondary: #F0F4F8;
+  --divider: #2A3341;
+  --hover: #252D3A;
+  --borderPrimary: #2A3341;
+  --borderSecondary: #3A4555;
+  --iconPrimary: #F0F4F8;
+  --action: #F0F4F8;
+  --icon-blue: #3B82F6;
+}
+html, body, input, button, select, textarea { font-family: "Segoe UI", Arial, sans-serif; }
+body { background: var(--background); }
+
+/* top bar and sidebar: the app's darker side colour */
+header { background: #0E1218 !important; border-bottom: 1px solid #2A3341; box-shadow: none; }
+nav { background: #0E1218; }
+nav .action { border-radius: 8px; }
+nav .action:hover { background: #252D3A; }
+#search #input { background: #10141A; border: 1px solid #2A3341; border-radius: 8px; }
+
+/* the listing: cards on the app's surface */
+#listing.list .item, #listing.mosaic .item { background: #1A2029; border-color: #2A3341; }
+#listing .item:hover { background: #212834; }
+#listing .item[aria-selected="true"] { background: #1E3A5F !important; }
+.card { background: #1A2029; border: 1px solid #2A3341; border-radius: 12px; }
+
+/* buttons and inputs as the app draws them */
+.button { border-radius: 8px; background: #3B82F6; font-weight: 600; }
+.button:hover { background: #60A5FA; }
+.button--flat { background: transparent; color: #93A3B5; }
+.button--flat:hover { background: #252D3A; color: #F0F4F8; }
+.input { background: #10141A; border: 1px solid #2A3341; border-radius: 8px; color: #F0F4F8; }
+.input:focus { border-color: #3B82F6; }
+
+/* the login page */
+#login { background: #12161D; }
+#login form { width: 340px; max-width: calc(100vw - 32px); box-sizing: border-box; background: #1A2029; border: 1px solid #2A3341; border-radius: 12px; padding: 32px 36px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, .35); }
+#login img { border-radius: 12px; }
+#login h1 { color: #F0F4F8; font-weight: 700; white-space: nowrap; }
+#login .input { padding: 10px 12px; margin-bottom: 10px; }
+#login .button { padding: 10px; }
+
+/* filebrowser's own version line and Help link */
+.credits { display: none; }

@@ -33,7 +33,7 @@ def _detector():
         root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
         if root not in sys.path:
             sys.path.insert(0, root)
-        from face_utils import FaceDetector
+        from fizgig.face_utils import FaceDetector
         det = FaceDetector()
         if not det.available:
             raise ImportError("insightface not installed")

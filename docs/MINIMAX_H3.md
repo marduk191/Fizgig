@@ -39,7 +39,7 @@ Three built-in presets ship; **Fast** applies the moment you pick the family:
 
 ## Training mode
 
-<p align="center"><img src="../assets/training_mode.png" alt="The Training mode dropdown on the Training tab" width="713"></p>
+<p align="center"><img src="assets/training_mode.png" alt="The Training mode dropdown on the Training tab" width="713"></p>
 
 **Training mode** picks the recipe. Use **Default**: it is high quality, versatile, and the best of the three at preserving what the model already knows. Photos, clips and voice all train the identity blocks (**20-49**), and because the backward stops at that window the steps are quicker too. Styles train faster and better on it, and every preset ships it.
 
@@ -51,7 +51,7 @@ In every mode the LoRA leaves the model's text token refiner alone, and blocks 0
 
 ## Optimizer
 
-Every H3 preset runs **automagic3**, the Automagic v3 optimizer (MIT, see [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)), started at 1e-6. It sets its own learning rate from the update signs, one rate for the whole LoRA, rising while the signs hold steady and falling while they alternate. In practice it warms up over the first couple of epochs, then anneals a few percent an epoch. The Learning Rate box is only its start, so leave it at 1e-6 rather than an AdamW number. The scheduler, Adaptive LR, the adapter ramp and band multipliers all stand down while it owns the rate. Krea 2's Optimizer Type row lists it too, with the same rules.
+Every H3 preset runs **automagic3**, the Automagic v3 optimizer (MIT, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)), started at 1e-6. It sets its own learning rate from the update signs, one rate for the whole LoRA, rising while the signs hold steady and falling while they alternate. In practice it warms up over the first couple of epochs, then anneals a few percent an epoch. The Learning Rate box is only its start, so leave it at 1e-6 rather than an AdamW number. The scheduler, Adaptive LR, the adapter ramp and band multipliers all stand down while it owns the rate. Krea 2's Optimizer Type row lists it too, with the same rules.
 
 The Optimizer Type dropdown also offers full-precision **adamw**, which measured as the single biggest likeness gain on H3 and is the right choice when you want a rate that does not move. For a style set, adamw is worth trying: its images all share the look being learned, so the signs agree for longer and automagic3 pushes harder than you want.
 
@@ -115,7 +115,7 @@ Settings are read at launch. Pause → Resume relaunches with your current setti
 
 ## Video and sound: how do I…
 
-**…train on video clips?** Cut them with **Gizmo** (launch it from the Image Prep tab, or the *Launch Gizmo* .bat), which exports clips already on H3's spec. Drop them into the training folder next to your images and caption them on the **Captions tab** like a photo. **Photos, clips and voice recordings all train together in the same folder**: no settings, no separate runs.
+**…train on video clips?** Cut them with **Gizmo** (launch it from the Image Prep tab, or `Launch Gizmo.bat`), which exports clips already on H3's spec. Drop them into the training folder next to your images and caption them on the **Captions tab** like a photo. **Photos, clips and voice recordings all train together in the same folder**: no settings, no separate runs.
 
 **…make clips from my footage?** Open Gizmo, drop a video on it, scrub to a moment, pick a length, *Add to queue*. Repeat, then *Export queue*.
 
@@ -149,7 +149,7 @@ Stills teach H3 a look; clips teach it **motion**, and clips with sound teach it
 | Dimensions | multiples of 32 |
 | Audio | 32 kHz stereo, or no track at all |
 
-<p align="center"><img src="../assets/gizmo_video.png" alt="Gizmo — Find the moment: first/last frame previews with frame-accurate stepping" width="720"></p>
+<p align="center"><img src="assets/gizmo_video.png" alt="Gizmo — Find the moment: first/last frame previews with frame-accurate stepping" width="720"></p>
 
 **Gizmo makes clips that meet it.** Mark every section you want (frame-accurate stepping, first/last-frame previews, a ▶ Play of the exact clip), then export the lot in one go. **Crop to the subject**: a clip's cost is its pixels, so drag a rectangle and every token goes on what you want learned, with shape locks (1:1, 16:9, 9:16…) for consistent framing. High-frame-rate footage can keep extra frames as slow motion, offered as a choice. Clips are cut at native resolution and resized to your Target Megapixels at training time, so cutting large keeps the choice open.
 
@@ -173,7 +173,7 @@ Drop **`.wav` / `.mp3` / `.flac` / `.m4a`** files into the training folder, alon
 | Caption | a `.txt` beside the file, or it silently won't train |
 | Audio VAE | required (the ~605 MB Preferences row) |
 
-<p align="center"><img src="../assets/gizmo_voice.png" alt="Gizmo — Voice tab: waveform with a marked segment, trigger word, transcribed caption and grid lengths" width="720"></p>
+<p align="center"><img src="assets/gizmo_voice.png" alt="Gizmo — Voice tab: waveform with a marked segment, trigger word, transcribed caption and grid lengths" width="720"></p>
 
 **Gizmo's Voice tab cuts them for you**: open a recording (or a video, for its soundtrack), mark segments on the waveform, pick a length, caption, export sample-exact. **Caption the voice, not a picture** (*"a man speaking calmly, low pitch, unhurried"*) with your trigger word leading; the **Transcribe** button (Whisper) appends the spoken words. **Or record the dataset from scratch**: **🎙 Record** prompts sentences across every length and five tonal flavours, rolls a delivery style per take, and every hold-and-release lands trimmed, captioned and ready to queue.
 

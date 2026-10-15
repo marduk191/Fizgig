@@ -41,6 +41,7 @@ if not os.path.isfile(BASH):
 def run(script, env=None):
     e = dict(os.environ)
     e.pop("VNC_PASSWORD", None)
+    e.pop("FIZGIG_PASSWORD", None)   # either name set by the caller would skip the generation path
     e.update(env or {})
     return subprocess.run([BASH, "-c", script], capture_output=True, text=True, env=e)
 
@@ -55,25 +56,54 @@ ck("still runs under set -euo pipefail", "set -euo pipefail" in src)
 
 # --- the password branch, actually executed ------------------------------------------------------
 # Lifted verbatim from the file so this cannot drift into testing a copy that no longer matches.
-m = re.search(r'^if \[ -z "\$\{VNC_PASSWORD:-\}" \]; then\n(.*?)^fi$', src, re.S | re.M)
-ck("found the VNC_PASSWORD branch", m is not None)
+# Fizgig 8 restructured it: FIZGIG_PASSWORD first, VNC_PASSWORD (the older name) as fallback, and a
+# generated password kept in PW_FILE so a pod restart (how a pod updates) keeps the same login. The
+# block now runs from the PW_FILE line to the VNC_PASSWORD export. PW_FILE is pointed at a temp file
+# so the persistence is exercised too, not just the generation.
+import tempfile  # noqa: E402
+
+m = re.search(r'^PW_FILE=.*?\n(.*?)^export VNC_PASSWORD="\$PW"$', src, re.S | re.M)
+ck("found the password block (PW_FILE .. export VNC_PASSWORD)", m is not None)
 if m:
-    block = 'set -euo pipefail\nlog() { :; }\n' + m.group(0) + '\necho "${#VNC_PASSWORD}"'
+    _tmpd = tempfile.mkdtemp(prefix="fizgig_pw_")
+    _pwf = os.path.join(_tmpd, "pw").replace("\\", "/")
+    body = m.group(0).replace(m.group(0).splitlines()[0], f'PW_FILE="{_pwf}"', 1)
+
+    def _block():
+        return 'set -euo pipefail\nlog() { :; }\n' + body + '\necho "${#VNC_PASSWORD}:${VNC_PASSWORD}"'
+
+    def _fresh():
+        if os.path.exists(_pwf):
+            os.remove(_pwf)
+
     # Repeated because the old bug was deterministic but a length bug would not be: filtering
     # random bytes to alnum yields a variable number of usable characters.
     lens, bad = set(), 0
     for _ in range(25):
-        r = run(block)
+        _fresh()
+        r = run(_block())
         if r.returncode != 0:
             bad += 1
         else:
-            lens.add(r.stdout.strip())
+            lens.add(r.stdout.strip().split(":", 1)[0])
     ck("generating a password never exits non-zero", bad == 0, f"{bad}/25 failed")
     ck("  and is always 12 characters", lens == {"12"}, lens)
 
-    r = run(block, {"VNC_PASSWORD": "chosen-by-user"})
-    ck("a password set in the template is left alone",
-       r.returncode == 0 and r.stdout.strip() == "14", (r.returncode, r.stdout.strip()))
+    _fresh()
+    first = run(_block()).stdout.strip().split(":", 1)[-1]
+    second = run(_block()).stdout.strip().split(":", 1)[-1]
+    ck("  a generated password is kept: the next start reads the same one back",
+       len(first) == 12 and first == second, (first, second))
+
+    _fresh()
+    r = run(_block(), {"FIZGIG_PASSWORD": "chosen-by-user"})
+    ck("a FIZGIG_PASSWORD set in the template is used as is",
+       r.returncode == 0 and r.stdout.strip() == "14:chosen-by-user", (r.returncode, r.stdout.strip()))
+    _fresh()
+    r = run(_block(), {"VNC_PASSWORD": "older-template"})
+    ck("  as is the older VNC_PASSWORD name",
+       r.returncode == 0 and r.stdout.strip() == "14:older-template", (r.returncode, r.stdout.strip()))
+    _fresh()
 
 # --- the whole class of bug, not just the one line -----------------------------------------------
 # Under pipefail, any consumer that exits before its producer finishes kills the script. Producers

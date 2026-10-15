@@ -21,10 +21,11 @@ import tempfile
 # absolute path, which made the whole suite unrunnable anywhere else.
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "src"))
-sys.path.insert(0, REPO)  # for lora_trainer_gui, to cross-check manifest keys against the prefs
+# NOT the repo root as well: Fizgig 8 ships a top-level fizgig.py, which would shadow the fizgig package and
+# make every `from fizgig...` import fail (this file did, the first run after the merge).
 
 from fizgig.scripts import fetch_models as F
-import lora_trainer_gui as G
+from fizgig.families import registry as _registry
 
 fails = []
 
@@ -71,11 +72,17 @@ ck("pref keys match what the GUI reads",
 ck("every family fetches the shared captioning TE",
    all("krea2_text_encoder" in {w.pref_key for w in fam} for fam in F.FAMILIES.values()),
    {k: sorted(w.pref_key for w in v) for k, v in F.FAMILIES.items()})
-# Every pref key the manifest can write must be one the GUI actually reads back, or a download
-# lands somewhere Preferences never looks.
-ck("no manifest key is unknown to the GUI",
-   {w.pref_key for fam in F.FAMILIES.values() for w in fam} <= set(G.DEFAULT_PREFS),
-   sorted({w.pref_key for fam in F.FAMILIES.values() for w in fam} - set(G.DEFAULT_PREFS)))
+# Every pref key the manifest can write must be one the app actually reads back, or a download lands somewhere
+# Preferences never looks. Fizgig 8 has no master list of pref keys (the desktop app's DEFAULT_PREFS went with
+# it): a model's key is read through its family description's model_files, so that is the set to check against,
+# and every manifest family must be a described one.
+_described = {k: _registry.get(k) for k in F.FAMILIES}
+ck("every manifest family is a described family", all(_described.values()),
+   sorted(k for k, d in _described.items() if d is None))
+_read = {mf.pref_key for d in _described.values() if d for mf in d.model_files}
+ck("no manifest key is unknown to the app",
+   {w.pref_key for fam in F.FAMILIES.values() for w in fam} <= _read,
+   sorted({w.pref_key for fam in F.FAMILIES.values() for w in fam} - _read))
 ck("Klein is flagged gated, Krea 2 is not",
    any(w.gated for w in F.FAMILIES["klein"]) and not any(w.gated for w in F.FAMILIES["krea2"]))
 # The rule here was "nothing in a family is optional": a download button that silently omits a model
@@ -108,9 +115,11 @@ ck("no family marks a training-critical model optional (unless a required file c
 ck("  SDXL's optional VAE really is carried by its required checkpoint",
    _carried("sdxl", _mf[("sdxl", "sdxl_vae")]))
 _k2_opt = {w.pref_key for w in F.FAMILIES["krea2"] if w.optional}
-ck("  Krea 2's optional files are exactly its two preview accelerators",
-   _k2_opt == {"krea2_turbo_dit", "krea2_turbo_lora"}
-   and {_mf[("krea2", k)].role for k in _k2_opt} == {"preview_dit", "speed_lora"}, sorted(_k2_opt))
+# Subset, not an exact set: that was my own over-tight equality (written one merge earlier), broken the moment
+# upstream decided the 0.47 GB Turbo LoRA is always worth fetching. What matters is that whatever IS optional
+# is only a preview accelerator, and nothing training needs.
+ck("  Krea 2's optional files are only preview accelerators",
+   bool(_k2_opt) and {_mf[("krea2", k)].role for k in _k2_opt} <= {"preview_dit", "speed_lora"}, sorted(_k2_opt))
 ck("  and Krea 2's base, VAE and text encoder are always fetched",
    not any(weight("krea2", k).optional for k in ("krea2_raw_dit", "krea2_vae", "krea2_text_encoder")))
 

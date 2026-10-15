@@ -38,12 +38,12 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from fizgig.minimax.refmod_meta import NODE_META_KEY, NODE_TOKEN_CAP  # noqa: F401
+
 logger = logging.getLogger(__name__)
 
-NODE_META_KEY = "refmod_meta"
 NODE_FORMAT_VERSION = 4          # what the pack writes as of v0.2.6; its reader takes 2 and 4 alike
 BUNDLE_FORMAT_VERSION = 5        # the pack's one-file container: members ref_0, ref_1, … (BUNDLE_FORMAT.md)
-NODE_TOKEN_CAP = 5120        # the node pack's Extract default `max_tokens`; its loader does not cap
 ARCH = "minimaxh3"
 MAX_REFS_DEFAULT = 16      # measured 10 Sep 2026: 16 references scored 70 on portraits vs 60 for 8
 
@@ -235,7 +235,7 @@ def reference_face_centres(refs, image_dirs, face_sizes: Optional[dict] = None) 
         _root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
         if _root not in _sys.path:
             _sys.path.insert(0, _root)
-        from face_utils import FaceDetector
+        from fizgig.face_utils import FaceDetector
         from PIL import Image as _Image
         det = FaceDetector()
         _avail = getattr(det, "available", True)
@@ -582,7 +582,7 @@ def make_audio_refmod(image_dirs, out_path_no_ext: str, *, name: str, audio_vae_
                             extra={"ss_refmod_audio_seconds": f"{max_seconds:g}"})
     logger.info(f"[refmod] audio mod saved {out} ({audio_token_count(latent)} tokens, "
                 f"{int(latent.shape[-1])} latent frames) — a second file for the same loader slot "
-                f"(components: Audio) or its own; plays in ComfyUI, RefMod Studio renders visual mods only")
+                f"(components: Audio) or its own; plays in ComfyUI, RefMod Toolkit renders visual mods only")
     return out
 
 

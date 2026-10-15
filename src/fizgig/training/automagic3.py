@@ -2,7 +2,7 @@
 (https://github.com/ostris/ai-toolkit, toolkit/optimizers/automagic3.py, main of 17 Sep 2026).
 
 Copyright (c) 2024 Ostris, LLC. Brought in under the MIT License — the full licence text ships
-verbatim in THIRD_PARTY_NOTICES.md (the "ai-toolkit" entry), which is what MIT requires. Nothing
+verbatim in docs/THIRD_PARTY_NOTICES.md (the "ai-toolkit" entry), which is what MIT requires. Nothing
 about this is surfaced in the app's own text.
 
 Fizgig keeps this file byte-for-byte as upstream below this header (so it can be refreshed by

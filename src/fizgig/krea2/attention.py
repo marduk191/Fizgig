@@ -1,6 +1,6 @@
 # Unified attention function supporting various implementations
 # Adapted from musubi-tuner (https://github.com/kohya-ss/musubi-tuner), Apache-2.0.
-# Modified for Fizgig. See THIRD_PARTY_NOTICES.md.
+# Modified for Fizgig. See docs/THIRD_PARTY_NOTICES.md.
 
 from dataclasses import dataclass
 import logging

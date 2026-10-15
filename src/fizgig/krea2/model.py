@@ -6,7 +6,7 @@ plus musubi-tuner training hooks (gradient checkpointing, block swap — Apache-
 shared attention backend. The core attention goes through the common ``attention`` module
 (SDPA / flash / sageattn, selectable via attn_mode), with the combined sequence ordered
 image-first so that valid tokens form a contiguous prefix per sample — this lets the shared
-varlen / cu_seqlens machinery handle text padding. See THIRD_PARTY_NOTICES.md.
+varlen / cu_seqlens machinery handle text padding. See docs/THIRD_PARTY_NOTICES.md.
 """
 
 from __future__ import annotations

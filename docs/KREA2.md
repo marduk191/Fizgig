@@ -34,12 +34,12 @@ Four Training-tab toggles no other trainer has. They work on Krea 2 and [Qwen Im
 
 Images don't start out as problems: early on, the hard ones are often the most valuable in the set. The watch follows every image's loss across epochs, and only an image that has stopped teaching the model (stuck without improving, or mined out after a good run) gets treated as a problem.
 
-- **Detect problem images** — per-image loss is tracked across epochs (noise-normalised); images that stay hard without improving get flagged in a live **Problem Images window** with thumbnails and trends. In real runs the top flags were all caption/image mismatches.
+- **Detect problem images** — per-image loss is tracked across epochs (noise-normalised); images that stay hard without improving get flagged in the run's **per-image loss** view (Runs & outputs), with thumbnails and trends. In real runs the top flags were all caption/image mismatches.
 - **Per-image adaptive LR** — flagged images are throttled so one bad caption can't yank the weights all run; healthy images get a gentle boost. Matched-epoch A/Bs: faster likeness *and* a higher ceiling.
 - **Auto-recaption stuck images** — between epochs, Krea 2's Qwen3-VL-4B *looks at* each stuck image and rewrites its caption from what's visible. Still stuck after two attempts and the image is excluded for the run (remembered per-dataset; fix the caption and it's re-admitted).
 - **Warm up look outliers** — real-but-unusual shots (tight angles, profiles) ease in at reduced LR while the identity forms, then release to full. It reads the scores saved by the [Look Consistency Filter](TRAINING.md#dataset-prep).
 
-Edit any caption yourself mid-run from the Problem Images window — no restart. When nothing is improving any more, a plateau banner names the best-checkpoint window to scrub in LoRA Royale. Pause, resume, restart: a resumed run replays its own loss log and loses nothing.
+Edit any caption yourself mid-run from that view — no restart. When nothing is improving any more, a plateau banner names the best-checkpoint window to scrub in LoRA Royale. Pause, resume, restart: a resumed run replays its own loss log and loses nothing.
 
 ## Captioning
 

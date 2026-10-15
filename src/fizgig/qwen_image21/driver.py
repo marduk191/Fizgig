@@ -9,7 +9,9 @@ Everything Qwen-specific the generic cache/train/preview code needs, behind the 
 * edit: reference images go into the text encoder's template as vision tokens (cond["ref_mask"] marks them) and
   into the DiT sequence as clean latents ahead of the target; the checkpoint is one model for both (up to 10 refs)
 """
+import logging
 import math
+import os
 
 import numpy as np
 import torch
@@ -18,6 +20,8 @@ import torch.nn.functional as F
 from fizgig.families.driver import FamilyDriver
 from fizgig.qwen_image21 import sampling as S
 
+logger = logging.getLogger(__name__)
+
 
 class QwenImage21Driver(FamilyDriver):
 
@@ -25,6 +29,24 @@ class QwenImage21Driver(FamilyDriver):
     def load_dit(self, path, device):
         from fizgig.qwen_image21.model import load_qwen21_dit
         return load_qwen21_dit(path, device=device).eval().requires_grad_(False)
+
+    def load_planned(self, path, device, precision, blocks_to_swap):
+        """A ComfyUI int8 ConvRot file (the Turbo's): its own int8 weights, as stored - the precision is the file's.
+        Streaming needs a weight the shared offloader can move, so a swapped load decodes it and takes Fizgig's INT8.
+        Any other file: the shared load."""
+        from fizgig.qwen_image21.model import is_convrot, load_qwen21_dit
+        if not is_convrot(path):
+            return None
+        swap = min(int(blocks_to_swap or 0), self.max_blocks_to_swap())
+        if swap <= 0:
+            logger.info(f"[precision] {os.path.basename(path)}: int8 ConvRot, as stored")
+            return load_qwen21_dit(path, device=device).eval().requires_grad_(False), 0
+        from fizgig.families import quant
+        dit = load_qwen21_dit(path, device="cpu", keep_convrot=False).eval().requires_grad_(False)
+        quant.quantize(dit, self, "int8", device, store_device="cpu")
+        self.enable_block_swap(dit, swap, device, False)
+        logger.info(f"[precision] {os.path.basename(path)}: decoded to INT8 with {swap} blocks streamed")
+        return dit, swap
 
     def max_blocks_to_swap(self, dit=None):
         return len(dit.transformer_blocks) - 2 if dit is not None else self.description.n_blocks - 2
@@ -38,6 +60,55 @@ class QwenImage21Driver(FamilyDriver):
             dit.switch_block_swap_for_inference()
         else:
             dit.switch_block_swap_for_training()
+
+    # ---- training previews on the Turbo checkpoint (Klein's Distilled handoff) ----------------------------------
+    def park_for_preview(self, dit, device):
+        """Stream all but two of the training model's blocks so the Turbo fits beside it; an NF4 base cannot stream and
+        is small - left as it is (token None)."""
+        if getattr(dit, "_nf4_quantized", False):
+            return None
+        orig = int(dit.blocks_to_swap or 0)
+        dit.enable_block_swap(len(dit.transformer_blocks) - 2, torch.device(device), True)
+        dit.prepare_block_swap_before_forward()
+        return orig
+
+    def load_preview_checkpoint(self, path, device, int8=False):
+        """The Turbo DiT for this preview round, sized to the VRAM left beside the parked training model: bf16 when it
+        fits with room for the render, else INT8, else INT8 with blocks streamed (forward-only)."""
+        from fizgig.families import quant
+        torch.cuda.empty_cache()
+        from fizgig.qwen_image21.model import is_convrot
+        free = quant.free_vram_gb()       # FIZGIG_SIM_VRAM_GB: the simulated card's
+        size = os.path.getsize(path) / 1024 ** 3
+        room = 4.0                          # 1024 px render + VAE decode
+        if is_convrot(path):                # already int8 (Comfy-Org's Turbo): it costs its size
+            precision, need = "int8", size + room
+        else:
+            precision = "int8" if int8 or free < size + room else "bf16"
+            need = (size / 2 if precision == "int8" else size) + room
+        swap = 0
+        if free < need:
+            per_block = (size / 2) / max(1, self.description.n_blocks)       # INT8 GB per block
+            swap = min(self.max_blocks_to_swap(), max(1, int((need - free) / max(per_block, 1e-3)) + 2))
+        m, swapped = quant.load_base(self, path, device, precision, swap, supports_backward=False)
+        if swapped:
+            self.block_swap_mode(m, inference=True)
+        logger.info(f"[sample] Turbo checkpoint: {precision}, {swapped} blocks streamed ({free:.1f} GB free)")
+        return m.eval().requires_grad_(False), swapped
+
+    def unpark_after_preview(self, dit, device, token):
+        """The run's own swap back, or with none the sample-time offloader torn down and the model back on the GPU."""
+        if token is None:
+            return
+        device = torch.device(device)
+        if token > 0:
+            dit.enable_block_swap(token, device, True)
+            dit.move_to_device_except_swap_blocks(device)
+        else:
+            from fizgig.families import quant
+            dit.disable_block_swap()
+            quant.move(dit, device)
+        dit.switch_block_swap_for_training()
 
     def ft_spec(self, dit):
         # four balanced windows per block (attention ~0.13 GB, each MLP matrix ~0.10); the file fuses the MLP's gate
@@ -183,7 +254,8 @@ class QwenImage21Driver(FamilyDriver):
         if sigmas is not None and len(sigmas) != steps:
             sigmas = None                   # an explicit schedule only applies at its own step count
         return S.sample(dit, cond["hidden_states"], height, width, steps=steps, seed=seed, cfg=cfg, neg_emb=neg,
-                        device=device, sigmas=sigmas, shift_terminal=shift_terminal, noise=noise, on_step=on_step,
+                        device=device, sigmas=sigmas, shift_terminal=shift_terminal,
+                        dynamic_shift=bool(opts.get("dynamic_shift", True)), noise=noise, on_step=on_step,
                         text_mask=cond.get("mask"), neg_mask=neg_mask, ref_latents=refs or None,
                         ref_mask=cond.get("ref_mask"), neg_ref_mask=neg_cond.get("ref_mask") if neg is not None else None)
 

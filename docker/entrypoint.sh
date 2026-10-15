@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Bring up a virtual screen, put Fizgig on it, and serve it to a browser over noVNC.
-#
-# Order matters: the screen has to exist before Tkinter starts, and the VNC server has to be
-# running before anything tries to draw on it.
+# Fizgig on a pod: update the app from git, set up /workspace, then serve the web UI on port 8081 (and the file
+# manager on 8080). You use Fizgig in your own browser - nothing here draws a screen.
 set -euo pipefail
 
 log() { echo "[fizgig] $*"; }
@@ -10,43 +8,35 @@ log() { echo "[fizgig] $*"; }
 REPO_URL="${FIZGIG_REPO:-https://github.com/shootthesound/Fizgig.git}"
 REPO_REF="${FIZGIG_REF:-master}"
 APP_DIR="/workspace/Fizgig"
-# Only the STARTING size now — KasmVNC resizes the desktop to match the browser window, so this
-# stops being the compromise it used to be between "fits a laptop" and "less in-app scrolling".
-SCREEN_W="${SCREEN_W:-1600}"
-SCREEN_H="${SCREEN_H:-1400}"
 
 mkdir -p /workspace/.cache /workspace/.insightface
 
-# ---------------------------------------------------------------- VNC password
-# An unprotected VNC on a public URL is a shell on someone else's GPU. If no password is set we
-# generate one and print it, rather than leaving it open — a random password in the logs is
-# recoverable; an open port is not fixable after the fact.
-if [ -z "${VNC_PASSWORD:-}" ]; then
-  # NOT `tr -dc ... </dev/urandom | head -c 12`. head exits at 12 bytes and closes the pipe, tr
-  # is still reading an infinite file, takes SIGPIPE and returns 141 — which `pipefail` makes the
-  # pipeline's status and `set -e` turns into an instant exit, before the first log line. The
-  # container then dies and restarts forever. It only bites when no password is set, so it
-  # survived every test where one was, and shipped as the default path in the public template.
-  # Reading a FIXED number of bytes means nothing exits early and no pipe is ever broken.
-  _rand="$(head -c 512 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9')"
-  VNC_PASSWORD="${_rand:0:12}"
-  unset _rand
-  log "No VNC_PASSWORD set — generated one for this pod: ${VNC_PASSWORD}"
-  log "Set VNC_PASSWORD in the template to choose your own."
+# ---------------------------------------------------------------- the password
+# The web UI on a public URL is a shell on someone else's GPU. FIZGIG_PASSWORD (or VNC_PASSWORD, the older
+# templates' name) chooses it; with neither we generate one and print it, rather than leaving it open - a random
+# password in the logs is recoverable, an open port is not fixable after the fact.
+# A generated one is kept on the volume, so restarting the pod (which is how it updates) keeps the same password.
+PW_FILE="/workspace/.fizgig_password"
+PW="${FIZGIG_PASSWORD:-${VNC_PASSWORD:-}}"
+if [ -z "$PW" ] && [ -s "$PW_FILE" ]; then
+  PW="$(head -n 1 "$PW_FILE")"
+  log "Password (generated on this pod's first start, kept in $PW_FILE): ${PW}"
 fi
-# Exported so Fizgig itself can authenticate against the same password — anything the app serves
-# on its own port (a phone-facing run monitor, say) should ask for the credential the user already
-# has, not invent a second one. Without this, a password the ENTRYPOINT generated is only a shell
-# variable and never reaches the app, which is the default case now that the public template ships
-# no VNC_PASSWORD at all.
-export VNC_PASSWORD
-
-mkdir -p /root/.vnc
-# KasmVNC authenticates the WEB session against its own user db, not a VNC-protocol password.
-# -w gives write (input) permission; without it you get a read-only desktop you cannot click.
-echo -e "${VNC_PASSWORD}
-${VNC_PASSWORD}
-" | kasmvncpasswd -u fizgig -w -o /root/.kasmpasswd >/dev/null 2>&1
+if [ -z "$PW" ]; then
+  # NOT `tr -dc ... </dev/urandom | head -c 12`: head exits at 12 bytes, tr takes SIGPIPE and returns 141, which
+  # pipefail + set -e turn into an instant exit before the first log line. Reading a FIXED number of bytes breaks
+  # no pipe.
+  _rand="$(head -c 512 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9')"
+  PW="${_rand:0:12}"
+  unset _rand
+  (umask 077; echo "$PW" > "$PW_FILE") || true
+  log "No FIZGIG_PASSWORD set — generated one for this pod: ${PW}"
+  log "Set FIZGIG_PASSWORD in the template to choose your own."
+fi
+# The web server takes a pod's VNC_PASSWORD as its login at any length (fizgig/web/server.py main); the file
+# manager below uses it too, so there is one password for everything on the pod.
+export VNC_PASSWORD="$PW"
+unset FIZGIG_PASSWORD
 
 # ---------------------------------------------------------------- optional SSH
 # Off by default — the file manager + runpodctl are the transfer path this image is built
@@ -127,8 +117,12 @@ python3 "$APP_DIR/uv_install_deps.py" "$APP_DIR/requirements.txt" "$VIRTUAL_ENV"
 # Point the portable output dirs at the volume. Model paths are left alone: fetch_models writes
 # those itself, and overwriting them here would stomp a path the user set by hand.
 python3 - <<'PY'
-import json, os
-p = "/workspace/Fizgig/prefs.json"
+import json, os, sys
+sys.path.insert(0, "/workspace/Fizgig/src")
+from fizgig import user_data
+user_data.migrate()                  # a volume from Fizgig 7: its prefs and state into user_data first
+p = user_data.PREFS_FILE
+os.makedirs(os.path.dirname(p), exist_ok=True)
 prefs = {}
 if os.path.exists(p):
     try:
@@ -161,24 +155,27 @@ Make one folder per LoRA, e.g.  /workspace/datasets/my_subject/
 and put the images and their .txt caption files in it together.
 
 Upload by dragging a folder into the file manager on port 8080, then on Fizgig's
-Start tab click Browse and pick your folder under /workspace/datasets.
+Start tab click Browse and pick your folder under /workspace/datasets. Or use
+the web UI on port 8081: Start tab -> Upload a training folder puts it here.
 
 Everything under /workspace lives on your persistent volume, so it survives
 stopping and restarting the pod. Anything outside /workspace does not.
 NOTE
 fi
 
-# fetch_models defaults to <repo>/models, which puts 32 GB of weights INSIDE the git clone that
+# fetch_models defaults to <repo>/user_data/models, which puts 32 GB of weights INSIDE the git clone that
 # this script runs `git reset --hard` on every boot. Point it at /workspace/models instead, next
 # to the datasets and outputs, so it survives a re-clone and is where anyone would look for it.
-if [ ! -L "$APP_DIR/models" ]; then
-    if [ -d "$APP_DIR/models" ] && [ -n "$(ls -A "$APP_DIR/models" 2>/dev/null)" ]; then
+MODELS_LINK="$APP_DIR/user_data/models"
+if [ ! -L "$MODELS_LINK" ]; then
+    if [ -d "$MODELS_LINK" ] && [ -n "$(ls -A "$MODELS_LINK" 2>/dev/null)" ]; then
         # Models already downloaded to the old location — move rather than orphan them.
         log "Moving existing models to /workspace/models"
-        mv "$APP_DIR/models"/* /workspace/models/ 2>/dev/null || true
+        mv "$MODELS_LINK"/* /workspace/models/ 2>/dev/null || true
     fi
-    rm -rf "$APP_DIR/models"
-    ln -s /workspace/models "$APP_DIR/models"
+    rm -rf "$MODELS_LINK"
+    mkdir -p "$APP_DIR/user_data"
+    ln -s /workspace/models "$MODELS_LINK"
 fi
 
 # Report the disk the models actually land on. Getting this wrong is expensive and silent: if the
@@ -189,16 +186,16 @@ _avail_kb=$(df -Pk /workspace | awk 'NR==2{print $4}')
 _avail_gb=$(( _avail_kb / 1024 / 1024 ))
 _total_gb=$(( $(df -Pk /workspace | awk 'NR==2{print $2}') / 1024 / 1024 ))
 if [ "$_total_gb" -gt 10000 ]; then
-    # A network volume does not expose its quota in here — the kernel reports the host's whole
+    # A RunPod volume (network or the pod's own) does not expose its quota in here — the kernel reports the host's whole
     # backing pool, so a 100 GB volume reads as ~1.4 PB. Printing that looks broken.
-    log "Storage: /workspace is a network volume (size is set in RunPod, not visible from here)"
+    log "Storage: /workspace is a RunPod volume (its size is set in RunPod, not visible from here)"
 else
     log "Storage: /workspace has ${_avail_gb} GB free of ${_total_gb} GB"
 fi
 if [ "$_total_gb" -lt 60 ]; then
     log "  WARN: that looks like the CONTAINER disk, not a volume. Krea 2 alone needs ~32 GB,"
     log "        and container disk is wiped when the pod stops. Check the template has a"
-    log "        Volume Disk of 100 GB+ AND a mount path of /workspace."
+    log "        Volume Disk of 300 GB (100 GB at least) AND a mount path of /workspace."
 fi
 
 # ---------------------------------------------------------------- optional model prefetch
@@ -213,123 +210,77 @@ if [ -n "${FETCH_MODELS:-}" ]; then
       "${ARGS[@]}" ${FETCH_MODELS_EXTRA:-} ) || log "model fetch incomplete — use the Preferences button"
 fi
 
-# ---------------------------------------------------------------- the screen
-# A restarted container keeps /tmp, so the previous run's X lock survives and the X server refuses
-# to start with "Server is already active for display 1" — even though nothing is running. It then
-# has no display, exits, and the container dies with no obvious cause. Stopping and starting a pod
-# is routine, so this has to be cleared every boot, not just on first run.
-rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
-rm -rf /tmp/.X11-unix/X1-lock /root/.vnc/*.pid
-
-# Session bus, started before anything that might open a link. Firefox passes a URL to an
-# already-running instance over this bus; without it the second link you click in a session
-# starts a second firefox, hits the profile lock, and shows "Close Firefox" instead of the page.
-# Deliberately non-fatal: set -e is on, and a bus that fails to start must not take the whole
-# container down with it.
-if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
-    if eval "$(dbus-launch --sh-syntax 2>/dev/null)" 2>/dev/null; then
-        export DBUS_SESSION_BUS_ADDRESS
-        log "session bus up"
-    else
-        log "WARN: no session bus — links may only open once per session"
-    fi
-fi
-
-log "Starting KasmVNC display (${SCREEN_W}x${SCREEN_H}, resizes to your browser window)"
-# One process instead of Xvfb + x11vnc + websockify: KasmVNC is an X server WITH a web server,
-# encoding in WebP rather than the LAN-shaped defaults noVNC fell back to.
-# SecurityTypes None + basic auth ON is the pairing that works, and the two halves are not
-# independent. KasmVNC defaults SecurityTypes to VncAuth, which wants a VNC-PROTOCOL password
-# (PasswordFile) -- a different credential from the web login. Set only the web one and the
-# browser authenticates fine, loads the client, and THEN the session underneath is rejected with
-# "No password configured for VNC Auth". Turning the VNC layer off is correct here because
-# DisableBasicAuth=0 means the HTTP gate is still doing the authenticating; it is stated
-# explicitly so nobody removes it later and leaves the pod wide open.
-# -httpd is NOT optional: the built-in default is /usr/local/share/kasmvnc/www but the Debian
-# package installs to /usr/share/kasmvnc/www, so without it the server authenticates you fine and
-# then closes the connection with an empty reply, having nothing to serve.
-# KasmPasswordFile is the WEB login (what kasmvncpasswd writes); PasswordFile/-rfbauth is the
-# VNC-protocol password, which nothing here uses since the client is the browser.
-# DynamicQuality 4-9 lets it drop quality while you drag and restore it when you stop, which is
-# where the responsiveness actually comes from over a long link.
-Xvnc :1     -geometry "${SCREEN_W}x${SCREEN_H}"     -depth 24     -websocketPort 6080     -interface 0.0.0.0     -KasmPasswordFile /root/.kasmpasswd     -httpd /usr/share/kasmvnc/www     -SecurityTypes None     -DisableBasicAuth=0     -sslOnly=0     -AlwaysShared     -FrameRate=60     -DynamicQualityMin=4     -DynamicQualityMax=9     >/var/log/kasmvnc.log 2>&1 &
-
-for _ in $(seq 1 60); do xdpyinfo -display :1 >/dev/null 2>&1 && break; sleep 0.25; done
-if ! xdpyinfo -display :1 >/dev/null 2>&1; then
-    log "ERROR: display never came up. Last lines of /var/log/kasmvnc.log:"
-    tail -15 /var/log/kasmvnc.log || true
-    exit 1
-fi
-
-# Tkinter draws Toplevels without decoration and mishandles focus if nothing is managing the
-# screen — Fizgig leans on dialogs (Repair Studio pop-out, the token prompt, Problem Images),
-# so a window manager is required, not cosmetic.
-openbox &
-
-log "Serving Fizgig on :6080"
-
+# ---------------------------------------------------------------- the file manager
 # Drag-and-drop file transfer on its own port: datasets in, trained LoRAs out, no terminal.
-# Shares VNC_PASSWORD rather than inventing a second credential — it exposes the same /workspace
-# the desktop already does, so a separate password would be security theatre, and one fewer
-# thing to lose. Non-fatal: file transfer failing must not stop training.
+# Shares the web UI's password rather than inventing a second credential — it exposes the same /workspace
+# the web UI already does, so a separate password would be security theatre, and one fewer thing to lose. Non-fatal: file transfer failing must not stop training.
 if command -v filebrowser >/dev/null 2>&1; then
     FB_DB=/workspace/.filebrowser.db
-    # filebrowser rejects passwords under 12 characters. A shorter VNC_PASSWORD therefore creates
-    # NO user at all, and the login just 403s — so pad rather than fail, and print what the
-    # padded password actually is. (Found the hard way: the first version wrapped these commands
-    # in `|| true`, so the log said "File manager on :8080" while the account did not exist.)
-    FB_PW="$VNC_PASSWORD"
-    while [ ${#FB_PW} -lt 12 ]; do FB_PW="${FB_PW}0"; done
+    FB_LOGIN=/tmp/fizgig_filebrowser_login     # "exact" / "padded" / "none": the web app says how to log in
+    # Fizgig's look, read from the checkout (a style change needs no new image); falls back to filebrowser's own
+    FB_BRAND="$APP_DIR/docker/filebrowser"
+    [ -d "$FB_BRAND" ] || FB_BRAND=""
 
     filebrowser config init --database "$FB_DB" >/dev/null 2>&1 || true
+    # The password floor goes to 1 so the pod's password works as it is, at any length. filebrowser still refuses
+    # a common password ("abc123", "password1234") whatever its length; the old 12-character pad (0s on the end)
+    # then usually passes, so that is the fallback. A login that can't be made is logged and shown in the app.
     filebrowser config set --database "$FB_DB" \
-        --address 0.0.0.0 --port 8080 --root /workspace >/dev/null 2>&1 || true
-    # Errors are logged, not swallowed: a file manager nobody can log into is worse than one
-    # that says why.
-    if ! _fb_out=$(filebrowser users add admin "$FB_PW" --perm.admin --database "$FB_DB" 2>&1); then
-        if ! _fb_out=$(filebrowser users update admin --password "$FB_PW" \
-                          --database "$FB_DB" 2>&1); then
-            log "WARN: file manager login not set up: $(echo "$_fb_out" | tail -1)"
-        fi
+        --address 0.0.0.0 --port 8080 --root /workspace --minimumPasswordLength 1 \
+        --branding.name "Fizgig files" --branding.theme dark --branding.disableExternal \
+        --branding.files "$FB_BRAND" >/dev/null 2>&1 || true
+    _fb_set() {    # admin's password -> 0 on success; the error is in $_fb_out
+        _fb_out=$(filebrowser users add admin "$1" --perm.admin --hideDotfiles --database "$FB_DB" 2>&1) && return 0
+        _fb_add="$_fb_out"     # no admin yet: the add's own reason ("too easy"), not the update's "does not exist"
+        _fb_out=$(filebrowser users update admin --password "$1" --hideDotfiles --database "$FB_DB" 2>&1) && return 0
+        case "$_fb_out" in *"does not exist"*) _fb_out="$_fb_add" ;; esac
+        return 1
+    }
+    FB_PAD="$VNC_PASSWORD"
+    while [ ${#FB_PAD} -lt 12 ]; do FB_PAD="${FB_PAD}0"; done
+    if _fb_set "$VNC_PASSWORD"; then
+        echo exact > "$FB_LOGIN"
+        log "File manager on :8080 — user 'admin', same password as the web UI"
+    elif [ "$FB_PAD" != "$VNC_PASSWORD" ] && _fb_set "$FB_PAD"; then
+        echo padded > "$FB_LOGIN"
+        log "File manager on :8080 — user 'admin', password '${FB_PAD}'"
+        log "  (the file manager refused the web UI's password as too common, so it has 0s added)"
+    else
+        echo none > "$FB_LOGIN"
+        log "WARN: file manager login not set up: $(echo "$_fb_out" | tail -1)"
+        log "  Set a less common FIZGIG_PASSWORD in the template to use the file manager."
     fi
     filebrowser --database "$FB_DB" >/dev/null 2>&1 &
-    if [ "$FB_PW" = "$VNC_PASSWORD" ]; then
-        log "File manager on :8080 — user 'admin', same password as VNC"
-    else
-        log "File manager on :8080 — user 'admin', password '${FB_PW}'"
-        log "  (padded: filebrowser needs 12+ characters and VNC_PASSWORD is shorter)"
-    fi
 fi
 
 cat <<EOF
 [fizgig] ------------------------------------------------------------
-[fizgig]  Ready. Open the pod's HTTP port 6080.
-[fizgig]  Your browser will ask for a username and password:
-[fizgig]      username: fizgig
+[fizgig]  Ready. Open the pod's HTTP port 8081 for Fizgig.
 [fizgig]      password: ${VNC_PASSWORD}
 [fizgig]
 [fizgig]  Models: Preferences -> "Download models for me"
-[fizgig]          Krea 2 needs no HuggingFace account; Klein needs a token.
+[fizgig]  Files:  port 8080 is a file manager for /workspace (user 'admin')
+[fizgig]
+[fizgig]  Closing the browser tab doesn't stop training: Fizgig runs here.
 [fizgig] ------------------------------------------------------------
 EOF
 
-# Maximise Fizgig once it appears. Its geometry is tuned for a Windows desktop with Segoe UI;
-# under DejaVu the tab strip is wider, so "Preferences" truncates at the designed width. Filling
-# the screen fixes that and stops a browser-sized viewport being mostly empty desktop. Runs in
-# the background because the GUI has to exist first, and the launch below never returns.
-(
-  for _ in $(seq 1 90); do
-    if wmctrl -l 2>/dev/null | grep -q "Fizgig"; then
-      wmctrl -r "Fizgig" -b add,maximized_vert,maximized_horz 2>/dev/null && \
-        log "window maximised"
-      break
-    fi
-    sleep 1
-  done
-) &
-
+# ---------------------------------------------------------------- the web UI
+# Kept running: with no desktop, a stopped web server is a pod nobody can reach, so it starts again after a crash.
+# A container stop (SIGTERM) passes to the server, which ends a run the way Stop does, and then the loop ends too.
 cd "$APP_DIR"
 export PYTHONPATH="$APP_DIR/src"
-# exec so Fizgig is PID 1's successor: a container stop signals the app directly, and the
-# container's lifetime is the app's lifetime rather than outliving a crashed GUI.
-exec python3 lora_trainer_gui.py
+child=0
+stopping=0
+trap 'stopping=1; [ "$child" -gt 0 ] && kill -TERM "$child" 2>/dev/null; wait "$child" 2>/dev/null; exit 0' TERM INT
+while true; do
+  python3 fizgig.py --web &
+  child=$!
+  set +e
+  wait "$child"
+  code=$?
+  set -e
+  [ "$stopping" = 1 ] && exit 0
+  log "the web UI stopped (exit ${code}) — starting it again in 3 s"
+  sleep 3
+done

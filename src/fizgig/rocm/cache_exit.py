@@ -1,7 +1,7 @@
 """Skip HIP/PyTorch teardown after successful cache scripts on Linux ROCm.
 
 Cache entrypoints import run_cache_main only on Linux when FIZGIG_GPU_BACKEND=rocm
-(set by run_fizgig_rocm.sh). NVIDIA and other platforms call main() directly.
+(set by launch_fizgig_amd.sh). NVIDIA and other platforms call main() directly.
 """
 from __future__ import annotations
 

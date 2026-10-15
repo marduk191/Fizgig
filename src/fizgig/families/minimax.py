@@ -5,7 +5,7 @@ and the 32B text caches are reused), kohya LoRA keys as the original writes them
 settings as family options seeded from their old MINIMAX_* keys. Facts are the original trainer's, cited per value.
 """
 from fizgig.families.description import (ClipSpec, FamilyDescription, FamilyOption, LoRAFormat, ModelFile,
-                                        SamplingSettings, SpeedLoRA)
+                                        SamplingSettings, SpeedLoRA, VideoCheckpoint, VideoWorkbench)
 
 # The old H3 Training-tab controls as family options (lora_trainer_gui.py's MiniMax rows and _build_minimax_command),
 # their old settings keys kept so presets, queued runs and Last Train carry across.
@@ -130,8 +130,8 @@ OPTIONS = (
                       "likeness (Default). Blocks 0-5 are in neither: they deform anatomy and pull the dataset's "
                       "colour into the render.",
                  summary="blocks {}", setting="MINIMAX_BLOCKS", requires="H3_LIKENESS_MODE=Off", section="other", always_shown=True, counts_blocks=50, unmet_notes=(
-                     ("Default", "Owned by the Training mode above: photos and clips 20-49, and voice the same. Set the mode to Off to hand-pick.", "photos and clips: 20-49"),
-                     ("More Blocks", "Owned by the Training mode above: every step type trains 6-49. Set the mode to Off to hand-pick.", "every step type: 6-49")), pady=(8, 2)),
+                     ("Default", "Set by Training mode (Default): blocks 20-49 for photos, clips and voice. To choose the blocks yourself, set Training mode to Off.", "photos and clips: 20-49"),
+                     ("More Blocks", "Set by Training mode (More Blocks): blocks 6-49 for photos, clips and voice. To choose the blocks yourself, set Training mode to Off.", "every step type: 6-49")), pady=(8, 2)),
     FamilyOption("H3_DISTILL", "Learn identity from my dataset (reference distillation)", kind="check",
                  tokens="distill=1 aux:distill=1 --dit=pref:minimax_ref_dit",
                  hint="Experiment. Teaches the LoRA to reproduce identity the way H3 does from a reference photo. "
@@ -156,7 +156,8 @@ OPTIONS = (
         ("Still (1 frame)", "preview_frames=1"),
         ("22 frames with sound (~1s)", "preview_frames=22 preview_audio=1"),
         ("56 frames with sound (~2.3s)", "preview_frames=56 preview_audio=1"),
-        ("124 frames with sound (~5s)", "preview_frames=124 preview_audio=1")), setting="SAMPLE_FRAMES"),
+        ("124 frames with sound (~5s)", "preview_frames=124 preview_audio=1")), setting="SAMPLE_FRAMES",
+        default="56 frames with sound (~2.3s)"),
     FamilyOption("H3_FT_SCOPE", "Train on", choices=(("All media", ""), ("Photos only", "ft_scope=photo")),
                  hint="A dataset FILTER, not a mode. All media fine-tunes on everything in the folder - photos, clips, "
                       "voice. Photos only skips the clips and voice of a mixed folder (with Training mode on Default "
@@ -177,6 +178,7 @@ MINIMAX = FamilyDescription(
     gui_label="MiniMax H3",
     lora_name_suffix="mmh3",
     experimental=True,
+    detail_blocks=("h3blk_46", "h3blk_47", "h3blk_48", "h3blk_49"),
     hidden=False,
 
     # the Preferences rows (the old hand-built "Model Paths (MiniMax H3)" section, texts unchanged)
@@ -264,7 +266,7 @@ MINIMAX = FamilyDescription(
                   download_note="~155MB — ostris/minimax_h3_training_adapter → "
                                 "minimax_h3_ref2va_training_adapter_v1.safetensors"),
     ),
-    prefs_title="Model Paths (MiniMax H3 — experimental)",
+    prefs_title="Model Paths (MiniMax H3)",
     prefs_intro="Image-only LoRA training for MiniMax's ~33B H3 omni DiT. Train on the pruned int8 DiT — the same file "
                 "ComfyUI runs — quantized to NF4 at load, so the resident base is ~11 GB. The Qwen3-VL-32B text "
                 "encoder and the video VAE are only needed for the one-time caching pass; the compact nvfp4 TE is "
@@ -286,7 +288,7 @@ MINIMAX = FamilyDescription(
     settings_aliases={"FAMILY_EMA": "MINIMAX_EMA", "FAMILY_PRECISION": "MINIMAX_BASE_QUANT", "FAMILY_FT": "MINIMAX_FINETUNE",
                       "FAMILY_FT_ROTATE_EVERY": "MINIMAX_FT_EVERY", "FAMILY_FT_FUSED": "MINIMAX_FT_FUSED",
                       "FAMILY_FT_REG_DIR": "MINIMAX_REG_DIR", "FAMILY_FT_REG_MULT": "MINIMAX_REG_MULT"},
-    workbench=("repair", "explorer", "profiler", "extract", "royale"),
+    workbench=("repair", "explorer", "profiler", "extract", "royale", "refmod"),
     workbench_engine="fizgig.minimax.workbench:H3WorkbenchEngine",
     finetune=True,
     ft_learning_rate=3e-5,            # the tested H3 fine-tune rate (1e-4 destroys; 1e-5 too slow to judge from)                    # the old rotation FT (component windows on an NF4 trunk, int8 ConvRot saves)
@@ -324,6 +326,23 @@ MINIMAX = FamilyDescription(
     clip_regimes=(("dial", 4, 1.0), ("confirm", 6, 0.75)),
     clip_spec=ClipSpec(fps=24, frame_step=17, frame_offset=5, max_frames=124, edge_multiple=32, audio_rate=32000,
                        audio_channels=2, mute_suffix="_mute", note="minimax/model.py FPS, pixel_frames_for_latent"),
+    video_controls=VideoWorkbench(
+        lengths=(("Still (1 frame)", 1), ("5 frames (~0.2s)", 5), ("9 frames (~0.4s, off-grid)", 9),
+                 ("13 frames (~0.5s, off-grid)", 13), ("22 frames (~1s)", 22), ("39 frames (~1.6s)", 39),
+                 ("56 frames (~2.3s)", 56), ("73 frames (~3s)", 73), ("90 frames (~3.8s)", 90),
+                 ("107 frames (~4.5s)", 107), ("124 frames (~5.2s)", 124)),
+        default_length="22 frames (~1s)",
+        sizes=(512, 640, 768, 960, 1024, 1152, 1280, 1536), default_size=(640, 768),
+        scales=(("Full", 1.0), ("⅔", 2.0 / 3.0), ("½", 0.5)),
+        checkpoints=(VideoCheckpoint("First/last frame (fl2va) — standard", "dit"),
+                     VideoCheckpoint("Reference (ref2va)", "ref_dit", references=True)),
+        bases=(("Auto (by free VRAM)", "auto"), ("Stream blocks (exact int8, room for big clips)", "stream"),
+               ("NF4 (smallest, 9.5% base error)", "nf4")),
+        refmod_checkpoints=(VideoCheckpoint("Reference (ref2va)", "ref_dit", references=True),
+                            VideoCheckpoint("First / Last Frame (fl2va)", "dit")),
+        refmod_lengths=(("Still (1 frame)", 1), ("22 frames (~1s)", 22), ("39 frames (~1.6s)", 39),
+                        ("56 frames (~2.3s)", 56), ("73 frames (~3s)", 73)),
+        refmod_size=(640, 768), sweep_frames=22),
 
     latent_channels=24,
     spatial_factor=16,                # dataset/image_dataset.py LATENT_SPATIAL_FACTOR[minimaxh3]

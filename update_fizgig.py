@@ -138,7 +138,7 @@ def rocm_deps():
             fail("Failed to install the bitsandbytes wheel.")
     # Refresh the launcher env. Stay --experimental unless rocm_env.bat pins BNB_ROCM_VERSION.
     experimental = True
-    env_bat = os.path.join(HERE, "rocm_env.bat")
+    env_bat = os.path.join(HERE, "user_data", "rocm_env.bat")
     if os.path.exists(env_bat):
         experimental = "bnb_rocm_version=" not in open(env_bat, encoding="utf-8", errors="replace").read().lower()
     if experimental:
@@ -199,7 +199,7 @@ def main():
     print("Updating Fizgig (AMD ROCm)..." if rocm else "Updating Fizgig...")
     clear_old_stage2()
     # Older installers overwrote the tracked launchers; restore them so they never block the pull.
-    for launcher in (("run_fizgig_rocm.bat", "run_fizgig.bat") if rocm else ("run_fizgig.bat",)):
+    for launcher in (("Launch Fizgig AMD.bat", "run_fizgig.bat") if rocm else ("run_fizgig.bat",)):
         quiet(["git", "checkout", "--", launcher])
     run(["git", "pull"])
     print()
@@ -214,7 +214,8 @@ def main():
     if not rocm:
         msvc_check()
     print()
-    print("Update complete! Launch with run_fizgig_rocm.bat" if rocm else "Update complete! Run Fizgig with run_fizgig.bat")
+    print("Update complete! Start Fizgig with Launch Fizgig AMD.bat" if rocm else
+          "Update complete! Start Fizgig with Launch Fizgig.bat (its own window) or Launch Fizgig in browser.bat")
 
 
 if __name__ == "__main__":

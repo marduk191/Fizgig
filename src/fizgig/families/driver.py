@@ -68,6 +68,23 @@ class FamilyDriver:
         """Free the encoder's VRAM (caching and preview-prompt encoding load it, then drop it)."""
         raise NotImplementedError
 
+    # ---- files loaded by name (tokenizers, processors, configs): cache first, so a cached setup runs offline -----
+    @staticmethod
+    def from_pretrained(cls, repo_id: str, **kwargs):
+        """`cls.from_pretrained(repo_id, **kwargs)` from the local cache, the Hub only when nothing is cached. Plain
+        from_pretrained asks the Hub on every call, so a fully cached tokenizer still fails offline or when the Hub
+        rate-limits the machine. List the repo and files in the description's `helper_files` so the model
+        downloader fetches them up front."""
+        from fizgig.utils.hf_cache import from_pretrained_cache_first
+        return from_pretrained_cache_first(cls, repo_id, **kwargs)
+
+    @staticmethod
+    def helper_dir(repo_id: str) -> str:
+        """The cached folder of a `helper_files` repo, for loaders that take a path or config repo (diffusers'
+        from_single_file config=), else the repo id itself (the first run then fetches it)."""
+        from fizgig.utils.hf_cache import cached_snapshot_dir
+        return cached_snapshot_dir(repo_id) or repo_id
+
     def enable_gradient_checkpointing(self, dit, on: bool = True) -> None:
         raise NotImplementedError
 
@@ -79,6 +96,11 @@ class FamilyDriver:
     def encode_text(self, te, captions: list) -> list:
         """captions -> list of conditioning dicts (tensors on CPU)."""
         raise NotImplementedError
+
+    def text_cache_key(self) -> tuple:
+        """What else besides the prompt the encoded conditioning depends on (the workbench's prompt cache keys on
+        it): () for most families; ACE-Step's caption carries the song's length."""
+        return ()
 
     def cache_stage(self, stage: str, datasets, args, device, aux: dict) -> bool:
         """Optional: cache `stage` ("latents" / "text") over the loaded datasets in the family's own layout and return
@@ -172,6 +194,13 @@ class FamilyDriver:
         pictures). Families whose previews are always stills need nothing."""
         import contextlib
         return contextlib.nullcontext()
+
+    def practice_latent(self, vae, latents, res):
+        """A prompt slider's practice item: generate()'s latents -> one training latent as the cache holds it,
+        (1, C, ...) on the CPU. Pictures go through the decoder and back (the cache's own encoding)."""
+        import numpy as np
+        img = self.decode(vae, latents, res, res)
+        return self.encode_images(vae, [np.array(img)])[0][None].cpu()
 
     def slider_preview(self, frames, multipliers):
         """One preview's decoded results at each strength -> what save_preview writes, or None for the shared
@@ -430,6 +459,12 @@ class FamilyDriver:
         """The Linears an INT8 / NF4 base quantises (families/quant.py). Default: the LoRA targets. A family whose
         LoRA reaches layers that must stay bf16 (Krea 2's text fusion and I/O layers) narrows it."""
         return self.lora_target_names(dit)
+
+    def activity_axis(self, module_name: str) -> bool:
+        """Block activity: whether this LoRA module's sequence runs along the output (the song's time, a picture's
+        tokens), so its push can be placed along it. A family whose cross-attention projects the prompt's tokens
+        says no for those."""
+        return True
 
     def block_of(self, module_name: str) -> Optional[str]:
         """The block id a module belongs to, or None for modules outside the map (e.g. a speed LoRA's extras)."""

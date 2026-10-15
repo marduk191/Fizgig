@@ -31,7 +31,7 @@ SDXL = FamilyDescription(
     key="sdxl",
     arch_id="sdxl",
     display_name="SDXL",
-    gui_label="SDXL (any checkpoint, experimental)",
+    gui_label="SDXL (any checkpoint)",
     lora_name_suffix="sdxl",
     aliases=("sdxl", "stable-diffusion-xl"),
     experimental=True,
@@ -167,8 +167,8 @@ SDXL = FamilyDescription(
         # alpha at half the rank (Peter, 5 Oct 2026: SDXL LoRAs gain from the halved alpha; it also halves the LoRA's
         # output scale, so the same 1e-4 moves it half as far per step)
         # 5e-5 for every SDXL preset (Peter, 5 Oct 2026: clearly better results than 1e-4 in his comparisons)
-        ("✨ SDXL Strong (rank 32, alpha 16, 5e-5)", _preset(32, lr=5e-5, alpha=16)),      # the default (Peter)
-        ("✨ SDXL Standard (rank 16, alpha 8, 5e-5)", _preset(16, lr=5e-5, alpha=8)),
+        ("✨ SDXL Strong (rank 32, alpha 16, 5e-5)", _preset(32, lr=5e-5, alpha=16, epochs=50)),      # the default (Peter)
+        ("✨ SDXL Standard (rank 16, alpha 8, 5e-5)", _preset(16, lr=5e-5, alpha=8, epochs=50)),
         # Slider: the default's rank 32 / alpha 16 at 5e-5 (Peter, 5 Oct 2026). Not yet measured on SDXL.
         ("✨ SDXL Slider (rank 32, alpha 16, 5e-5)", _preset(32, lr=5e-5, alpha=16, epochs=30, slider=True)),
         # full fine-tune at the shared fine-tune rate (Peter), and at OneTrainer's

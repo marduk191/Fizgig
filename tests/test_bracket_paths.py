@@ -16,14 +16,10 @@ os.environ["FIZGIG_NO_PERSIST"] = "1"
 # Repo root, derived from this file's location -- was hardcoded to one machine's
 # absolute path, which made the whole suite unrunnable anywhere else.
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, REPO)
+# src only. The repo root holds Fizgig 8's fizgig.py, which would shadow the fizgig package.
 sys.path.insert(0, os.path.join(REPO, "src"))
 
-import tkinter as tk
 from PIL import Image
-import lora_trainer_gui as G
-
-G.LAST_USED_FILE = os.path.join(os.environ["TEMP"], "nope", ".last_used.json")
 
 fails = []
 
@@ -62,36 +58,32 @@ for _f in FOLDERS:
        len(glob_images(d, caption_extension=".txt")))
 
 # --- 3. the training pre-flight that actually blocked the run -----------------------------
-root = tk.Tk()
-root.withdraw()
-g = G.LoRATrainerGUI(root)
-
-_errors = []
-G.messagebox.showerror = lambda title, msg: _errors.append(msg)
+# Fizgig 8: Start's checks are plain functions (fizgig.families.checks), the same ones the launch plan refuses on.
+from fizgig.families import checks  # noqa: E402
 
 for _f in FOLDERS:
     d = os.path.join(BASE, _f)
-    g.image_folder_var.set(d)
-    g.dataset_caption_ext_var.set(".txt")
-    _errors.clear()
-    try:
-        g.validate_inputs()
-    except Exception:
-        pass  # other validation (model paths) may fail — we only care about the caption error
-    blob = " ".join(_errors)
+    problems = checks.training_folder(d, ".txt", media_exts={".png"})
     ck(f"no bogus 'missing captions' error for {_f!r}",
-       "No caption files" not in blob,
-       [ln for ln in blob.splitlines() if "caption" in ln.lower()][:1])
+       not any("caption" in p.lower() for p in problems), problems[:1])
 
-# --- 4. the GUI's own caption discovery agrees with the pre-flight ------------------------
-g.image_folder_var.set(os.path.join(BASE, FOLDERS[0]))
+# And the check is still ALIVE: a bracketed folder that really has no captions must still be refused, or the
+# assertion above would pass for a check that had simply stopped looking.
+_bare = os.path.join(BASE, "[uncaptioned] set")
+os.makedirs(_bare)
+Image.new("RGB", (64, 64)).save(os.path.join(_bare, "img0.png"))
+ck("  ...while a bracketed folder with NO captions is still refused",
+   any("No caption files" in p for p in checks.training_folder(_bare, ".txt", media_exts={".png"})))
+
+# --- 4. the Captions tab's own discovery agrees with the pre-flight ------------------------
+from fizgig.web import captions as CAP  # noqa: E402
+
+_bf = os.path.join(BASE, FOLDERS[0])
 ck("Captions tab lists the images in a bracketed folder",
-   len(g.get_caption_image_files()) == 3, len(g.get_caption_image_files()))
-_analysis = g._analyze_dataset(os.path.join(BASE, FOLDERS[0]))
-ck("  dataset analysis sees the captions too",
-   _analysis and _analysis["has_captions"] and _analysis["caption_count"] == 3, _analysis)
+   len(CAP.media_files(_bf, clips=False)) == 3, len(CAP.media_files(_bf, clips=False)))
+_fr = CAP.find_replace(_bf, "caption", "label", apply=False)
+ck("  and Find & Replace finds its captions (glob-escaped too)", len(_fr["changes"]) == 3, len(_fr["changes"]))
 
-root.destroy()
 shutil.rmtree(BASE, ignore_errors=True)
 print("\n" + ("ALL PASS" if not fails else f"{len(fails)} FAILURE(S)"))
 sys.exit(1 if fails else 0)

@@ -803,12 +803,13 @@ python -m pip install --upgrade uv
 echo
 echo "Detecting AMD GPU architecture..."
 ARCH=""
-if [[ ! -f detect_gpu_linux.py ]]; then
-    echo "ERROR: detect_gpu_linux.py not found."
+mkdir -p user_data
+if [[ ! -f src/install/detect_gpu_linux.py ]]; then
+    echo "ERROR: src/install/detect_gpu_linux.py not found."
     exit 1
 fi
 
-if ! ARCH="$(python detect_gpu_linux.py 2>gpu_detect_debug.log)"; then
+if ! ARCH="$(python src/install/detect_gpu_linux.py 2>user_data/gpu_detect_debug.log)"; then
     echo "ERROR: GPU detection failed or unsupported AMD GPU."
     cat gpu_detect_debug.log 2>/dev/null || true
     exit 1
@@ -925,14 +926,14 @@ PY
 echo
 echo "Writing ROCm launcher config (BNB_ROCM_VERSION, rocm_env.sh)..."
 python write_rocm_env.py || true
-chmod +x run_fizgig_rocm.sh
+chmod +x launch_fizgig_amd.sh
 
 echo
 echo "============================================================"
 echo "  Installation complete!"
 echo
-echo "  Launch with: ./run_fizgig_rocm.sh"
-echo "  (run_fizgig.sh is the upstream launcher — no ROCm env; do not use for AMD training)"
+echo "  Launch with: ./launch_fizgig_amd.sh"
+echo "  (launch_fizgig.sh / launch_fizgig_browser.sh are the upstream launchers — no ROCm env; do not use for AMD training)"
 echo
 echo "  NOTE: Linux AMD ROCm is highly experimental — crashes and GPU resets are common."
 echo "============================================================"

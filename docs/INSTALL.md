@@ -6,7 +6,7 @@
 
 Fizgig ships as a ready-made cloud image: the whole app in a browser tab, not a cut-down web version. Drag datasets in and LoRAs out with the built-in file manager, download models in one click, and optionally have the pod shut itself down when training finishes. Models and datasets persist between sessions.
 
-**[⚡ Deploy on RunPod →](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=faoq8ed6um&ref=vkb387ep)**  ·  [Read the guide first](../docker/README.md)
+**[⚡ Deploy on RunPod →](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=bdrdew7hxw&ref=vkb387ep)**  ·  [Read the guide first](../docker/README.md)  ·  Need the old pod? [Fizgig Classic v7.x](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=faoq8ed6um&ref=vkb387ep)
 
 ## Requirements
 
@@ -67,11 +67,11 @@ Your model paths, output LoRAs, caches, presets and the venv are left alone. `up
 
 ### Windows (NVIDIA, one-click)
 
-Double-click `install_fizgig.bat`. It creates a venv, installs CUDA 12.8 PyTorch and all dependencies, pre-downloads the InsightFace models, and verifies CUDA is visible to PyTorch. Launch with `run_fizgig.bat`; update with `update_fizgig.bat`.
+Double-click `install_fizgig.bat`. It creates a venv, installs CUDA 12.8 PyTorch and all dependencies, pre-downloads the InsightFace models, and verifies CUDA is visible to PyTorch. Launch with `Launch Fizgig.bat` (its own window) or `Launch Fizgig in browser.bat` (in your web browser); update with `update_fizgig.bat`.
 
 ### Windows (AMD ROCm)
 
-Install a full **Python 3.12** first: the ROCm bitsandbytes wheel is cp312-only, and Fizgig's GUI needs Tkinter. Do not use the embeddable zip. Install from [Windows downloads](https://www.python.org/downloads/windows/):
+Install a full **Python 3.12** first: the ROCm bitsandbytes wheel is cp312-only, and Gizmo needs Tkinter. Do not use the embeddable zip. Install from [Windows downloads](https://www.python.org/downloads/windows/):
 
 - **Recommended** — [Python Install Manager](https://www.python.org/downloads/latest/pymanager) from the [Microsoft Store](https://apps.microsoft.com/detail/9NQ7512CXL7T), then `py install 3.12`.
 - **Alternative** — [python-3.12.10-amd64.exe](https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe); tick **Add python.exe to PATH** and **tcl/tk and IDLE**.
@@ -82,7 +82,7 @@ Then double-click `install_fizgig_rocm.bat` (NVIDIA users never run this). It pi
 - `torchvision==0.27.0+rocm7.15.0a20260728`
 - `rocm-sdk-devel==7.15.0a20260728`
 
-Override with `TORCH_PIN` / `TORCHVISION_PIN` / `ROCM_SDK_DEVEL_PIN` if needed. **bitsandbytes** is a pinned community Windows ROCm wheel from [0xDELUXA/bitsandbytes_win_rocm](https://github.com/0xDELUXA/bitsandbytes_win_rocm), built by neither AMD nor Fizgig. Shared deps come from `requirements.txt` with CUDA `torch`/`bitsandbytes` and NVIDIA-only `nvidia-ml-py` filtered out (`filter_requirements_rocm.py`). Launch with `run_fizgig_rocm.bat`; update with `update_fizgig_rocm.bat` — **not** `update_fizgig.bat`, which installs CUDA torch and would wipe the ROCm stack.
+Override with `TORCH_PIN` / `TORCHVISION_PIN` / `ROCM_SDK_DEVEL_PIN` if needed. **bitsandbytes** is a pinned community Windows ROCm wheel from [0xDELUXA/bitsandbytes_win_rocm](https://github.com/0xDELUXA/bitsandbytes_win_rocm), built by neither AMD nor Fizgig. Shared deps come from `requirements.txt` with CUDA `torch`/`bitsandbytes` and NVIDIA-only `nvidia-ml-py` filtered out (`filter_requirements_rocm.py`). Launch with `Launch Fizgig AMD.bat`; update with `update_fizgig_rocm.bat` — **not** `update_fizgig.bat`, which installs CUDA torch and would wipe the ROCm stack.
 
 **`--experimental` (unsupported):** `install_fizgig_rocm.bat --experimental` installs unpinned `torch[device-ARCH]` / `torchvision[device-ARCH]` / `rocm-sdk-devel` from AMD's **whl-next** nightlies (`https://nightly.repo.amd.com/rocm/whl-next/`, the index comfyui-rocm uses for floating installs; the pinned TORCH_PIN wheels are not on it) and leaves `BNB_ROCM_VERSION` unset so bitsandbytes auto-selects its highest matching DLL. It is **not** the same as Linux `ROCM_CHANNEL=nightly` (which stays on the constrained 7.14 / bitsandbytes 714 lane), and not the default Windows multi-arch pin index. Local experimentation only. **Do not open GitHub issues for crashes, install failures, or training problems when `--experimental` was used** — those reports are not supported. Use the pinned install (no flag) for anything you expect help with.
 
@@ -93,7 +93,7 @@ Expect crashes, GPU resets, and incomplete model support on many setups. Best-ef
 ```bash
 chmod +x install_fizgig_rocm.sh
 ./install_fizgig_rocm.sh
-./run_fizgig_rocm.sh
+./launch_fizgig_amd.sh
 ```
 
 The script detects your gfx target (`detect_gpu_linux.py`). **Nightly is the Linux default**: the [TheRock multi-arch RELEASES.md](https://github.com/ROCm/TheRock/blob/main/RELEASES.md) index plus a `[device-gfx*]` extra for your GPU (e.g. `gfx1201` → `device-gfx1201`). Unpinned nightly resolves the latest **torch 2.12** + **ROCm 7.14.0a\*** stack (matches `libbitsandbytes_rocm714.so`). Override with `TORCH_PIN=…`, `ROCM_META_PIN=…`, or `TORCH_NIGHTLY_MINOR=…`.
@@ -115,7 +115,7 @@ ROCM_CHANNEL=nightly TORCH_NIGHTLY_MINOR=2.14 ./install_fizgig_rocm.sh
 
 The installer then adds shared deps from `requirements.txt` (filtered) and `bitsandbytes>=0.50.0` for ROCm.
 
-Linux ROCm cache scripts import `fizgig.rocm.cache_exit` only when `FIZGIG_GPU_BACKEND=rocm` (set by `run_fizgig_rocm.sh`); NVIDIA and other platforms call `main()` directly. Opt out with `FIZGIG_ROCM_NO_FAST_EXIT=1 ./run_fizgig_rocm.sh`.
+Linux ROCm cache scripts import `fizgig.rocm.cache_exit` only when `FIZGIG_GPU_BACKEND=rocm` (set by `launch_fizgig_amd.sh`); NVIDIA and other platforms call `main()` directly. Opt out with `FIZGIG_ROCM_NO_FAST_EXIT=1 ./launch_fizgig_amd.sh`.
 
 ### Linux / macOS (NVIDIA CUDA)
 
@@ -123,13 +123,12 @@ Linux ROCm cache scripts import `fizgig.rocm.cache_exit` only when `FIZGIG_GPU_B
 
 ```bash
 python install_fizgig.py
-chmod +x run_fizgig.sh
-./run_fizgig.sh
+./launch_fizgig.sh            # its own window (./launch_fizgig_browser.sh: in your web browser)
 ```
 
 Run it from your system Python, not a conda environment (`conda deactivate` first): conda bundles its own Tk, which can't see the system's fonts, so the app comes up with missing text. The installer refuses when conda is active; `FIZGIG_ALLOW_CONDA=1` overrides it.
 
-### VRAM status bar on AMD
+### The VRAM meter on AMD
 
 NVIDIA uses `pynvml` / `nvidia-smi`; the AMD readers (`vram_monitor.read_amd_gpu_vram`) run only as a fallback. Windows ROCm uses `typeperf`; Linux ROCm uses the **`amd-smi`** CLI when available ([AMD SMI / ROCm Core SDK](https://rocm.docs.amd.com/projects/amdsmi/en/latest/install/install.html), e.g. `sudo apt install amdrocm-amdsmi`), falling back to `rocm-smi`. Fizgig picks the GPU with the largest VRAM total and skips empty iGPU entries. Do not `pip install amdsmi` — the PyPI package is outdated.
 

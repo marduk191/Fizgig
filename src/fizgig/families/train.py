@@ -61,6 +61,7 @@ from fizgig.training.adaptive_lr import AdaptiveLR  # noqa: E402
 from fizgig.training.metadata import (build_metadata, latest_sample_image, refresh_checkpoint_thumbnail,  # noqa: E402
                                       resolve_title, sample_for_epoch, thumbnail_data_uri)
 from fizgig.training.train_utils import LossRecorder, prune_state_dirs, validate_output_name  # noqa: E402
+from fizgig.training.step_log import StepLog, take_request  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -250,23 +251,42 @@ def _small_card_previews():
 
 
 def _read_sample_override(output_dir):
-    """The GUI's live sample override (<output_dir>/.sample_override.json, written by the status-bar panel):
-    {prompt, seed, width, height} while a prompt is set, else None. The reference image field is Klein's and ignored."""
+    """The live sample override (<output_dir>/.sample_override.json, written by the desktop's status-bar panel or the
+    web UI's Samples tab): {prompts, prompt (the first), seed, width, height} while a prompt is set, else None. A
+    "prompts" list (the web's, every line of its box) or a single "prompt"; the reference image field is ignored."""
     path = os.path.join(output_dir, ".sample_override.json")
     try:
         with open(path, encoding="utf-8") as f:
             d = json.load(f)
-        prompt = str(d.get("prompt", "")).strip()
-        if prompt:
-            return {"prompt": prompt, "seed": int(d.get("seed", 1234)), "width": int(d.get("width", 1024)),
-                    "height": int(d.get("height", 1024))}
+        prompts = d.get("prompts") if isinstance(d.get("prompts"), list) else [d.get("prompt", "")]
+        prompts = [str(p).strip() for p in prompts if str(p or "").strip() and not str(p).strip().startswith("#")]
+        if prompts:
+            return {"prompts": prompts, "prompt": prompts[0], "seed": int(d.get("seed", 1234)),
+                    "width": int(d.get("width", 1024)), "height": int(d.get("height", 1024))}
     except (OSError, ValueError, TypeError):
         pass
     return None
 
 
-def _encode_override(driver, te_path, prompt, dit, device, parkable=True, references=None):
-    """Encode one override prompt mid-run. The text encoder loads beside the training DiT when it fits; otherwise the
+SLIDER_LIVE = ".slider_prompts.json"            # written by the web UI while a prompt slider trains
+SLIDER_LIVE_APPLIED = ".slider_prompts_applied.json"   # what the trainer took, and at which epoch (the UI reads it)
+
+
+def _read_slider_live(output_dir):
+    """A prompt slider's new prompts, set while it trains: {base, pos, neg, guidance} or None - the form's own three
+    (what the picture is, what each end adds), all needed, as at launch."""
+    try:
+        with open(os.path.join(output_dir, SLIDER_LIVE), encoding="utf-8") as f:
+            d = json.load(f)
+        out = {"base": str(d.get("base") or "").strip(), "pos": str(d.get("pos") or "").strip(),
+               "neg": str(d.get("neg") or "").strip(), "guidance": float(d.get("guidance"))}
+        return out if out["base"] and out["pos"] and out["neg"] and out["guidance"] > 0 else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _encode_override(driver, te_path, prompts, dit, device, parkable=True, references=None):
+    """Encode the override's prompts mid-run. The text encoder loads beside the training DiT when it fits; otherwise the
     DiT waits on CPU for the encode (a block-swapped DiT is small enough to stay, and the driver picks a smaller
     encoder when VRAM is short)."""
     from fizgig.families import quant
@@ -283,8 +303,8 @@ def _encode_override(driver, te_path, prompt, dit, device, parkable=True, refere
             te = driver.load_text_encoder(te_path, device)
         try:
             if references:
-                return driver.encode_text_with_references(te, [prompt], [references])
-            return driver.encode_text(te, [prompt])
+                return driver.encode_text_with_references(te, list(prompts), [references] * len(prompts))
+            return driver.encode_text(te, list(prompts))
         finally:
             driver.unload_text_encoder(te)
             del te
@@ -348,18 +368,23 @@ SLIDER_PREVIEW_MULTIPLIERS = (-1.0, 0.0, 1.0)
 def _slider_strip(frames, multipliers):
     from PIL import Image, ImageDraw, ImageFont
     w, h = frames[0].size
-    gap, band = 8, 30
-    strip = Image.new("RGB", (w * len(frames) + gap * (len(frames) - 1), h + band), (16, 16, 16))
-    draw = ImageDraw.Draw(strip)
+    gap = 8
     try:
         font = ImageFont.load_default(size=max(14, w // 40))
     except Exception:
         font = ImageFont.load_default()
-    for k, (im, m) in enumerate(zip(frames, multipliers)):
+    labels = ["strength 0 (slider off)" if m == 0 else f"strength {m:+g}" for m in multipliers]
+    # the band fits the text (the font grows with the picture): its full height, descenders too, padded evenly
+    probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    top, bottom = min(probe.textbbox((0, 0), t, font=font)[1] for t in labels),         max(probe.textbbox((0, 0), t, font=font)[3] for t in labels)
+    pad = max(6, (bottom - top) // 3)
+    band = (bottom - top) + 2 * pad
+    strip = Image.new("RGB", (w * len(frames) + gap * (len(frames) - 1), h + band), (16, 16, 16))
+    draw = ImageDraw.Draw(strip)
+    for k, (im, label) in enumerate(zip(frames, labels)):
         x = k * (w + gap)
         strip.paste(im, (x, band))
-        draw.text((x + 8, 7), "strength 0 (slider off)" if m == 0 else f"strength {m:+g}", fill=(236, 236, 236),
-                  font=font)
+        draw.text((x + 8, pad - top), label, fill=(236, 236, 236), font=font)
     return strip
 
 
@@ -406,12 +431,14 @@ def _prompt_slider_step(driver, dit, net, latents, enc, gen, *, guidance, min_t,
 
 
 def _render_previews(driver, dit, net, vae, encoded, out_dir, epoch, *, output_name, steps, cfg, neg, width,
-                     height, seed, ema=None, speed=None, lowmem=False, swapped=False, refs=None, slider=False):
+                     height, seed, ema=None, speed=None, lowmem=False, swapped=False, refs=None, slider=False,
+                     strengths=()):
     """Previews on the RESIDENT training model: training adapter OFF (the deployment setup), the family's speed
     LoRA ON if one is loaded (it lives on CPU between previews). On small cards the DiT parks on CPU for the
     decode. File names match the other trainers so the GUI gallery reads them:
     <name>_e<epoch>_<idx>_<timestamp>_<seed>.png. `speed` is the speed LoRA's SamplingSettings or None; `refs` the edit previews' reference latents; `slider`
-    renders each prompt at -1 / 0 / +1 on one seed and saves them as one strip."""
+    renders each prompt at -1 / 0 / +1 on one seed and saves them as one strip. `strengths`: each prompt again at
+    these LoRA strengths, same seed, saved beside it as <...>_s<strength x100>.png (_s050 = 0.5)."""
     os.makedirs(out_dir, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     device = next(iter(dit.parameters())).device
@@ -435,11 +462,18 @@ def _render_previews(driver, dit, net, vae, encoded, out_dir, epoch, *, output_n
             driver.block_swap_mode(dit, inference=True)
         ref_kw = {"refs": [r.to(device) for r in refs]} if refs else {}
         lats = []
-        mults = SLIDER_PREVIEW_MULTIPLIERS if slider else (None,)
+        extra = () if slider else tuple(strengths or ())
+        mults = SLIDER_PREVIEW_MULTIPLIERS if slider else (None,) + extra
+        # previews run the blocks uncompiled (Compile Blocks): eval mode, the preview size and the speed LoRA are each a
+        # new graph, and building them took ~5 minutes of Triton/MSVC work on the first preview after every start or
+        # resume - a handful of eager steps costs seconds. Training keeps its compiled graphs
+        _eager = torch.compiler.set_stance("force_eager")
+        _eager.__enter__()
+        done.add("eager")
         for i, cond in enumerate(encoded):
             for m in mults:
-                if m is not None:
-                    net.set_trainable_multiplier(m)
+                if m is not None or extra:
+                    net.set_trainable_multiplier(1.0 if m is None else m)
                 if speed is not None:
                     # the speed LoRA's own CFG, unless the Samples tab asks for more (then the negative applies too)
                     _cfg = cfg if cfg and cfg > 1.0 else speed.cfg
@@ -459,18 +493,22 @@ def _render_previews(driver, dit, net, vae, encoded, out_dir, epoch, *, output_n
             quant.move(dit, "cpu")
             torch.cuda.empty_cache()
             _preview_vram("DiT parked for the decode")
-        per = len(SLIDER_PREVIEW_MULTIPLIERS) if slider else 1
+        per = len(mults)
         for i in range(len(lats) // per):
             p = os.path.join(out_dir, f"{output_name}_e{epoch:06d}_{i:02d}_{ts}_{seed + i}.png")
-            frames = [driver.decode(vae, lat, width, height) for lat in lats[i * per:(i + 1) * per]]
             if slider:
+                frames = [driver.decode(vae, lat, width, height) for lat in lats[i * per:(i + 1) * per]]
                 strip = driver.slider_preview(frames, SLIDER_PREVIEW_MULTIPLIERS)
                 paths += driver.save_preview(_slider_strip(frames, SLIDER_PREVIEW_MULTIPLIERS) if strip is None
                                              else strip, p)
-            else:
-                paths += driver.save_preview(frames[0], p)
+                continue
+            for m, lat in zip(mults, lats[i * per:(i + 1) * per]):      # decoded one at a time: a song is big
+                q = p if m is None else f"{p[:-4]}_s{int(round(m * 100)):03d}.png"
+                paths += driver.save_preview(driver.decode(vae, lat, width, height), q)
     finally:
-        if slider:
+        if "eager" in done:
+            _eager.__exit__(None, None, None)
+        if slider or strengths:
             net.set_trainable_multiplier(1.0)  # a preview that failed mid-dial must not leave the LoRA scaled
         if "decode_park" in done:
             driver.unpark(dit, device, tok)
@@ -710,7 +748,7 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                  vae_path=None, te_path=None, sample_prompts=None, sample_every_n_epochs=0, sample_width=None,
                  sample_height=None, sample_steps=None, sample_cfg_scale=None, sample_negative=None,
                  sample_at_first=False, sample_seed=42, sample_reference=None, sample_image=None,
-                 slider_pairs=False, slider_diff_weight=1.0, slider_prompts=None, slider_guidance=3.0,
+                 sample_strengths=(), slider_pairs=False, slider_diff_weight=1.0, slider_prompts=None, slider_guidance=3.0,
                  train_blocks=None,
                  slider_bank=16, slider_bank_res=768,
                  metadata_title=None, metadata_author=None, metadata_description=None, metadata_license=None,
@@ -845,8 +883,9 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
         driver.slider_setup(group)           # e.g. H3: still previews unless the pairs are clips
     for ds in group.datasets:
         if getattr(ds, "batch_size", 1) != 1:
-            raise RuntimeError(f"{desc.display_name} trains at batch size 1 here (conditioning lengths differ per "
-                               f"image). Set Batch Size to 1.")
+            raise RuntimeError("Fizgig trains one image at a time: set batch_size = 1 in the dataset config. For a "
+                               "larger effective batch use --gradient_accumulation_steps (the same averaged "
+                               "gradient, at the memory of batch 1).")
     loader = DataLoader(group, batch_size=1, shuffle=True, num_workers=0,
                         collate_fn=(lambda b: b[0]) if slider_prompts else _Collator(shared_epoch, group))
     steps_per_epoch = len(loader)
@@ -1022,13 +1061,14 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             blocks = set(train_blocks)
             logger.info(f"[blocks] the LoRA trains {len(blocks)} of {len(known)} blocks only: {', '.join(train_blocks)}")
         net.add_trainable(network_dim, network_alpha, blocks=blocks, kind=network_type, factor=lokr_factor)
-    if slider_prompts:
-        # the practice bank: the base model's own renders of the neutral prompt (adapter at 0, training adapter
-        # off, the speed LoRA on when it is loaded), decoded and re-encoded into training latents
-        import numpy as np
+    def render_bank():
+        """The practice bank: the base model's own renders of the neutral prompt (adapter at 0, training adapter
+        off, the speed LoRA on when it is loaded), decoded and re-encoded into training latents."""
+        nonlocal vae
         if vae is None:
             vae = driver.load_vae(vae_path, device)
         n_c = {k: v[0].to(device) for k, v in slider_enc[0].items()}
+        was_training = dit.training
         net.set_trainable_multiplier(0.0)
         net.set_enabled(ADAPTER, False)
         use_speed = speed_lora is not None and speed_desc is not None and net.has(SPEED)
@@ -1047,16 +1087,20 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                     lat = driver.generate(dit, n_c, slider_bank_res, slider_bank_res, steps=desc.preview_steps,
                                           seed=seed + 1000 + i, cfg=sample_cfg_scale,
                                           **({"neg_cond": slider_neg} if slider_neg is not None else {}))
-                img = driver.decode(vae, lat, slider_bank_res, slider_bank_res)
-                bank.append(driver.encode_images(vae, [np.array(img)])[0][None].cpu())
+                bank.append(driver.practice_latent(vae, lat, slider_bank_res))
         if use_speed:
             net.set_enabled(SPEED, False)
             net.move_adapter(SPEED, "cpu")
         net.set_enabled(ADAPTER, True)
         net.set_trainable_multiplier(1.0)
+        if was_training:
+            dit.train()
         group.latents = bank
         torch.cuda.empty_cache()
         logger.info("[slider] %d practice images rendered at %dx%d", len(bank), slider_bank_res, slider_bank_res)
+
+    if slider_prompts:
+        render_bank()
     if do_compile:                       # decided before the load (below the Auto plan), applied last
         driver.compile_blocks(dit, "outside" if do_compile == "outside" else "inside",
                               blocks_to_swap if swapped else 0)
@@ -1164,6 +1208,55 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                 scheduler.step()
 
     last_prompt = [None]
+    slider_history = []                     # [{epoch, prompts, guidance}] - each live change, for the saved metadata
+
+    def slider_live(done):
+        """A prompt slider's new prompts (the web UI's Slider prompts panel), taken at an epoch boundary: the poles
+        encoded again, and a new base renders a new practice bank and becomes the previews' prompt. Training goes on
+        from where it is, toward the new ends."""
+        nonlocal slider_prompts, slider_guidance, slider_enc, encoded, sample_prompts
+        new = _read_slider_live(output_dir) if slider_prompts else None
+        if new is None:
+            return
+        # each end is the base and its own words, as the launch builds them (families/launch.py)
+        prompts = [new["base"], f"{new['base']} {new['pos']}", f"{new['base']} {new['neg']}"]
+        if prompts == [str(x) for x in slider_prompts] and new["guidance"] == float(slider_guidance):
+            return
+        base_changed = prompts[0] != str(slider_prompts[0])
+        logger.info("[slider] new prompts from epoch %d: base '%s' | +1 -> '%s' | -1 -> '%s' (guidance %g)",
+                    done + 1, *prompts, new["guidance"])
+        parked = []
+        try:
+            enc = _encode_override(driver, te_path, prompts, dit, device, parkable=not swapped)
+            slider_enc = [{k: v[None] for k, v in c.items()} for c in enc]
+            if base_changed:
+                if desc.preview_park_optimizer and optimizer is not None:     # room for the renders, as previews do
+                    for st in optimizer.state.values():
+                        for k, v in st.items():
+                            if torch.is_tensor(v) and v.is_cuda:
+                                st[k] = v.to("cpu")
+                                parked.append((st, k))
+                    torch.cuda.empty_cache()
+                render_bank()
+                if prompts[0] and sample_prompts == [str(slider_prompts[0])]:   # the previews followed the old base
+                    sample_prompts = [prompts[0]]
+                    if encoded is not None and not sample_reference and not (sample_image and desc.preview_image):
+                        encoded = [enc[0]]                  # text-only previews: the new base's own encoding
+        except Exception as exc:
+            logger.warning(f"[slider] could not take the new prompts ({type(exc).__name__}: {str(exc)[:200]}) - "
+                           "training goes on with the ones it had", exc_info=True)
+            return
+        finally:
+            for st, k in parked:
+                st[k] = st[k].to(device)
+        slider_prompts, slider_guidance = prompts, new["guidance"]
+        slider_history.append({"epoch": done, "prompts": prompts, "guidance": new["guidance"]})
+        try:
+            with open(os.path.join(output_dir, SLIDER_LIVE_APPLIED), "w", encoding="utf-8") as f:
+                json.dump({"epoch": done, "base": new["base"], "pos": new["pos"], "neg": new["neg"],
+                           "guidance": new["guidance"], "practice_rerendered": base_changed, "at": time.time()}, f)
+        except OSError:
+            pass
 
     def metadata(epoch):
         thumb = None if (metadata_thumbnail or "").lower() in ("off", "none") else (
@@ -1191,6 +1284,8 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             if slider_prompts:
                 md.update({"ss_slider_prompts": json.dumps([str(x) for x in slider_prompts]),
                            "ss_slider_guidance": f"{float(slider_guidance):g}"})
+                if slider_history:          # the prompts it was steered through, from which epoch
+                    md.update({"ss_slider_prompt_history": json.dumps(slider_history)})
             else:
                 md.update({"ss_slider_diff_weight": f"{float(slider_diff_weight):g}"})
         if train_blocks:
@@ -1240,15 +1335,23 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             for st, k in parked:            # the next training step needs it back, whatever happened
                 st[k] = st[k].to(device)
 
+    ov_cache = [None, None]                  # the override's prompts and their encoding, kept while they don't change
+
     def _previews(epoch):
         conds, w, h, sd, prompts = encoded, sample_width, sample_height, sample_seed, sample_prompts
         ov = _read_sample_override(output_dir)
+        if ov and slider:       # a slider preview is its own prompt across strengths: an override never applies
+            logger.info("[sample override] ignored - slider previews always show the slider's own prompt")
+            ov = None
         if ov:
-            logger.info(f"[sample override] active - '{ov['prompt'][:60]}' seed={ov['seed']} {ov['width']}x{ov['height']}")
+            logger.info(f"[sample override] active - {len(ov['prompts'])} prompt(s), '{ov['prompt'][:60]}' "
+                        f"seed={ov['seed']} {ov['width']}x{ov['height']}")
             try:
-                conds = _encode_override(driver, te_path, ov["prompt"], dit, device, parkable=not swapped,
-                                         references=ref_imgs)
-                sd, prompts = ov["seed"], [ov["prompt"]]
+                if ov_cache[0] != ov["prompts"]:     # encoded again only when the prompts changed
+                    ov_cache[:] = [list(ov["prompts"]), _encode_override(driver, te_path, ov["prompts"], dit, device,
+                                                                         parkable=not swapped, references=ref_imgs)]
+                conds = ov_cache[1]
+                sd, prompts = ov["seed"], list(ov["prompts"])
                 if not ref_imgs:        # an edit keeps the reference's canvas: its latents are already encoded
                     w, h = ov["width"], ov["height"]
                     if lowmem and max(w, h) > 768:
@@ -1269,7 +1372,8 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                          steps=sample_steps, cfg=sample_cfg_scale, neg=neg, width=w, height=h,
                          seed=sd, ema=ema,
                          speed=speed_desc.settings if (speed_lora and speed_desc) else None, lowmem=lowmem,
-                         swapped=bool(swapped), refs=ref_latents, slider=slider)
+                         swapped=bool(swapped), refs=ref_latents, slider=slider,
+                         strengths=sample_strengths if epoch > 0 else ())   # before training the LoRA is all zero
         last_prompt[0] = prompts[-1] if prompts else None
 
     ckpt_previews = None
@@ -1295,6 +1399,11 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
     gen = torch.Generator().manual_seed(seed + start_epoch)
     pause_flag = os.path.join(output_dir, ".pause_requested")
     recorder = LossRecorder()
+    # the web UI's loss graph: each step's loss, numbered across a resume / a fine-tune's continuation
+    step_off = ftr.epochs_done * steps_per_epoch if ftr is not None else 0
+    steplog = StepLog(output_dir, output_name, start_step=step_off + global_step)
+    for _w in ("sample", "save"):          # a request left from an earlier run is not this one's
+        take_request(output_dir, _w)
     progress = tqdm(total=steps_per_epoch * max_train_epochs, initial=global_step, desc="steps", smoothing=0)
     dit.train()
     pending = 0                            # micro-batches backpropagated since the last optimizer step
@@ -1438,6 +1547,18 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                 _update()
             global_step += 1
             recorder.add(epoch=epoch, step=i, loss=loss.item())
+            steplog.add(step_off + global_step, epoch + 1 + (ftr.epochs_done if ftr is not None else 0), loss.item(),
+                        None if global_step % 20 else      # the rate now and then (Automagic's averages it)
+                        learning_rate if optimizer is None else optimizer_lr(optimizer))
+            if pending == 0 and ftr is None:   # the web UI's Sample now / Save now, between optimizer steps
+                if take_request(output_dir, "save"):
+                    save_lora(os.path.join(output_dir, f"{output_name}-step{global_step:07d}.safetensors"), epoch + 1)
+                    logger.info(f"[save now] step {global_step} saved as {output_name}-step{global_step:07d}.safetensors")
+                if take_request(output_dir, "sample"):
+                    logger.info(f"[sample now] previews at step {global_step} (epoch {epoch + 1} in progress)")
+                    _tp = time.time()
+                    previews(epoch + 1)
+                    progress.start_t += time.time() - _tp
             watch.observe(epoch + 1, global_step, batch, _info.get("t", 0.5), loss.item())
             progress.set_postfix(avr_loss=f"{recorder.moving_average:.4f}", refresh=False)
             progress.update(1)
@@ -1450,6 +1571,7 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                     f"lr={learning_rate if optimizer is None else optimizer_lr(optimizer):.3e}  "
                     + (f"({group_rates(optimizer)})  " if optimizer is not None and group_rates(optimizer) else "") +
                     f"peak VRAM {torch.cuda.max_memory_reserved() / 1024 ** 3:.1f} GB")
+        steplog.flush()
         if adaptive:
             adaptive.epoch_boundary(epoch, recorder.moving_average, net.trainable_modules(), optimizer)
         # problem-image verdicts + queued caption fixes / auto-recaptions, re-encoded before the next epoch
@@ -1503,8 +1625,13 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                 state(done)
             progress.close()
             sys.exit(0)
+        if slider_prompts and done < max_train_epochs:
+            _tp = time.time()
+            slider_live(done)
+            progress.start_t += time.time() - _tp       # the bar's s/it is training speed
 
     progress.close()
+    steplog.flush()
     final = os.path.join(output_dir, f"{output_name}.safetensors")
     if ftr is not None:
         optimizer = params = None
@@ -1578,6 +1705,8 @@ def setup_parser():
     p.add_argument("--sample_negative", default=None)
     p.add_argument("--sample_at_first", action="store_true")
     p.add_argument("--sample_seed", type=int, default=42)
+    p.add_argument("--sample_strengths", default="",
+                   help="Also render each preview at these LoRA strengths, comma-separated (e.g. 0.5)")
     p.add_argument("--family_option", action="append", default=[], metavar="KEY=VALUE",
                    help="a family's own training option (the driver's set_options), e.g. photo_blocks=20-49")
     p.add_argument("--preview_checkpoint", default=None,
@@ -1671,6 +1800,7 @@ def main():
         sample_prompts=prompts, sample_every_n_epochs=a.sample_every_n_epochs, sample_width=a.sample_width,
         sample_height=a.sample_height, sample_steps=a.sample_steps, sample_cfg_scale=a.sample_cfg_scale,
         sample_negative=a.sample_negative, sample_at_first=a.sample_at_first, sample_seed=a.sample_seed,
+        sample_strengths=tuple(float(x) for x in a.sample_strengths.split(",") if x.strip()),
         sample_reference=[a.sample_reference] if a.sample_reference else None, sample_image=a.sample_image,
         slider_pairs=a.slider_pairs, slider_diff_weight=a.slider_diff_weight, slider_prompts=a.slider_prompts,
         slider_guidance=a.slider_guidance, slider_bank=a.slider_bank, slider_bank_res=a.slider_bank_res,

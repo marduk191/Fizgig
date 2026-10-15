@@ -2,7 +2,7 @@
 """Probe the installed PyTorch ROCm version and write rocm_env.bat / rocm_env.sh.
 
 bitsandbytes needs BNB_ROCM_VERSION to match the ROCm SDK bundled with the PyTorch wheel
-(e.g. 714 for ROCm 7.14, 715 for 7.15). run_fizgig_rocm.bat and run_fizgig_rocm.sh source these.
+(e.g. 714 for ROCm 7.14, 715 for 7.15). Launch Fizgig AMD.bat and launch_fizgig_amd.sh source these.
 
 With --experimental (Windows floating install): omit BNB_ROCM_VERSION so bitsandbytes
 auto-selects its highest matching lib (falls back with a warning if exact ROCm minor is
@@ -19,8 +19,8 @@ import sys
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
-OUT_BAT = SCRIPT_DIR / "rocm_env.bat"
-OUT_SH = SCRIPT_DIR / "rocm_env.sh"
+OUT_BAT = SCRIPT_DIR / "user_data" / "rocm_env.bat"
+OUT_SH = SCRIPT_DIR / "user_data" / "rocm_env.sh"
 DEFAULT_BNB_LINUX = "714"  # libbitsandbytes_rocm714.so - matches stable repo.amd.com torch
 DEFAULT_BNB_WIN = "715"  # Windows 0xDELUXA wheel / pinned multi-arch torch (+rocm7.15)
 
@@ -104,7 +104,7 @@ def _ensure_windows_rocm_on_path() -> None:
 
 def detect_gfx_target() -> str | None:
     """Return gfx code (e.g. gfx1201) or None. Prefer detect_gpu*.py, then torch."""
-    script = SCRIPT_DIR / ("detect_gpu_linux.py" if sys.platform.startswith("linux") else "detect_gpu.py")
+    script = SCRIPT_DIR / "src" / "install" / ("detect_gpu_linux.py" if sys.platform.startswith("linux") else "detect_gpu.py")
     if script.is_file():
         try:
             out = subprocess.run(
@@ -262,6 +262,7 @@ def main(argv: list[str] | None = None) -> int:
         if gfx:
             bat_lines.append(f'REM GPU gfx target: {gfx}')
         bat_lines.append("")
+        OUT_BAT.parent.mkdir(exist_ok=True)
         OUT_BAT.write_text("\r\n".join(bat_lines), encoding="utf-8")
         bnb_msg = "BNB_ROCM_VERSION unset" if omit_bnb else f"BNB_ROCM_VERSION={bnb}"
         extra = f"  gfx={gfx}" if gfx else ""
@@ -287,6 +288,7 @@ def main(argv: list[str] | None = None) -> int:
         if gfx:
             sh_lines.append(f"# GPU gfx target: {gfx}")
         sh_lines.append("")
+        OUT_SH.parent.mkdir(exist_ok=True)
         OUT_SH.write_text("\n".join(sh_lines), encoding="utf-8")
         bnb_msg = "BNB_ROCM_VERSION unset" if omit_bnb else f"BNB_ROCM_VERSION={bnb}"
         extra = f"  gfx={gfx}" if gfx else ""

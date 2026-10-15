@@ -9,8 +9,8 @@ For each entry:
   - file already in <repo>/models/ ........... just populates the pref
   - neither ................................... downloads with progress, verifies, populates
 
-Entries: the Krea 2 Turbo LoRA (previews render on RAW + Turbo LoRA, no model swapping) and
-the MiniMax H3 training adapters — Circlestone's (the default, one file for both bases) and
+Entries: the Krea 2 Turbo LoRA (previews render on RAW + Turbo LoRA, no model swapping), the
+Qwen Image 2.1 Turbo LoRA and Fizgig's Qwen Image 2.1 training adapter (v2), and the MiniMax H3 training adapters — Circlestone's (the default, one file for both bases) and
 Ostris's two (per base) — which the Training tab's adapter dropdown chooses between. Always fetched when missing,
 whatever family is configured (Peter, 2 Sep 2026: no "not a Krea 2 install" gate, ever).
 The GUI calls ensure_turbo_lora() again at Krea 2 training start as a fallback.
@@ -21,6 +21,10 @@ import struct
 import sys
 
 REPO_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+if os.path.join(REPO_DIR, "src") not in sys.path:      # the updater runs this file by path
+    sys.path.insert(0, os.path.join(REPO_DIR, "src"))
+from fizgig import user_data  # noqa: E402
+user_data.migrate()                                     # an update from Fizgig 7: its prefs into user_data first
 
 # (pref key, filename, url, a key that must exist in the genuine file, minimum size, label)
 # The probe key catches truncated/HTML-error downloads beyond what a size check can.
@@ -45,6 +49,20 @@ LORAS = [
      "minimax_h3_ref2va_training_adapter_v1.safetensors",
      "diffusion_model.blocks.0.attn.out_proj.lora_A.weight", 140 * 1024 * 1024,
      "MiniMax H3 training adapter, ref2va (~155 MB, Ostris)"),
+    # Qwen Image 2.1's Turbo LoRA (Comfy-Org) replaced Viggle's in the same pref: an install still pointing at
+    # another file gets this one (the old file stays on disk)
+    ("qwen21_turbo_lora", "qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors",
+     "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/loras/"
+     "qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors",
+     "diffusion_model.transformer_blocks.0.attn.to_q.lora_down.weight", 850 * 1024 * 1024,
+     "Qwen Image 2.1 Turbo LoRA (~910 MB)", True),
+    # Fizgig's Qwen Image 2.1 training adapter, v2: a pref on v1 (or none) moves to it, v1 stays on disk; another
+    # adapter someone chose is kept
+    ("qwen21_training_adapter", "fizgig_qwen_image_2.1_training_adapter_v2.safetensors",
+     "https://huggingface.co/ShootTheSound/Fizgig-Qwen-Image-2.1-Training-Adapter/resolve/main/"
+     "fizgig_qwen_image_2.1_training_adapter_v2.safetensors",
+     "transformer.transformer_blocks.0.attn.to_q.lora_A.weight", 75 * 1024 * 1024,
+     "Qwen Image 2.1 Fizgig training adapter v2 (~84 MB)", ("fizgig_qwen_image_2.1_training_adapter.safetensors",)),
 ]
 
 # Kept for callers that import the Krea 2 constants by name.
@@ -120,17 +138,21 @@ def _save_pref(prefs_file, key, value):
     os.replace(tmp, prefs_file)
 
 
-def ensure_lora(pref_key, filename, url, probe_key, min_size, label,
+def ensure_lora(pref_key, filename, url, probe_key, min_size, label, replaces=False,
                 repo_dir: str = REPO_DIR, log=print):
     """Make sure one LoRA exists locally and prefs.json points at it. Returns the path on
-    success, None otherwise. Never raises."""
+    success, None otherwise. Never raises. replaces: True = the pref must point at THIS file (it
+    took over a pref that held another one); a tuple of file names = earlier versions of this file, moved to it
+    (any other file there is the user's own choice and kept)."""
     try:
-        prefs_file = os.path.join(repo_dir, "prefs.json")
+        prefs_file = os.path.join(repo_dir, "user_data", "prefs.json")
         current = str(_load_prefs(prefs_file).get(pref_key) or "").strip()
-        if current and os.path.isfile(current):
+        old = isinstance(replaces, (tuple, list)) and os.path.basename(current) in replaces
+        if current and os.path.isfile(current) and not old and (replaces is not True
+                                                                or os.path.basename(current) == filename):
             log(f"{label}: already present ({current})")
             return current
-        models_dir = os.path.join(repo_dir, "models")
+        models_dir = os.path.join(repo_dir, "user_data", "models")
         dest = os.path.join(models_dir, filename)
         if not (os.path.isfile(dest) and _valid_safetensors(dest, probe_key, min_size)):
             os.makedirs(models_dir, exist_ok=True)
@@ -160,5 +182,22 @@ def ensure_all(repo_dir: str = REPO_DIR, log=print):
     return {e[0]: ensure_lora(*e, repo_dir=repo_dir, log=log) for e in LORAS}
 
 
+def qwen_turbo_dit_hint(repo_dir: str = REPO_DIR, log=print):
+    """A Qwen Image 2.1 install without the Turbo DiT gets told how to fetch it (7.3 GB - too big for the
+    updater to pull unasked). Runs after the update's git pull, so it reaches this update, not the next."""
+    try:
+        prefs = _load_prefs(os.path.join(repo_dir, "user_data", "prefs.json"))
+        qwen = str(prefs.get("qwen21_dit") or "").strip()
+        turbo = str(prefs.get("qwen21_turbo_dit") or "").strip()
+        if qwen and os.path.isfile(qwen) and not (turbo and os.path.isfile(turbo)):
+            log("")
+            log("Qwen Image 2.1: the new Turbo model (7.3 GB) for fast workbench previews isn't downloaded yet.")
+            log("  Open Fizgig, go to the Preferences tab, and in the Qwen Image 2.1 section press")
+            log("  'Download models for me'. Until then, previews work as before.")
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
     ensure_all()
+    qwen_turbo_dit_hint()

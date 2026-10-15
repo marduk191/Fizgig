@@ -136,6 +136,25 @@ def model_prefixes() -> list:
     return sorted(out, key=len, reverse=True)
 
 
+def prefix_family(prefix):
+    """The fine-tune family whose checkpoints name their model weights under `prefix` (its FTSpec.file_prefix), or
+    None - ComfyUI's generic "diffusion_model." belongs to no one family."""
+    if not prefix or prefix == "diffusion_model.":
+        return None
+    try:
+        from fizgig.families.registry import training_families
+        for d in training_families():
+            if d.finetune:
+                try:
+                    if d.load_driver().ft_spec(None).file_prefix == prefix:
+                        return d
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return None
+
+
 def model_prefix(keys) -> str:
     """The prefix most of a checkpoint's keys share from model_prefixes(), or "" (Klein, Krea 2, Qwen, H3 files)."""
     keys = list(keys)
@@ -211,6 +230,12 @@ def extract_diff_loras(
     if not keys:
         raise RuntimeError("no comparable 2-D weights found — are these the same architecture?")
     say(f"{len(keys)} candidate matrices, ranks {ranks}, device {dev}")
+    # a family with its own (non-kohya) LoRA names gets them, as its own trainer writes them - ACE-Step's PEFT
+    # base_model.model.<path>.lora_A, which ComfyUI maps (it ignores lora_unet_ names there)
+    fam = prefix_family(prefix)
+    fmt = fam.lora if fam is not None and fam.lora is not None and not fam.lora.kohya else None
+    if fmt is not None:
+        say(f"{fam.display_name}: writing its own LoRA names ({fmt.file_prefix}<path>.{fmt.down})")
 
     sd = {r: {} for r in ranks}
     changed = skipped = 0
@@ -231,12 +256,17 @@ def extract_diff_loras(
                 progress(i + 1, len(keys), k)
             continue
         total_norm += nrm
-        lk = lora_key(k, prefix)
+        if fmt is not None:
+            lk = fmt.file_prefix + k[len(prefix):-len(".weight")]
+            dn, upn, ak = f"{lk}.{fmt.down}.weight", f"{lk}.{fmt.up}.weight", fmt.alpha_key.format(prefix=lk)
+        else:
+            lk = lora_key(k, prefix)
+            dn, upn, ak = f"{lk}.lora_down.weight", f"{lk}.lora_up.weight", f"{lk}.alpha"
         for r, (up, down) in factor_multi(d, ranks).items():
-            sd[r][f"{lk}.lora_up.weight"] = up
-            sd[r][f"{lk}.lora_down.weight"] = down
+            sd[r][upn] = up
+            sd[r][dn] = down
             # alpha == rank -> scale 1.0, so up @ down reproduces the delta as-is.
-            sd[r][f"{lk}.alpha"] = torch.tensor(float(min(r, min(d.shape))))
+            sd[r][ak] = torch.tensor(float(min(r, min(d.shape))))
         changed += 1
         del d
         if progress:
@@ -261,6 +291,8 @@ def extract_diff_loras(
             "fizgig_source_tuned": os.path.basename(tuned_path),
             "fizgig_source_layers": str(changed),
         }
+        if fam is not None and getattr(fam, "modelspec_arch", ""):
+            meta["modelspec.architecture"] = fam.modelspec_arch
         save_file(sd[r], path, metadata=meta)
         written.append(path)
         say(f"saved r{r}: {os.path.basename(path)} "

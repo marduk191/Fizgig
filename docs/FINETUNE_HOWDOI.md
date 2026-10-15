@@ -198,7 +198,7 @@ the dataset at the same epoch, so the rotation's epoch-to-epoch shifts cancel ou
 Two exceptions, both deliberate: **(global) Adaptive LR** switches off when you pick
 Fine-tune — rotation boundaries look like instability to its plateau watcher — and
 **auto-recaption** is off under a fine-tune (its between-epoch caption re-encode isn't
-fine-tune-safe yet). Caption edits queued from the Problem Images window during a
+fine-tune-safe yet). Caption edits queued from the per-image loss view (Runs & outputs) during a
 fine-tune are held and apply in your next LoRA-mode run on that dataset.
 
 ## What are regularisation images, and what does LR × do?
@@ -262,10 +262,7 @@ exactly which ingredient is missing.
 
 ## How do I share a fine-tune? It's 26 GB!
 
-Run **Checkpoint to LoRA** — the **Checkpoint to LoRA…** button on the fine-tune card, or your
-**Fizgig folder's `run_diff_to_lora.bat`**
-(double-click it; it opens its own small window, separate from the main app — on Linux
-or a RunPod pod use `./run_diff_to_lora.sh`). It diffs
+On the **Extract** tab, choose **From a fine-tune**. It diffs
 your fine-tune against the
 base model and extracts the difference as an ordinary kohya `.safetensors` at several
 ranks at once. Measured: **rank 64 was perceptually indistinguishable from the full
