@@ -175,7 +175,8 @@ def _sample_image_impl(model, text_embeds, *, width=512, height=512, steps=8, cf
                  ref_latents=None, text_token_tags=None, num_frames: int = 1,
                  on_slow_step=None, slow_step_s: float = 120.0, return_audio=False,
                  block_cache: "BlockCacheContext | None" = None, keyframes=None,
-                 on_denoised=None, exact_frames: bool = False, ref_schedule=None):
+                 on_denoised=None, exact_frames: bool = False, ref_schedule=None,
+                 speed_boost: bool = False):
     """Denoise one image OR clip and return its LATENT [1, 24, T, H/16, W/16].
 
     ref_schedule(step, n_steps, sigma) -> list of reference latents for THAT step replaces
@@ -216,6 +217,10 @@ def _sample_image_impl(model, text_embeds, *, width=512, height=512, steps=8, cf
     step's clean-latent estimate (`x + sigma * out`, fp32, the clip's latent shape) — the
     Repair Studio's "show early" hook decodes one of these while the remaining passes run.
     Video only; exceptions are swallowed like on_slow_step's.
+
+    speed_boost (the Studio's H3 tick, minimax/speed_boost.py): the first half of the steps (rounded down) run on a
+    half-size video - the noise and any keyframes shrunk in their cosine spectrum - then the video is grown to full
+    size and the rest run there; the audio stays whole and is topped up with noise at the grow. A clip only.
 
     on_slow_step(seconds, step, total) fires ONCE if any step exceeds slow_step_s. It exists
     because the interesting failure here is not an exception: when a preview oversubscribes
@@ -267,8 +272,25 @@ def _sample_image_impl(model, text_embeds, *, width=512, height=512, steps=8, cf
     _use_block_cache = (block_cache is not None and not use_cfg and not ref_latents
                         and ref_schedule is None and not keyframes
                         and hasattr(model, "forward_cached"))
-    sigmas = sample_schedule(steps, shift=shift, mode=schedule_mode)
+    sigmas = list(sample_schedule(steps, shift=shift, mode=schedule_mode))
     n_eval = len(sigmas) - 1                            # the terminal 0 is not an evaluation
+    boost_at, _kf_full, _boost_gen = 0, None, None
+    if speed_boost and latent_t > 1:
+        import math
+        from fizgig.minimax import speed_boost as _sb
+        boost_at = _sb.small_steps(n_eval)
+        if boost_at:
+            _sh, _sw = _sb.half_size(lat_h, lat_w)
+            _r = math.sqrt(lat_h * lat_w / float(_sh * _sw))
+            x = _sb.shrink(x, _sh, _sw)                 # the same noise, its low part: white stays white
+            if _ref_kw.get("keyframes"):
+                _kf_full = _ref_kw["keyframes"]
+                _ref_kw["keyframes"] = [(i_, _sb.shrink(z_, _sh, _sw) / _r) for i_, z_ in _kf_full]
+                _ref_uncond_kw["keyframes"] = _ref_kw["keyframes"]
+            _boost_gen = torch.Generator(device="cpu").manual_seed((int(seed) + 7) & 0xFFFFFFFF)
+            if log_steps:
+                print(f"[speed boost] {boost_at} of {n_eval} steps at latent {_sw}x{_sh}, the rest at {lat_w}x{lat_h}",
+                      flush=True)
     prev_denoised = None                                # res_multistep's one-step memory
     prev_denoised_a = None                              # ...and the audio stream's own
     import time as _t
@@ -276,6 +298,18 @@ def _sample_image_impl(model, text_embeds, *, width=512, height=512, steps=8, cf
     _slow_fired = False                                 # on_slow_step is a ONE-shot notice
     for i in range(n_eval):
         _step_t0 = _t.time()
+        if boost_at and i == boost_at:
+            # Speed Boost: the half-size video grown to full size; this step carries on from the grown noise level
+            # as a fresh run (Euler first, no second-order memory across the size change)
+            _t0 = float(sigmas[i])
+            x, _t2 = _sb.grow(x, lat_h, lat_w, _t0, _boost_gen)
+            if joint_audio and audio_rows is not None:
+                audio_rows = _sb.grow_audio(audio_rows, _t0, _t2, _boost_gen)
+            sigmas[i] = _t2
+            prev_denoised = prev_denoised_a = None
+            if _kf_full is not None:
+                _ref_kw["keyframes"] = _kf_full
+                _ref_uncond_kw["keyframes"] = _kf_full
         s_curr, s_next = sigmas[i], sigmas[i + 1]
         if log_steps:
             _now = _step_t0

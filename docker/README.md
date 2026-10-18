@@ -6,6 +6,18 @@ Fizgig in your browser: the pod runs the app and you open it as a web page, from
 
 *That link is a referral one — it supports Fizgig's development at no extra cost to you.*
 
+## Quick start: nothing installed on your computer
+
+You don't need Fizgig on your own computer for this. You need a RunPod account and a web browser.
+
+1. **Click [Deploy on RunPod](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=bdrdew7hxw&ref=vkb387ep).** It opens RunPod with the Fizgig template and an RTX 5090 chosen. Keep the template's 300 GB disk and press **Deploy**. (Other cards: [Which GPU](#which-gpu).)
+2. **Wait for "Ready".** Open the pod's **Logs** tab. The first start downloads the image and takes a few minutes. It's ready when the log ends with `Ready. Open the pod's HTTP port 8081 for Fizgig.` and the password on the line under it.
+3. **Open Fizgig in your browser.** In the pod's **Connect** menu, click **HTTP port 8081** and log in with that password (there's no user name). That page is Fizgig, the whole app.
+4. **Download a model.** **Preferences → ⬇ Download models for me.** Krea 2 needs no Hugging Face account.
+5. **Train.** On the **Start** tab, **Upload a training folder**, then on the **Training** tab press **Start**.
+
+Close the tab whenever you like: the run carries on, and you can come back from any browser, your phone included. **Stop** the pod between sessions to keep everything on its disk; terminating it deletes the disk ([Storage](#storage)). The rest of this page has the detail on each step.
+
 **Need the old pod?** The previous template, with the classic app in a remote desktop, stays available as **[Fizgig Classic v7.x](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=faoq8ed6um&ref=vkb387ep)**: see [the classic template](#the-classic-template-remote-desktop) below. Pods you already have keep running as they are.
 
 ---
@@ -92,7 +104,7 @@ In the pod's **Connect** menu, open **HTTP port 8081** and log in with that pass
 ## First run
 
 1. Open **port 8081** and log in.
-2. **Preferences → ⬇ Download models for me.** Krea 2 is ~45 GB and needs no Hugging Face account; gated models (Klein) ask for a free token.
+2. **Preferences → ⬇ Download models for me.** Krea 2 is ~45 GB and needs no Hugging Face account; gated models (Klein, Flux 3 Image Klein) ask for a free token.
 3. **Start tab → Upload a training folder**, or drag a folder into `/workspace/datasets` on **port 8080**.
 4. **Training → Start.**
 
@@ -143,8 +155,8 @@ Environment variables, set on the deploy screen under **Edit Template**:
 | Variable | Values | |
 |---|---|---|
 | `FIZGIG_PASSWORD` | your choice (not a very common one) | Fizgig *and* the file manager. Generated on the first start if unset, then kept. (`VNC_PASSWORD`, the classic template's name, works too.) |
-| `HF_TOKEN` | `hf_…` | Only needed for Klein, which is gated. Krea 2 needs nothing. |
-| `FETCH_MODELS` | `krea2`, `klein`, `minimax`, `tools` — comma-separated | Download at boot instead of clicking the button in Preferences. `minimax` includes the Circlestone and both Ostris training adapters. `tools` is the Florence-2 captioner, the EN→ZH translator for bilingual captions, and the face model the Look Filter uses. |
+| `HF_TOKEN` | `hf_…` | Only needed for Klein and Flux 3 Image Klein, which are gated. Krea 2 needs nothing. |
+| `FETCH_MODELS` | `krea2`, `klein`, `flux3`, `minimax`, `tools` — comma-separated | Download at boot instead of clicking the button in Preferences. `minimax` includes the Circlestone and both Ostris training adapters. `tools` is the Florence-2 captioner, the EN→ZH translator for bilingual captions, and the face model the Look Filter uses. |
 | `FIZGIG_REF` | branch or tag | Which Fizgig to run. Defaults to `master`, so the app updates itself at every pod start. |
 
 Nothing is compulsory — the defaults are the intended setup, and everything here can be done from

@@ -44,7 +44,7 @@ The full field list, with comments, is `FamilyDescription` in `src/fizgig/famili
 | `loss_watch` (default on) | The per-image loss watch: problem images, per-image learning rates, auto-recaption. |
 | `train_areas` | Model Area to Train: named block sets with optional timestep windows, plus a Custom block pick. |
 | `identity_blocks` | Fast Identity Mode: a standard LoRA trains only the identity blocks, faster. |
-| `multi_concept`, `multi_concept_defaults`, `multi_concept_hint` | Multi Concept: extra subject folders, each its own dataset block. |
+| `multi_concept`, `multi_concept_defaults`, `multi_concept_hint` | The Subjects card's "Who is this LoRA of?" (2 to 4 subjects): extra subject folders, each its own dataset block. The card's protection choices (DOP, the side-by-side pictures) need nothing more from a driver than training does. |
 | `options` (`FamilyOption`) | Your own Training / Samples tab controls; each value becomes trainer flags, `--family_option` pairs for `set_options`, or cache `--aux` values. |
 
 The Context LoRA (train on top of another LoRA, frozen) needs nothing; every family has it.

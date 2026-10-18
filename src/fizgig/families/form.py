@@ -22,7 +22,7 @@ import os
 
 from fizgig.families import launch
 
-ADAPTIVE_MIN = ("1e-5", "5e-5", "1e-4", "2e-4 - rank 4/8 only", "3e-4 - low-rank only")
+ADAPTIVE_MIN = ("1e-5", "5e-5", "1e-4", "2e-4", "3e-4")
 ADAPTIVE_MAX = ("1e-4", "2e-4", "3e-4", "4e-4")
 MEGAPIXELS = ("0.25", "0.37", "0.5", "0.75", "1.0", "1.5", "2.0", "2.4", "3.0", "4.2")
 SWAP = ("Auto (detect from GPU)", "0  (No swap — 16GB fp8 / 24GB bf16)", "4  (Light — 14GB fp8 / 20GB bf16)",
@@ -45,13 +45,21 @@ DEFAULTS = {
     "SEED": "42", "BLOCKS_SWAP": "Auto (detect from GPU)", "RESUME_TRAINING": "", "OPTIMIZER_TYPE": "adamw8bit",
     "OPTIMIZER_ARGS": "", "GRADIENT_ACCUMULATION": "1", "MAX_GRAD_NORM": "1.0", "LR_SCHEDULER": "constant",
     "LR_WARMUP_STEPS": "", "ADAPTIVE_LR": False, "ADAPTIVE_LR_MIN": "1e-5", "ADAPTIVE_LR_MAX": "4e-4",
-    "CONTEXT_LORA_PATH": "", "CONTEXT_LORA_STRENGTH": "1.0", "COMPILE_BLOCKS": "Auto", "SAVE_STATE": True,
+    "CONTEXT_LORA_PATH": "", "CONTEXT_LORA_STRENGTH": "1.0", "FAMILY_DOP": False, "FAMILY_MULTI_PERSON": False, "FAMILY_DOP_TRIGGER": "",
+    "FAMILY_DOP_CLASS": "", "FAMILY_DOP_TRIGGER2": "", "FAMILY_DOP_CLASS2": "",
+    "FAMILY_DOP_TRIGGER3": "", "FAMILY_DOP_CLASS3": "", "FAMILY_DOP_TRIGGER4": "", "FAMILY_DOP_CLASS4": "",
+    "COMPILE_BLOCKS": "Auto", "SAVE_STATE": True,
+    "FAMILY_SUBJECTS": "1 subject", "FAMILY_PEOPLE_MODE": "Off - a normal LoRA", "FAMILY_SUBJECT_FIX": False,
+    "FAMILY_MP_MANUAL": False, "FAMILY_SUBJECT_KIND": "From its captions", "FAMILY_SUBJECT_KIND2": "From its captions",
+    "FAMILY_SUBJECT_KIND3": "From its captions", "FAMILY_SUBJECT_KIND4": "From its captions",
     "SAVE_STATE_ON_TRAIN_END": True, "KEEP_LAST_N_STATES": "2", "KREA2_LOSS_WATCH": False,
     "KREA2_PER_IMAGE_LR": False, "KREA2_AUTO_RECAPTION": False, "CAPTION_TRIGGER_WORD": "", "KREA2_WARMUP_LOOK": False,
     "FAMILY_PRECISION": launch.PRECISION_LABELS["auto"], "FAMILY_EMA": "0.98 (recommended)",
     "FAMILY_TRAINING_ADAPTER": True, "FAMILY_KIND": "standard", "FAMILY_FAST_ID": False,
-    "FAMILY_MULTICONCEPT": False, "FAMILY_CONCEPT_DIR": "",
+    "FAMILY_MULTICONCEPT": False, "FAMILY_CONCEPT_DIR": "", "FAMILY_CONCEPT_COUNT": "2 subjects",
+    "FAMILY_CONCEPT_DIR3": "", "FAMILY_CONCEPT_DIR4": "", "FAMILY_CONCEPT_BALANCE": False,
     "FAMILY_EDIT_DIR": "", "FAMILY_EDIT_REF": "", "FAMILY_EDIT_CAPTION": "",
+    "FAMILY_EDIT_PICTURES": launch.EDIT_PHOTO_ONLY, "FAMILY_EDIT_EXTRAS_DIR": "",
     "FAMILY_SLIDER_SOURCE": "pairs", "FAMILY_SLIDER_DIR": "", "FAMILY_SLIDER_CAPTION": "",
     "FAMILY_SLIDER_BASE": "", "FAMILY_SLIDER_POS": "", "FAMILY_SLIDER_NEG": "", "FAMILY_SLIDER_ULTRA": False,
     "FAMILY_FT_ROTATIONS": "10", "FAMILY_FT_SAVE_EVERY": "1", "FAMILY_FT_ROTATE_EVERY": "1",
@@ -159,9 +167,38 @@ def slider_sources(desc):
             if s in SLIDER_SOURCES]
 
 
-MULTICONCEPT_HINT = ("Each folder needs its own trigger word, in every caption: that is the only thing telling the "
-                     "subjects apart. Caption and prep every folder yourself first; this box is training-only.")
-
+CONCEPT_COUNTS = ("2 subjects", "3 subjects", "4 subjects")
+SUBJECT_COUNTS = ("1 subject",) + CONCEPT_COUNTS
+# the Subjects card's "Your subject and other people": off / DOP / Fizgig LoRA Isolation (DOP + multi-person, the measured recipe)
+PEOPLE_MODES = ("Off - a normal LoRA", "Leave the rest of the model alone",
+                "Fizgig LoRA Isolation")
+PEOPLE_HINT = ("Off: your subject's face can leak onto other people, even in prompts that don't use its trigger "
+               "word.\n"
+               "Leave the rest of the model alone: ask for \"a man at a party\" without the trigger word and you get "
+               "a stranger, just as the model made before you trained. Your subject only appears when you call for "
+               "them.\n"
+               "Fizgig LoRA Isolation: your subjects can stand together in one picture, or next to "
+               "a person the model already knows well, and every face stays right. Best for people, and best with two "
+               "or more people in the LoRA. "
+               "Training takes about 1.5x as long. Prompt with the word shown at the bottom of this card for "
+               "each subject, e.g. zwxemwoman.")
+VIDEO = "https://youtu.be/8uW5NdL5b20"          # the Subjects card video: setting up Fizgig LoRA Isolation
+GUIDE = "https://github.com/shootthesound/Fizgig/blob/master/docs/MULTI_PERSON.md"     # the multi-person captioning guide (docs/MULTI_PERSON.md)
+from fizgig.families.multi_person import KINDS as SUBJECT_KINDS  # noqa: E402
+KIND_HINT = ("What each subject is decides what Fizgig adds to its training.\n"
+             "From its captions: Fizgig decides - a person if the captions say woman, man, girl or boy, otherwise an "
+             "animal or thing.\n"
+             "A person: also trains on side-by-side pictures next to strangers, so other people keep their own "
+             "faces.\n"
+             "An animal or thing: a dog, a cat, a car. Its word is joined like a person's (rexodog), with no "
+             "side-by-side pictures.\n"
+             "A style or look: paper cut, a lighting style. Its trigger word stays as written, and the look only "
+             "appears when you use it.")
+KIND_ROWS = ("FAMILY_SUBJECT_KIND", "FAMILY_SUBJECT_KIND2", "FAMILY_SUBJECT_KIND3", "FAMILY_SUBJECT_KIND4")
+SUBJECTS_HINT = ("Each subject is a folder of their photos, with their own trigger word in every caption - that is "
+                 "how the LoRA tells them apart. Caption each folder first.\n"
+                 "Up to 4 people work well, with 2 or 3 of them in one picture. With a person the model already knows "
+                 "well in the picture too: 2 subjects is reliable, 3 is hit and miss.")
 
 def form(desc):
     opts = [o for o in desc.options if o.kind != "fixed"]
@@ -170,10 +207,12 @@ def form(desc):
         section is None or o.section == section) and (mode is None or (o.mode == "finetune") == (mode == "finetune"))]
     sections = []
 
-    def add(sid, title, tab, rows, collapsed=False):
+    def add(sid, title, tab, rows, collapsed=False, help=None):
+        """help: {"href", "text", "sub"?} - the card's video, a link across its top"""
         rows = [r for r in rows if r]
         if rows:
-            sections.append({"id": sid, "title": title, "tab": tab, "rows": rows, "collapsed": collapsed})
+            sections.append({"id": sid, "title": title, "tab": tab, "rows": rows, "collapsed": collapsed,
+                             **({"help": help} if help else {})})
 
     add("model", "Base Model", "training",
         by_section("model") + ([_row("_model_note", desc.model_note, "note")] if desc.model_note else []))
@@ -257,8 +296,8 @@ def form(desc):
                  "epochs)", "check", "A stuck image gets a new caption written from what is in it, and a fresh start; "
                  "a second try goes into more detail. Still stuck after that, it is left out of training - edit its "
                  "caption to bring it back. Needs the Krea 2 text encoder set in Preferences."),
-            _row("CAPTION_TRIGGER_WORD", "Trigger word", hint="Auto-recaption adds it at the end of a new caption. The "
-                 "training folder's word, the same as the Captions tab's."),
+            _row("CAPTION_TRIGGER_WORD", "Trigger word", hint="Used by Auto-recaption (below): it adds this word at the "
+                 "end of a new caption. The training folder's word, the same as the Captions tab's."),
         ]
     params += by_section("training", "", "lora")
     if desc.identity_blocks:
@@ -266,34 +305,104 @@ def form(desc):
         params.append(_row("FAMILY_FAST_ID", "Fast Identity Mode", "check",
                            f"Trains only the identity blocks ({a}-{b}): about 1.5x faster."))
     params += by_section("training", "after", "lora")
-    if desc.multi_concept:          # the desktop's box: a click applies the family's recipe (still editable)
-        params += [
-            _row("FAMILY_MULTICONCEPT", "Multi Concept - a second subject in its own folder", "check",
-                 " ".join(t for t in (MULTICONCEPT_HINT, desc.multi_concept_hint) if t),
-                 sets={"true": dict(desc.multi_concept_defaults)} if desc.multi_concept_defaults else None),
-            _row("FAMILY_CONCEPT_DIR", "Subject 2 folder", "folder", upload=True, start="data"),
-        ]
+    # who the LoRA is of and how it treats other people: the Subjects card (after Training Parameters)
+    mc = dict(desc.multi_concept_defaults or {})
+    subjects = [
+        _row("_subjects_intro", "1 subject with Off is ordinary LoRA training. Every other setting here is new: "
+             "Fizgig's own techniques combined with DOP (Differential Output Preservation, from @ostris's "
+             "AI-Toolkit), for a new level of separation between your subjects and everyone else.", "note"),
+        _row("FAMILY_SUBJECTS", "Who is this LoRA of?", "radio",
+             " ".join(t for t in (SUBJECTS_HINT, desc.multi_concept_hint) if t), SUBJECT_COUNTS,
+             default=SUBJECT_COUNTS[0],
+             sets={SUBJECT_COUNTS[0]: {"FAMILY_MULTICONCEPT": False},
+                   **{c: {**mc, "FAMILY_MULTICONCEPT": True, "FAMILY_CONCEPT_COUNT": c} for c in CONCEPT_COUNTS}})
+        if desc.multi_concept else None,
+        _row("_subject1_folder", "Subject 1", "shown", "The training folder - change it on the Start tab."),
+        _row("FAMILY_SUBJECT_KIND", "Subject 1 is", "choice", KIND_HINT, SUBJECT_KINDS, default=SUBJECT_KINDS[0],
+             hint_labels=True),                 # one spaced line per choice, its name in bold (said once, here)
+        *([_row("FAMILY_CONCEPT_DIR", "Subject 2", "folder", upload=True, start="data"),
+           _row("FAMILY_SUBJECT_KIND2", "Subject 2 is", "choice", choices=SUBJECT_KINDS, default=SUBJECT_KINDS[0]),
+           _row("FAMILY_CONCEPT_DIR3", "Subject 3", "folder", upload=True, start="data"),
+           _row("FAMILY_SUBJECT_KIND3", "Subject 3 is", "choice", choices=SUBJECT_KINDS, default=SUBJECT_KINDS[0]),
+           _row("FAMILY_CONCEPT_DIR4", "Subject 4", "folder", upload=True, start="data"),
+           _row("FAMILY_SUBJECT_KIND4", "Subject 4 is", "choice", choices=SUBJECT_KINDS, default=SUBJECT_KINDS[0]),
+           _row("FAMILY_CONCEPT_BALANCE", "Balance the subjects (optional)", "check", "Repeats the smaller folders "
+                "so each subject gets about as many steps an epoch as the largest. Epochs get longer by the repeats.")]
+          if desc.multi_concept else []),
+        _row("FAMILY_PEOPLE_MODE", "Your subject and other people", "radio", PEOPLE_HINT, PEOPLE_MODES,
+             default=PEOPLE_MODES[0], hint_labels=True,           # one line per choice, its name in bold
+             sets={PEOPLE_MODES[0]: {"FAMILY_DOP": False, "FAMILY_MULTI_PERSON": False},
+                   PEOPLE_MODES[1]: {"FAMILY_DOP": True, "FAMILY_MULTI_PERSON": False},
+                   PEOPLE_MODES[2]: {"FAMILY_DOP": True, "FAMILY_MULTI_PERSON": True}}),
+        _row("FAMILY_MP_MANUAL", "Use my captions exactly as written", "check",
+             "No joining or guessing: Fizgig trains on your captions as they are. Write each subject's joined word "
+             "(zwxemwoman) into the captions yourself. The side-by-side pictures and the training recipe stay on.",
+             link={"href": GUIDE + "#captioning-it-yourself", "text": "How to caption for this"}),
+        _row("FAMILY_SUBJECT_FIX", "Correct a trigger word, or what a subject is", "check",
+             "Fizgig reads each subject's trigger word, and what they are, from their captions. Tick this only if "
+             "the line under a subject shows the wrong word."),
+        *[r for n in (1, 2, 3, 4) for r in (
+            _row("FAMILY_DOP_TRIGGER" + ("" if n == 1 else str(n)), f"Subject {n} - trigger word",
+                 hint="The word your captions use for this subject, e.g. zwxem.\n"
+                      "The box shows the word Fizgig found. Type over it only if that is wrong."),
+            _row("FAMILY_DOP_CLASS" + ("" if n == 1 else str(n)), f"Subject {n} - what they are",
+                 hint="One word: woman, man, girl, boy, dog, cat ...\n"
+                      "The box shows what Fizgig found. Type over it only if that is wrong."))],
+        # how often and how strongly the trigger-free pass runs is the tested recipe (every second step, x2): no control
+        # last, under everything that changes them: what training will use, per subject (one of its own captions)
+        *[_row(f"_subject{n}_as", f"Subject {n} - what training will use", "note", hint_labels=True)
+          for n in ((1, 2, 3, 4) if desc.multi_concept else (1,))],
+    ]
     if desc.training_adapter:
         params.append(_row("FAMILY_TRAINING_ADAPTER", "Training adapter (recommended)", "check",
                            desc.training_adapter_note))
     if desc.ema_default:
         params.append(_row("FAMILY_EMA", "Weight averaging (EMA)", "choice", desc.ema_hint or EMA_HINT,
                            EMA + ((EMA_SHORT,) if desc.ema_short_run else ())))
+    # the on/off tiles together at the bottom of the card, under every plain box (Adaptive LR stays beside its Min/Max)
+    TILES = ("KREA2_LOSS_WATCH", "KREA2_PER_IMAGE_LR", "KREA2_WARMUP_LOOK", "KREA2_AUTO_RECAPTION", "FAMILY_FAST_ID",
+             "FAMILY_TRAINING_ADAPTER")
+    params = [r for r in params if not (r and r["key"] in TILES)] + [r for r in params if r and r["key"] in TILES]
     add("params", "Training Parameters", "training", params)
+    add("subjects", "Subjects", "training", subjects,
+        help={"href": VIDEO, "text": "How to set up Fizgig LoRA Isolation",
+              "sub": "A step-by-step video of this card · Watch on YouTube"})
     if desc.edit_training:
         add("edit", "Edit pairs", "training", [
             _row("_edit_note", desc.edit_note, "note") if desc.edit_note else None,
+            # a multi-picture edit (description edit_references > 1): the choice, then its own folder (step 2)
+            _row("FAMILY_EDIT_PICTURES", "What the edit uses", "radio", choices=[launch.EDIT_PHOTO_ONLY, launch.EDIT_WITH_EXTRAS], hint=
+                 "The photo only: an edit that changes how a photo looks (a grade, a relight, a retouch). The photo + "
+                 "extra pictures: an edit that brings something from other pictures into it (a person, an object, a "
+                 "place).", default=launch.EDIT_PHOTO_ONLY) if desc.edit_references > 1 else None,
             _row("FAMILY_EDIT_DIR", "1. Originals folder (before editing)", "folder",
                  "Your original, unedited photos. No captions needed.", upload=True, start="data"),
+            _row("FAMILY_EDIT_EXTRAS_DIR", "2. Extra pictures folder", "folder",
+                 "The pictures to bring into the edits: a person, an object, a place.\n"
+                 "Name each after the photo it belongs to, adding _1, _2 ...: for beach.jpg, its extras are "
+                 "beach_1.jpg, beach_2.jpg.\n"
+                 "The number is the order the model sees them in: beach_1 is the second picture after the original, "
+                 "beach_2 the third. Say so in the edit instruction, e.g. \"Put the man from the second picture into "
+                 "this scene.\"\n"
+                 f"A photo can have none (it trains as a normal pair) or up to {desc.edit_references - 1}. Any shape "
+                 "or file type.", upload=True, start="data")
+            if desc.edit_references > 1 else None,
+            _row("_edit_extras_found", "", "note") if desc.edit_references > 1 else None,
             _row("_edit_edited_dir", "2. Edited folder (after editing)", "shown", "The same photos after your edit, "
                  "with the same file names as the originals. It is the training folder on the Start tab - change it "
                  "there."),
             _row("FAMILY_EDIT_CAPTION", "3. Edit instruction", hint="What the edit is, e.g. \"Apply my concert grade.\" "
                  "Write captions saves it as the caption of every photo in the Edited folder.",
                  action="write_captions"),
-            _row("FAMILY_EDIT_REF", "4. Test photo (optional)", "path", "An original photo that is in neither folder: "
-                 "the previews show the edit applied to it. Any size - it is fitted to the preview size. Leave empty "
-                 "to use the first original.", upload=True, start="data"),
+            _row("FAMILY_EDIT_REF", "4. Test photo (optional)", "path",
+                 "Optional - you can leave this empty. A photo for the previews to edit, so you can watch the LoRA "
+                 "learn: an original, unedited photo that is in neither folder. One it never trains on shows whether "
+                 "it learned the edit itself. Any size.\n"
+                 "Left empty, the previews use your first original - that works, but it is a photo the LoRA trains on, "
+                 "so the previews can look better than the LoRA really is." + (
+                     "\nWith extra pictures: put the test photo's own in the Extra pictures folder the same way "
+                     "(test_1.jpg, test_2.jpg ... for test.jpg)." if desc.edit_references > 1 else ""),
+                 upload=True, start="data"),
         ])
     if desc.slider_training:
         srcs = slider_sources(desc)
@@ -445,6 +554,12 @@ def form(desc):
                                f"Set the {sp.name} in Preferences for fast Turbo previews; without it previews use "
                                "the plain model."))
     add("samples", "Previews during training", "samples", [
+        # an edit run's previews come from the Edit pairs card, not these prompts (shown only while Edit is picked)
+        _row("_edit_samples_note", "Edit LoRA previews: each round makes one picture from your edit instruction and "
+             "test photo (Training tab, Edit pairs" + (", with its extra pictures" if desc.edit_references > 1 else "")
+             + "). The prompts below are not used - to try other instructions while it trains, type them below "
+             "(one per line) and tick Change the previews of the run going now.", "note")
+        if desc.edit_training else None,
         _row("SAMPLE_ENABLED", "Make previews while training", "check"),
         _row("SAMPLE_PROMPT", "Prompts", "text", " ".join(t for k, t in desc.samples_text if k == "banner") or
              "One prompt per line."),
@@ -477,7 +592,12 @@ def form(desc):
              "full-strength one: how the LoRA will look or sound the way you'll use it.", default=True)
         if desc.preview_strengths else None,
         _row("SAMPLE_AT_FIRST", "Preview before training starts", "check"),
-        *([_row("SAMPLE_CHECKPOINT", desc.preview_checkpoint_tick, "check", default=desc.preview_checkpoint_on),
+        *([_row("SAMPLE_CHECKPOINT", desc.preview_checkpoint_tick, "check", default=desc.preview_checkpoint_on,
+                **({"follow": {"on": {"SAMPLE_STEPS": str(desc.preview_checkpoint_sampling.steps),
+                                      "SAMPLE_CFG_SCALE": f"{desc.preview_checkpoint_sampling.cfg:g}"},
+                               "off": {"SAMPLE_STEPS": str(desc.preview_steps),
+                                       "SAMPLE_CFG_SCALE": f"{desc.preview_cfg:g}"}}}
+                   if desc.preview_checkpoint_sampling else {})),
            _row("CACHE_SAMPLE_MODEL", "Cache sample model in RAM", "choice", choices=["auto", "on", "off"],
                 default="auto")] if desc.train_preview_checkpoint else []),
     ])
@@ -514,10 +634,12 @@ def apply_preset(desc, values, preset, whole=False):
             p[new] = p.pop(old)
     if "MINIMAX_MULTICONCEPT" in p and "FAMILY_MULTICONCEPT" not in p:
         p["FAMILY_MULTICONCEPT"] = p.pop("MINIMAX_MULTICONCEPT")
-    if "MINIMAX_CONCEPT_DIRS" in p:                      # a list (one folder today)
+    if "MINIMAX_CONCEPT_DIRS" in p:                      # a list: subject 2, 3, 4
         dirs = p.pop("MINIMAX_CONCEPT_DIRS") or []
         dirs = [dirs] if isinstance(dirs, str) else list(dirs)
-        p["FAMILY_CONCEPT_DIR"] = str(dirs[0]).strip() if dirs else ""
+        for (d, _t, _c), f in zip(CONCEPT_ROWS, list(dirs) + [""] * len(CONCEPT_ROWS)):
+            p[d] = str(f or "").strip()
+        p.setdefault("FAMILY_CONCEPT_COUNT", CONCEPT_COUNTS[min(max(len(dirs), 1), len(CONCEPT_COUNTS)) - 1])
     if not whole:
         p = {k: v for k, v in p.items() if not _not_in_preset(k)}
     rows = {r["key"]: r for sec in form(desc)["sections"] for r in sec["rows"] if r}
@@ -558,12 +680,26 @@ def to_preset(desc, values):
     model_keys = {o.key for o in desc.options if o.tab == "model"}
     kind = _kind(desc, values)
     out = {k: v for k, v in values.items() if not k.startswith("__") and k not in model_keys and k != "FAMILY_KIND"
-           and not _not_in_preset(k) and k != "FAMILY_CONCEPT_DIR"
+           and not _not_in_preset(k) and k not in {d for d, _t, _c in CONCEPT_ROWS}
            and not (k == "LORA_OUTPUT_DIR" and not str(v or "").strip())}      # an empty folder = the default
     out.update(FAMILY_EDIT=kind == "edit", FAMILY_SLIDER=kind == "slider", FAMILY_FT=kind == "finetune")
     if desc.multi_concept:
-        out["MINIMAX_CONCEPT_DIRS"] = [str(values.get("FAMILY_CONCEPT_DIR") or "").strip()]
+        out["MINIMAX_CONCEPT_DIRS"] = [str(values.get(d) or "").strip()
+                                       for d, _t, _c in CONCEPT_ROWS[:concept_count(values) - 1]]
     return out
+
+
+# subject 2, 3, 4: its folder, and its DOP word to remove / replacement
+CONCEPT_ROWS = (("FAMILY_CONCEPT_DIR", "FAMILY_DOP_TRIGGER2", "FAMILY_DOP_CLASS2"),
+                ("FAMILY_CONCEPT_DIR3", "FAMILY_DOP_TRIGGER3", "FAMILY_DOP_CLASS3"),
+                ("FAMILY_CONCEPT_DIR4", "FAMILY_DOP_TRIGGER4", "FAMILY_DOP_CLASS4"))
+DOP_EXTRA_ROWS = {k for _d, t, c in CONCEPT_ROWS for k in (t, c)}
+
+
+def concept_count(values):
+    """Subjects in a Multi Concept run, the training folder included (2-4)."""
+    v = str(values.get("FAMILY_CONCEPT_COUNT") or CONCEPT_COUNTS[0])
+    return next((i + 2 for i, c in enumerate(CONCEPT_COUNTS) if c == v or c.split(" ")[0] == v.split(" ")[0]), 2)
 
 
 def _kind(desc, values):
@@ -594,14 +730,12 @@ def state(desc, values, image_folder="", captioner="", speed_file=False, checkpo
     if lokr:
         notes["NETWORK_TYPE"] = "LoKR selected: set your learning rate to 5e-5 - or with Adaptive LR, set Max 1e-4 " \
                                 "and Min 5e-5."
-    if not values.get("ADAPTIVE_LR") or kind == "slider":    # a slider trains at the Learning Rate box
+    if not values.get("ADAPTIVE_LR") or kind in ("slider", "finetune"):   # these train at the Learning Rate box
         hidden |= {"ADAPTIVE_LR_MIN", "ADAPTIVE_LR_MAX"}
     else:
         disabled.add("LEARNING_RATE")
-        lo, hi = DEFAULTS["ADAPTIVE_LR_MIN"], DEFAULTS["ADAPTIVE_LR_MAX"]   # the desktop's Reset Defaults
-        if (str(values.get("ADAPTIVE_LR_MIN") or lo).split(" ")[0], str(values.get("ADAPTIVE_LR_MAX") or hi).split(" ")[0])                 != (lo, hi) and "ADAPTIVE_LR_MAX" not in actions:
-            actions["ADAPTIVE_LR_MAX"] = {"label": f"Reset to {lo} / {hi}",
-                                          "values": {"ADAPTIVE_LR_MIN": lo, "ADAPTIVE_LR_MAX": hi}}
+    if kind == "finetune":       # a fine-tune trains at its own fixed rate: no Adaptive LR, on any model
+        hidden.add("ADAPTIVE_LR")
     if str(values.get("OPTIMIZER_TYPE", "")) == "automagic3":
         disabled |= {"ADAPTIVE_LR", "KREA2_PER_IMAGE_LR", "KREA2_WARMUP_LOOK"}
         force.update({k: False for k in ("ADAPTIVE_LR", "KREA2_PER_IMAGE_LR", "KREA2_WARMUP_LOOK") if values.get(k)})
@@ -616,8 +750,66 @@ def state(desc, values, image_folder="", captioner="", speed_file=False, checkpo
         hidden |= {"CONTEXT_LORA_PATH", "CONTEXT_LORA_STRENGTH"}
     if kind != "standard":
         hidden.add("FAMILY_FAST_ID")
-    if not values.get("FAMILY_MULTICONCEPT"):
-        hidden.add("FAMILY_CONCEPT_DIR")
+    if not desc.subject_isolation:                    # a family without it (a music model): a normal LoRA, always
+        hidden |= {"FAMILY_DOP", "FAMILY_MULTI_PERSON", "FAMILY_PEOPLE_MODE"}
+        force.update({k: False for k in ("FAMILY_DOP", "FAMILY_MULTI_PERSON") if values.get(k)})
+        values = {**values, "FAMILY_DOP": False, "FAMILY_MULTI_PERSON": False}
+    if kind not in ("standard", "finetune"):          # DOP keeps a subject apart: a LoRA's or a fine-tune's job
+        hidden.add("FAMILY_DOP")
+    if kind != "standard":                            # multi-person mode: a LoRA (its LR boost is per step)
+        hidden.add("FAMILY_MULTI_PERSON")
+    elif values.get("FAMILY_MULTI_PERSON"):           # it runs on DOP
+        force["FAMILY_DOP"] = True
+        disabled.add("FAMILY_DOP")
+        if desc.loss_watch:             # a new AI caption would be encoded with the trigger unfused
+            disabled.add("KREA2_AUTO_RECAPTION")
+            force["KREA2_AUTO_RECAPTION"] = False
+            notes["KREA2_AUTO_RECAPTION"] = "Off with Fizgig LoRA Isolation (Subjects card)."
+            for k in ("KREA2_LOSS_WATCH", "KREA2_PER_IMAGE_LR", "KREA2_WARMUP_LOOK"):   # side-by-sides: hard on purpose
+                disabled.add(k)
+                force[k] = False
+                notes[k] = "Off with Fizgig LoRA Isolation (Subjects card)."
+        for o in desc.options:          # a family check that can't run beside it (H3 reference distillation)
+            if getattr(o, "isolation_off", False):
+                disabled.add(o.key)
+                if values.get(o.key):
+                    force[o.key] = False
+                notes[o.key] = "Off with Fizgig LoRA Isolation (Subjects card)."
+        values = {**values, "FAMILY_DOP": True}
+        notes["SAMPLE_PROMPT"] =("Write prompts as your captions are (\"zwxem, a woman at a cafe\"): previews read "
+                                  "them the way training reads the captions.")
+    if kind in ("edit", "slider"):      # the first folder has a partner folder (originals, the -1 end): one subject
+        hidden.add("subjects")
+    n_sub = concept_count(values) if kind not in ("edit", "slider") and values.get("FAMILY_MULTICONCEPT") else 1
+    # the card's two choices follow the settings under them (a preset, a saved run, an older setup)
+    want = SUBJECT_COUNTS[n_sub - 1] if desc.multi_concept else SUBJECT_COUNTS[0]
+    if str(values.get("FAMILY_SUBJECTS") or "") != want:
+        force["FAMILY_SUBJECTS"] = want
+    mode = PEOPLE_MODES[2 if values.get("FAMILY_MULTI_PERSON") and kind == "standard" else
+                        1 if values.get("FAMILY_DOP") else 0]
+    if str(values.get("FAMILY_PEOPLE_MODE") or "") != mode:
+        force["FAMILY_PEOPLE_MODE"] = mode
+    if kind == "finetune" and values.get("FAMILY_MULTI_PERSON"):
+        notes["FAMILY_PEOPLE_MODE"] = "A fine-tune trains as On - only where you use its trigger word; the " \
+                                      "group-picture option is for LoRAs."
+    hidden.add("FAMILY_CONCEPT_COUNT")
+    if n_sub == 1:
+        hidden.add("FAMILY_CONCEPT_BALANCE")
+    notes["_subject1_folder"] = image_folder or "Not chosen yet - pick it on the Start tab"
+    dop = bool(values.get("FAMILY_DOP")) and kind in ("standard", "finetune")
+    if not dop:
+        hidden.add("FAMILY_SUBJECT_FIX")
+    if not (kind == "standard" and values.get("FAMILY_MULTI_PERSON")):
+        hidden.add("FAMILY_MP_MANUAL")
+        hidden |= set(KIND_ROWS)            # what a subject is only changes the group-picture recipe
+    if not (dop and values.get("FAMILY_SUBJECT_FIX")):
+        hidden |= {"FAMILY_DOP_TRIGGER", "FAMILY_DOP_CLASS"} | DOP_EXTRA_ROWS
+    if not (kind == "standard" and values.get("FAMILY_MULTI_PERSON")):   # "what they are" is the joined word's
+        hidden |= {"FAMILY_DOP_CLASS"} | {c for _d, _t, c in CONCEPT_ROWS}
+    for i, (d, t, c) in enumerate(CONCEPT_ROWS, start=2):     # subject i's folder, line and words, up to the count
+        if i > n_sub:
+            hidden |= {d, t, c, f"_subject{i}_as", KIND_ROWS[i - 1]}
+    
     kn = _kind_notes(desc)
     if len(kinds(desc)) > 1:
         notes["FAMILY_KIND"] = kn.get(kind, ("", ""))[1] or KIND_HINTS.get(kind, "")
@@ -635,6 +827,8 @@ def state(desc, values, image_folder="", captioner="", speed_file=False, checkpo
                                if values.get("ADAPTIVE_LR") else {"label": "Use 1e-4", "values": {"LEARNING_RATE": "1e-4"}})
     if kind in ("edit", "slider"):
         hidden.add("_overtrain_tip")
+    if kind != "edit":
+        hidden.add("_edit_samples_note")
     ts = _timestep_note(values)
     if ts:
         notes["MAX_TIMESTEP"] = ts
@@ -683,10 +877,41 @@ def state(desc, values, image_folder="", captioner="", speed_file=False, checkpo
             hidden.add("SAMPLE_NEGATIVE")
     except ValueError:
         pass
+    shown, labels = {}, {}
+    if desc.edit_training and getattr(desc, "edit_references", 1) > 1:
+        if kind == "edit" and str(values.get("FAMILY_EDIT_PICTURES") or "") == launch.EDIT_WITH_EXTRAS:
+            labels = {"_edit_edited_dir": "3. Edited folder (after editing)", "FAMILY_EDIT_CAPTION": "4. Edit instruction",
+                      "FAMILY_EDIT_REF": "5. Test photo (optional)"}
+            notes["_edit_extras_found"] = _extras_found(desc, values, image_folder)
+        else:
+            hidden |= {"FAMILY_EDIT_EXTRAS_DIR", "_edit_extras_found"}
     if desc.train_preview_checkpoint and checkpoint_file and values.get("SAMPLE_CHECKPOINT", True):
-        disabled |= {"SAMPLE_STEPS", "SAMPLE_CFG_SCALE", "SAMPLE_NEGATIVE"}     # the Distilled renders its own way
+        # the Distilled: Steps and CFG switch to its own values and stay editable (the tick's follow), as the Turbo
+        # LoRA's do; CFG 1 hides the negative (above)
+        if desc.preview_checkpoint_sampling is None:
+            disabled |= {"SAMPLE_STEPS", "SAMPLE_CFG_SCALE", "SAMPLE_NEGATIVE"}
     return {"hidden": sorted(hidden), "disabled": sorted(disabled), "notes": notes, "kind": kind,
-            "media": sorted(media), "turbo_file": bool(speed_file), "force": force, "actions": actions}
+            "media": sorted(media), "turbo_file": bool(speed_file), "force": force, "actions": actions,
+            "shown": shown, "checkpoint_file": bool(checkpoint_file), "labels": labels}
+
+
+def _extras_found(desc, values, image_folder):
+    """The Extra pictures folder's readout: how many edited photos have extra pictures, and how many each."""
+    xdir = str(values.get("FAMILY_EDIT_EXTRAS_DIR") or "").strip()
+    if not xdir or not os.path.isdir(xdir) or not image_folder or not os.path.isdir(image_folder):
+        return ""
+    try:
+        found, orphans, misnamed = launch.edit_extras(image_folder, xdir,
+                                                      test_photo=str(values.get("FAMILY_EDIT_REF") or ""))
+        total = sum(1 for f in os.listdir(image_folder) if os.path.splitext(f)[1].lower() in launch.PAIR_EXTS)
+    except OSError:
+        return ""
+    counts = sorted(len(v) for v in found.values())
+    line = (f"Found: {total} edited photos, {len(found)} with extra pictures"
+            + (f" ({counts[0]}-{counts[-1]} each)" if counts and counts[0] != counts[-1] else
+               f" ({counts[0]} each)" if counts else ""))
+    loose = len(orphans) + len(misnamed)
+    return line + (f". {loose} picture(s) here match no photo's name." if loose else ".")
 
 
 def _timestep_note(values):
@@ -814,8 +1039,11 @@ def inputs(desc, values, *, models, python, repo_dir, image_folder, cache_root, 
                  **({"checkpoint": b("SAMPLE_CHECKPOINT"), "checkpoint_cache": s("CACHE_SAMPLE_MODEL") or "auto",
                      "int8": bool(inference_int8)} if desc.train_preview_checkpoint else {})},
         samples_dir=samples_dir, edit_caption=s("FAMILY_EDIT_CAPTION"),
-        multiconcept=b("FAMILY_MULTICONCEPT") and desc.multi_concept,
-        extra_folders=[s("FAMILY_CONCEPT_DIR")] if b("FAMILY_MULTICONCEPT") and s("FAMILY_CONCEPT_DIR") else [],
+        multiconcept=b("FAMILY_MULTICONCEPT") and desc.multi_concept and kind not in ("edit", "slider"),
+        # subject 2 on, in order; a blank folder stays in its place so the plan can name it
+        extra_folders=([s(d) for d, _t, _c in CONCEPT_ROWS[:concept_count(v) - 1]]
+                       if b("FAMILY_MULTICONCEPT") and desc.multi_concept and kind not in ("edit", "slider") else []),
+        concept_balance=b("FAMILY_CONCEPT_BALANCE"),
         FAMILY_OPTIONS=_option_values(desc, v),
     )
     return d

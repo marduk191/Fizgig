@@ -99,7 +99,7 @@ KLEIN = FamilyDescription(
         ("Style+Composition", tuple((f"double_{i}", 1.0) for i in range(8))
          + (("single_0", 1.0), ("single_1", 1.0), ("single_2", 0.5))),
         ("Details", tuple((f"single_{i}", 1.0) for i in range(12, 24)))),
-    workbench=("repair", "explorer", "profiler", "extract", "royale"),
+    workbench=("repair", "profiler", "extract", "royale"),
 
     # Model Area to Train, the old Training tab's areas and their block patterns (lora_trainer_gui.py, Klein's
     # include_patterns): Style trains the style+composition blocks at the late (clean) timesteps 0-400
@@ -165,6 +165,10 @@ KLEIN = FamilyDescription(
                   "Build Tools) - both located automatically. Never used with Blocks Swap, since swapping moves "
                   "weights and compiled graphs assume they stay put."),
     edit_training=True,               # Klein is an edit model: references ride after the image tokens
+    # BFL's FLUX.2 overview (docs.bfl.ml/flux_2/flux2_overview): [klein] "Up to 4" references ([max]/[pro]/[flex]
+    # take 8-10); its code sets no count (each its own t offset, capped at 1 MP when several). The text encoder never
+    # sees them
+    edit_references=4,
     reference_strength=True,          # the original workbench's reference strength + previous-frame latent chain
     edit_note=("Pairs of an original and its edited version, the same crop and shape - about 40 pairs is a good "
                "start (20 at least). Each photo 1 MP or larger; Fizgig resizes them."),

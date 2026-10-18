@@ -1,4 +1,4 @@
-"""The workbench for video families: clips in Repair Studio, the Explorer and LoRA Royale.
+"""The workbench for video families: clips in Repair Studio and LoRA Royale.
 
 Two pieces:
 
@@ -103,7 +103,7 @@ class ClipContract:
                 turbo_strength, bool(with_audio), self.keyframe_signature(state),
                 round(float(getattr(state, "primary_scale", 1.0)), 4),
                 round(float(getattr(state, "donor_scale", 1.0)), 4),
-                bool(getattr(self, "int8_attention", False)))
+                bool(getattr(self, "int8_attention", False)), bool(getattr(self, "speed_boost", False)))
 
     def cache_key_for(self, state, *, frames, regime, steps=None, turbo_strength=None, **_ignored):
         """The render library's setup key for this state's render setup, or None before a primary is loaded. Sound
@@ -224,7 +224,9 @@ class ClipContract:
         base.references = getattr(state, "references", None)
         if with_scales:
             base.primary_scale = float(getattr(state, "primary_scale", 1.0))
-            base.donor_scale = float(getattr(state, "donor_scale", 1.0))
+        base.donor_scale = 0.0              # the primary alone: a loaded donor stays out of the baseline clip
+        for bs in base.blocks.values():
+            bs.donor_enabled = False
         return base
 
     def baseline_clip(self, state, *, frames: Optional[int] = None, regime: str = "confirm",

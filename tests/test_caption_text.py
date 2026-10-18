@@ -28,6 +28,7 @@ from PIL import Image  # noqa: E402
 
 from fizgig.dataset.caption_text import decode_caption as light, read_caption  # noqa: E402
 
+sys.stdout.reconfigure(errors="replace")   # a failing check prints U+FFFD, which a cp1252 console lacks
 fails = []
 
 
@@ -101,6 +102,21 @@ try:
        after == "the girl’s worm’s-eye angle", after)
 except Exception as e:
     ck("Find & Replace survives a cp1252 caption and finds both matches", False, f"{type(e).__name__}: {e}")
+
+# --- 2b. LoRA Isolation's Subjects card reads the same captions ------------------------------
+# multi_person reads a subject folder's captions for the trigger word, the class word and the card's preview caption.
+from fizgig.families import multi_person as MP  # noqa: E402
+
+m = tempfile.mkdtemp(prefix="fizgig_capenc_mp_")
+with open(os.path.join(m, "1.txt"), "wb") as f:
+    f.write("zwxem, a woman’s portrait".encode("cp1252"))
+with open(os.path.join(m, "2.txt"), "w", encoding="utf-8") as f:
+    f.write("zwxem, a woman smiling")
+ck("Subjects card: the preview caption shows a cp1252 caption's real text",
+   MP.sample_caption(m, "zwxem") == "zwxem, a woman’s portrait", MP.sample_caption(m, "zwxem"))
+ck("  the trigger word is still found", MP.caption_trigger(m) == "zwxem", MP.caption_trigger(m))
+ck("  and every caption is read, decoded", sorted(MP._captions(m, ".txt")) ==
+   ["zwxem, a woman smiling", "zwxem, a woman’s portrait"], MP._captions(m, ".txt"))
 
 # --- 3. the server stays torch-free ---------------------------------------------------------
 # Run in a fresh interpreter, from a folder with no fizgig.py in it (the repo root's would shadow the package).

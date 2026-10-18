@@ -74,7 +74,7 @@ SDXL = FamilyDescription(
         ("Input blocks", tuple((b, 1.0) for b in _IN)),
         ("Middle + output blocks", tuple((b, 1.0) for b in _MID + _OUT)),
     ),
-    workbench=("repair", "explorer", "profiler", "extract", "royale"),
+    workbench=("repair", "profiler", "extract", "royale"),
 
     lora=LoRAFormat(
         key_template="lora_unet_{block}_{module}.{ab}.weight",

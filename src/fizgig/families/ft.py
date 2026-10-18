@@ -62,6 +62,9 @@ class FTSpec:
     blocks: str = "blocks"
     components: tuple = ()
     always_on: tuple = ()
+    # False: the model's forward can't stream out-of-window blocks (they don't run in one ordered list), so plans
+    # only use windows that fit with every frozen block resident
+    streams: bool = True
     overhead_gb: Optional[float] = None
     trunk_gb_per_block: Optional[float] = None
     slots_gb: float = 1.5
@@ -471,6 +474,7 @@ class Rotator:
 
 
 def _plan(comp_gb, n_blocks, trunk, spec: FTSpec, usable, allow_stream=True, mp=None, spans=None, max_parts=0):
+    allow_stream = allow_stream and spec.streams
     if spec.window_factor != 1.0:      # a family whose windows cost more than their weights (FTSpec.window_factor)
         comp_gb = {p: g * spec.window_factor for p, g in comp_gb.items()}
     overhead = spec.overhead_gb if spec.overhead_gb is not None else trunk * n_blocks + 3.5
@@ -727,8 +731,15 @@ class SharedBackend:
     def start_always(self):
         return self.rot.start_always()
 
-    def plan(self, free_gb, allow_stream=True, mp=None, max_parts=0):
-        windows, stream, why, usable = plan_windows(self.dit, self.spec, self.rot, free_gb, allow_stream, mp,
+    def plan(self, free_gb, allow_stream=True, mp=None, max_parts=0, held_grads=False):
+        """held_grads: every trained weight's gradient is held at once this run (DOP's pass joins the step's
+        backward, so each weight waits for both passes' gradients before its free-each-gradient step: measured +8.3
+        GB on Krea 2's 4.04B-parameter attention window) - planned as the window factor's weights-plus-gradient."""
+        spec = self.spec
+        if held_grads and spec.window_factor < 2.0:
+            import dataclasses
+            spec = dataclasses.replace(spec, window_factor=2.0)
+        windows, stream, why, usable = plan_windows(self.dit, spec, self.rot, free_gb, allow_stream, mp,
                                                     max_parts)
         if windows is not None and stream and any(isinstance(w, tuple) for w in windows):
             from fizgig.krea2.rotation import RotationOffloader

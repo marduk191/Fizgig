@@ -453,6 +453,48 @@ def _one_window() -> bool:
         return True
 
 
+WEBVIEW2_URL = "https://developer.microsoft.com/microsoft-edge/webview2/"
+
+
+def _log(msg):
+    """The app window's problems, to user_data/app_window.log: the Windows launcher runs without a console, so a
+    window that fails would otherwise say nothing anywhere."""
+    try:
+        with open(user_file("app_window.log"), "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + str(msg).rstrip() + "\n")
+    except OSError:
+        pass
+    print(msg, flush=True)
+
+
+def _log_pywebview():
+    """pywebview's own errors (a WebView2 that fails to start says why there) into the same log."""
+    import logging
+    try:
+        h = logging.FileHandler(user_file("app_window.log"), encoding="utf-8")
+        h.setFormatter(logging.Formatter("%(asctime)s pywebview %(levelname)s: %(message)s"))
+        logging.getLogger("pywebview").addHandler(h)
+    except OSError:
+        pass
+
+
+def _windows_engine_problem():
+    """Why the window can't show the web UI on this Windows machine, or "". pywebview falls back to the Internet
+    Explorer engine when it finds no WebView2 runtime (or .NET under 4.6.2), and the web UI can't run there: the
+    window stayed white (#189)."""
+    if os.name != "nt":
+        return ""
+    try:
+        from webview.platforms import winforms
+    except Exception as e:
+        return f"the window's Windows layer did not load ({type(e).__name__}: {e})"
+    if not getattr(winforms, "is_chromium", True):
+        return ("Microsoft Edge WebView2 Runtime isn't installed (or .NET Framework is older than 4.6.2), so the "
+                f"window can only use Internet Explorer's engine, which can't show Fizgig. Install WebView2 from "
+                f"{WEBVIEW2_URL} (the Evergreen Bootstrapper) to get the window back")
+    return ""
+
+
 def main():
     if not _one_window():
         return
@@ -473,8 +515,19 @@ def main():
             sys.exit("Fizgig's web UI did not start. Run `python fizgig.py --web` to see why.")
     url = f"http://127.0.0.1:{port}/" + (f"?app_key={key}" if key else "")
     home = f"http://127.0.0.1:{port}/"
+    fallback = [""]                       # why the window gave way to the browser, when it did
     try:
         import webview
+        _log_pywebview()
+        if os.name == "nt":            # the taskbar shows Fizgig's own button and icon, not pythonw's (as the old app)
+            try:
+                import ctypes
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("fizgig.lora.studio")
+            except Exception:
+                pass
+        why = _windows_engine_problem()
+        if why:
+            raise RuntimeError(why)
         _unhook_requests()
         # clips decode on the CPU in this window: the first clip played froze the window (pointer included) while
         # WebView2 brought up the GPU's video decoder, on more than one machine; Fizgig's previews are small clips
@@ -486,6 +539,10 @@ def main():
             """What a page in the window - a pod's page included - can ask of it: to come back to this computer, and
             to read this computer's training folders (read-only, those folders only: local_bridge) so a pod's page
             can send one up with its own upload."""
+            def ready(self):
+                """The page's script ran (app.js calls this as the bridge arrives): the window shows the web UI."""
+                page_ready.set()
+
             def home(self):
                 # after this call has returned to the page: pywebview hands the page a reply, and the page must
                 # still be there for it
@@ -619,18 +676,34 @@ def main():
             webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True   # Buy me a coffee, RunPod, the docs
         except Exception:
             pass
+        page_ready = threading.Event()
+
         def watchdog():                    # a window that never appears ends, its server with it, not left unseen
             if not window.events.shown.wait(120):
                 _stop(own)
                 os._exit(1)
+            # a window that appears but never runs the page (a white window: a broken WebView2, its sandbox on a
+            # junctioned profile folder, a blocked GPU process) gives way to the browser rather than staying white.
+            # Only for this computer's own page: a pod's may be an older Fizgig that doesn't report in
+            if first == url and not page_ready.wait(30):
+                fallback[0] = ("the window opened but the page never ran in it (WebView2 may be failing to draw, or "
+                               "be blocked by security software)")
+                try:
+                    window.destroy()
+                except Exception:
+                    pass
         threading.Thread(target=watchdog, daemon=True).start()
         profile = user_file("app_profile")
         webview.start(private_mode=False, storage_path=profile, icon=_icon(profile))
+        if fallback[0]:
+            raise RuntimeError(fallback[0])
     except Exception as e:
-        # no engine here (a Linux machine without GTK/WebKit or Qt): the browser, and how to get the window
-        print(f"[app] no app window ({type(e).__name__}: {e}) - opening the web UI in your browser instead. For the "
-              "window on Linux: install your distro's WebKitGTK (e.g. gir1.2-webkit2-4.1 and python3-gi) or "
-              "`pip install pywebview[qt]` in Fizgig's venv.")
+        # no engine here (a Linux machine without GTK/WebKit or Qt, Windows without WebView2) or a window that never
+        # showed the page: the browser, and how to get the window
+        how = (f"For the window, install Microsoft Edge WebView2 Runtime: {WEBVIEW2_URL}" if os.name == "nt" else
+               "For the window on Linux: install your distro's WebKitGTK (e.g. gir1.2-webkit2-4.1 and python3-gi) "
+               "or `pip install pywebview[qt]` in Fizgig's venv.")
+        _log(f"[app] no app window ({e}) - opening the web UI in your browser instead. {how}")
         webbrowser.open(url)
         if own is not None:
             try:

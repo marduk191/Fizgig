@@ -304,6 +304,26 @@ body {
 .collapsible-header:hover {
   background: var(--bg-hover);
 }
+.tc-box { grid-column: 1 / -1; margin-top: 16px; border-top: 1px solid var(--border); padding-top: 12px; }   /* Check a trigger word */
+.tc-box > summary { cursor: pointer; font-weight: 700; color: var(--text-primary); margin-bottom: 8px; }
+.tc-box > .field-hint { max-width: 760px; margin: 4px 0 8px; line-height: 1.45; }
+.tc-verdict { margin: 10px 0 6px; font-weight: 600; }      /* Check a trigger word's answer */
+.tc-good { color: var(--success); }
+.tc-warn { color: var(--warning); }
+.tc-bad { color: var(--danger); }
+.sec-video {        /* a card's help video: a link across the top of the card */
+  display: flex; align-items: center; gap: 14px; margin: 12px 0 14px 0; padding: 10px 16px 10px 12px;
+  background: var(--bg-inset); border: 1px solid var(--border); border-left: 4px solid #CC0000;
+  border-radius: 8px; text-decoration: none; color: var(--text-primary); max-width: 760px;
+  transition: background 0.1s, border-color 0.1s;
+}
+.sec-video:hover { background: var(--bg-hover); border-color: #CC0000; }
+.sec-video-play {
+  flex: none; width: 36px; height: 36px; border-radius: 50%; background: #CC0000; color: #FFFFFF;
+  display: inline-flex; align-items: center; justify-content: center; font-size: 13pt; padding-left: 3px;
+}
+.sec-video-text { display: flex; flex-direction: column; gap: 2px; font-size: 11pt; }
+.sec-video-sub { font-size: 9pt; color: var(--text-secondary); }
 .collapsible-title {
   font-family: var(--font-family);
   font-size: 12pt;
@@ -1705,9 +1725,32 @@ input[type="radio"] { accent-color: var(--accent); width: 16px; height: 16px; ma
 .st-btns { gap: 3px; }
 .st-btns .btn-sm { padding: 0 7px; height: 26px; min-width: 28px; font-size: 10.5pt; font-weight: 700; justify-content: center; }
 /* Lucky with its Min and Max, kept together on one line */
-.st-lucky { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
-.st-lucky .st-lucky-label { color: var(--text-secondary); font-size: 9.5pt; }
-.st-lucky input { width: 56px; flex: 0 0 56px; }
+/* the Blocks card's top: the title, description and bulk row on the left, I'm feeling lucky's pill on the right with
+   its top level with the title; the sliders start under both. Narrower, the pill drops under the bulk row */
+#tab-studio .section-card > .st-blocks-head { margin: 0; display: flex; align-items: flex-start; gap: 16px; padding-right: 20px; }
+.st-blocks-main { flex: 1; min-width: 0; }
+.st-blocks-main > .st-bulk { padding: 0 20px; margin-bottom: 12px; }
+.st-lucky-pill { flex: none; margin-top: 12px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 12px;
+  background: var(--bg-deep); display: flex; flex-direction: column; gap: 6px; }
+.st-lucky-line { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.st-lucky-pill .st-lucky-label { color: var(--text-secondary); font-size: 9.5pt; }
+.st-lucky-pill input[type="text"] { width: 56px; flex: 0 0 56px; }
+#stLuckyWho { margin-right: 6px; }
+.st-lucky-pill select.st-small-select { width: auto !important; min-width: 72px; flex: none; }   /* sized to its choices */
+/* the bulk row and the pill: every button, dropdown and box one height (the small buttons'), thumb-sized on a phone */
+.st-bulk .btn-sm, .st-bulk select, .st-bulk input[type="text"],
+.st-lucky-pill .btn-sm, .st-lucky-pill select, .st-lucky-pill input[type="text"] { height: 28px; box-sizing: border-box; }
+.st-bulk select, .st-bulk input[type="text"], .st-lucky-pill select, .st-lucky-pill input[type="text"] { font-size: 12.5px; }
+@media (max-width: 1180px) {
+  #tab-studio .section-card > .st-blocks-head { flex-direction: column; align-items: stretch; gap: 0; padding-right: 0; }
+  .st-lucky-pill { margin: 0 20px 12px; }
+  .st-lucky-line { flex-wrap: wrap; white-space: normal; }
+}
+@media (max-width: 760px) {
+  .st-bulk .btn-sm, .st-bulk select, .st-bulk input[type="text"],
+  .st-lucky-pill .btn-sm, .st-lucky-pill select, .st-lucky-pill input[type="text"] { height: 36px; }
+  .st-bulk select, .st-bulk input[type="text"], .st-lucky-pill select, .st-lucky-pill input[type="text"] { font-size: 16px; }
+}
 #tab-studio .field-row select.st-small-select { flex: 0 0 auto; width: auto; min-width: 96px; }
 #tab-studio .st-inline { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
 #tab-studio .st-inline input { width: 64px; flex: 0 0 64px; }
@@ -1733,6 +1776,36 @@ input[type="radio"] { accent-color: var(--accent); width: 16px; height: 16px; ma
 .crop-window { width: auto !important; max-width: 96vw; }
 #cropCanvas { display: block; margin: 8px 0; touch-action: none; cursor: move; max-width: 100%; }
 .st-slot canvas { display: block; background: var(--bg-deep); }
+
+/* Studio: the preview kept in view - floating (moved by its bar, resized from its corner) or pinned to the top of the
+   tab (its bottom edge sets the height); the panes keep their side-by-side row and scale to the panel */
+.st-dock { display: flex; flex-direction: column; background: var(--bg-surface); border: 1px solid var(--border);
+  border-radius: 8px; box-shadow: 0 10px 32px rgba(0, 0, 0, 0.45); overflow: hidden; z-index: 60; }
+.st-dock.floating { position: fixed; resize: both; min-width: 260px; min-height: 160px; }
+.st-dock.pinned { position: sticky; top: 0; margin: 0 36px 16px; min-height: 140px; border-radius: 0 0 8px 8px; }
+.st-dock.collapsed { resize: none; min-height: 0; height: auto !important; }
+.st-dock.collapsed .st-dock-body, .st-dock.collapsed .st-dock-grip { display: none; }
+.st-dock-bar { display: flex; align-items: center; gap: 6px; padding: 6px 8px 6px 12px; background: var(--bg-deep);
+  border-bottom: 1px solid var(--border); user-select: none; flex: none; }
+.st-dock.floating .st-dock-bar { cursor: move; touch-action: none; }
+.st-dock-title { flex: 1; font-weight: 700; font-size: 13px; color: var(--text-primary); }
+.st-dock-body { flex: 1; min-height: 0; padding: 8px; overflow: hidden; }
+.st-dock-grip { flex: none; height: 10px; cursor: ns-resize; touch-action: none; background: var(--bg-deep);
+  border-top: 1px solid var(--border); }
+.st-dock.floating .st-dock-grip { display: none; }
+.st-dock-grip::after { content: ""; display: block; width: 44px; height: 3px; margin: 3px auto 0; border-radius: 2px;
+  background: var(--text-secondary); opacity: 0.6; }
+.st-dock .st-preview, .st-dock .st-preview.three { height: 100%; grid-template-columns: none; grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr); gap: 8px; }
+.st-dock .st-pane { display: flex; flex-direction: column; min-height: 0; margin: 0; }
+.st-dock .st-pane img, .st-dock .st-pane video { flex: 1; min-height: 0; height: auto; aspect-ratio: auto;
+  width: 100%; object-fit: contain; }
+.st-dock .st-pane.audio img { flex: 1; aspect-ratio: auto; }
+.st-dock .st-pane figcaption { flex: none; }
+.st-dock.st-resizing video { visibility: hidden; }     /* clips step aside while the panel is being resized */
+.st-dock-home { padding: 14px; border: 1px dashed var(--border); border-radius: 8px; color: var(--text-secondary);
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+@media (max-width: 760px) { .st-dock.pinned { margin: 0 0 12px; } }
 
 /* Studio (ACE-Step): the section dragged across the Tweaked waveform */
 .st-pane { position: relative; }
@@ -2012,3 +2085,10 @@ input[type="radio"] { accent-color: var(--accent); width: 16px; height: 16px; ma
 .section-card.model-strip { padding-top: 0; padding-bottom: 0; }
 .model-strip > .card-content { padding: 14px 20px; }
 .model-strip .field-row { margin: 0; }
+
+/* a hint with one line per choice (Subjects card): spaced, each choice's name bold and white as the tick titles */
+.hint-lines > div { margin: 0 0 6px; }
+.hint-lines b { font-style: normal; font-weight: 700; color: var(--text-primary); }
+.note-lines { color: var(--text-explain); }   /* the Subjects card's caption preview: an explanation, not a warning */
+/* Studio (H3): the Clip row's ticks after Steps / Turbo - a gap before each, so every box reads with its own word */
+#stVideoRows .st-inline .checkbox-label { margin-left: 14px; }

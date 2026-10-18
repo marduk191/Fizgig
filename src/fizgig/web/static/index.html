@@ -13,7 +13,22 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-title" content="Fizgig">
   <meta name="apple-mobile-web-app-status-bar-style" content="black">
-  <link rel="stylesheet" href="/style.css">
+  <script>
+    // a pod's proxy can fail one request just after the pod comes up: the page then arrived without its styles.
+    // A stylesheet or script that fails is fetched again, a little later each time.
+    function fizgigRetry(el) {
+      var n = +(el.dataset.tries || 0) + 1, at = el.tagName === "LINK" ? "href" : "src";
+      if (n > 8) return;
+      setTimeout(function () {
+        var c = document.createElement(el.tagName);
+        for (var i = 0; i < el.attributes.length; i++) c.setAttribute(el.attributes[i].name, el.attributes[i].value);
+        c.dataset.tries = n;
+        c.setAttribute(at, el.getAttribute(at).split("?")[0] + "?r=" + n);
+        el.replaceWith(c);
+      }, 400 * n);
+    }
+  </script>
+  <link rel="stylesheet" href="/style.css" onerror="fizgigRetry(this)">
 </head>
 <body>
   <header class="window-titlebar">
@@ -630,7 +645,9 @@
               </div>
               <div class="field-row"><span class="field-label">Seed:</span><input type="text" id="stSeed" class="w-num" value="42">
                 <button class="btn btn-sm" id="stSeedNew" title="A random seed">↻</button>
-                <span class="field-label" id="stResLabel">Res:</span><select id="stRes" class="w-combo st-small-select"></select>
+                <span class="field-label" id="stResLabel">Length (s):</span><select id="stRes" class="w-combo st-small-select"></select>
+                <span class="st-inline" id="stSizeRow"><span class="field-hint">Width</span><select id="stW" class="w-combo st-small-select"></select>
+                  <span class="field-hint">Height</span><select id="stH" class="w-combo st-small-select"></select></span>
                 <label class="checkbox-label" id="stTurboRow" title="It keeps the unchanged blocks' results in VRAM to replay them: turn it off if VRAM is tight."><input type="checkbox" id="stTurbo" checked> Turbo Preview
                   (late-block changes render almost at once; the same picture as a full render)</label></div>
               <div id="stVideoRows" style="display:none">
@@ -639,13 +656,12 @@
                 <div class="field-row"><span class="field-label">Clip:</span>
                   <span class="st-inline"><select id="stH3Len" class="w-combo st-small-select"></select>
                     <span class="field-hint">W</span><select id="stH3W" class="w-combo st-small-select"></select>
-                    <span class="field-hint">H</span><select id="stH3H" class="w-combo st-small-select"></select>
-                    <span class="field-hint">Render size</span><select id="stH3Scale" class="w-combo st-small-select"></select></span></div>
+                    <span class="field-hint">H</span><select id="stH3H" class="w-combo st-small-select"></select></span></div>
                 <div class="field-row"><span class="field-label"></span>
                   <span class="st-inline"><span class="field-hint">Steps</span><input type="text" id="stH3Steps" value="4" title="Sampling steps for the clip. With Turbo at 1.0, 4 steps is the fast loop; Turbo 0 needs about 20.">
                     <span class="field-hint">Turbo</span><input type="text" id="stH3Turbo" value="1" title="Strength of the built-in Turbo LoRA: 1.0 for the fast loop, 0.75 matches the in-training previews. 0 switches it off - the render is the base plus your LoRAs at the steps set. That is how you edit a Turbo LoRA: load it as the primary and set this to 0.">
                     <label class="checkbox-label"><input type="checkbox" id="stH3Sound" checked> Sound</label>
-                    <label class="checkbox-label" title="Also render the same seed, prompt and photos with no LoRA at all, shown on the left. Rendered once per setup: a slider move doesn't re-render it."><input type="checkbox" id="stH3NoLora"> No-LoRA clip</label>
+                    <label class="checkbox-label" title="The first half of the steps (rounded down: 7 steps gives 3) render at half size, then the clip grows to full size for the rest - a faster render. The layout is worked out at half size, so a seed frames differently with it on. From Fizgig's H3 Speed Boost node (SPEED, Xiao et al. 2026, via LC Speed Boost)."><input type="checkbox" id="stH3Boost" checked> Speed Boost</label>
                     <label class="checkbox-label" title="Put up the pass-2 estimate in the Tweaked pane while the remaining passes run"><input type="checkbox" id="stH3Early" checked> Show early</label></span></div>
               </div>
               <div class="field-row" id="stNegRow"><span class="field-label">Negative:</span>
@@ -681,8 +697,11 @@
               <a class="btn btn-sm" id="stReport" target="_blank" rel="noopener">📊 Open full report</a></div>
           </div>
           <div class="section-card">
-            <div class="card-title">Preview</div>
+            <div class="card-title">Preview <button class="btn btn-sm" id="stDockOpen"
+              title="Keeps Baseline and Tweaked in view while you scroll to the sliders: a panel you can move and resize, or pin to the top">⧉ Keep in view</button></div>
             <div class="card-content">
+              <div class="st-dock-home" id="stDockHome" style="display:none">The preview is in the panel kept in view.
+                <button class="btn btn-sm" id="stDockBack">Put it back here</button></div>
               <div class="st-preview" id="stPreview">
                 <figure class="gallery-item st-pane" id="stNolPane" style="display:none"><img id="stNol" alt=""><video id="stNolVid" controls loop muted playsinline preload="auto"
                   style="display:none"></video><audio id="stNolAud" controls style="display:none"></audio>
@@ -692,7 +711,7 @@
                   <figcaption id="stBaseCap">Baseline (LoRA at default 1.0)</figcaption></figure>
                 <figure class="gallery-item st-pane"><div class="st-region" id="stRegion"></div><img id="stTweak" alt=""><video id="stTweakVid" controls loop muted playsinline preload="auto"
                   style="display:none"></video><audio id="stTweakAud" controls style="display:none"></audio>
-                  <figcaption>Tweaked (current sliders)</figcaption></figure>
+                  <figcaption id="stTweakCap">Tweaked (current sliders)</figcaption></figure>
               </div>
               <div class="field-hint" id="stPreviewHint">Click either picture to see both full size (← → switches between them).</div>
               <div class="st-metrics" id="stMetrics" style="display:none" title="Paired numbers for the two renders on screen (same seed and prompt, only the blocks differ - where such measures are honest). Likeness: ArcFace similarity to your reference photo. Grid: the model's patch lattice showing through (rising = overbake). Detail: face texture energy (down = plastic, up = fried). Clipped: blown pixels. Sat: saturation.">
@@ -734,27 +753,44 @@
             </div>
           </div>
           <div class="section-card">
-            <div class="card-title"><span>Blocks</span>
-              <span><button class="btn btn-sm" id="stUndo" title="Undo (Ctrl+Z)">↶ Undo</button>
-                <button class="btn btn-sm" id="stRedo" title="Redo (Ctrl+Y)">↷ Redo</button></span></div>
-            <div class="card-desc">One slider per block of the model. A greyed row is a block the loaded LoRA doesn't train, so moving it changes nothing.</div>
-            <div class="card-content">
-              <div class="field-row st-bulk">
-                <select id="stPreset" class="w-combo preset-select"></select>
-                <button class="btn btn-sm" id="stPresetSave">Save preset…</button>
-                <button class="btn btn-sm" data-bulk="reset">Reset all</button>
-                <button class="btn btn-sm" data-bulk="off">All off</button>
-                <button class="btn btn-sm st-detail-only" style="display:none" data-bulk="alternate" title="The main blocks alternate: block 0 on, 1 off, 2 on and so on (even on, odd off); the rest untouched. Invert for the other half. Strengths are kept.">Alternate</button>
-                <button class="btn btn-sm st-detail-only" style="display:none" data-bulk="detail" title="The detail end of the model (H3: blocks 46-49) all on or all off together. Strengths are kept.">Toggle detail blocks</button>
-                <button class="btn btn-sm" data-bulk="on">All on</button>
-                <button class="btn btn-sm" data-bulk="invert">Invert</button>
-                <span class="st-lucky"><button class="btn btn-sm" data-bulk="lucky">🎲 I'm feeling lucky</button>
-                  <span class="st-lucky-label">Min</span><input type="text" id="stLuckyLo" value="0">
-                  <span class="st-lucky-label">Max</span><input type="text" id="stLuckyHi" value="1.5">
-                  <label class="checkbox-label" id="stLuckyHoldBox" style="display:none" title="A lucky roll gives every block a strength anywhere between Min and Max, evenly (a negative Min allows inverted blocks). Hold keeps this model's structure and tidy-up bands near 1; untick it to roll every block across Min-Max."><input type="checkbox" id="stLuckyHold" checked> Hold structure + tidy-up</label></span>
-                <button class="btn btn-sm st-donor-only" data-bulk="donor_on">Donor: all on</button>
-                <button class="btn btn-sm st-donor-only" data-bulk="donor_off">Donor: all off</button>
+            <div class="st-blocks-head">
+              <div class="st-blocks-main">
+                <div class="card-title"><span>Blocks</span>
+                  <span><button class="btn btn-sm" id="stUndo" title="Undo (Ctrl+Z)">↶ Undo</button>
+                    <button class="btn btn-sm" id="stRedo" title="Redo (Ctrl+Y)">↷ Redo</button></span></div>
+                <div class="card-desc">One slider per block of the model. A greyed row is a block the loaded LoRA doesn't train, so moving it changes nothing.</div>
+                <div class="field-row st-bulk">
+                  <select id="stPreset" class="w-combo preset-select"></select>
+                  <button class="btn btn-sm" id="stPresetSave">Save preset…</button>
+                  <button class="btn btn-sm" data-bulk="reset">Reset all</button>
+                  <button class="btn btn-sm" data-bulk="off">All off</button>
+                  <button class="btn btn-sm st-detail-only" style="display:none" data-bulk="alternate" title="The main blocks alternate: block 0 on, 1 off, 2 on and so on (even on, odd off); the rest untouched. Invert for the other half. Strengths are kept.">Alternate</button>
+                  <button class="btn btn-sm st-detail-only" style="display:none" data-bulk="detail" title="The detail end of the model (H3: blocks 46-49) all on or all off together. Strengths are kept.">Toggle detail blocks</button>
+                  <button class="btn btn-sm" data-bulk="on">All on</button>
+                  <button class="btn btn-sm" data-bulk="invert">Invert</button>
+                  <button class="btn btn-sm st-donor-only" data-bulk="donor_on">Donor: all on</button>
+                  <button class="btn btn-sm st-donor-only" data-bulk="donor_off">Donor: all off</button>
+                </div>
               </div>
+              <div class="st-lucky-pill" id="stLuckyPill">
+                <div class="st-lucky-line"><button class="btn btn-sm" data-bulk="lucky">🎲 I'm feeling lucky</button>
+                  <select id="stLuckyWho" class="w-combo st-small-select st-donor-only" style="display:none"
+                    title="Which LoRA's block strengths a lucky roll changes. Both rolls each one separately."><option>Primary</option><option>Donor</option><option>Both</option></select>
+                  <span class="st-lucky-label">Roll</span><select id="stLuckyCount" class="w-combo st-small-select"
+                    title="How many sliders a roll changes, picked at random from those not locked or frozen (with Both, a block's primary and donor are two). All: every one."><option value="all">All</option></select></div>
+                <div class="st-lucky-line">
+                  <span class="st-lucky-label" title="Each rolled block's slider is set to a strength between these two">Slider strengths from</span><input type="text" id="stLuckyLo" value="0"
+                    title="The lowest slider strength a roll can give (a negative one inverts the block)">
+                  <span class="st-lucky-label">to</span><input type="text" id="stLuckyHi" value="1.5"
+                    title="The highest slider strength a roll can give">
+                  <label class="checkbox-label" id="stLuckyHoldBox" style="display:none" title="A lucky roll gives each block it picks a slider strength anywhere in the range set beside it, evenly. Hold keeps this model's structure and tidy-up bands near 1; untick it to roll every block across the whole range."><input type="checkbox" id="stLuckyHold" checked> Hold structure + tidy-up</label></div>
+                <div class="st-lucky-line">
+                  <button class="btn btn-sm" id="stFreeze" title="Lock every block you've moved from its default, so the next rolls leave them alone (and so do presets and the bulk buttons). Press again after a roll to freeze the newly rolled ones too.">🔒 Freeze tweaked</button>
+                  <button class="btn btn-sm" id="stUnfreeze" style="display:none" title="Unlock the blocks Freeze locked (blocks you locked yourself stay locked)">🔓 Unfreeze</button>
+                  <span class="st-lucky-label" id="stLuckyFree" title="The sliders a roll can change: not frozen, not locked by you, and on for the LoRA being rolled"></span></div>
+              </div>
+            </div>
+            <div class="card-content">
               <div id="stPresetSaveRow"></div>
               <div id="stBlocks"></div>
             </div>
@@ -1661,7 +1697,7 @@
     <button class="btn lightbox-step" id="lightboxNext" title="Next (→)">›</button>
   </div>
 
-  <script src="/qrcode.js"></script>
-  <script src="/app.js"></script>
+  <script src="/qrcode.js" onerror="fizgigRetry(this)"></script>
+  <script src="/app.js" onerror="fizgigRetry(this)"></script>
 </body>
 </html>

@@ -71,7 +71,7 @@ QWEN_IMAGE_21 = FamilyDescription(
                   role="speed_lora", fetch_optional=False),
         ModelFile("qwen21_turbo_dit", "Qwen 2.1 Turbo DiT (int8, previews)", False, _COMFY,
                   "diffusion_models/qwen_image_2.1_turbo_int8_convrot.safetensors", 7.26,
-                  "Repair Studio, LoRA the Explorer and LoRA Royale preview on it (8 steps, CFG 1); training "
+                  "Repair Studio and LoRA Royale preview on it (8 steps, CFG 1); training "
                   "previews can use it too (a tick on the Samples tab).",
                   role="preview_dit",
                   fetch_optional=False),   # the workbench default: fetched with the family (Peter, 9 Oct 2026)
@@ -156,6 +156,9 @@ QWEN_IMAGE_21 = FamilyDescription(
     optimizers=("adamw", "adamw8bit"),
     network_types=("lora", "lokr"),
     edit_training=True,             # one checkpoint for text-to-image and edits (up to 10 references)
+    # the edited photo first, then up to 9 supporting references (qwen.ai/blog?id=qwen-image-2.1). The text encoder sees
+    # them too: the dataset's resize (own shape, the 32 px grid) is what both the vision pass and the latents get
+    edit_references=10,
     slider_training=True,
     workbench_follows_samples=True,   # Peter, 1 Oct 2026: the workbench previews as the Samples tab says
     # the reference default is CFG 1 (none); community reports find a little CFG helps 2.1 (1.5-3), higher
@@ -261,7 +264,7 @@ QWEN_IMAGE_21 = FamilyDescription(
         # steps). Measured on Qwen: a prompt smile slider was clear by 160 steps, a 40-pair warmth slider by 160.
         ("✨ Qwen 2.1 Slider (rank 8, 2e-4)", _preset(8, lr=2e-4, epochs=30, slider=True)),
     ),
-    workbench=("repair", "explorer", "profiler", "extract", "royale"),
+    workbench=("repair", "profiler", "extract", "royale"),
 
     notes=(
         ("A plain LoRA is unstable: collapse to texture at lr 5e-4 (~step 300), wobble at 1e-4, a no-adapter "

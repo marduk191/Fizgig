@@ -49,6 +49,9 @@ class ModelFile:
     # the download button fetches it only with the section's optional tick (description.fetch_optional_label);
     # None = not required -> optional
     fetch_optional: Optional[bool] = None
+    # False: left out of "Download models for me" altogether - the row's own Download link only (a file nobody needs
+    # by default, kept so a user can add it: MOSS-Image's Turbo LoRA)
+    bulk_fetch: bool = True
     # a file added after most users set the family up: its line in the one-time "new model files" popup (shown when
     # the family's DiT is set but this file is not; description.announce_intro opens it). "" = never announced
     announce: str = ""
@@ -167,6 +170,9 @@ class VideoWorkbench:
     refmod_lengths: tuple = ()        # (label, frames)
     refmod_size: tuple = (640, 768)
     sweep_frames: int = 22            # a RefMod sweep's clips: a still doesn't show what a RefMod does
+    # Studio's Speed Boost tick (on by default): the first half of a clip's steps at half size, then full size. The
+    # family's sampler honours speed_boost=True (H3: minimax/sampling.py with minimax/speed_boost.py)
+    speed_boost: bool = False
 
     def checkpoint(self, label, refmod=False) -> VideoCheckpoint:
         """The checkpoint a picker label names (the first when it names none)."""
@@ -215,6 +221,7 @@ class FamilyOption:
     setting: str = ""                 # the old settings key this option's value is read from on first use
     show_if_media: str = ""           # shown only when the dataset holds this media kind ("clip", "voice")
     mixed_only: bool = False          # shown only when the dataset mixes voice with photos or clips
+    isolation_off: bool = False       # a check that can't run with Fizgig LoRA Isolation: off and greyed while it's on
     requires: str = ""                # shown (and sent) only while this check is ticked ("KEY") or this choice is
     #                                   picked ("KEY=LABEL", matched as pick() matches)
     suggestions: tuple = ()           # entry: ready-made values offered in an editable dropdown ("6-49 · why")
@@ -311,11 +318,15 @@ class FamilyDescription:
 
     # what one training item may be: "photo", "clip" (frames + optional sound), "voice" (sound only)
     media: tuple = ("photo",)
-    # Multi Concept: extra subject folders, each its own dataset block (H3: reference distillation pairs each image
+    # Multi Concept: extra subject folders, each its own dataset block, on every family (Standard LoRA and fine-tune;
+    # an edit's or a pair slider's first folder has a partner folder). H3: reference distillation pairs each image
     # only with others of its own subject - the reference rotation runs per block). multi_concept_defaults: the family
     # options a click on the box sets ((option key, value) pairs, still editable after); multi_concept_hint: a line
     # added to the box's hint
-    multi_concept: bool = False
+    multi_concept: bool = True
+    # The Subjects card's "Your subject and other people" (DOP, and Fizgig LoRA Isolation on top of it): False hides
+    # both and the run trains as a normal LoRA (a music model has no people in a picture to keep apart)
+    subject_isolation: bool = True
     multi_concept_defaults: tuple = ()
     multi_concept_hint: str = ""
     clip_spec: Optional[ClipSpec] = None
@@ -438,6 +449,10 @@ class FamilyDescription:
     samples_turbo_pace: bool = False
     edit_training: bool = False       # Edit LoRA from before/after pairs (the driver's supports_references)
     edit_note: str = ""               # the Edit LoRA section's "What you need" line: pair count and photo size
+    # the most before-images an edited photo may have (photo.png, then photo_1.png, photo_2.png ... in the Originals
+    # folder): the first is the original at the same crop, the others are extra references at their own shape. 1 =
+    # one original only
+    edit_references: int = 1
     slider_training: bool = False     # Slider LoRAs (strength is a dial between two looks); the driver needs
     #                                   training_loss(diff_ref=, diff_weight=) and noise_latents / predict
     slider_guidance: float = 2.0      # a prompt slider's default push strength (the Training tab box when empty)
@@ -463,13 +478,13 @@ class FamilyDescription:
     # the Samples tab's default negative prompt for the family (each family keeps the user's own edit); None = its
     # previews take no negative, so the box greys out
     preview_negative: Optional[str] = None
-    # Repair Studio / Explorer / Royale renders take comfy-kitchen's INT8 attention (fizgig/modules/int8_attention.py:
+    # Repair Studio / Royale renders take comfy-kitchen's INT8 attention (fizgig/modules/int8_attention.py:
     # the family's attention calls attend() first). Inference only; the Profiler keeps exact attention
     int8_attention: bool = False
     # Repair Studio's Turbo Preview tick (families/act_cache.py): a slider change replays the unchanged blocks on
     # step 1 - the same picture as a full render
     activation_cache: bool = False
-    workbench_follows_samples: bool = False   # Repair Studio / Explorer / Royale previews take the Samples tab's steps,
+    workbench_follows_samples: bool = False   # Repair Studio / Royale previews take the Samples tab's steps,
     #                                   CFG, negative prompt and turbo strength (else the family's fixed preview recipe)
     preview_cfg: float = 1.0
     preview_width: int = 1024
@@ -489,7 +504,7 @@ class FamilyDescription:
     # downloader fetches them with the helper models so first use works offline
     helper_files: tuple = ()
 
-    # workbench tools that support this family ("repair", "explorer", "profiler", "extract", "royale", and "refmod":
+    # workbench tools that support this family ("repair", "profiler", "extract", "royale", and "refmod":
     # RefMod Toolkit, the engine's render_refmod / reference_items); the generic WorkbenchEngine drives them all
     workbench: tuple = ()
     # the workbench engine class ("module:Class") when the generic engines do not fit (a family with clips gets the

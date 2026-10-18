@@ -148,7 +148,7 @@ def _event(ev):
                           donor=ev.get("donor", ""), status="Loaded.", error="")
                 _S["profile"] = _profile(ev.get("hash", ""))
             else:
-                _S.update(donor=ev.get("donor", ""), status="Donor loaded. Enable it per block to mix it in."
+                _S.update(donor=ev.get("donor", ""), status="Donor loaded, fully on in its blocks: turn a block down or off to use less of it."
                           if ev.get("donor") else "Donor unloaded.")
         elif kind == "early" and _S.get("rendering"):     # H3's Show early: the tweaked pane's unfinished look
             _S.update(early=ev.get("png", ""), early_gen=ev.get("gen", 0),
@@ -709,7 +709,7 @@ CAT_SHORT = {"style_composition": "Style+Comp", "style_ident_overlap": "Style/ID
 KLEIN_PRESETS = {"✨Reset All": None, "✨Identity Only": ["identity", "style_ident_overlap", "ident_details_overlap"],
                  "✨Style+Composition Only": ["style_composition", "style_ident_overlap"],
                  "✨Details Only": ["details", "ident_details_overlap"]}
-STILLS_SIZES = ["256", "384", "512", "768", "1024"]
+STILLS_SIZES = ["256", "384", "512", "640", "768", "1024", "1280", "1536"]   # the Samples tab's + two quick ones
 
 
 def families():
@@ -774,7 +774,7 @@ def layout(desc, prefs, pref_path, samples=None):
                       "scales": [n for n, _ in vc.scales], "scale_of": dict(vc.scales),
                       "models": [c.label for c in vc.checkpoints],
                       "references": {c.label: c.references for c in vc.checkpoints},
-                      "bases": [n for n, _ in vc.bases],
+                      "bases": [n for n, _ in vc.bases], "speed_boost": bool(vc.speed_boost),
                       "sound": bool(audio_vae and os.path.exists(audio_vae))} if kind == "video" and vc else None,
             "song_lengths": SONG_LENGTHS if kind == "audio" else None,
             "prompt_blend": bool(getattr(desc.load_driver(), "supports_prompt_blend", False)),

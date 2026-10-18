@@ -1,7 +1,7 @@
 # Full fine-tuning — "How do I…?"
 
-The extended companion to the README's fine-tuning section, for **Krea 2**, **Qwen Image 2.1**
-and **MiniMax H3**. Everything here is measured or field-tested, not aspirational. If you're
+The extended companion to the README's fine-tuning section, for **Flux 3 Image Klein**, **Krea 2**,
+**Qwen Image 2.1** and **MiniMax H3**. Everything here is measured or field-tested, not aspirational. If you're
 new to fine-tuning and coming from LoRA training, read the first four answers in order —
 they're the ones that save you a wasted overnight run.
 
@@ -16,7 +16,7 @@ they're the ones that save you a wasted overnight run.
 
 ## How do I start a fine-tune?
 
-On Krea 2 or Qwen Image 2.1, pick **Fine-tune the whole model** under **Kind of training** on
+On Flux 3 Image Klein, Krea 2 or Qwen Image 2.1, pick **Fine-tune the whole model** under **Kind of training** on
 the Training tab; on MiniMax H3, tick **⚗ Fine-tune the BASE MODEL instead of training a
 LoRA**. Then press Start. That's genuinely it — the planner
 measures the memory actually free on your card at launch, picks the plan that fits, and
@@ -94,11 +94,11 @@ space — see the regularisation answer below.
 
 At the default training resolution:
 
-| Your card | Krea 2 — photos | H3 — photos | H3 — voice | H3 — video, confirmed | H3 — video on likeness blocks, expected |
-|---|---|---|---|---|---|
-| **16 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** | up to **3.8 s** |
-| **24 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** | up to **5.2 s** |
-| **32 GB** | ✅ | ✅ | ✅ | ✅ up to **3.8 s** | up to **5.2 s** |
+| Your card | Flux 3 Image Klein — photos | Krea 2 — photos | H3 — photos | H3 — voice | H3 — video, confirmed | H3 — video on likeness blocks, expected |
+|---|---|---|---|---|---|---|
+| **16 GB** | ✅ | ✅ | ✅ | ✅ | ✅ up to **2.3 s** | up to **3.8 s** |
+| **24 GB** | ✅ | ✅ | ✅ | ✅ | ✅ up to **2.3 s** | up to **5.2 s** |
+| **32 GB** | ✅ | ✅ | ✅ | ✅ | ✅ up to **3.8 s** | up to **5.2 s** |
 
 12 GB cards train **LoRAs**, not fine-tunes — 16 GB is the tested fine-tune floor. Every
 confirmed cell comes from a measured run; the expected column is conservative arithmetic
@@ -296,6 +296,8 @@ The same training bases you already have — nothing new to download:
 - **Krea 2** fine-tunes the **RAW bf16 model** (`krea2_raw_bf16.safetensors`, ~26 GB).
   The fp8 Turbo is the workbench preview model and can't be fine-tuned.
 - **Qwen Image 2.1** fine-tunes its **bf16 DiT** (`qwen_image_2.1_bf16.safetensors`).
+- **Flux 3 Image Klein** fine-tunes its **bf16 Base** (`flux3_image_klein_bf16.safetensors`), not the
+  distilled model.
 - **MiniMax H3** fine-tunes the **pruned int8 checkpoint**
   (`minimax_h3_fl2va_pruned_int8_convrot.safetensors`, ~21 GB) — the same file ComfyUI
   runs. The ~66 GB bf16 file works for LoRA training only; the trainer refuses it for

@@ -57,9 +57,22 @@ VAE = weight("krea2", "krea2_vae")
 TE = weight("krea2", "krea2_text_encoder")
 
 # --- the manifest itself -----------------------------------------------------------------
+# LoRA Isolation's strangers (fetch_models.Strangers) are the one deliberate exception: a pinned dataset downloaded
+# into user_data with no pref to write, shaped like a Weight only for the listing. Every other entry is a model file.
+def _models(fam):
+    return [w for w in fam if not isinstance(w, F.Strangers)]
+
+
 ck("every weight has a pref key, repo and path",
    all(w.pref_key and w.repo and w.path_in_repo
-       for fam in F.FAMILIES.values() for w in fam))
+       for fam in F.FAMILIES.values() for w in _models(fam)),
+   [(k, w.note) for k, fam in F.FAMILIES.items() for w in _models(fam)
+    if not (w.pref_key and w.repo and w.path_in_repo)])
+ck("  the only pref-less entry is the strangers set, and every family fetches it (a multi-person run never "
+   "downloads at its start)",
+   all(sum(isinstance(w, F.Strangers) for w in fam) == 1 for fam in F.FAMILIES.values())
+   and all(w.repo and w.filename for fam in F.FAMILIES.values() for w in fam if isinstance(w, F.Strangers)),
+   {k: sum(isinstance(w, F.Strangers) for w in fam) for k, fam in F.FAMILIES.items()})
 ck("pref keys match what the GUI reads",
    {w.pref_key for w in F.FAMILIES["klein"]} >= {"base_dit", "distilled_dit", "vae", "text_encoder"}
    and {w.pref_key for w in F.FAMILIES["krea2"]} >= {"krea2_raw_dit", "krea2_turbo_dit",
@@ -81,8 +94,8 @@ ck("every manifest family is a described family", all(_described.values()),
    sorted(k for k, d in _described.items() if d is None))
 _read = {mf.pref_key for d in _described.values() if d for mf in d.model_files}
 ck("no manifest key is unknown to the app",
-   {w.pref_key for fam in F.FAMILIES.values() for w in fam} <= _read,
-   sorted({w.pref_key for fam in F.FAMILIES.values() for w in fam} - _read))
+   {w.pref_key for fam in F.FAMILIES.values() for w in _models(fam)} <= _read,
+   sorted({w.pref_key for fam in F.FAMILIES.values() for w in _models(fam)} - _read))
 ck("Klein is flagged gated, Krea 2 is not",
    any(w.gated for w in F.FAMILIES["klein"]) and not any(w.gated for w in F.FAMILIES["krea2"]))
 # The rule here was "nothing in a family is optional": a download button that silently omits a model

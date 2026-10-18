@@ -51,7 +51,7 @@ KREA2 = FamilyDescription(
                   "8-step previews on the training model.", role="speed_lora", fetch_optional=False),
         ModelFile("krea2_turbo_dit", "Turbo DiT (fp8, workbench previews)", False, _COMFY,
                   "diffusion_models/krea2_turbo_fp8_scaled.safetensors", 13.1,
-                  "Optional: Repair Studio, LoRA the Explorer and LoRA Royale preview on it by default (8-step, "
+                  "Optional: Repair Studio and LoRA Royale preview on it by default (8-step, "
                   "CFG-free); without it they use the Turbo LoRA on the RAW model.", role="preview_dit"),
     ),
     prefs_note=("💡 Already have these files for ComfyUI? Filling the paths in by hand works perfectly — the download "
@@ -110,7 +110,7 @@ KREA2 = FamilyDescription(
     int8_attention=True,              # workbench renders: comfy-kitchen's INT8 attention
     activation_cache=True,            # Turbo Preview: step-1 replay, identical to a full render
     finetune=True,
-    workbench=("repair", "explorer", "profiler", "extract", "royale"),
+    workbench=("repair", "profiler", "extract", "royale"),
     # the text-fusion boosts (15 Sep 2026, #137): the four text-fusion blocks at x2 / x3, everything else untouched.
     # Measured across several LoRAs, x3 lifted the detail metric ~72 -> ~77 and likeness 2-7 points on every LoRA but
     # an overtrained one, composition unchanged

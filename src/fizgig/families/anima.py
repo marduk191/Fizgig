@@ -61,7 +61,7 @@ ANIMA = FamilyDescription(
     block_prefix="blocks",
     block_note="28 identical DiT blocks (self-attention, cross-attention to the text, MLP). The LLM adapter that "
                "turns the text into the DiT's context is never trained (the model card: it degrades easily).",
-    workbench=("repair", "explorer", "profiler", "extract", "royale"),
+    workbench=("repair", "profiler", "extract", "royale"),
 
     lora=LoRAFormat(
         key_template="lora_unet_blocks_{block}_{module}.{ab}.weight",

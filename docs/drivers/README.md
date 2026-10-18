@@ -1,6 +1,6 @@
 # Adding a model to Fizgig: the driver system
 
-Every model Fizgig trains — Klein 9B, MiniMax H3, Krea 2, Qwen Image 2.1, Z-Image Turbo, SDXL and Anima — runs through one shared layer in `src/fizgig/families/`. A model is added as a **family**, and a family is three pieces:
+Every model Fizgig trains — Klein 9B, Flux 3 Image Klein, MiniMax H3, Krea 2, Qwen Image 2.1, Z-Image Turbo, SDXL and Anima — runs through one shared layer in `src/fizgig/families/`. A model is added as a **family**, and a family is three pieces:
 
 | Piece | Where | What it holds |
 |---|---|---|
@@ -37,6 +37,7 @@ The existing families are the best reference. Read them side by side:
 |---|---|---|---|
 | Qwen Image 2.1 | `families/qwen_image.py` | `qwen_image21/driver.py` | The leanest complete stills driver: edit training, sliders, prompt travel, fine-tune |
 | Klein 9B | `families/klein.py` | `klein/driver.py` | A preview checkpoint (Distilled), fp8 files, Model Area presets, Repair Studio categories |
+| Flux 3 Image Klein | `families/flux3.py` | `flux3/driver.py` | A vendored reference model, references as latents (edit), a distilled preview model, prompts of varying length in prompt travel, an NF4 model that parks for previews on small cards |
 | Krea 2 | `families/krea2.py` | `krea2/driver.py` | Named block areas (text fusion, I/O), a vision path for reference pictures, compile |
 | MiniMax H3 | `families/minimax.py` | `minimax/driver.py` | Video and sound, family options, its own cache layout and workbench engine |
 | SDXL | `families/sdxl.py` | `sdxl/driver.py` | A UNet through diffusers, any single-file checkpoint, conv LoRAs, kohya LDM names (`alias_flat`), a default negative |
@@ -101,5 +102,23 @@ Every model brings quirks: reference images, frames, sound, an unusual mask or q
 - **One-off:** keep it inside your driver.
 
 Either way, no `if family == ...` in shared code. Every optional feature in [ABILITIES.md](ABILITIES.md) started this way.
+
+## What a driver doesn't bring
+
+A model pull request adds the model: its description, driver and model package. The layer change above is for something the model itself needs, such as reference images or sound. These belong in their own issue and pull request, not in a model's:
+
+- **Training features any model could use:**
+  - batch size
+  - caption dropout
+  - timestep pickers or loss weightings
+  - new optimizers or schedulers
+  - new kinds of LoRA
+
+  Even when they're off by default, they change shared code, the Training tab and the memory plans for every family. Open an issue so they can be designed once for all models. A family option (`FamilyOption`) is for something only that model has, like MiniMax H3's sound.
+- **Second environments, worker processes or dependency changes:** no side virtual environment, no subprocess running part of the model, and no change to Fizgig's pinned versions. Everything runs in the one install, so a model works offline, on pods and behind antivirus without anything new appearing on first use. If the reference needs a newer library than Fizgig pins, port the parts the model uses into its package, and check them against the library (MOSS-Image's Qwen3.5 text encoder is a text-only port, checked bit for bit against transformers 5.20).
+- **Changes to other families:** no new defaults, memory settings or presets for models other than yours.
+- **Tests:** `tests/` isn't tracked in the repo. Keep your checks locally, and describe what you measured in the pull request.
+
+Everything inside your own package is yours to shape: a loader for an unusual file, a memory-saving path for the text encoder, a preview checkpoint through the existing ability. If you're unsure which side something falls on, ask in the model's Discussion.
 
 Please open a discussion before starting a family, so two people don't build the same one.

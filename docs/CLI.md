@@ -32,9 +32,12 @@ Every script supports `--help` for the full argument list. This document covers 
 - [Dataset config (TOML)](#dataset-config-toml)
 - [Preparing images and captions](#preparing-images-and-captions)
 - [Klein 9B training](#klein-9b-training)
+- [Flux 3 Image Klein training](#flux-3-image-klein-training)
+- [MOSS-Image training](#moss-image-training)
 - [Krea 2 training](#krea-2-training)
 - [MiniMax H3 training](#minimax-h3-training)
 - [Qwen Image 2.1 training](#qwen-image-21-training)
+- [Keeping a subject to its trigger (DOP)](#keeping-a-subject-to-its-trigger-dop)
 - [Sample previews during training](#sample-previews-during-training)
 - [Pause and resume](#pause-and-resume)
 - [VRAM guidance (block swap)](#vram-guidance-block-swap)
@@ -59,6 +62,24 @@ Headless, there is no Preferences tab: **model locations are passed as flags on 
 | Text encoder `qwen_3_8b.safetensors` | [Comfy-Org Klein text encoder](https://huggingface.co/Comfy-Org/vae-text-encorder-for-flux-klein-9b/blob/main/split_files/text_encoders/qwen_3_8b.safetensors) | `--text_encoder` |
 
 > **VAE trap:** use `ae.safetensors` from the FLUX.2-dev repo **root** — not `vae/diffusion_pytorch_model.safetensors`, which is the Diffusers-format file and will not load.
+
+**Flux 3 Image Klein** (all in [flux-3-image-klein-comfy](https://huggingface.co/black-forest-labs/flux-3-image-klein-comfy/tree/main), gated):
+
+| File | Download | Used for |
+|---|---|---|
+| Base DiT `flux3_image_klein_bf16.safetensors` | diffusion_models/ | training (`--dit`); quantised to INT8 or NF4 at load when `--precision` asks |
+| Distilled DiT `flux3_image_klein_sd_bf16.safetensors` | diffusion_models/ | 16-step previews (`--preview_checkpoint`) and the workbench tabs |
+| Autoencoder `flux2-vae.safetensors` | vae/ | `--vae` (cache step: `--model`) |
+| Text encoder `qwen3vl_4b_bf16.safetensors` | text_encoders/ | `--text_encoder` (cache step: `--model`) |
+
+**MOSS-Image** (none gated):
+
+| File | Download | Used for |
+|---|---|---|
+| Base DiT `moss_image_base_bf16.safetensors` | [Comfy-Org/MOSS-Image → diffusion_models](https://huggingface.co/Comfy-Org/MOSS-Image/tree/main/diffusion_models) | training (`--dit`); quantised to INT8 or NF4 at load when `--precision` asks |
+| Autoencoder `flux2-vae_small.safetensors` | [Comfy-Org/MOSS-Image → vae](https://huggingface.co/Comfy-Org/MOSS-Image/tree/main/vae): FLUX.2's encoder with the small decoder MOSS-Image ships with (Flux 3's `flux2-vae.safetensors` works too) | `--vae` (cache step: `--model`) |
+| SFT DiT `moss_image_sft_int8_convrot.safetensors` (optional) | [Comfy-Org/MOSS-Image → diffusion_models](https://huggingface.co/Comfy-Org/MOSS-Image/tree/main/diffusion_models) | previews on the SFT model (`--preview_checkpoint`) |
+| Text encoder `qwen3.5_9b_bf16.safetensors` | [Comfy-Org/Qwen3.5 → text_encoders](https://huggingface.co/Comfy-Org/Qwen3.5/tree/main/text_encoders) | `--text_encoder` (cache step: `--model`) |
 
 **Krea 2:**
 
@@ -100,18 +121,18 @@ The quickest way to get every file is the fetcher the Preferences download butto
 
 ## What's family-specific at a glance
 
-Every family trains through the same two scripts — `src/fizgig/families/cache.py` and `src/fizgig/families/train.py`, selected with `--family` (`klein`, `minimax`, `krea2`, `qwen_image21`) — and shares the dataset format, pause/resume, Context LoRA, LoKR, sliders, fine-tuning and the memory planner. What differs:
+Every family trains through the same two scripts — `src/fizgig/families/cache.py` and `src/fizgig/families/train.py`, selected with `--family` (`klein`, `flux3`, `minimax`, `krea2`, `qwen_image21`, `moss_image`) — and shares the dataset format, pause/resume, Context LoRA, LoKR, sliders, fine-tuning and the memory planner. What differs:
 
-| Feature | Klein 9B | MiniMax H3 | Krea 2 | Qwen Image 2.1 |
-|---|---|---|---|---|
-| Base precision (`--precision`) | auto / bf16 / int8 / nf4 | auto / int8 / nf4 / hqq | auto / bf16 / int8 / nf4 | auto / bf16 / int8 / nf4 |
-| Adaptive LR (`--adaptive_lr`) | ✅ | ❌ | ✅ | ✅ |
-| Per-image loss watch, per-image LR, auto-recaption, look-outlier warm-up | ✅ | ❌ | ✅ | ✅ |
-| Model Area / block targeting (`--train_blocks`) | ✅ (identity, style, details areas) | ✅ (Blocks to Train, Training mode) | ❌ | ❌ |
-| Timestep range (`--min/max_timestep`, 0-1000) | ✅ | ❌ | ✅ | ✅ |
-| torch.compile (`--compile_blocks auto`) | ✅ | ❌ | ✅ | ✅ |
-| Edit LoRAs (original + edited pairs) | ✅ | ❌ | ❌ | ✅ |
-| Photos, video clips with sound, voice | photos | all three | photos | photos |
+| Feature | Klein 9B | Flux 3 Image Klein | MiniMax H3 | Krea 2 | Qwen Image 2.1 |
+|---|---|---|---|---|---|
+| Base precision (`--precision`) | auto / bf16 / int8 / nf4 | auto / bf16 / int8 / nf4 | auto / int8 / nf4 / hqq | auto / bf16 / int8 / nf4 | auto / bf16 / int8 / nf4 |
+| Adaptive LR (`--adaptive_lr`) | ✅ | ✅ | ❌ | ✅ | ✅ |
+| Per-image loss watch, per-image LR, auto-recaption, look-outlier warm-up | ✅ | ✅ | ❌ | ✅ | ✅ |
+| Model Area / block targeting (`--train_blocks`) | ✅ (identity, style, details areas) | ❌ | ✅ (Blocks to Train, Training mode) | ❌ | ❌ |
+| Timestep range (`--min/max_timestep`, 0-1000) | ✅ | ✅ | ❌ | ✅ | ✅ |
+| torch.compile (`--compile_blocks auto`) | ✅ | ✅ | ❌ | ✅ | ✅ |
+| Edit LoRAs (original + edited pairs) | ✅ | ✅ | ❌ | ❌ | ✅ |
+| Photos, video clips with sound, voice | photos | photos | all three | photos | photos |
 
 Auto-recaption captions with Krea 2's Qwen3-VL-4B, the same model the GUI's Captions tab uses, whichever model you're training (`--captioner`). MiniMax H3's own settings (training structure, Training mode, TREAD, clip stills, distillation, retirement of a finished category) reach the trainer as `--family_option name=value` pairs; see [MiniMax H3 training](#minimax-h3-training).
 
@@ -182,8 +203,11 @@ Field notes:
 - **`num_repeats`** — multiplies how often each image appears per epoch. Leave at 1 and train more epochs instead, unless you're balancing multiple `[[datasets]]` blocks against each other.
 - **`cache_directory`** — where latents and text embeddings are stored. **Give every dataset its own cache directory.** The training set is built from the cache, and a shared cache directory can mix a previous dataset's images into your run. (Fizgig cross-checks the cache against `image_directory` and skips orphans with a warning, but a dedicated directory per dataset is the clean way.)
 - **Multiple `[[datasets]]` blocks** are supported — each with its own `image_directory`, `cache_directory`, and optional per-dataset overrides of any `[general]` key (e.g. a different `num_repeats` to weight one folder more heavily).
+- **`caption_replace = [["zwxem, a woman", "zwxemwoman"]]`** — rewrites captions as they're read (whole words, any case, in order); your `.txt` files aren't changed. Fizgig LoRA Isolation uses it to join each trigger to its class.
+- **`photos_only = true`** — a family that trains clips or voice (MiniMax H3) reads only the pictures in this folder. Fizgig LoRA Isolation sets it on H3, which trains people from their photos.
+- **`is_reg = true`** — marks a fine-tune's regularisation set: those images train at `--reg_lr_multiplier` (default 0.2) times the learning rate, as a light anchor on the class. A LoRA run trains such a block as ordinary images and says so in the log.
 
-If you change captions, re-run the text cache step. If you add/remove/edit images, re-run both cache steps.
+If you change captions, re-run the text cache step. If you add/remove/edit images, re-run both cache steps (a picture edited after it was cached is encoded again even with `--skip_existing`).
 
 ---
 
@@ -276,6 +300,96 @@ Style genuinely lives at late timesteps (0-400) on Klein — the style blocks wi
 **Context LoRA** — `--context_lora_path FILE --context_lora_strength 1.0` trains on top of an existing LoRA, frozen and active; deploy the pair together at the same strength. Accepts kohya, PEFT/Diffusers, OneTrainer, LoKR and LoHa formats.
 
 **Checkpoints / state** — `--save_state` writes resumable state dirs (`<name>-NNNNNN-state/`, NNNNNN = epochs done); `--save_state_on_train_end` lets a finished run be trained further; `--keep_last_n_states N` keeps only the newest N; `--resume <state dir>` continues (see [Pause and resume](#pause-and-resume)).
+
+---
+
+## Flux 3 Image Klein training
+
+Flux 3 trains through the shared cache script and trainer with `--family flux3`. You need the four files from the [download table](#model-files-where-they-come-from-where-they-go); the distilled DiT is optional but is what makes previews quick. The dataset TOML is the same as the other families'. 8 GB is the smallest card.
+
+### Full example
+
+The GUI's **Ultra Fast** preset, as it builds it — rank 16, 0.25 MP (`resolution = [512, 512]` in the TOML), Adaptive LR 1e-4 to 2e-4, 30 epochs:
+
+```bash
+python src/fizgig/families/cache.py --family flux3 --stage latents --dataset_config my_dataset.toml --model /models/flux2-vae.safetensors
+python src/fizgig/families/cache.py --family flux3 --stage text    --dataset_config my_dataset.toml --model /models/qwen3vl_4b_bf16.safetensors
+
+python src/fizgig/families/train.py \
+  --family flux3 \
+  --dataset_config my_dataset.toml \
+  --dit /models/flux3_image_klein_bf16.safetensors \
+  --output_dir ./output_loras/my_subject \
+  --output_name my_subject \
+  --network_dim 16 --network_alpha 16 \
+  --learning_rate 1e-4 \
+  --adaptive_lr --adaptive_lr_min 1e-4 --adaptive_lr_max 2e-4 \
+  --max_train_epochs 30 \
+  --save_every_n_epochs 1 \
+  --seed 42 \
+  --optimizer_type adamw8bit \
+  --precision auto --blocks_to_swap -1 --compile_blocks auto \
+  --ema_decay 0.98 \
+  --log_per_image_loss --per_image_lr \
+  --save_state --save_state_on_train_end --keep_last_n_states 2 \
+  --vae /models/flux2-vae.safetensors \
+  --text_encoder /models/qwen3vl_4b_bf16.safetensors \
+  --preview_checkpoint /models/flux3_image_klein_sd_bf16.safetensors \
+  --sample_prompts sample_prompts.txt \
+  --sample_every_n_epochs 1 --sample_at_first \
+  --sample_width 1024 --sample_height 1024 --sample_seed 1234
+```
+
+**Standard** is `--network_dim 32 --network_alpha 32 --max_train_epochs 64` with no `--adaptive_lr` flags (a flat 1e-4). **Style** is `--network_dim 16 --network_alpha 16 --adaptive_lr_min 5e-5 --adaptive_lr_max 2e-4 --max_train_epochs 64`.
+
+### The flags that matter
+
+- `--precision auto|bf16|int8|nf4` and `--blocks_to_swap -1` — as for Qwen Image 2.1 below: the most precise base that fits your free VRAM, quantised before it swaps.
+- `--preview_checkpoint FILE` — previews on the distilled model (16 steps, no CFG). Without it they render on the Base at 50 steps with `--sample_cfg_scale 3.5` against an empty negative, as BFL's reference does.
+- **Edit LoRAs**, **slider LoRAs**, **fine-tuning**, `--context_lora_path` and the per-image loss watch work as for [Qwen Image 2.1](#qwen-image-21-training); fine-tuning starts at 5e-5 in the GUI. `--sample_reference FILE` makes every preview an edit of that photo.
+- `--train_blocks` and Model Area presets aren't offered yet: Flux 3's block map isn't charted.
+
+The saved LoRA loads in ComfyUI's standard LoRA loader.
+
+---
+
+## MOSS-Image training
+
+MOSS-Image trains through the shared cache script and trainer with `--family moss_image`. You need the three files from the [download table](#model-files-where-they-come-from-where-they-go); the dataset TOML is the same as the other families'. Previews run res_multistep for 30 steps with CFG 4.
+
+### Full example
+
+The **Fast** preset, as the GUI's planner builds it: rank 16, 0.5 MP (`resolution = [704, 704]` in the TOML), Adaptive LR 1e-4 to 2e-4, 30 epochs:
+
+```bash
+python src/fizgig/families/cache.py --family moss_image --stage latents --dataset_config my_dataset.toml --model /models/flux2-vae_small.safetensors
+python src/fizgig/families/cache.py --family moss_image --stage text    --dataset_config my_dataset.toml --model /models/qwen3.5_9b_bf16.safetensors
+
+python src/fizgig/families/train.py \
+  --family moss_image \
+  --dataset_config my_dataset.toml \
+  --dit /models/moss_image_base_bf16.safetensors \
+  --output_dir ./output_loras/my_subject \
+  --output_name my_subject \
+  --network_dim 16 --network_alpha 16 \
+  --learning_rate 1e-4 \
+  --adaptive_lr --adaptive_lr_min 1e-4 --adaptive_lr_max 2e-4 \
+  --max_train_epochs 30 \
+  --save_every_n_epochs 1 \
+  --seed 42 \
+  --optimizer_type adamw \
+  --precision auto --compile_blocks auto \
+  --ema_decay 0.98 \
+  --save_state --save_state_on_train_end --keep_last_n_states 2 \
+  --vae /models/flux2-vae_small.safetensors \
+  --text_encoder /models/qwen3.5_9b_bf16.safetensors \
+  --sample_prompts sample_prompts.txt \
+  --sample_every_n_epochs 1 \
+  --sample_width 1024 --sample_height 1024 --sample_steps 30 --sample_cfg_scale 4.0 \
+  --sample_negative "worst quality, bad anatomy, watermark, jpeg artifact"
+```
+
+See [MOSS-Image](MOSS_IMAGE.md) for the presets and preview settings.
 
 ---
 
@@ -474,7 +588,7 @@ The other two presets change only a few flags. **Standard** is `--network_dim 16
 
 **Per-image loss watch** — `--log_per_image_loss`, `--per_image_lr`, `--auto_recaption` and `--warmup_look_outliers` work as they do on [Krea 2](#krea-2-training). Auto-recaption captions with Krea 2's Qwen3-VL-4B, as the Captions tab does. Pass it as `--captioner` (the `qwen3vl_4b_fp8_scaled.safetensors` file the Qwen download fetches), plus `--text_encoder` to re-encode the new caption. `--trigger_word` and `--trigger_position start|end` control where the trigger goes in rewritten captions.
 
-**Edit LoRAs** — add `control_directory = "/data/before"` under `[[datasets]]` in the TOML, beside `image_directory` (the after-images). Before-images match after-images by file name, one each (`photo.png` pairs with `photo.png`). The cache script then stores each before-image's latent and encodes the caption with the before-images, so run both cache stages again after changing the pairs or the resolution. `--sample_reference FILE` makes the previews edits of that photo. Everything else is as above.
+**Edit LoRAs** — add `control_directory = "/data/before"` under `[[datasets]]` in the TOML, beside `image_directory` (the after-images). Before-images match after-images by file name (`photo.png` pairs with `photo.png`). Extra pictures for an edit (Flux 3 Image Klein and Qwen Image 2.1 up to 9 per photo, Klein 9B up to 3) go in their own folder, `extra_reference_directory = "/data/extras"` beside `control_directory`, named `photo_1.png`, `photo_2.png` … for `photo.png`, at any shape. The cache script then stores each before-image's latent and encodes the caption with the before-images, so run both cache stages again after changing the pairs or the resolution. `--sample_reference FILE` makes the previews edits of that photo. Everything else is as above.
 
 **Slider LoRAs** — from photo pairs: put the -1 photos in `control_directory` (same file names as the +1 photos in `image_directory`), run both cache stages with `--slider` (it caches the -1 latents and encodes the captions as plain text), then train with `--slider_pairs`. `--slider_diff_weight` (default 1) concentrates the loss where the two photos of a pair differ; 0 is the plain loss. From prompts: no dataset and no caching, just `--slider_prompts "BASE" "BASE +1 WORDS" "BASE -1 WORDS"` with `--text_encoder` and `--vae`; `--slider_guidance` (default 3; the GUI starts at 3 on Krea 2 and 2 on Qwen Image 2.1, values 2 to 9 tested on both) is the push strength, `--slider_bank` (16) and `--slider_bank_res` (768) set the practice pictures. Sliders train a plain LoRA with Adaptive LR, EMA and the per-image watch off; previews render at -1 / 0 / +1. `--train_blocks` (comma-separated block ids, e.g. `block_0,block_1,txt_lw_0`) limits the LoRA to those blocks; the GUI's Krea 2 **Ultra mode** sends blocks 0-7 and the four text-fusion blocks, so the slider holds up at much higher strengths. It works best for prompt sliders, and for photo pairs whose change is compositional (pose, framing, layout).
 
@@ -483,6 +597,28 @@ The other two presets change only a few flags. **Standard** is `--network_dim 16
 **Other** — `--context_lora_path FILE --context_lora_strength S` trains on top of an existing Qwen LoRA, frozen and active in training and previews (not with `--finetune`). `--metadata_title/author/description/license/tags/trigger_phrase` are recorded in the saved LoRA. The saved file loads in ComfyUI's standard LoRA loader.
 
 ---
+
+## Keeping a subject to its trigger (DOP)
+
+Every family, Standard LoRA and fine-tune runs. `--dop` adds a second pass to each step: the same picture, with the caption's trigger swapped for `--dop_class` (or dropped when that is empty), trained to match what the base model itself predicts there. Without the trigger the LoRA learns to change nothing, so the subject stops leaking into plain prompts ("a woman ..."). It costs about 1.5-2x the time per step. Differential Output Preservation comes from Ostris's AI-Toolkit.
+
+| Flag | Meaning |
+|---|---|
+| `--dop` | turn it on (needs `--text_encoder`: the swapped captions are encoded once at the start) |
+| `--dop_trigger zwxem` | the word in the captions that means the subject; several subjects comma-separated (`zwxem, qrtpl`). Default `--trigger_word` |
+| `--dop_class woman` | what replaces each trigger: one per trigger in order (`woman, man`) or one for all; empty = the triggers are just left out |
+| `--dop_weight 1.0` | the preservation loss's weight |
+| `--dop_every 1` | a preservation pass every N steps; raise `--dop_weight` by the same factor to keep the same preservation on average (the web UI's "Every second step" sends `--dop_every 2` with the weight doubled) |
+| `--dop_ft_samples 8` | fine-tunes only: how many of the original model's predictions are made per image before the first step (a fine-tune has no adapter to switch off, so these stand in for the base model; saved beside the run so a continued fine-tune reuses them) |
+
+A caption with several triggers (a photo of both people) has each one swapped. Images whose caption has no trigger train as usual. Each epoch logs the preservation loss: how far the LoRA moves the trigger-free prompt from the base model.
+
+The web app's **Subjects** card always uses the tested recipe, `--dop --dop_every 2 --dop_weight 2`. **Fizgig LoRA Isolation** adds three things, which the launch builds for you:
+- each subject's 16 side-by-side pictures, built first by `src/fizgig/scripts/multi_person.py --subject FOLDER FUSED_WORD OUT_DIR` (one `--subject` per person) and trained as one more dataset block per subject;
+- `--lr_boost fizgig_mp_=2`, so those pictures train at 2x the learning rate;
+- a `caption_replace` list in each subject's dataset block, which reads `zwxem, a woman` as `zwxemwoman`, with `--dop_trigger zwxemwoman --dop_class "a woman"`.
+
+How to caption for it: [People in group pictures](MULTI_PERSON.md).
 
 ## Sample previews during training
 
@@ -535,6 +671,7 @@ python src/fizgig/families/train.py --family krea2 ... --max_train_epochs 45 \
 `--blocks_to_swap` parks transformer blocks in CPU RAM and streams them over PCIe — slower per step, but fits big models on small cards. Every family plans for itself: `--precision auto --blocks_to_swap -1` reads the free VRAM at launch and your training resolution, quantises before it swaps (INT8, then NF4), and logs the plan as an `Auto plan` line. Set either by hand to override.
 
 - **Klein 9B**: INT8 when it compiles, else the Base file as it is (BFL's fp8 file stays fp8, ~9.6 GB resident, so 16 GB+ cards skip swap), NF4 on small cards.
+- **Flux 3 Image Klein**: bf16, INT8 or NF4 by free VRAM (a rank-16 LoRA at 1 MP peaked at 12.7 / 9.1 / 6.2 GB); on small cards the NF4 model steps off the GPU for previews, so 8 GB cards train and preview.
 - **MiniMax H3**: int8 at ~21 GB resident on 32 GB cards, 4-bit at ~11 GB below that, the swap planned with it.
 - **Qwen Image 2.1**: bf16 on 24 GB+ cards, INT8 with no swap on 12 and 16 GB cards and NF4 on 10 GB cards, at the presets' 0.5 MP. The text encoder only encodes and loads 8-bit below about 20 GB free, which sets the 10 GB floor.
 

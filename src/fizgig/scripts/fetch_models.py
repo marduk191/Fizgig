@@ -62,6 +62,27 @@ _CAPTION_TE = Weight("krea2_text_encoder", "Comfy-Org/Krea-2",
                      "text_encoders/qwen3vl_4b_fp8_scaled.safetensors", 5.2,
                      "Qwen3-VL text encoder — powers the Captions tab (shared with Krea 2)")
 
+class Strangers:
+    """The Subjects card's 32 base-model strangers (families/multi_person.py: a pinned Hugging Face dataset, into
+    user_data, no pref). Fetched with every family's files, as the captioner is, so a multi-person run never has to
+    download them at its start (a pod hit Hugging Face's rate limit there). Shaped like a Weight for the listing."""
+    pref_key, repo, path_in_repo = "", "ShootTheSound/fizgig-multi-person-strangers", ""
+    filename, gb, optional, gated, replaces = "multi_person_strangers/", 0.02, False, False, ()
+    note = "Multi-person strangers - the Subjects card's side-by-side pictures (21 MB)"
+
+
+_STRANGERS = Strangers()
+
+
+def fetch_strangers(log=print, dry_run=False):
+    if dry_run:
+        log(f"  [plan] {_STRANGERS.filename} (~0.02 GB) — {_STRANGERS.note}")
+        return True
+    sys.path.insert(0, os.path.join(REPO_DIR, "src"))
+    from fizgig.families import multi_person
+    return multi_person.download_strangers(log=log)
+
+
 # Paths verified against the HuggingFace API, not the README — the two can drift.
 FAMILIES = {
     "minimax": [
@@ -102,6 +123,7 @@ FAMILIES = {
                "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors", 21.0,
                "Reference DiT (ref2va) — reference distillation only", optional=True),
         _CAPTION_TE,
+        _STRANGERS,
     ],
     "klein": [
         Weight("base_dit", "black-forest-labs/FLUX.2-klein-base-9b-fp8",
@@ -117,6 +139,7 @@ FAMILIES = {
                "flux-2-klein-9b-fp8.safetensors", 9.0,
                "Distilled DiT — 4-step previews and the workbench", gated=True),
         _CAPTION_TE,
+        _STRANGERS,
     ],
 }
 
@@ -139,8 +162,8 @@ def _described_families():
         ws = [Weight(f.pref_key, f.repo, f.path, f.size_gb, f.label + (" — " + f.note if f.note else ""),
                      optional=f.fetch_is_optional, gated=f.gated, local_name=f.local_name or None,
                      replaces=f.replaces)
-              for f in d.model_files if f.repo and f.path]
-        out[d.key] = ws + ([] if any(w.pref_key == _CAPTION_TE.pref_key for w in ws) else [_CAPTION_TE])
+              for f in d.model_files if f.repo and f.path and f.bulk_fetch]
+        out[d.key] = ws + ([] if any(w.pref_key == _CAPTION_TE.pref_key for w in ws) else [_CAPTION_TE]) + [_STRANGERS]
     return out
 
 
@@ -450,6 +473,10 @@ def fetch(families, models_dir=None, repo_dir=REPO_DIR, token=None, include_opti
         for w in FAMILIES[fam]:
             if w.optional and not include_optional:
                 log(f"  [skip] {w.filename} (~{w.gb:g} GB) — optional: {w.note}")
+                continue
+            if isinstance(w, Strangers):
+                if not fetch_strangers(log=log, dry_run=dry_run):
+                    ok = False
                 continue
             if not fetch_weight(w, models_dir, prefs, token=token, log=log, dry_run=dry_run):
                 ok = False

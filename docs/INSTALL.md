@@ -10,19 +10,20 @@ Fizgig ships as a ready-made cloud image: the whole app in a browser tab, not a 
 
 ## Requirements
 
-- **GPU** — NVIDIA RTX 30 / 40 / 50-series, or **AMD Radeon** with ROCm (RDNA1 through RDNA4, Strix Point / Halo, Instinct MI300+). **Klein 9B** trains on 10 GB (the 4-bit base below 16 GB), **Krea 2** trains on 8 GB, **MiniMax H3** on 16 GB, **Qwen Image 2.1** on 10 GB — see [VRAM guidance](#vram-guidance). The fp8 Base's VRAM savings apply on NVIDIA Ada+; on AMD, NF4 and INT8 are the primary quant paths.
+- **GPU** — NVIDIA RTX 30 / 40 / 50-series, or **AMD Radeon** with ROCm (RDNA1 through RDNA4, Strix Point / Halo, Instinct MI300+). **Klein 9B** trains on 10 GB (the 4-bit base below 16 GB), **Flux 3 Image Klein** and **Krea 2** train on 8 GB, **MiniMax H3** on 16 GB, **Qwen Image 2.1** on 10 GB — see [VRAM guidance](#vram-guidance). The fp8 Base's VRAM savings apply on NVIDIA Ada+; on AMD, NF4 and INT8 are the primary quant paths.
 - **NVIDIA driver** — 555+ on Windows, 550+ on Linux (CUDA 12.8 wheels).
 - **AMD ROCm** — **Windows:** `install_fizgig_rocm.bat` (supported path; launcher and installer improvements by [@scryptio](https://github.com/scryptio)). **Linux:** `./install_fizgig_rocm.sh`, **highly experimental**: newer gfx such as RDNA4, a desktop compositor sharing the training GPU, and driver resets are common. Use Windows ROCm or NVIDIA Linux for production training. Optional system `amdrocm-amdsmi` gives accurate status-bar VRAM via `amd-smi`.
 - **OS** — Windows 10 / 11 or Linux. macOS handles captioning and image prep; training needs CUDA or ROCm.
 - **Python** — 3.10 – 3.13.
 - **System RAM** — 32 GB recommended; see [System RAM](#system-ram).
 - **Disk** — ~10 GB for the venv, plus ~40 GB for model files.
-- **Full fine-tuning** (experimental, Krea 2 & MiniMax H3) — see [Full fine-tuning](#full-fine-tuning).
+- **Full fine-tuning** (experimental, every model; Flux 3 Image Klein, Krea 2 and MiniMax H3 in the guides) — see [Full fine-tuning](#full-fine-tuning).
 - **Visual Studio Build Tools** (Windows only) — for InsightFace and the torch.compile speedup: **[aka.ms/vs/17/release/vs_BuildTools.exe](https://aka.ms/vs/17/release/vs_BuildTools.exe)**, tick **"Desktop development with C++"**. Without it everything works except the compile speedup.
+- **Microsoft Edge WebView2 Runtime** (Windows 10) — Fizgig's app window runs on it. Windows 11 has it built in, but it isn't always installed on Windows 10. If the window opens white, install it from **[developer.microsoft.com/microsoft-edge/webview2](https://developer.microsoft.com/microsoft-edge/webview2/)** (the **Evergreen Bootstrapper**). Without it, Fizgig opens in your browser instead.
 
 ### System RAM
 
-32 GB is recommended; 16 GB is workable for **Klein 9B** and **Krea 2**.
+32 GB is recommended; 16 GB is workable for **Klein 9B**, **Flux 3 Image Klein** and **Krea 2**.
 
 **MiniMax H3 needs more.** Its text encoder is a 15.7 GB file that streams from system RAM while captions are cached, and INT8 block streaming stages a similar amount again during training. 32 GB is comfortable for caching and training; 24 GB works only with other apps closed.
 
@@ -138,11 +139,12 @@ Three small models download on first use: InsightFace `buffalo_l` (~300 MB, duri
 
 ## Model downloads
 
-Fizgig doesn't bundle weights; download only the family you use. **Preferences has a ⬇ Download models for me button** under each model card that downloads, verifies, and fills in the paths. Klein needs a free HuggingFace token for BFL's licence; Krea 2 needs no account. Every row also has a manual **Download** link. From the command line:
+Fizgig doesn't bundle weights; download only the family you use. **Preferences has a ⬇ Download models for me button** under each model card that downloads, verifies, and fills in the paths. Klein and Flux 3 Image Klein need a free HuggingFace token for BFL's licence; Krea 2 needs no account. Every row also has a manual **Download** link. From the command line:
 
 ```bash
 python -m fizgig.scripts.fetch_models --family krea2   # ~32 GB, no account needed
 python -m fizgig.scripts.fetch_models --family klein   # ~34 GB, needs a token
+python -m fizgig.scripts.fetch_models --family flux3 --include-optional   # ~31 GB, needs a token
 python -m fizgig.scripts.fetch_models --family minimax # ~47 GB, no account needed
 python -m fizgig.scripts.fetch_models --family qwen_image21 --include-optional   # ~38 GB, no account needed
 python -m fizgig.scripts.fetch_models --family tools   # Florence-2, face model, translator
@@ -159,6 +161,19 @@ python -m fizgig.scripts.fetch_models --family tools   # Florence-2, face model,
 | Text Encoder | `qwen_3_8b.safetensors` | ~15 GB | [Comfy-Org/vae-text-encorder-for-flux-klein-9b](https://huggingface.co/Comfy-Org/vae-text-encorder-for-flux-klein-9b/blob/main/split_files/text_encoders/qwen_3_8b.safetensors) |
 
 Training runs on the **Base DiT**; the fp8 version is recommended on every GPU (same quality, half the VRAM). The **Distilled DiT** powers the 4-step previews and the workbench. More in [KLEIN.md](KLEIN.md).
+
+### Flux 3 Image Klein
+
+All files live in [black-forest-labs/flux-3-image-klein-comfy](https://huggingface.co/black-forest-labs/flux-3-image-klein-comfy) (gated: accept the licence on the model page first).
+
+| Model | File | Size |
+|---|---|---|
+| **Base DiT (bf16) — training** | `flux3_image_klein_bf16.safetensors` | ~11.1 GB |
+| **Distilled DiT (bf16) — previews and workbench** | `flux3_image_klein_sd_bf16.safetensors` | ~11.1 GB |
+| Autoencoder | `flux2-vae.safetensors` | ~340 MB |
+| Text Encoder | `qwen3vl_4b_bf16.safetensors` | ~8.9 GB |
+
+Files with `_sd_` in the name are the distilled model; train on the one without. More in [FLUX3.md](FLUX3.md).
 
 ### Krea 2
 
@@ -199,6 +214,10 @@ Use the **Download models for me** button in the Qwen Image 2.1 section of the P
 | 16 | 12 GB |
 
 On first launch Fizgig detects your VRAM and picks the default (0 on 16 GB cards and up); your own choice sticks.
+
+### Flux 3 Image Klein
+
+Trains on cards down to **8 GB**. Auto picks bf16, INT8 or 4-bit NF4 from your free VRAM; a rank-16 LoRA at 1 MP peaked at 12.7 GB on bf16, 9.1 GB on INT8 and 6.2 GB on NF4. On small cards the training model steps off the GPU while previews render. See [FLUX3.md](FLUX3.md#memory-8-gb-and-up).
 
 ### Krea 2
 

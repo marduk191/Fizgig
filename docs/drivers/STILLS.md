@@ -196,6 +196,25 @@ train_memory={
 
 Measure them with short training runs at two resolutions. The trainer logs the peak each epoch. With `train_memory` empty, Auto takes the first precision and doesn't swap.
 
+### Work it out first, then measure only what you can't predict
+
+Most of `train_memory` follows from the model file, so you need very few runs.
+
+- **GB per swapped block = one block's weights at that precision.** Sum the block's tensor sizes from the safetensors header (no model load needed): bf16 is 2 bytes per parameter, INT8 about half that. Checked against two measured families: Qwen 2.1's 0.44 GB per block against 14.23 GB / 32 blocks = 0.445, and Z-Image's 0.36 against 12.31 / 30 = 0.41.
+- **The training peak ≈ the DiT's weights at that precision + a small overhead + activations.** One short run gives the overhead. For example, a run with some blocks swapped is an exact check: peak = weights − blocks swapped × GB per block + overhead.
+- **Measure what the file can't tell you:** how much activations grow with resolution (one run at 1.0 MP per precision), and whether something other than training sets the peak. Z-Image's figures are flat across resolutions because its preview step sets them.
+- **Never borrow another family's activation growth.** It depends on the model's block count, width and token count, not on the file size. MOSS-Image's first estimate borrowed Flux 3's +0.4 GB from 0.25 to 1 MP; the measured growth was 2.1 GB.
+- **Put the preview's peak in `train_memory` when it's higher than training's.** Take it from a preview after at least one epoch, when the optimizer state is resident. On MOSS-Image (1024², 50 steps, CFG 3) the preview round peaks 1.7 GB above training in bf16 and further above in INT8 and NF4, so figures from training alone would let Auto plan a card that runs out of memory at the first preview.
+
+Flux 3 as a worked example:
+1. **From the file:** an 11.08 GB DiT; a single block is 0.245 GB in bf16.
+2. **One run at 0.25 MP with 10 blocks swapped:** 11.08 − 10 × 0.245 = 8.63 GB resident, and the 9.7 GB measured peak gives a 1.07 GB overhead. So bf16 at 0.25 MP with no swap ≈ 12.3 GB.
+3. **One run at 1.0 MP per precision:** 12.7 GB (bf16), 9.1 GB (INT8), 6.2 GB (NF4). Activations grew only 0.4 GB from 0.25 MP, which gives the other 0.25 MP points.
+
+That's four short runs (1 epoch, 4 images, 2 previews) in place of a full sweep.
+
+A preview round on a separate checkpoint (`train_preview_checkpoint`) sizes itself to the VRAM left over: it uses bf16, INT8 or streamed blocks as room allows. So its peak fills a large card and isn't the planning figure. Check it fits on a small card (below) rather than putting it in `train_memory`.
+
 Then run the plans on small cards: `FIZGIG_SIM_VRAM_GB=12` (or 16, 24) makes the planner and the allocator behave as that card. The [checklist](CHECKLIST.md#small-cards) lists the runs every family needs: Auto LoRA plans at 12 and 16 GB, block swap forced on, fine-tune plans at 16 and 24 GB, and a workbench render at 12 GB.
 
 ## 5. Presets and samples

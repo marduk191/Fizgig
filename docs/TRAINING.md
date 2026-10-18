@@ -2,7 +2,7 @@
 
 [← Back to the README](../README.md)
 
-Everything on this page works on every model unless it says otherwise: [Klein 9B](KLEIN.md), [Krea 2](KREA2.md), [MiniMax H3](MINIMAX_H3.md) and [Qwen Image 2.1](QWEN_IMAGE.md).
+Everything on this page works on every model unless it says otherwise: [Klein 9B](KLEIN.md), [Flux 3 Image Klein](FLUX3.md), [Krea 2](KREA2.md), [MiniMax H3](MINIMAX_H3.md) and [Qwen Image 2.1](QWEN_IMAGE.md).
 
 ## The sample gallery is an instrument
 
@@ -16,6 +16,21 @@ Everything on this page works on every model unless it says otherwise: [Klein 9B
 - **AI captioning with Krea 2's Qwen3-VL-4B** — every model's captions, on the Captions tab and in auto-recaption, come from it. It writes viewpoint-aware training captions in five editable preset styles (including **Style**, which describes everything *except* the look so your trigger word binds to it). Every preset's instruction is editable in plain English and persists. Florence-2 is the zero-setup option. **Bilingual captions** (English + Chinese via Helsinki-NLP) act as text-level augmentation — measurably better skin detail on Klein at identical loss.
 - **Image Prep** — batch resize, PNG conversion, InsightFace face-crops with gender targeting. Pairing a tight crop with a full shot adds a lot to a character dataset.
 - **Look Consistency Filter** — pick the 3 images that best nail the look and every image is scored against them (ArcFace). Worst matches surface first; mark drifters or let Auto-Suggest flag the outliers, then move them out in one click — nothing is deleted, and the scores feed the trainer's [look-outlier warm-up](KREA2.md#the-trainer-curates-your-dataset-while-it-trains-experimental).
+
+## Subjects: more than one person, and keeping them to their trigger
+
+The Training tab's **Subjects** card says who the LoRA is of and how it behaves with other people. 1 subject with Off is ordinary LoRA training. Every other setting is Fizgig's own techniques combined with DOP (Differential Output Preservation, from @ostris's AI-Toolkit).
+
+- **Who is this LoRA of?** 1 to 4 subjects, each a folder of their photos with their own trigger word in every caption. Subject 1 is the Start tab's folder.
+- **Your subject and other people:**
+  - **Off - a normal LoRA:** your subject's face can leak onto other people, even in prompts that don't use its trigger word.
+  - **Leave the rest of the model alone:** ask for "a man at a party" without the trigger word and you get a stranger, just as the model made before you trained.
+  - **Fizgig LoRA Isolation:** your subjects can stand together in one picture, or next to someone the model already knows, and every face stays right. Best for people; about 1.5x the training time; its 21 MB of strangers come with any model's download in Preferences. It joins each trigger to what the subject is (`zwxem, a woman` trains as `zwxemwoman`, your caption files untouched) and adds 16 side-by-side pictures per subject next to fixed strangers. **Use my captions exactly as written** turns the joining off for anyone who writes the joined word themselves.
+- At the bottom of the card, each subject shows one of its own captions and exactly what training makes of it, and it updates as you change the settings above.
+- Two subjects of the same kind (two women) need about 1.6x the epochs; the Training tab says so.
+- Up to 4 people work well, 2 or 3 of them in one picture. With a person the model already knows well in the picture too, 2 subjects is reliable and 3 is hit and miss: see [How many subjects](MULTI_PERSON.md#how-many-subjects).
+
+How to caption for it, choose trigger words and prompt the finished LoRA: [People in group pictures](MULTI_PERSON.md).
 
 ## Output folders
 
@@ -47,4 +62,4 @@ How much rank a LoRA really uses and where its weights are, then renders with ea
 
 ### Extract
 
-Distil any Klein, Krea 2, MiniMax H3 or Qwen Image 2.1 LoRA to a lower rank — it runs weight-only SVD with no models loaded, and Klein's presets keep just the Identity, Style+Composition or Details blocks (or any blocks you pick). PEFT and LyCORIS sources supported.
+Distil any Klein, Flux 3 Image Klein, Krea 2, MiniMax H3 or Qwen Image 2.1 LoRA to a lower rank — it runs weight-only SVD with no models loaded, and Klein's presets keep just the Identity, Style+Composition or Details blocks (or any blocks you pick). PEFT and LyCORIS sources supported.

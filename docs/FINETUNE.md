@@ -2,7 +2,7 @@
 
 [← Back to the README](../README.md)
 
-Fine-tuning trains the **base model itself** — no adapter, no rank bottleneck — on a single consumer GPU, for **Krea 2**, **Qwen Image 2.1** and **MiniMax H3**. On Krea 2 and Qwen, pick **Fine-tune the whole model** under **Kind of training** on the Training tab; on MiniMax H3, tick **⚗ Fine-tune the BASE MODEL instead of training a LoRA**. The window plan sizes itself to your card either way.
+Fine-tuning trains the **base model itself** — no adapter, no rank bottleneck — on a single consumer GPU, for **Flux 3 Image Klein**, **Krea 2**, **Qwen Image 2.1** and **MiniMax H3**. On Flux 3, Krea 2 and Qwen, pick **Fine-tune the whole model** under **Kind of training** on the Training tab; on MiniMax H3, tick **⚗ Fine-tune the BASE MODEL instead of training a LoRA**. The window plan sizes itself to your card either way.
 
 For step-by-step answers, including five-minute recipes for both families, see **["How do I…?"](FINETUNE_HOWDOI.md)**.
 
@@ -18,18 +18,18 @@ On Krea 2 and Qwen the fine-tune card counts in rotations: **Train for N rotatio
 
 The "trains on 8 GB" figures elsewhere apply to **LoRA** training. Fine-tuning tiers itself to your card: the planner measures free VRAM at launch, picks the largest plan that fits, and prints what it chose and why. At the default training resolution:
 
-| Your card | Krea 2 — photos | MiniMax H3 — photos | H3 — voice | H3 — video, confirmed | H3 — video on likeness blocks, expected |
-|---|---|---|---|---|---|
-| **16 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** | up to **3.8 s** |
-| **24 GB** | ✅ | ✅ | ✅ | ✅ up to **2.3 s** | up to **5.2 s** |
-| **32 GB** | ✅ | ✅ | ✅ | ✅ up to **3.8 s** | up to **5.2 s** |
+| Your card | Flux 3 Image Klein — photos | Krea 2 — photos | MiniMax H3 — photos | H3 — voice | H3 — video, confirmed | H3 — video on likeness blocks, expected |
+|---|---|---|---|---|---|---|
+| **16 GB** | ✅ | ✅ | ✅ | ✅ | ✅ up to **2.3 s** | up to **3.8 s** |
+| **24 GB** | ✅ | ✅ | ✅ | ✅ | ✅ up to **2.3 s** | up to **5.2 s** |
+| **32 GB** | ✅ | ✅ | ✅ | ✅ | ✅ up to **3.8 s** | up to **5.2 s** |
 
 - Clip lengths follow Gizmo's grid: **2.3 s is the 56-frame slot**, confirmed by measured runs on every tier. **3.8 s is confirmed on 32 GB**, even with video training the whole model.
 - The expected column assumes **Training mode: Default** (the default), which confines clips to the likeness blocks; in our tests that trains video as well as the whole model and makes clips far lighter. Those figures are conservative arithmetic from measured constants, not individually measured.
 - Whole-model 5.2 s clips need more than 32 GB (measured).
 - With Training mode set to Off, one clip anywhere in the folder trains the **whole** model, so a mixed photos + clips dataset uses the clip column.
 - **16 GB is the fine-tune floor.** 12 GB cards train LoRAs only.
-- Measured 16 GB peaks: **8.8–12.3 GB for H3**, **up to 11.4 GB for Krea 2** (at 1 MP). The console prints your run's peak every epoch.
+- Measured 16 GB peaks: **8.8–12.3 GB for H3**, **up to 11.4 GB for Krea 2** (at 1 MP). Flux 3 Image Klein trains the whole model at once with a **14.0 GB** peak at 1 MP (12.6 GB at 0.25 MP), measured on a 32 GB card, so it fits 16 GB without splitting. The console prints your run's peak every epoch.
 - Too little VRAM refuses cleanly at launch instead of running out of memory mid-run.
 
 ## How it fits
@@ -48,6 +48,7 @@ Fine-tuning uses the same training bases as LoRA training; nothing new to downlo
 
 - **Krea 2** fine-tunes the **RAW bf16 model** (`krea2_raw_bf16.safetensors`, ~26 GB). The fp8 Turbo is the workbench preview model and can't be fine-tuned.
 - **Qwen Image 2.1** fine-tunes its **bf16 DiT** (`qwen_image_2.1_bf16.safetensors`); the training adapter stays on, as for LoRAs.
+- **Flux 3 Image Klein** fine-tunes its **bf16 Base** (`flux3_image_klein_bf16.safetensors`), every block's Linears; the distilled model can't be fine-tuned. It peaked at 12.6 GB at 0.25 MP and 14.0 GB at 1 MP, the whole model at once on a 32 GB card.
 - **MiniMax H3** fine-tunes the **pruned int8 checkpoint** (`minimax_h3_fl2va_pruned_int8_convrot.safetensors`, ~21 GB), the same file ComfyUI runs. The ~66 GB bf16 file works for LoRA training only; the trainer refuses it for fine-tuning with a clear message.
 
 A finished fine-tune checkpoint is a valid base for its family:
@@ -105,8 +106,13 @@ An H3 fine-tune is a normal H3 checkpoint: load it in ComfyUI directly, or extra
 **Fine-tuning wants much lower learning rates than LoRAs.** A LoRA nudges a small adapter on a frozen model; a fine-tune moves the model's own weights, so a normal LoRA rate can wreck a fine-tune.
 
 - **MiniMax H3: 3e-5**, the tested fast-and-reliable rate. **1e-4 destroys an H3 fine-tune** (measured).
+- **Flux 3 Image Klein: 5e-5** (choosing Fine-tune sets it). Its weights are larger than Krea 2's and Qwen's, so it needs a higher rate to move.
 - **Krea 2 and Qwen Image 2.1: 1e-5** (choosing Fine-tune sets it, and turns Adaptive LR off). On Krea 2, 1e-4 trains, but treat it as the top of the experiment range; the best results are found lower. When a run looks almost right but slightly overcooked, lower the rate rather than the epoch count.
 - The regularisation **LR ×** multiplier (below) is part of the same tuning space.
+
+## Subjects
+
+A fine-tune can train up to four subjects from their own folders, and **Leave the rest of the model alone** on the Subjects card keeps them out of prompts that don't use their trigger words. A fine-tune has no LoRA to switch off, so Fizgig saves what the original model makes for each training picture before the first step and holds the trigger-free pass to that. **Fizgig LoRA Isolation** is for LoRAs.
 
 ## Regularisation images (optional)
 

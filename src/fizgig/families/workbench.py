@@ -1,4 +1,4 @@
-"""The standard layer's workbench engine: Repair Studio (and later the Explorer and Royale) for any described family.
+"""The standard layer's workbench engine: Repair Studio and Royale for any described family.
 
 One engine over a family's driver (model code) and the family LoRA layer (adapters, block controls, bake). It speaks
 the same protocol as the H3 engine (repair_studio/h3_engine.py), so the tabs drive
@@ -301,7 +301,7 @@ class WorkbenchEngine:
         if self.donor_network is not None:
             raise RuntimeError("Donor already loaded — unload_donor() or reset() first.")
         self._attach(path, DONOR)
-        # The donor comes in through its block sliders only (strength 0 by default); anything it adapts outside
+        # The donor comes in through its block sliders only (fully on by default); anything it adapts outside
         # the block map stays off, as on the other engines.
         self.net.set_outside(DONOR, False)
         self._clear_blend_state(DONOR)
@@ -868,10 +868,12 @@ class WorkbenchEngine:
         neg = None
         ps = self.preview_settings
         try:
-            if ps is not None and float(self.sampling()[1] or 1.0) > 1.0:     # the CFG this render uses (a preview
-                #                                                          checkpoint has its own: Qwen's Turbo, CFG 1)
-                # the Samples tab's negative, seen the same way as the prompt (an edit's reference included)
-                neg = self.encode([str(ps.get("negative") or "")], ref=("" if override_ctx is not None else ref),
+            if float(self.sampling()[1] or 1.0) > 1.0:     # the CFG this render uses (a preview checkpoint has
+                #                                            its own: Qwen's Turbo, CFG 1)
+                # the Samples tab's negative (with no Samples settings, the family's default), seen the same way as
+                # the prompt (an edit's reference included)
+                text = ps.get("negative") if ps is not None else self.desc.preview_negative
+                neg = self.encode([str(text or "")], ref=("" if override_ctx is not None else ref),
                                   ref_mp=ref_mp, size=(width, height))[0]
         except (TypeError, ValueError):
             neg = None
@@ -936,12 +938,21 @@ class WorkbenchEngine:
                self._settings_key())
         if self._baseline_key == key and self._baseline_img is not None:
             return self._baseline_img
+        if self.same_as_baseline(state):
+            # nothing moved: the tweaked render IS the baseline - one render for both panes, and it fills Turbo
+            # Preview's cache for the first slider move
+            img = self.generate_preview(state)
+            self._baseline_key, self._baseline_img = key, img
+            return img
         base = self.default_state(state.preview_width, state.preview_height)
         base.seed, base.prompt = state.seed, state.prompt
         base.ref_image_path = getattr(state, "ref_image_path", "")
         base.ref_megapixels = getattr(state, "ref_megapixels", 1.0)
         base.ref_strength = getattr(state, "ref_strength", 1.0)
         base.primary_scale = float(getattr(state, "primary_scale", 1.0))
+        base.donor_scale = 0.0              # the primary alone: a loaded donor stays out of the left pane
+        for bs in base.blocks.values():
+            bs.donor_enabled = False
         self._act_bypass = True             # the baseline would overwrite the tweaked render's cache
         try:
             img = self.generate_preview(base)
@@ -949,6 +960,16 @@ class WorkbenchEngine:
             self._act_bypass = False
         self._baseline_key, self._baseline_img = key, img
         return img
+
+    def same_as_baseline(self, state):
+        """True when the tweaked render would be the baseline: every primary block on at 1.0 and no donor block
+        contributing (no donor, its load strength 0, or each of its blocks off or at 0)."""
+        if any(not bs.primary_enabled or float(bs.primary_strength) != 1.0 for bs in state.blocks.values()):
+            return False
+        if self.donor_network is None or float(getattr(state, "donor_scale", 1.0)) == 0.0:
+            return True
+        return not any(bs.donor_enabled and float(bs.donor_strength) != 0.0
+                       for b, bs in state.blocks.items() if b in self.donor_block_ids)
 
     def _invalidate_baseline_cache(self):
         self._baseline_key = self._baseline_img = None

@@ -1,0 +1,6 @@
+pytest>=8
+numpy
+pillow
+safetensors
+# torch: CPU is enough. If it isn't installed yet:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu

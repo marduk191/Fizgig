@@ -152,13 +152,84 @@ function renderAll() {
 }
 
 // ---- the generated forms -----------------------------------------------------------------------------------
+// ---- Check a trigger word: under the Subjects card, collapsed. The training model's own text encoder reads the word
+// the way Fizgig LoRA Isolation joins it ("zwxem, a woman" -> zwxemwoman); values kept across the card's re-draws
+S.tc = {open: false, word: "", cls: "woman", others: ""};
+
+function triggerCheckBlock() {
+  const name = (S.fam && (S.fam.gui_label || S.fam.display_name)) || "this model";
+  const word = el("input", {type: "text", class: "w-combo", placeholder: "e.g. zwxem", value: S.tc.word});
+  const cls = el("select", {class: "w-combo"});
+  for (const [v, t] of [["woman", "a woman"], ["man", "a man"], ["girl", "a girl"], ["boy", "a boy"],
+                        ["person", "a person"], ["dog", "a dog"], ["cat", "a cat"], ["horse", "a horse"],
+                        ["", "a style or look"]])
+    cls.append(el("option", {value: v, text: t}));
+  cls.value = S.tc.cls;
+  const others = el("input", {type: "text", class: "w-combo-lg", placeholder: "e.g. dlor, gwelt", value: S.tc.others});
+  const result = el("div");
+  const run = async () => {
+    S.tc.word = word.value.trim(); S.tc.cls = cls.value; S.tc.others = others.value;
+    result.innerHTML = "";
+    if (!S.tc.word) { result.append(el("div", {class: "field-hint", text: "Type a trigger word first."})); return; }
+    result.append(el("div", {class: "field-hint", text: "Checking…"}));
+    let r;
+    try {
+      r = await api("/api/captions/trigger_check", {family: S.family, trigger: S.tc.word, cls: cls.value,
+        others: others.value.split(",").map((s) => s.trim()).filter(Boolean)});
+    } catch (e) { result.innerHTML = ""; result.append(el("div", {class: "field-hint", text: String(e.message || e)})); return; }
+    result.innerHTML = "";
+    const clean = r.ok && !r.notes.length;
+    result.append(el("div", {class: "tc-verdict " + (clean ? "tc-good" : r.ok ? "tc-warn" : "tc-bad"),
+      text: (clean ? "✓ Good word. " : r.ok ? "Joins cleanly, with a note below. " : "✗ ") +
+            (clean || r.ok ? `${r.joined} reads as ${r.pieces.join(" | ")}` : r.notes[0])}));
+    for (const n of (r.ok ? r.notes : r.notes.slice(1))) result.append(el("div", {class: "field-hint", text: "• " + n}));
+    if (r.encoder) result.append(el("div", {class: "field-hint", text: `Checked with ${r.encoder}.`}));
+    if (r.suggestions && r.suggestions.length) {
+      const row = el("div", {class: "field-row"},
+        el("span", {class: "field-hint", text: "Made-up words that work here (click one to check it):"}));
+      for (const s of r.suggestions)
+        row.append(el("button", {class: "btn btn-sm", text: s, onclick: () => { word.value = s; run(); }}));
+      result.append(row);
+    }
+  };
+  word.addEventListener("keydown", (e) => { if (e.key === "Enter") run(); });
+  const d = el("details", {class: "tc-box"},
+    el("summary", {text: "Check a trigger word (optional)"}),
+    el("div", {class: "field-hint", text:
+      `Fizgig LoRA Isolation joins each subject's trigger word to what the subject is: "zwxem, a woman" trains as one ` +
+      `word, zwxemwoman. Some words join badly: the text encoder splits them so the subject word is no longer whole ` +
+      `(fyxo + woman reads as f | yx | ow | oman), and the LoRA learns that subject less cleanly. This checks a word ` +
+      `with ${name}'s text encoder, the one this LoRA trains with, before you caption.`}),
+    el("div", {class: "field-row"}, el("span", {class: "field-label", text: "Trigger word to check:"}), word),
+    el("div", {class: "field-row"}, el("span", {class: "field-label", text: "The subject is:"}), cls),
+    el("div", {class: "field-hint", text: "The word Fizgig joins on: the same trigger can join cleanly with one " +
+      "(dlor + woman) and break with another (dlor + man). A style or look is never joined, so only the word itself " +
+      "is checked."}),
+    el("div", {class: "field-row"}, el("span", {class: "field-label", text: "Other triggers:"}), others),
+    el("div", {class: "field-hint", text: "Optional: the trigger words of your other subjects in this same LoRA, separated by commas. Two " +
+      "subjects whose words start with the same letter, or share a piece, can blend into each other, so the check " +
+      "looks for that too. Leave it empty for a one-subject LoRA."}),
+    el("div", {class: "field-row"}, el("button", {class: "btn btn-primary", text: "Check", onclick: run})),
+    result);
+  d.open = S.tc.open;
+  d.addEventListener("toggle", () => { S.tc.open = d.open; });
+  return d;
+}
+
 function renderSections(tab, host) {
   host.innerHTML = "";
   for (const sec of S.fam.form.sections.filter((s) => s.tab === tab)) {
     const body = el("div", {class: "card-content" + (sec.collapsed ? " collapsed" : "")});
     const head = el("div", {class: "card-title collapsible-header", onclick: () => body.classList.toggle("collapsed")},
       el("span", {text: (sec.collapsed ? "▶ " : "▼ ") + sec.title}));
+    if (sec.help) {         // the card's video, a link across the top of the card
+      body.append(el("a", {class: "sec-video", href: sec.help.href, target: "_blank", rel: "noopener"},
+        el("span", {class: "sec-video-play", text: "▶"}),
+        el("span", {class: "sec-video-text"}, el("b", {text: sec.help.text}),
+          el("span", {class: "sec-video-sub", text: sec.help.sub || "Watch on YouTube"}))));
+    }
     for (const r of sec.rows) body.append(renderRow(r));
+    if (sec.id === "subjects" && !S.family.startsWith("acestep")) body.append(triggerCheckBlock());
     host.append(el("div", {class: "section-card", id: "sec-" + sec.id, "data-section": sec.id}, head, body));
   }
 }
@@ -175,8 +246,9 @@ function renderRow(r) {
     return wrap;
   }
   if (r.kind === "note") {                        // its own text, and any the form's state writes (RefMod's tokens)
-    if (r.label) wrap.append(el("div", {class: "field-hint", text: r.label}));
-    wrap.append(el("div", {class: "field-hint row-note", id: "note_" + r.key}));
+    if (r.label) wrap.append(el("div", {class: r.hint_labels ? "field-label" : "field-hint", text: r.label}));
+    wrap.append(el("div", {class: "field-hint row-note" + (r.hint_labels ? " hint-lines note-lines" : ""),
+      id: "note_" + r.key}));
     return wrap;
   }
   const v = S.values[r.key];
@@ -270,7 +342,22 @@ function renderRow(r) {
     if (upStatus) wrap.append(upStatus);
   }
   wrap.append(el("div", {class: "field-hint row-note", id: "note_" + r.key}));
-  if (r.hint) wrap.append(el("div", {class: "field-hint", text: r.hint}));
+  const link = r.link ? el("a", {class: "inline-link", target: "_blank", rel: "noopener", href: r.link.href,
+    text: r.link.text + " →"}) : null;      // a row's guide on GitHub, under its hint
+  if (r.hint && r.hint_labels) {                  // one spaced line per choice, "Name: what it does" with the name bold
+    const h = el("div", {class: "field-hint hint-lines"});
+    for (const line of r.hint.split("\n")) {
+      const at = line.indexOf(": ");
+      h.append(at > 0 ? el("div", {}, el("b", {text: line.slice(0, at) + ": "}), line.slice(at + 2))
+                      : el("div", {text: line}));
+    }
+    wrap.append(h);
+  } else if (r.hint) {                            // a hint of several lines keeps its line breaks
+    const h = el("div", {class: "field-hint", text: r.hint});
+    if (r.hint.includes("\n")) h.style.whiteSpace = "pre-line";
+    wrap.append(h);
+  }
+  if (link) wrap.append(el("div", {class: "field-hint"}, link));
   return wrap;
 }
 
@@ -328,7 +415,11 @@ function fillCombo(sel, choices, v, labels) {
 function syncInputs(keys) {
   for (const k of keys) {
     const i = $("f_" + k);
-    if (!i) continue;
+    if (!i) {                                     // a choice of pills: its radio inputs share the name
+      document.querySelectorAll(`input[type="radio"][name="f_${k}"]`).forEach((rb) => {
+        rb.checked = rb.value === String(S.values[k] ?? ""); });
+      continue;
+    }
     if (i.tagName === "SELECT" && [...i.options].some((o) => o.value === "__other")) {
       const row = (S.fam.form.sections.flatMap((s) => s.rows).find((r) => r && r.key === k)) || {choices: []};
       fillCombo(i, row.choices, S.values[k], row.labels);
@@ -343,14 +434,32 @@ async function refreshState() {
   const force = Object.keys(S.state.force || {});      // what a setting turns off (automagic3: Adaptive LR...)
   if (force.length) { Object.assign(S.values, S.state.force); syncInputs(force); saveStateSoon(); }
   const hidden = new Set(S.state.hidden), disabled = new Set(S.state.disabled);
+  for (const [k, ph] of Object.entries(S.state.placeholders || {})) {   // what Fizgig found, greyed in the box
+    const box = $("f_" + k);
+    if (box) box.placeholder = ph;
+  }
   document.querySelectorAll(".form-row[data-key]").forEach((row) => {
     const k = row.dataset.key;
     row.style.display = hidden.has(k) ? "none" : "";
+    // a label the state renumbers (the Edit pairs steps when an extra-pictures folder joins), else the form's own
+    const lab = row.querySelector(".field-label"), rowDef = (S.fam.form.sections.flatMap((s) => s.rows)
+      .find((r) => r && r.key === k));
+    if (lab && rowDef) lab.textContent = ((S.state.labels || {})[k] || rowDef.label) + ":";
     row.querySelectorAll("input,select,textarea,button").forEach((i) => { i.disabled = disabled.has(k); });
+    // a greyed box shows what that run will really use (the Distilled's steps / CFG), the form's own value kept
+    const shown = (S.state.shown || {})[k], box = $("f_" + k);
+    if (box && shown !== undefined && disabled.has(k)) { box.value = shown; box.dataset.shown = "1"; }
+    else if (box && box.dataset.shown) { delete box.dataset.shown; syncInputs([k]); }
     const n = $("note_" + k);
     if (n) {
       if (n.tagName === "INPUT") { n.value = S.state.notes[k] || ""; return; }
-      n.textContent = S.state.notes[k] || "";
+      if (n.classList.contains("note-lines")) {    // one line each, "Label: text" with the label bold (Subjects card)
+        n.replaceChildren(...String(S.state.notes[k] || "").split("\n").filter(Boolean).map((line) => {
+          const at = line.indexOf(": ");
+          return at > 0 ? el("div", {}, el("b", {text: line.slice(0, at) + ": "}), line.slice(at + 2))
+                        : el("div", {text: line});
+        }));
+      } else n.textContent = S.state.notes[k] || "";
       const act = (S.state.actions || {})[k];      // a hint's one-click change (the desktop's: Use 1e-4)
       if (act) n.append(" ", el("button", {class: "btn btn-sm", text: act.label, onclick: () => {
         Object.assign(S.values, act.values); syncInputs(Object.keys(act.values)); refreshStateSoon(); saveStateSoon(); }}));
@@ -367,21 +476,30 @@ async function refreshState() {
 // file set in Preferences AND strength above 0 - else the plain model's (Qwen: 25, CFG 3). They switch on a first visit
 // or when the turbo turned on or off since last seen (the file set, or the strength moved across 0), and only a box
 // still on the other side's default, so a value you typed is never replaced.
+// A preview-checkpoint tick (Klein's / Flux 3's distilled) does the same with its row's follow: ticked with the file
+// set, Steps shows the distilled's own count (Flux 3: 16), unticked the Base's (50).
 function turboFollow() {
-  let row = null;
-  for (const s of S.fam.form.sections) for (const r of s.rows) if (r.turbo) row = r;
-  if (!row) return;
-  const raw = S.values.FAMILY_TURBO_STRENGTH;
-  const strength = parseFloat(raw === undefined || raw === "" ? row.default : raw);
-  const live = !!S.state.turbo_file && strength > 0;
-  if (S.values.__turbo_live === live) return;
-  const want = live ? row.turbo.on : row.turbo.off, other = live ? row.turbo.off : row.turbo.on;
-  const moved = Object.keys(want).filter((k) => S.values[k] === undefined || S.values[k] === "" ||
-    parseFloat(S.values[k]) === parseFloat(other[k]));          // "3.0" is the default 3
-  for (const k of moved) S.values[k] = want[k];
-  S.values.__turbo_live = live;
-  syncInputs(moved);
-  saveStateSoon();
+  for (const s of S.fam.form.sections) for (const row of s.rows) {
+    if (!row || !(row.turbo || row.follow)) continue;
+    let live, flag, sides;
+    if (row.turbo) {
+      const raw = S.values.FAMILY_TURBO_STRENGTH;
+      const strength = parseFloat(raw === undefined || raw === "" ? row.default : raw);
+      live = !!S.state.turbo_file && strength > 0; flag = "__turbo_live"; sides = row.turbo;
+    } else {
+      const v = S.values[row.key];
+      live = !!S.state.checkpoint_file && !!(v === undefined ? row.default : v);
+      flag = "__follow_" + row.key; sides = row.follow;
+    }
+    if (S.values[flag] === live) continue;
+    const want = live ? sides.on : sides.off, other = live ? sides.off : sides.on;
+    const moved = Object.keys(want).filter((k) => S.values[k] === undefined || S.values[k] === "" ||
+      parseFloat(S.values[k]) === parseFloat(other[k]));        // "3.0" is the default 3
+    for (const k of moved) S.values[k] = want[k];
+    S.values[flag] = live;
+    syncInputs(moved);
+    saveStateSoon();
+  }
 }
 const refreshStateSoon = debounce(refreshState, 250);
 
@@ -2315,7 +2433,9 @@ async function profilerToStudio() {
   for (let i = 0; i < 100 && !(S.st.familiesLoaded && S.st.layout); i++) await new Promise((r) => setTimeout(r, 100));
   if ($("stFamily").value !== h.family) { $("stFamily").value = h.family; await studioFamily(); }
   $("stPrimary").value = h.lora; $("stPrompt").value = h.prompt; $("stSeed").value = String(h.seed);
-  if ([...$("stRes").options].some((o) => o.value === String(h.size))) $("stRes").value = String(h.size);
+  const [hw, hh] = Array.isArray(h.size) ? h.size : [h.size, h.size];
+  if ([...$("stW").options].some((o) => o.value === String(hw))) $("stW").value = String(hw);
+  if ([...$("stH").options].some((o) => o.value === String(hh))) $("stH").value = String(hh);
   for (const [id, b] of Object.entries(S.st.blocks)) {
     const [on, strength] = h.blocks[id] || [true, 1.0];
     b.pe = !!on; b.ps = Number(strength);
@@ -3168,9 +3288,10 @@ const ST_KEY = "fizgig_studio";
 const stSaved = () => { try { return JSON.parse(localStorage.getItem(ST_KEY) || "{}"); } catch (e) { return {}; } };
 const stRemember = debounce(() => {
   const d = {family: $("stFamily").value, primary: $("stPrimary").value, donor: $("stDonor").value,
-    prompt: $("stPrompt").value, seed: $("stSeed").value, res: $("stRes").value, turbo: $("stTurbo").checked,
+    prompt: $("stPrompt").value, seed: $("stSeed").value, res: $("stRes").value,
+    w: $("stW").value, h: $("stH").value, turbo: $("stTurbo").checked,
     ref: $("stRef").value, refMp: $("stRefMp").value, refStr: $("stRefStr").value, luckyLo: $("stLuckyLo").value,
-    luckyHi: $("stLuckyHi").value, neg: {...(stSaved().neg || {}), [$("stFamily").value]: $("stNeg").value},
+    luckyHi: $("stLuckyHi").value, luckyWho: $("stLuckyWho").value, luckyCount: $("stLuckyCount").value, neg: {...(stSaved().neg || {}), [$("stFamily").value]: $("stNeg").value},
     scales: {...(stSaved().scales || {}), [$("stFamily").value]: [$("stPScale").value, $("stDScale").value]},
     h3: stSaved().h3, ace: stSaved().ace, metricsRef: stSaved().metricsRef};                           // H3's clip settings and photos (studioH3Remember's)
   try { localStorage.setItem(ST_KEY, JSON.stringify(d)); } catch (e) { /* private window */ }
@@ -3191,16 +3312,16 @@ async function studioOpen() {
     const sv = stSaved();
     if (sv.family && r.families.some((f) => f.key === sv.family)) sel.value = sv.family;
     for (const [id, k] of [["stPrimary", "primary"], ["stDonor", "donor"], ["stPrompt", "prompt"], ["stSeed", "seed"],
-      ["stRef", "ref"], ["stRefMp", "refMp"], ["stRefStr", "refStr"], ["stLuckyLo", "luckyLo"], ["stLuckyHi", "luckyHi"]])
+      ["stRef", "ref"], ["stRefMp", "refMp"], ["stRefStr", "refStr"], ["stLuckyLo", "luckyLo"], ["stLuckyHi", "luckyHi"], ["stLuckyWho", "luckyWho"]])
       if (sv[k] != null && sv[k] !== "") $(id).value = sv[k];
     if (sv.turbo != null) $("stTurbo").checked = sv.turbo;
     S.st.familiesLoaded = true;
-    await studioFamily(sv.res);
+    await studioFamily(sv.res, sv.w, sv.h);
   }
   studioPoll();
 }
 
-async function studioFamily(res) {
+async function studioFamily(res, w, h) {
   const key = $("stFamily").value;
   const L = S.st.layout = await api("/api/studio/layout?family=" + encodeURIComponent(key));
   const sv = stSaved();
@@ -3208,6 +3329,12 @@ async function studioFamily(res) {
   $("stRes").innerHTML = "";
   for (const s of L.sizes) $("stRes").append(el("option", {value: s, text: s}));
   $("stRes").value = L.sizes.includes(String(res)) ? String(res) : L.size;
+  for (const [id, v] of [["stW", w], ["stH", h]]) {             // pictures: any width and height from the list
+    const keep = String(v ?? $(id).value);
+    $(id).innerHTML = "";
+    for (const s of L.sizes) $(id).append(el("option", {value: s, text: s}));
+    $(id).value = L.sizes.includes(keep) ? keep : L.size;
+  }
   const sc = (sv.scales || {})[key];
   $("stPScale").value = sc ? sc[0] : L.default_strength;
   $("stDScale").value = sc ? sc[1] : 1;
@@ -3225,7 +3352,9 @@ async function studioFamily(res) {
   studioNegRow();
   S.st.blocks = {};
   for (const g of L.groups) for (const b of g.blocks) S.st.blocks[b.id] = {pe: true, ps: 1, de: true, ds: 1};
-  S.st.locks = new Set(); S.st.hist = []; S.st.redo = [];
+  S.st.locks = new Set(); S.st.dlocks = new Set(); S.st.frozen = new Set(); S.st.dfrozen = new Set();
+  S.st.hist = []; S.st.redo = [];
+  studioLuckyCounts();
   studioMasters();
   studioPresets();
   studioRows();
@@ -3234,10 +3363,23 @@ async function studioFamily(res) {
 // H3 (clips) and ACE-Step (songs): their own controls, the desktop's
 function studioKind(L, sv) {
   const video = L.kind === "video", audio = L.kind === "audio";
+  if (S.st.kindShown && S.st.kindShown !== L.kind) {     // pictures / clips / songs: the last kind's previews go
+    for (const id of ["stBase", "stTweak", "stNol"]) $(id).removeAttribute("src");
+    for (const id of ["stBaseVid", "stTweakVid", "stNolVid", "stBaseAud", "stTweakAud", "stNolAud"]) {
+      const m = $(id);
+      m.pause(); m.removeAttribute("src"); m.removeAttribute("poster"); m.load(); m.style.display = "none";
+    }
+    $("stDownloads").style.display = "none";
+    if (S.song) { S.song.src = {}; S.song.peaks = {}; S.song.act = {}; }     // a song comes back fresh, not "already loaded"
+  }
+  S.st.kindShown = L.kind;
   $("stVideoRows").style.display = video ? "" : "none";
   $("stFrames").style.display = video ? "" : "none";
-  $("stResLabel").textContent = audio ? "Length (s):" : "Res:";
-  $("stRes").style.display = $("stResLabel").style.display = video ? "none" : "";
+  $("stRes").style.display = $("stResLabel").style.display = audio ? "" : "none";      // a song's length
+  if (audio) studioDock(false, false);                  // Keep in view: never for a music model (kept as remembered)
+  else if (stDockSaved().open && !$("stDock")) studioDock(true);
+  else studioDock(!!$("stDock"));
+  $("stSizeRow").style.display = video || audio ? "none" : "";                          // a picture's width and height
   document.querySelectorAll(".st-pane").forEach((p) => p.classList.toggle("audio", audio));
   $("stPreviewHint").textContent = video ? "Each clip plays with its sound; the picture is its middle frame." :
     audio ? "Play any song; the picture is its waveform." : "Click either picture to see both full size (← → switches between them).";
@@ -3259,12 +3401,12 @@ function studioKind(L, sv) {
   fill("stH3Len", V.lengths, h3.len || V.length);
   fill("stH3W", V.dims, h3.w || V.size[0]);
   fill("stH3H", V.dims, h3.h || V.size[1]);
-  fill("stH3Scale", V.scales, h3.scale || "Full");
   if (h3.steps) $("stH3Steps").value = h3.steps;
   if (h3.turbo != null) $("stH3Turbo").value = h3.turbo;
   $("stH3Sound").checked = V.sound && h3.sound !== false;
   $("stH3Sound").disabled = !V.sound;
-  $("stH3NoLora").checked = !!h3.nolora;
+  $("stH3Boost").checked = h3.boost !== false;           // on unless turned off
+  $("stH3Boost").parentElement.style.display = V.speed_boost ? "" : "none";   // a family ability (H3 has it)
   $("stH3Early").checked = h3.early !== false;
   S.st.kf = h3.kf || {};
   S.st.kfRect = h3.kfRect || {};
@@ -3403,8 +3545,8 @@ function studioH3Remember() {
   try {
     const d = stSaved();
     d.h3 = {model: $("stH3Model").value, base: $("stH3Base").value, len: $("stH3Len").value, w: $("stH3W").value,
-      h: $("stH3H").value, scale: $("stH3Scale").value, steps: $("stH3Steps").value, turbo: $("stH3Turbo").value,
-      sound: $("stH3Sound").checked, nolora: $("stH3NoLora").checked, early: $("stH3Early").checked, kf: S.st.kf,
+      h: $("stH3H").value, steps: $("stH3Steps").value, turbo: $("stH3Turbo").value,
+      sound: $("stH3Sound").checked, boost: $("stH3Boost").checked, early: $("stH3Early").checked, kf: S.st.kf,
       kfRect: S.st.kfRect};
     localStorage.setItem(ST_KEY, JSON.stringify(d));
   } catch (e) { /* private window */ }
@@ -3415,15 +3557,14 @@ function studioExtra() {
   const L = S.st.layout;
   if (L.kind === "audio") return {audio: studioAceExtra()};
   if (L.kind !== "video") return {};
-  const V = L.video, f = V.scale_of[$("stH3Scale").value] || 1;
-  const snap = (x) => f >= 0.999 ? x : Math.max(256, Math.floor(x * f / 32) * 32);
-  const w = snap(Number($("stH3W").value) || 640), h = snap(Number($("stH3H").value) || 768);
+  const V = L.video;
+  const w = Number($("stH3W").value) || 640, h = Number($("stH3H").value) || 768;     // the clip at its Width x Height
   const ref = !!V.references[$("stH3Model").value];
   const slots = ref ? ["ref1", "ref2"] : ["first", "last"];
   return {video: {frames: V.length_frames[$("stH3Len").value] || 22, width: w, height: h,
     steps: Math.max(1, Math.min(40, parseInt($("stH3Steps").value, 10) || 4)),
     turbo: Math.max(0, Math.min(1.5, Number($("stH3Turbo").value) || 0)), sound: $("stH3Sound").checked,
-    nolora: $("stH3NoLora").checked, early: $("stH3Early").checked},
+    speed_boost: !!V.speed_boost && $("stH3Boost").checked, early: $("stH3Early").checked},
     keyframes: slots.filter((s) => S.st.kf[s]).map((s) => ({slot: s, path: S.st.kf[s], rect: S.st.kfRect[s] || null})),
     ref_mode: ref};
 }
@@ -4056,13 +4197,14 @@ const ST_SRC_MODES = [["song", "Whole song"], ["repaint", "Repaint the loop sect
 const ST_SETUP_MAP = [
   ["stPrimary", "repair_primary_var"], ["stDonor", "repair_donor_var"], ["stPScale", "repair_primary_scale_var"],
   ["stDScale", "repair_donor_scale_var"], ["stPrompt", "repair_prompt_var"], ["stSeed", "repair_seed_var"],
-  ["stRes", "repair_res_var"], ["stNeg", "repair_negative_var"], ["stTurbo", "repair_turbo_var", "check"],
+  ["stRes", "repair_res_var"], ["stW", "repair_width_var"], ["stH", "repair_height_var"], ["stNeg", "repair_negative_var"], ["stTurbo", "repair_turbo_var", "check"],
   ["stRef", "repair_ref_path_var"], ["stRefMp", "repair_ref_mp_var"], ["stRefStr", "repair_ref_strength_var"],
   ["stLuckyLo", "repair_lucky_min_var"], ["stLuckyHi", "repair_lucky_max_var"],
   ["stH3Model", "repair_h3_model_var"], ["stH3Base", "repair_h3_base_var"], ["stH3Len", "repair_h3_frames_var"],
-  ["stH3W", "repair_h3_width_var"], ["stH3H", "repair_h3_height_var"], ["stH3Scale", "repair_h3_dial_scale_var"],
+  ["stH3W", "repair_h3_width_var"], ["stH3H", "repair_h3_height_var"],
   ["stH3Steps", "repair_h3_steps_var"], ["stH3Turbo", "repair_h3_turbo_var"], ["stH3Sound", "repair_h3_sound_var", "check"],
-  ["stH3NoLora", "repair_h3_nolora_var", "check"], ["stH3Early", "repair_h3_early_var", "check"],
+  ["stH3Boost", "repair_h3_speed_boost_var", "check"],
+  ["stH3Early", "repair_h3_early_var", "check"],
   ["stPbOn", "repair_pb_on_var", "check"], ["stPromptB", "repair_prompt_b_var"], ["stPbBlend", "repair_pb_blend_var", "num"],
   ["stPbKeep", "repair_pb_keep_lyrics_var", "check"], ["stSrcOn", "repair_src_on_var", "check"],
   ["stSrcPath", "repair_src_path_var"], ["stSrcMode", "repair_src_mode_var", "srcmode"],
@@ -4227,10 +4369,13 @@ function studioRow(b) {
     const btn = (t, title, f) => el("button", {class: "btn btn-sm", text: t, title, onclick: () => { f(); studioCommit(); }});
     const label = side === "p" ? el("span", {class: "st-label", style: b.color ? `color:${b.color}` : ""},
       b.label, b.cat ? el("small", {text: `[${b.cat}]`}) : null) : el("span", {class: "st-label", text: "donor"});
-    const lock = side === "p" ? el("button", {class: "st-lock", title: "Lock this block (presets, Lucky and bulk leave it alone)",
-      text: "🔓", onclick: (e) => { S.st.locks.has(b.id) ? S.st.locks.delete(b.id) : S.st.locks.add(b.id);
-        e.currentTarget.textContent = S.st.locks.has(b.id) ? "🔒" : "🔓"; e.currentTarget.classList.toggle("on"); }}) :
-      el("span", {});
+    const locks = () => side === "p" ? S.st.locks : S.st.dlocks, frozen = () => side === "p" ? S.st.frozen : S.st.dfrozen;
+    const lock = el("button", {class: "st-lock", title: side === "p" ?
+      "Lock this slider (presets, Lucky and bulk leave it alone; the donor's slider has its own lock)" :
+      "Lock the donor's slider for this block (presets, Lucky and bulk leave it alone)",
+      text: "🔓", onclick: () => {
+        if (locks().has(b.id)) { locks().delete(b.id); frozen().delete(b.id); } else locks().add(b.id);
+        studioSync([b.id]); }});
     const row = el("div", {class: "st-row" + (side === "d" ? " donor" : "")}, lock, tick, label, range, val,
       el("span", {class: "st-btns"},
         btn("0", "Set to 0", () => studioSet(b.id, sv, 0)), btn("1", "Set to 1", () => studioSet(b.id, sv, 1)),
@@ -4241,7 +4386,8 @@ function studioRow(b) {
           const o = side === "p" ? "ds" : "ps", v = st()[sv];
           if (S.st.donor && v >= 0 && v <= 1) { studioSet(b.id, o, Math.round((1 - v) * 100) / 100); studioSet(b.id, "de", true); }
         })));
-    row._sync = () => { tick.checked = st()[en]; range.value = st()[sv]; val.textContent = stFmt(st()[sv]); };
+    row._sync = () => { tick.checked = st()[en]; range.value = st()[sv]; val.textContent = stFmt(st()[sv]);
+      const on = locks().has(b.id); lock.textContent = on ? "🔒" : "🔓"; lock.classList.toggle("on", on); };
     row._sync();
     return row;
   };
@@ -4256,6 +4402,62 @@ function studioSync(ids) {
   document.querySelectorAll("#stBlocks .st-block").forEach((box) => {
     if (!ids || ids.includes(box.dataset.id)) box._rows.forEach((r) => r._sync());
   });
+  studioFreezeState();
+}
+
+// ---- I'm feeling lucky's pill: how many blocks a roll changes, and Freeze / Unfreeze the ones you've moved ----------
+function studioLuckyCounts() {                     // Roll: 1, 2, 4 ... below the model's block count, then All
+  const n = Object.keys(S.st.blocks).length, sel = $("stLuckyCount"), keep = stSaved().luckyCount || sel.value;
+  sel.innerHTML = "";
+  for (let k = 1; k < n; k *= 2) sel.append(el("option", {value: String(k), text: String(k)}));
+  sel.append(el("option", {value: "all", text: "All"}));
+  sel.value = [...sel.options].some((o) => o.value === keep) ? keep : "all";
+}
+
+function studioLuckyPool() {                      // the blocks a roll can change: on for the LoRA it rolls, not locked
+  const who = S.st.donor ? $("stLuckyWho").value : "Primary";
+  const pOk = (id) => who !== "Donor" && !S.st.locks.has(id) && !(S.st.ready && !S.st.primaryBlocks.has(id)) && S.st.blocks[id].pe;
+  const dOk = (id) => who !== "Primary" && !S.st.dlocks.has(id) && S.st.donorBlocks.has(id) && S.st.blocks[id].de;
+  const ids = Object.keys(S.st.blocks);
+  return {pOk, dOk, who, pool: ids.filter((id) => pOk(id) || dOk(id)),
+          free: ids.filter(pOk).length + ids.filter(dOk).length,       // sliders a roll can change
+          total: (who !== "Donor" ? ids.length : 0) + (who !== "Primary" ? ids.length : 0)};
+}
+
+function studioTweaked(id, side) {                 // a slider moved from its default (its strength or on / off)
+  const b = S.st.blocks[id];
+  if (!b) return false;
+  if (side === "d") return !!(S.st.donor && S.st.donorBlocks.has(id) && (b.ds !== 1 || !b.de));
+  return !(S.st.ready && !S.st.primaryBlocks.has(id)) && (b.ps !== 1 || !b.pe);
+}
+
+function studioFreezeState() {
+  if (!$("stFreeze") || !S.st.frozen) return;
+  const ids = Object.keys(S.st.blocks);
+  const fresh = ids.filter((id) => studioTweaked(id, "p") && !S.st.locks.has(id)).length +
+    ids.filter((id) => studioTweaked(id, "d") && !S.st.dlocks.has(id)).length;
+  const held = S.st.frozen.size + S.st.dfrozen.size;
+  $("stFreeze").textContent = `🔒 Freeze tweaked${fresh ? ` (${fresh})` : ""}`;
+  $("stFreeze").disabled = !fresh;
+  $("stUnfreeze").style.display = held ? "" : "none";
+  $("stUnfreeze").textContent = `🔓 Unfreeze (${held})`;
+  // what is left to roll: not frozen, not locked by hand, on for the LoRA being rolled (the dropdown's sliders)
+  const pl = studioLuckyPool();
+  $("stLuckyFree").textContent = pl.total ? `${pl.free} of ${pl.total} sliders free to roll` : "";
+}
+
+function studioFreeze(on) {
+  if (on) {
+    for (const id of Object.keys(S.st.blocks)) {
+      if (studioTweaked(id, "p") && !S.st.locks.has(id)) { S.st.locks.add(id); S.st.frozen.add(id); }
+      if (studioTweaked(id, "d") && !S.st.dlocks.has(id)) { S.st.dlocks.add(id); S.st.dfrozen.add(id); }
+    }
+  } else {
+    for (const id of S.st.frozen) S.st.locks.delete(id);
+    for (const id of S.st.dfrozen) S.st.dlocks.delete(id);
+    S.st.frozen.clear(); S.st.dfrozen.clear();
+  }
+  studioSync();
 }
 
 function studioActivity() {
@@ -4279,10 +4481,11 @@ function studioActivity() {
   document.querySelectorAll(".st-detail-only").forEach((x) => {
     x.style.display = S.st.layout && (S.st.layout.detail_blocks || []).length ? "" : "none"; });
   $("stTargetDonor").disabled = !S.st.donor;
+  studioFreezeState();                             // a donor in or out changes what is free to roll
 }
 
 function studioSet(id, k, v, live) {
-  if (S.st.locks.has(id)) { studioSync([id]); return; }
+  if ((k === "ds" || k === "de" ? S.st.dlocks : S.st.locks).has(id)) { studioSync([id]); return; }
   S.st.blocks[id][k] = v;
   studioSync([id]);
   studioSchedule(live);
@@ -4317,7 +4520,7 @@ function studioMasters() {
       const donor = (document.querySelector('input[name="stTarget"]:checked') || {}).value === "donor";
       const has = donor ? S.st.donorBlocks : S.st.primaryBlocks;
       for (const [id, c] of Object.entries(L.category_of))
-        if (c === m.cat && (!S.st.ready || has.has(id)) && !S.st.locks.has(id)) S.st.blocks[id][donor ? "ds" : "ps"] = v;
+        if (c === m.cat && (!S.st.ready || has.has(id)) && !(donor ? S.st.dlocks : S.st.locks).has(id)) S.st.blocks[id][donor ? "ds" : "ps"] = v;
       range.value = v; val.textContent = stFmt(v);
       studioSync(); studioSchedule(true);
     };
@@ -4328,7 +4531,7 @@ function studioMasters() {
       const v = Number(range.value), donor = (document.querySelector('input[name="stTarget"]:checked') || {}).value === "donor";
       if (!(S.st.donorBlocks && S.st.donorBlocks.size) || v < 0 || v > 1) return;
       for (const [id, c] of Object.entries(L.category_of)) {
-        if (c !== m.cat || S.st.locks.has(id)) continue;
+        if (c !== m.cat || (donor ? S.st.locks : S.st.dlocks).has(id)) continue;     // the other side's lock
         if (donor) S.st.blocks[id].ps = Math.round((1 - v) * 100) / 100;
         else Object.assign(S.st.blocks[id], {ds: Math.round((1 - v) * 100) / 100, de: true});
       }
@@ -4368,15 +4571,20 @@ async function studioPresetApply(v) {
   if (v.startsWith("b:")) {
     const p = L.presets.find((x) => x.name === v.slice(2));
     for (const [id, b] of Object.entries(S.st.blocks)) {
+      if (!S.st.dlocks.has(id)) Object.assign(b, {de: true, ds: 1});
       if (S.st.locks.has(id)) continue;
-      Object.assign(b, {pe: true, ps: 1, de: true, ds: 1});
+      Object.assign(b, {pe: true, ps: 1});
       if (p.keep) b.pe = p.keep.includes(L.category_of[id]);
       if (p.blocks && id in p.blocks) { b.pe = true; b.ps = Number(p.blocks[id]); }
     }
   } else {
     const r = await api("/api/studio/preset_load", {family: L.key, name: v.slice(2)});
-    for (const [id, bs] of Object.entries(r.blocks || {})) if (S.st.blocks[id] && !S.st.locks.has(id))
-      S.st.blocks[id] = {pe: !!bs.primary_enabled, ps: Number(bs.primary_strength), de: !!bs.donor_enabled, ds: Number(bs.donor_strength)};
+    for (const [id, bs] of Object.entries(r.blocks || {})) {
+      const b = S.st.blocks[id];
+      if (!b) continue;
+      if (!S.st.locks.has(id)) Object.assign(b, {pe: !!bs.primary_enabled, ps: Number(bs.primary_strength)});
+      if (!S.st.dlocks.has(id)) Object.assign(b, {de: !!bs.donor_enabled, ds: Number(bs.donor_strength)});
+    }
   }
   studioSync(); studioCommit(); studioSchedule();
   $("stPreset").value = "";
@@ -4408,26 +4616,37 @@ function studioBulk(kind) {
   }
   let rolled = 0;
   for (const [id, b] of Object.entries(S.st.blocks)) {
-    if (S.st.locks.has(id)) continue;
-    if (kind === "reset") Object.assign(b, {pe: true, ps: 1, de: true, ds: 1});
-    else if (kind === "off") b.pe = false;
-    else if (kind === "on") b.pe = true;
-    else if (kind === "invert") b.pe = !b.pe;
-    else if (kind === "donor_on") Object.assign(b, {de: true, ds: 1});
-    else if (kind === "donor_off") b.ds = 0;
-    else if (kind === "lucky") {
-      if ((S.st.ready && !S.st.primaryBlocks.has(id)) || !b.pe) continue;
+    const p = !S.st.locks.has(id), d = !S.st.dlocks.has(id);
+    if (kind === "reset") { if (p) Object.assign(b, {pe: true, ps: 1}); if (d) Object.assign(b, {de: true, ds: 1}); }
+    else if (kind === "off") { if (p) b.pe = false; }
+    else if (kind === "on") { if (p) b.pe = true; }
+    else if (kind === "invert") { if (p) b.pe = !b.pe; }
+    else if (kind === "donor_on") { if (d) Object.assign(b, {de: true, ds: 1}); }
+    else if (kind === "donor_off") { if (d) b.ds = 0; }
+  }
+  if (kind === "lucky") {
+    // which LoRA rolls: the primary, or with a donor loaded the dropdown's choice (Both rolls each on its own)
+    // the sliders it can change (a block's primary and donor are two), shuffled, the Roll count of them
+    const {pOk, dOk} = studioLuckyPool();
+    const pool = Object.keys(S.st.blocks).flatMap((id) => [...(pOk(id) ? [[id, "ps"]] : []), ...(dOk(id) ? [[id, "ds"]] : [])]);
+    for (let j = pool.length - 1; j > 0; j--) { const k = Math.floor(Math.random() * (j + 1)); [pool[j], pool[k]] = [pool[k], pool[j]]; }
+    const want = $("stLuckyCount").value === "all" ? pool.length : Number($("stLuckyCount").value);
+    for (const [id, key] of pool.slice(0, want)) {
       // a held band (lucky_zones: [first, last, low, high] by the block's place in the model's order), bounded by
       // Min / Max as the desktop does
-      const i = order.indexOf(id);
+      const i = order.indexOf(id), b = S.st.blocks[id];
       const zone = $("stLuckyHold").checked ? (L.lucky_zones || []).find((zn) => zn[0] <= i && i <= zn[1]) : null;
       let a = zone ? Math.max(zone[2], lo) : lo, z = zone ? Math.min(zone[3], hi) : hi;
       if (a > z) a = z = Math.min(Math.max(1, lo), hi);
-      b.ps = Math.round((a + Math.random() * (z - a)) * 20) / 20; rolled++;
+      const roll = () => Math.round((a + Math.random() * (z - a)) * 20) / 20;
+      b[key] = roll();
+      rolled++;
     }
   }
   studioSync(); studioCommit(); studioSchedule();
-  if (kind === "lucky") $("stStatus").textContent = `Lucky mix: ${rolled} block(s) rolled, ${lo} to ${hi} (Undo for the mix before; Save preset… to keep it).`;
+  if (kind === "lucky") $("stStatus").textContent = `Lucky mix: ${rolled} slider(s) rolled, ${lo} to ${hi}` +
+    `${S.st.locks.size + S.st.dlocks.size ? `, ${S.st.locks.size + S.st.dlocks.size} locked or frozen slider(s) left alone` : ""} (Undo for the mix before; Freeze tweaked to keep ` +
+    "what you like and roll the rest; Save preset… to keep it).";
   stRemember();
 }
 
@@ -4454,10 +4673,9 @@ function studioPresetSaveOpen() {
 function studioState() {
   const blocks = {};
   for (const [id, b] of Object.entries(S.st.blocks)) blocks[id] = {primary_enabled: b.pe, primary_strength: b.ps, donor_enabled: b.de, donor_strength: b.ds};
-  const res = Number($("stRes").value) || 768;
   const num = (id, d) => { const v = Number($(id).value); return isFinite(v) ? v : d; };
-  return {blocks, seed: seedOf("stSeed"), prompt: $("stPrompt").value.trim(), preview_width: res,
-    preview_height: res, ref_image_path: $("stRefRow").style.display === "none" ? "" : $("stRef").value.trim(),
+  return {blocks, seed: seedOf("stSeed"), prompt: $("stPrompt").value.trim(), preview_width: Number($("stW").value) || 768,
+    preview_height: Number($("stH").value) || 768, ref_image_path: $("stRefRow").style.display === "none" ? "" : $("stRef").value.trim(),
     ref_megapixels: num("stRefMp", 1), ref_strength: num("stRefStr", 1), primary_scale: num("stPScale", 1),
     donor_scale: num("stDScale", 1)};
 }
@@ -4506,6 +4724,10 @@ async function studioPoll() {
   S.st.ready = st.state === "ready";
   S.st.donor = !!st.donor;
   S.st.primaryBlocks = new Set(st.primary_blocks || []); S.st.donorBlocks = new Set(st.donor_blocks || []);
+  // a donor loaded (or unloaded) after the model: its rows and buttons show (or go) now, not at the next load
+  const actKey = [S.st.ready, st.donor || "", (st.primary_blocks || []).length, (st.donor_blocks || []).length].join("|");
+  if (wasReady && S.st.ready && actKey !== S.st.actKey) studioActivity();
+  S.st.actKey = actKey;
   // loaded with nothing to render yet: say what it waits for (a prompt), not that a preview is coming
   const waiting = st.state === "ready" && !st.rendering && !st.shown && !$("stPrompt").value.trim();
   $("stStatus").textContent = (waiting ? "Loaded. Enter a prompt (include the LoRA's trigger word), then press Update." :
@@ -4552,7 +4774,9 @@ async function studioPoll() {
     studioMetrics();
     studioDownloads(st, q);
     const ps = Number($("stPScale").value) || 1;
-    $("stBaseCap").textContent = ps === 1 ? "Baseline (LoRA at default 1.0)" : `Baseline (LoRA at ${ps})`;
+    $("stBaseCap").textContent = (ps === 1 ? "Baseline (LoRA at default 1.0)" : `Baseline (LoRA at ${ps})`) +
+      (st.donor ? " - the donor is not in the baseline" : "");
+    $("stTweakCap").textContent = "Tweaked (current sliders)" + (st.donor ? " - includes the donor" : "");
   }
   studioNoLoraPane(st);
   studioAceNotes(st.notes);
@@ -4593,7 +4817,7 @@ function studioDownloads(st, q) {
 function studioNoLoraPane(st) {
   // the base model's own clip / song, left of the pair (the desktop's player has it there): H3 with the tick, ACE always
   const kind = S.st.layout && S.st.layout.kind;
-  const on = kind === "audio" || (kind === "video" && $("stH3NoLora").checked);
+  const on = kind === "audio";                        // No LoRA: ACE-Step's song only (H3's clip was too slow)
   $("stNolPane").style.display = on && kind === "video" ? "" : "none";     // a song's No LoRA is heard in the player
   $("stPreview").classList.toggle("three", on && kind === "video");
   if (kind === "audio") $("stSongNolora").textContent = st.nolora_busy ? "▶ No LoRA (rendering…)" : "▶ No LoRA";
@@ -4637,10 +4861,133 @@ async function studioSave(overwrite) {
   } catch (e) { $("stSaveMsg").replaceChildren(el("div", {class: "problems", text: e.message})); }
 }
 
+// ---- the preview kept in view: the Preview card's panes moved into a panel that floats (move it, resize it from the
+// corner) or is pinned to the top of the tab (its bottom edge sets the height); renders, clips, songs and Play
+// together keep working because it is the same panes, moved - and put back when it closes
+const ST_DOCK_KEY = "fizgig_studio_dock";
+const stDockSaved = () => { try { return JSON.parse(localStorage.getItem(ST_DOCK_KEY) || "{}"); } catch (e) { return {}; } };
+const stDockSave = (d) => { try { localStorage.setItem(ST_DOCK_KEY, JSON.stringify({...stDockSaved(), ...d})); } catch (e) { /* private window */ } };
+
+function studioDockClamp(dock) {                   // a floating panel stays on screen (a smaller window, a phone)
+  const r = dock.getBoundingClientRect(), vw = window.innerWidth, vh = window.innerHeight;
+  const w = Math.min(r.width, vw - 16), h = Math.min(r.height, vh - 16);
+  dock.style.width = w + "px"; dock.style.height = dock.classList.contains("collapsed") ? "" : h + "px";
+  dock.style.left = Math.max(8, Math.min(r.left, vw - w - 8)) + "px";
+  dock.style.top = Math.max(8, Math.min(r.top, vh - 40)) + "px";
+}
+
+function studioDockMode(pinned) {
+  const dock = $("stDock"), sv = stDockSaved();
+  dock.classList.toggle("pinned", pinned); dock.classList.toggle("floating", !pinned);
+  $("stDockPin").textContent = pinned ? "⧉ Float" : "📌 Pin to top";
+  $("stDockPin").title = pinned ? "Float the panel: move it anywhere and resize it from its corner" :
+    "Lock the panel to the top of the tab, full width; drag its bottom edge to set how much room it takes";
+  if (pinned) {                                    // in the tab's flow, stuck to the top as the page scrolls under it
+    $("tab-studio").prepend(dock);
+    Object.assign(dock.style, {left: "", top: "", width: "", height: (sv.pinH || 320) + "px"});
+  } else {                                         // inside the tab too: it goes whenever the tab does
+    $("tab-studio").append(dock);
+    const w = sv.w || Math.min(560, window.innerWidth - 32), h = sv.h || 340;
+    Object.assign(dock.style, {width: w + "px", height: h + "px",
+      left: (sv.x ?? window.innerWidth - w - 24) + "px", top: (sv.y ?? 90) + "px"});
+    studioDockClamp(dock);
+  }
+  if (sv.collapsed) dock.style.height = "";
+  stDockSave({pinned});
+}
+
+const studioDockAllowed = () => !(S.st.layout && S.st.layout.kind === "audio");     // never for a music model
+
+function studioDock(open, remember = true) {
+  let dock = $("stDock");
+  if (!open) {
+    if (dock) {
+      $("stDockHome").after($("stPreview"));
+      dock.remove();
+    }
+    $("stDockHome").style.display = "none"; $("stDockOpen").style.display = studioDockAllowed() ? "" : "none";
+    if (remember) stDockSave({open: false});
+    return;
+  }
+  if (!studioDockAllowed()) return;
+  if (!dock) {
+    const btn = (id, text, title) => el("button", {class: "btn btn-sm", id, text, title});
+    dock = el("div", {class: "st-dock", id: "stDock"},
+      el("div", {class: "st-dock-bar", id: "stDockBar"}, el("span", {class: "st-dock-title", text: "Preview"}),
+        btn("stDockPlay", "▶ Play together", "Play the clips or songs together"),
+        btn("stDockPin", "", ""), btn("stDockFold", "▁", "Collapse to the title bar / open it again"),
+        btn("stDockClose", "✕", "Close - the preview goes back to its card")),
+      el("div", {class: "st-dock-body", id: "stDockBody"}),
+      el("div", {class: "st-dock-grip", id: "stDockGrip", title: "Drag to set how much room the panel takes"}));
+    $("tab-studio").append(dock);                  // in the page first: its buttons are found by id below
+    $("stDockClose").addEventListener("click", () => studioDock(false));
+    $("stDockPin").addEventListener("click", () => studioDockMode(!dock.classList.contains("pinned")));
+    $("stDockPlay").addEventListener("click", () => $("stPlayBothBtn").click());
+    $("stDockFold").addEventListener("click", () => {
+      const c = !dock.classList.contains("collapsed");
+      dock.classList.toggle("collapsed", c); stDockSave({collapsed: c});
+      const sv = stDockSaved();
+      dock.style.height = c ? "" : (dock.classList.contains("pinned") ? (sv.pinH || 320) : (sv.h || 340)) + "px";
+    });
+    // floating: drag by the title bar
+    $("stDockBar").addEventListener("pointerdown", (e) => {
+      if (!dock.classList.contains("floating") || e.target.closest("button")) return;
+      const r = dock.getBoundingClientRect(), dx = e.clientX - r.left, dy = e.clientY - r.top;
+      $("stDockBar").setPointerCapture(e.pointerId);
+      const move = (m) => { dock.style.left = (m.clientX - dx) + "px"; dock.style.top = (m.clientY - dy) + "px"; };
+      const up = () => { $("stDockBar").removeEventListener("pointermove", move); studioDockClamp(dock);
+        const q = dock.getBoundingClientRect(); stDockSave({x: Math.round(q.left), y: Math.round(q.top)}); };
+      $("stDockBar").addEventListener("pointermove", move);
+      $("stDockBar").addEventListener("pointerup", up, {once: true});
+    });
+    // pinned: drag the bottom edge for the height
+    $("stDockGrip").addEventListener("pointerdown", (e) => {
+      if (!dock.classList.contains("pinned")) return;
+      const y0 = e.clientY, h0 = dock.getBoundingClientRect().height;
+      $("stDockGrip").setPointerCapture(e.pointerId);
+      const move = (m) => { dock.style.height = Math.max(140, Math.min(window.innerHeight * 0.85, h0 + m.clientY - y0)) + "px"; };
+      const up = () => { $("stDockGrip").removeEventListener("pointermove", move);
+        stDockSave({pinH: Math.round(dock.getBoundingClientRect().height)}); };
+      $("stDockGrip").addEventListener("pointermove", move);
+      $("stDockGrip").addEventListener("pointerup", up, {once: true});
+    });
+    // while the panel is being resized its clips step aside (scaling playing video every frame is the slow part),
+    // back a moment after the size stops changing - the pinned edge drag and the floating corner alike
+    let sizing = null;
+    new ResizeObserver(() => {
+      if (!dock.isConnected) return;
+      dock.classList.add("st-resizing");
+      clearTimeout(sizing);
+      sizing = setTimeout(() => dock.classList.remove("st-resizing"), 200);
+    }).observe(dock);
+    // floating: the corner resize is the browser's own; its size is remembered
+    new ResizeObserver(debounce(() => {
+      if (dock.isConnected && dock.classList.contains("floating") && !dock.classList.contains("collapsed")) {
+        const q = dock.getBoundingClientRect(); stDockSave({w: Math.round(q.width), h: Math.round(q.height)});
+      }
+    }, 300)).observe(dock);
+  }
+  $("stDockBody").append($("stPreview"));
+  $("stDockHome").style.display = ""; $("stDockOpen").style.display = "none";
+  const sv = stDockSaved();
+  dock.classList.toggle("collapsed", !!sv.collapsed);
+  studioDockMode(!!sv.pinned);
+  studioDockPlay();
+  stDockSave({open: true});
+}
+
+function studioDockPlay() {                        // the panel's Play together: when the card has one (clips, songs)
+  if ($("stDockPlay")) $("stDockPlay").style.display = $("stPlayBoth").style.display === "none" ? "none" : "";
+}
+
 function wireStudio() {
+  $("stDockOpen").addEventListener("click", () => studioDock(true));
+  $("stDockBack").addEventListener("click", () => studioDock(false));
+  new MutationObserver(studioDockPlay).observe($("stPlayBoth"), {attributes: true, attributeFilter: ["style"]});
+  window.addEventListener("resize", debounce(() => { const d = $("stDock"); if (d && d.classList.contains("floating")) studioDockClamp(d); }, 150));
   $("stFamily").addEventListener("change", () => { studioFamily(); stRemember(); });
   // H3: a length / size / steps / sound change renders; Model and Base take effect at the next Start
-  for (const id of ["stH3Len", "stH3W", "stH3H", "stH3Scale", "stH3Steps", "stH3Turbo", "stH3Sound", "stH3NoLora"])
+  for (const id of ["stH3Len", "stH3W", "stH3H", "stH3Steps", "stH3Turbo", "stH3Sound", "stH3Boost"])
     $(id).addEventListener("change", () => { studioH3Remember(); studioSchedule(); });
   $("stH3Early").addEventListener("change", studioH3Remember);
   $("stH3Model").addEventListener("change", () => { studioH3Remember(); studioSlots(); $("stStart").textContent = "Update"; });
@@ -4668,9 +5015,13 @@ function wireStudio() {
   $("stRefPick").addEventListener("click", () => pick($("stRef").value || refStart(), false, (p) => { $("stRef").value = p; stRemember(); studioSchedule(); }));
   $("stRefClear").addEventListener("click", () => { $("stRef").value = ""; stRemember(); studioSchedule(); });
   $("stSeedNew").addEventListener("click", () => { $("stSeed").value = 1 + Math.floor(Math.random() * 99999); stRemember(); studioSchedule(); });
-  for (const id of ["stSeed", "stRes", "stRefMp", "stRefStr", "stPScale", "stDScale"])
+  for (const id of ["stSeed", "stRes", "stW", "stH", "stRefMp", "stRefStr", "stPScale", "stDScale"])
     $(id).addEventListener("change", () => { stRemember(); studioSchedule(); });
   for (const id of ["stPrompt", "stPrimary", "stDonor", "stLuckyLo", "stLuckyHi"]) $(id).addEventListener("input", stRemember);
+  $("stLuckyWho").addEventListener("change", () => { stRemember(); studioFreezeState(); });
+  $("stLuckyCount").addEventListener("change", stRemember);
+  $("stFreeze").addEventListener("click", () => studioFreeze(true));
+  $("stUnfreeze").addEventListener("click", () => studioFreeze(false));
   $("stNeg").addEventListener("change", () => { stRemember();
     if (S.st.ready) api("/api/studio/settings", {family: S.st.layout.key, negative: $("stNeg").value.trim()}).then(() => studioSchedule()); });
   $("stTurbo").addEventListener("change", () => { stRemember(); if (S.st.ready) api("/api/studio/settings", {family: S.st.layout.key, turbo: $("stTurbo").checked}); });
@@ -6059,6 +6410,11 @@ async function podLocalSend(d) {
   podLocalDraw();
 }
 window.addEventListener("pywebviewready", podLocalInit);    // the window's bridge arrives after the page loads
+// tell the app window the page runs in it (app_window.py gives a white window up for the browser otherwise)
+window.addEventListener("pywebviewready", () => {
+  const a = window.pywebview && window.pywebview.api;
+  if (a && a.ready) a.ready();
+});
 
 // the app window and a pod must run the same build (app_window.py blocks the page when they don't). A window from
 // before that check has no build() to ask: it is older than this pod, so the page says to update this computer
@@ -6261,7 +6617,8 @@ function wireLightbox() {
     const img = e.target.closest && e.target.closest(LIGHTBOX_PICS);
     if (!img) return;
     const host = img.closest(".gallery, .captions-grid, .st-preview") || document;   // step through the pictures beside it
-    const imgs = [...host.querySelectorAll(LIGHTBOX_PICS)];
+    const imgs = [...host.querySelectorAll(LIGHTBOX_PICS)]       // only the pictures on show (a hidden pane is not one)
+      .filter((i) => i === img || (i.getClientRects().length && (i.currentSrc || i.getAttribute("src"))));
     S.lb.list = imgs.map((i) => {
       const fig = i.closest(".gallery-item, .caption-card");
       const cap = fig && fig.querySelector("figcaption, .caption-card-title");

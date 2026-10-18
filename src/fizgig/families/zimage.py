@@ -69,7 +69,7 @@ ZIMAGE = FamilyDescription(
     block_prefix="layers",
     block_note="30 identical single-stream layers (attention + SwiGLU MLP, per-layer AdaLN). The two noise and two "
                "context refiner layers ahead of them are not trained.",
-    workbench=("repair", "explorer", "profiler", "extract", "royale"),
+    workbench=("repair", "profiler", "extract", "royale"),
 
     lora=LoRAFormat(
         key_template="diffusion_model.layers.{block}.{module}.{ab}.weight",

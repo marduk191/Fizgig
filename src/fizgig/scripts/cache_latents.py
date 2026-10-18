@@ -105,12 +105,21 @@ def encode_datasets(datasets, encode_fn, args):
                 # veto the skip for a file that exists and matches — MiniMax uses it for a
                 # clip cached without the still that --clip_still asks for.
                 _needs = getattr(args, "needs_reencode", None)
+
+                def _newer(item):
+                    """The picture changed after it was cached (same name, new pixels: an edited photo, or LoRA
+                    Isolation's side-by-sides rebuilt from a new strangers set)."""
+                    try:
+                        return os.path.getmtime(item.item_key) > os.path.getmtime(item.latent_cache_path)
+                    except (OSError, TypeError):
+                        return False
                 batch = [item for item in batch
                          if not os.path.exists(item.latent_cache_path)
                          or _ID.latent_cache_matches_reso(item.latent_cache_path,
                                                           item.bucket_size,
                                                           dataset.architecture) is not True
-                         or (_needs is not None and _needs(item.latent_cache_path))]
+                         or (_needs is not None and _needs(item.latent_cache_path))
+                         or _newer(item)]
                 if not batch:
                     continue
 

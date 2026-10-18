@@ -100,6 +100,14 @@ see "Note on model weights" below.)
 
 ---
 
+## FLUX 3 Image Klein (Black Forest Labs) — Apache License 2.0
+
+Upstream: https://github.com/black-forest-labs/flux-3-image-klein
+
+`src/fizgig/flux3/` (the DiT, autoencoder, text-encoder wrapper and sampler) is adapted from the FLUX 3 Image Klein reference implementation; its licence is in `src/fizgig/flux3/LICENSE`. Licensed under the Apache License, Version 2.0. (Model weights are distributed separately under the FLUX Kommunity License — see "Note on model weights" below.)
+
+---
+
 ## Diffusers / Qwen-Image VAE — Apache License 2.0
 
 Upstream: https://github.com/huggingface/diffusers
@@ -229,6 +237,32 @@ THE SOFTWARE.
 ```
 
 The word "QR Code" is a registered trademark of DENSO WAVE INCORPORATED.
+
+## LC Speed Boost (lonecatone23) — MIT License
+
+`src/fizgig/minimax/speed_boost.py` (the Studio's H3 **Speed Boost**) adapts the spectral shrink / grow from LC Speed Boost in ComfyUI_LC123_nodes: <https://github.com/lonecatone23/ComfyUI_LC123_nodes>. It implements SPEED ("Spectral Progressive Diffusion for Efficient Image and Video Generation", Xiao, Chao, Yariv and Wetzstein, 2026).
+
+```
+Copyright (c) 2026 lonecatone23
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
 
 ## Note on model weights
 
