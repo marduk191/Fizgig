@@ -13,11 +13,14 @@ import os
 import shutil
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-USER_DATA = os.path.join(BASE_DIR, "user_data")
+# a second Fizgig on this computer's other GPU (web/helpers.py local_start) keeps its own settings and state there;
+# the model files stay shared
+OWN_USER_DATA = os.environ.get("FIZGIG_USER_DATA") or ""
+USER_DATA = os.path.abspath(OWN_USER_DATA) if OWN_USER_DATA else os.path.join(BASE_DIR, "user_data")
 PREFS_FILE = os.path.join(USER_DATA, "prefs.json")
 LAST_USED_FILE = os.path.join(USER_DATA, "last_used.json")       # the training folder and its trigger words
 PRESETS_DIR = os.path.join(USER_DATA, "presets")
-MODELS_DIR = os.path.join(USER_DATA, "models")              # where Download models for me puts them
+MODELS_DIR = os.path.join(BASE_DIR, "user_data", "models")  # where Download models for me puts them
 
 # what Fizgig 7 kept in its folder -> where it lives now
 _MOVES = (
@@ -224,7 +227,7 @@ def _write(path, data):
 def migrate(log=print):
     """Fizgig 7's files into user_data, once per process (cheap when there is nothing to move). Never raises: a file
     another program holds open stays where it is, and the next start tries again."""
-    if _done:
+    if _done or OWN_USER_DATA:                 # a second Fizgig's folder has no Fizgig 7 files to take in
         return
     _done.append(True)
     moved = []

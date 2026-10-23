@@ -13,6 +13,7 @@
 </p>
 <p align="center">
   <sub>No GPU, or want a bigger one? Fizgig runs on rented hardware — one click, nothing to install.<br>
+  On RunPod's page, <b>add a 300 GB Volume disk before Deploy Pod</b> (<a href="docker/README.md#give-it-a-disk-on-runpods-deploy-page">how</a>).<br>
   Deploying through that link supports Fizgig's development at no extra cost to you.</sub>
 </p>
 
@@ -30,7 +31,9 @@
 </p>
 
 > ### 📰 Latest news
-> - **Fizgig 8.5 — MOSS-Image.** OpenMOSS's new 5B open image model trains in Fizgig: LoRAs, LoKRs, sliders, full fine-tuning, Multi Concept and Fizgig LoRA Isolation, with previews on MOSS-Image SFT, the model most people generate with, and every workbench tool. Brought to Fizgig by @Murf-Code. 8.5.1 fixes the GPU readout on AMD cards (thanks @scryptio). [Release notes](docs/RELEASE_NOTES_v8.5.1.md) · [MOSS-Image guide](docs/MOSS_IMAGE.md)
+> - **Fizgig 8.9.0 — your other GPUs, at home or in the cloud, speeding up your run.** A helper is another computer running Fizgig: a second PC or laptop, a second GPU in this computer, or a RunPod or Vast.ai pod. It renders your previews so training never stops for them, takes over a run while you need your computer, or trains a share of each epoch alongside your GPU. In a share, each GPU trains its own copy of the LoRA on its part of the images and the copies' changes are added into one LoRA at every combine: in testing its likeness matched a one-GPU run. On a fast network, combine every epoch for the closest result. It pays most on long runs. Training on a pod? Your home GPU can help it, and its checkpoints come home as they're saved. [Release notes](docs/RELEASE_NOTES_v8.9.0.md) · [▶ Watch the video](https://www.youtube.com/watch?v=7Ao0gE2b2qw) · [Helpers guide](docs/HELPERS.md)
+> - **Fizgig 8.8.1 — MOSS-Image likeness sooner, and previews with the SFT look.** A new Clean-end share default, **Slide**, brings likeness in early and keeps it: on our most difficult dataset, the best of eight settings we tried, around 70% likeness from epoch 20 to epoch 60. Base previews can take on much of MOSS-Image SFT's look with no model swap, every enlarged preview says how it was made, and Krea 2's Auto precision no longer picks a slow setup on 16 GB cards. 8.8.2 stops the web UI freezing when you open it during a long run. [Release notes](docs/RELEASE_NOTES_v8.8.1.md) · [8.8.2](docs/RELEASE_NOTES_v8.8.2.md) · [▶ Watch the video](https://www.youtube.com/watch?v=UCoCtM8yrBk) · [MOSS-Image guide](docs/MOSS_IMAGE.md)
+> - **Fizgig 8.5 — MOSS-Image.** OpenMOSS's new 5B open image model trains in Fizgig: LoRAs, LoKRs, sliders, full fine-tuning, Multi Concept and Fizgig LoRA Isolation, with previews on MOSS-Image SFT, the model most people generate with, and every workbench tool. Brought to Fizgig by @Murf-Code. 8.5.1 fixes the GPU readout on AMD cards (thanks @scryptio); 8.5.3 fixes Linux launching; 8.5.4 makes MOSS-Image previews render as ComfyUI does; 8.5.5 trains MOSS-Image at 1 MP; 8.5.8 fixes MOSS-Image training with block swap; 8.5.9 makes MOSS-Image Studio renders faster; 8.6.0 improves MOSS-Image likeness and adds an option for training on SFT; 8.6.1 fixes noisy Qwen Image 2.1 previews; 8.7 brings MOSS-Image likeness much sooner with a new Clean-end share option, 30% by default since 8.7.1, fine-tunes included in 8.7.2, since 8.7.3 a fine-tune fits a 16 GB card, and 8.7.4 adds an 8-step Turbo LoRA for fast previews on Base, 8.7.5 lets MOSS-Image train on computers with 16 GB of RAM, 8.7.6 fixes the cache on a resume and for a refilled folder, 8.7.7 drops Kromoss, 8.7.8 adds preview and save schedules, 8.7.9 is a maintenance release, and 8.8.0 fixes resuming a run on Python 3.10. [Release notes](docs/RELEASE_NOTES_v8.8.0.md) · [MOSS-Image guide](docs/MOSS_IMAGE.md)
 > - **Fizgig 8.4 — Fizgig LoRA Isolation.** Train two people into one LoRA and every stranger keeps their own face: with a normal LoRA 48 of 50 strangers came out looking like the trained person, with LoRA Isolation 0 of 50, at the same likeness. DOP from @ostris's AI-Toolkit at its base, with Fizgig's own techniques on top, set up on the Training tab's new Subjects card, on every model except ACE-Step. 8.4.2 adds a trigger word checker on the same card. [Demo](https://youtu.be/CNh4sN5vN_8) · [How to set it up](https://youtu.be/8uW5NdL5b20) · [Release notes](docs/RELEASE_NOTES_v8.4.0.md)
 > - **Fizgig 8.1 — Flux 3 Image Klein, from day one.** Black Forest Labs' new 5.6B text-to-image and edit model trains in Fizgig the day it came out: LoRAs, LoKRs, edit LoRAs from before/after pairs, slider LoRAs and full fine-tuning, from an 8 GB card, with every workbench tool, prompt travel and edit chains in LoRA Royale included. [Release notes](docs/RELEASE_NOTES_v8.1.0.md) · [Flux 3 guide](docs/FLUX3.md)
 > - **Fizgig 8 — the new app (yes, the web UI).** Fizgig opens in its own window or your browser, and your phone can watch a run. One **Pods** tab opens your other computers' GPUs, found on your network by themselves, and RunPod pods, logged in for you. What's training and what's up next sit in the sidebar on every tab, and **Runs & outputs** keeps every run. Updating keeps your settings, presets, folders and queued runs; a welcome tour on the first start shows where everything went. [Release notes](docs/RELEASE_NOTES_v8.0.0.md) · [The app](docs/WEB_UI.md)
@@ -73,9 +76,9 @@ https://github.com/user-attachments/assets/2db82d0d-e7ed-4f60-a79c-d2ac1f4984ac
 | **MiniMax H3** (33B) | photos, video clips, sound, voice | ✅ | ✅ | ✅ slider | ✅ experimental | 16 GB | [MiniMax H3](docs/MINIMAX_H3.md) |
 | **Qwen Image 2.1** | photos | ✅ | ✅ | ✅ slider + edit | ✅ experimental | 10 GB | [Qwen Image 2.1](docs/QWEN_IMAGE.md) |
 | **MOSS-Image** (5B), experimental | photos | ✅ | ✅ | ✅ slider | ✅ experimental | 12 GB | [MOSS-Image](docs/MOSS_IMAGE.md) |
-| **Z-Image Turbo** (6B), experimental | photos | ✅ | ✅ | ✅ slider | ✅ experimental | 12 GB | [7.1 notes](docs/RELEASE_NOTES_v7.1.0.md) |
-| **SDXL** (any checkpoint), experimental | photos | ✅ | ✅ | ✅ slider | ✅ experimental | 8 GB | [7.0 notes](docs/RELEASE_NOTES_v7.0.0.md) |
-| **Anima** (2B), experimental | photos | ✅ | ✅ | ✅ slider | ✅ experimental | 8 GB | [7.0 notes](docs/RELEASE_NOTES_v7.0.0.md) |
+| **Z-Image Turbo** (6B), experimental | photos | ✅ | ✅ | ✅ slider | ✅ experimental | 12 GB | [Z-Image Turbo](docs/ZIMAGE.md) |
+| **SDXL** (any checkpoint), experimental | photos | ✅ | ✅ | ✅ slider | ✅ experimental | 8 GB | [SDXL](docs/SDXL.md) |
+| **Anima** (2B), experimental | photos | ✅ | ✅ | ✅ slider | ✅ experimental | 8 GB | [Anima](docs/ANIMA.md) |
 | **ACE-Step 1.5 XL** (4B), experimental | songs | ✅ | — | ✅ slider | ✅ experimental | 16 GB | [ACE-Step](docs/ACESTEP.md) |
 
 Every image and video model gets all four workbench tools; ACE-Step has Studio and Extract. Qwen Image 2.1 trains on the base model and previews on Qwen's own Turbo (8 steps, CFG 1); your LoRAs work on both. MOSS-Image trains on Base and previews on MOSS-Image SFT, the model most people generate with. MiniMax H3 also makes **RefMods**, tuned against H3 itself rather than a plain encode ([how do I…?](docs/REFMOD_HOWDOI.md)). Fizgig's training adapters for [Qwen Image 2.1](https://huggingface.co/ShootTheSound/Fizgig-Qwen-Image-2.1-Training-Adapter) and [Z-Image Turbo](https://huggingface.co/ShootTheSound/Fizgig-Z-Image-Turbo-Training-Adapter) are free on Hugging Face for any trainer. Full fine-tuning has [its own guide](docs/FINETUNE.md).
@@ -105,6 +108,7 @@ Each tool works on your own runs **or any LoRA you've downloaded**, and they han
 - **Fast previews** in a few steps on a turbo or distilled model where one exists: Klein's and Flux 3 Image Klein's distilled models, the Turbo LoRAs for Krea 2, MiniMax H3, Qwen Image 2.1 and Anima, and Qwen Image 2.1's Turbo model.
 - **A sample gallery that scores likeness** live, and a run visualiser to scrub epochs.
 - **Dataset prep**: AI captions with Qwen3-VL or Florence-2, bilingual captions, face crops, and a Look Consistency Filter.
+- **Face backends for every kind of character**: face crops, the Look Filter and likeness scores work on anime, furry and fursuit characters as well as people (see the section below).
 - **Gizmo** (MiniMax H3): cut clips with scene detection, crop to the subject, and record or segment a voice dataset with Whisper transcription.
 
 Full list: [docs/TRAINING.md](docs/TRAINING.md). Everything also runs headless: [docs/CLI.md](docs/CLI.md).
@@ -115,7 +119,8 @@ Full list: [docs/TRAINING.md](docs/TRAINING.md). Everything also runs headless: 
 - **The queue in sight**: what's training and what's up next sit in the sidebar on every tab; a held queue says why, with Start queue right there.
 - **On your phone or another computer**: set a password in Preferences and open it over your network, or scan the Start tab's **Open on your phone** QR code and you're straight in; add it to your phone's home screen and it opens like an app.
 - **On your other computer's GPU**: train on your desktop's card from your laptop. Fizgig finds your other computers running it, and the **Pods** tab opens one as it does a pod ([how](docs/WEB_UI.md#your-other-computers-use-ones-gpu-from-another)).
-- **On a rented GPU**: the **Pods** tab finds the card that's cheapest per run among those RunPod has free right now, deploys it, opens the pod in the same window (logged in for you), and sends a training folder from your computer straight to it.
+- **On a rented GPU**: the **Pods** tab finds the card that's cheapest per run among those RunPod has free right now (one card or two), deploys it, opens the pod in the same window (logged in for you), and sends a training folder from your computer straight to it. Prefer Vast.ai? Fizgig has a template there too, with https addresses and a stop when the run finishes ([Vast.ai](docs/VAST.md)).
+- **Your other GPUs helping**: a second computer, a second GPU in this one, or a pod renders your previews so training never stops for them, trains a share of each epoch alongside yours, or takes over a run while you game or someone else needs the computer, then hands it back. A pod's checkpoints can come home as they're saved, and the pod can be deleted once they're all here ([Helpers](docs/HELPERS.md)).
 - **Runs & outputs** keeps every run with its loss graph, notes, previews and checkpoints, and starts any of them again with the same settings.
 
 <p align="center">
@@ -124,6 +129,17 @@ Full list: [docs/TRAINING.md](docs/TRAINING.md). Everything also runs headless: 
 </p>
 
 More: [docs/WEB_UI.md](docs/WEB_UI.md).
+
+## Face backends
+
+Face crops, the Look Consistency Filter and every likeness score can work on anime, furry and drawn characters and fursuits too, not just people.
+
+**The defaults are InsightFace (face finder) and ArcFace (look match), the same as before.** People's sets need nothing changed. Everything else is opt-in: open **Image Prep → Anime/furry/drawn characters** and pick:
+
+- **Face finder**: **Anime/furry/drawn (YOLO model)** for characters, or **Both** for a set with people and characters in it.
+- **Look match**: **Anime/furry/drawn** for characters, or **Auto (Decide for each set)**. Each look match has its own thresholds, and saved scores record which one made them.
+
+Setup (which face model to use and how to get it), numbers and limitations are in [docs/FACE_BACKENDS.md](docs/FACE_BACKENDS.md).
 
 ## Install
 
@@ -137,7 +153,7 @@ cd Fizgig
 ```
 
 - **Windows (NVIDIA):** double-click `install_fizgig.bat`, then launch with `Launch Fizgig.bat` (its own window) or `Launch Fizgig in browser.bat` (in your web browser); update with `update_fizgig.bat`.
-- **Linux (NVIDIA):** `python install_fizgig.py`, then `./launch_fizgig.sh` or `./launch_fizgig_browser.sh`.
+- **Linux (NVIDIA):** `python install_fizgig.py`, then `./launch_fizgig.sh` or `./launch_fizgig_browser.sh`; update with `./update_fizgig.sh`.
 - **AMD ROCm:** see [docs/INSTALL.md](docs/INSTALL.md).
 
 Model files download from the **Preferences** tab: one **Download models for me** button per model.
@@ -146,10 +162,12 @@ Model files download from the **Preferences** tab: one **Download models for me*
 
 **Nothing to install on your computer:** the whole app runs on the pod, in your browser.
 
-1. **[⚡ Deploy on RunPod](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=bdrdew7hxw&ref=vkb387ep)** (keep the 300 GB disk).
+1. **[⚡ Deploy on RunPod](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=bdrdew7hxw&ref=vkb387ep)**, and add a **300 GB Volume disk** before **Deploy Pod**: RunPod doesn't add one for you ([how](docker/README.md#give-it-a-disk-on-runpods-deploy-page)).
 2. Wait for **Ready** in the pod's **Logs** tab; the password is printed under it.
 3. **Connect → HTTP port 8081**, and log in with that password.
 4. **Preferences → Download models for me**, upload your training folder on the **Start** tab, and press **Start** on the **Training** tab.
+
+Prefer Vast.ai? The same image runs there: **[Fizgig on Vast.ai](https://cloud.vast.ai/?ref_id=757773&creator_id=757773&name=Fizgig%20LoRa%20Training%20and%20Fine-tuning)** ([guide](docs/VAST.md)).
 
 Step by step: [Quick start](docker/README.md#quick-start-nothing-installed-on-your-computer). The pod also has a drag-and-drop file manager for big datasets and fine-tunes (the **File manager** button in the sidebar), one-click model downloads and an optional auto-stop when training finishes. [The full pod guide](docker/README.md).
 
@@ -187,7 +205,7 @@ Fizgig is free. If it saves you time or makes your LoRAs better, a coffee or a G
 
 <a href="https://buymeacoffee.com/lorasandlenses"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black" alt="Buy Me A Coffee"></a> <a href="https://github.com/sponsors/shootthesound"><img src="https://img.shields.io/badge/Sponsor-EA4AAA?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="Sponsor on GitHub"></a>
 
-Renting through the [RunPod link](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=bdrdew7hxw&ref=vkb387ep) supports development too, at no extra cost to you.
+Renting through the [RunPod link](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=bdrdew7hxw&ref=vkb387ep) supports development too, at no extra cost to you. **Add a 300 GB Volume disk on RunPod's page before Deploy Pod** ([how](docker/README.md#give-it-a-disk-on-runpods-deploy-page)).
 
 ---
 
@@ -196,14 +214,16 @@ Renting through the [RunPod link](https://console.runpod.io/deploy?type=GPU&gpu=
 | Guide | What's in it |
 |---|---|
 | [Install and requirements](docs/INSTALL.md) | Hardware, system RAM, AMD ROCm, model downloads, VRAM tables |
-| [Klein 9B](docs/KLEIN.md) · [Flux 3 Image Klein](docs/FLUX3.md) · [Krea 2](docs/KREA2.md) · [MiniMax H3](docs/MINIMAX_H3.md) · [Qwen Image 2.1](docs/QWEN_IMAGE.md) · [MOSS-Image](docs/MOSS_IMAGE.md) | Each model: presets, features, memory |
+| [Klein 9B](docs/KLEIN.md) · [Flux 3 Image Klein](docs/FLUX3.md) · [Krea 2](docs/KREA2.md) · [MiniMax H3](docs/MINIMAX_H3.md) · [Qwen Image 2.1](docs/QWEN_IMAGE.md) · [MOSS-Image](docs/MOSS_IMAGE.md) · [Z-Image Turbo](docs/ZIMAGE.md) · [SDXL](docs/SDXL.md) · [Anima](docs/ANIMA.md) · [ACE-Step](docs/ACESTEP.md) | Each model: presets, features, memory |
 | [Training and the workbench](docs/TRAINING.md) | The shared features and tools in detail |
+| [Face backends](docs/FACE_BACKENDS.md) | Face finder (InsightFace / YOLO) and look match (ArcFace / DINOv2) for people, anime and furry |
 | [Full fine-tuning](docs/FINETUNE.md) · [How do I…?](docs/FINETUNE_HOWDOI.md) | Training the base model itself |
 | [RefMods](docs/REFMOD_HOWDOI.md) | RefMods for MiniMax H3 |
 | [Command line](docs/CLI.md) | Every trainer, headless |
 | [Fizgig LoRA Isolation](docs/LORA_ISOLATION.md) | How it works, the recipe and the results |
 | [The app](docs/WEB_UI.md) | Starting Fizgig, its window and browser, your phone, your other computers, the port and password, pods |
-| [RunPod](docker/README.md) | The cloud image |
+| [Helpers](docs/HELPERS.md) · [Previews on a helper](docs/HELPER_PREVIEWS.md) · [Training share](docs/TRAINING_SHARE.md) · [Move a run](docs/MOVE_RUN.md) | Another computer or a pod renders your previews, trains a share of each epoch, or takes over a run while you use your computer |
+| [RunPod](docker/README.md) · [Vast.ai](docs/VAST.md) | The cloud image, on RunPod and on Vast.ai |
 
 ## License
 

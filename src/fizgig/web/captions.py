@@ -19,10 +19,23 @@ import sys
 import threading
 import time
 
-from fizgig.dataset.caption_text import read_caption  # [fork] torch-free, any encoding
 from fizgig.user_data import user_file  # noqa: E402  (Fizgig's own files: user_data/)
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 JOB_DIR = user_file("caption_jobs")
+
+def read_text(path) -> str:
+    """A caption file's words, whatever wrote it: UTF-8 (a BOM dropped), UTF-16 with its BOM, else Windows-1252 (older
+    Windows tools save that) - so one such file never empties a folder's caption list (#225). OSError if it isn't
+    there."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return raw.decode("utf-16", errors="replace")
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", errors="replace")
+
 
 FLORENCE_DEFAULT_MODEL = "MiaoshouAI/Florence-2-base-PromptGen"
 FLORENCE_MODELS = [FLORENCE_DEFAULT_MODEL, "microsoft/Florence-2-base", "microsoft/Florence-2-large"]
@@ -180,8 +193,9 @@ def find_replace(folder, find, replace, apply, ext=".txt"):
     for fp in sorted(glob.glob(os.path.join(glob.escape(folder), "*" + ext))):
         if fp.lower().endswith(".lyrics.txt"):          # a song's lyrics are the words sung, not a caption
             continue
-        old = read_caption(fp)       # [fork] any encoding: one cp1252 caption used to fail the whole request
-        if old is None:
+        try:
+            old = read_text(fp)
+        except OSError:
             continue
         if not pat.search(old):
             continue

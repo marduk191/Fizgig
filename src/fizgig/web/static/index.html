@@ -63,6 +63,7 @@
           <button class="tab-item" data-tab="metadata"><i></i><span>Metadata</span></button>
           <button class="tab-item" data-tab="prefs"><i></i><span>Preferences</span></button>
           <button class="tab-item" data-tab="pods" id="podsTabBtn" style="display:none"><i></i><span>Pods</span></button>
+          <button class="tab-item" data-tab="helpers"><i></i><span>Helpers</span></button>
         </nav>
         <button class="side-run" id="sideRun" data-goto="training" title="The run - open the Training tab">
           <span class="side-run-top"><span class="run-badge" id="runBadge"></span><span id="sideRunName"></span></span>
@@ -78,7 +79,7 @@
         </div>
         <div class="gpu-monitor" id="statusBar"></div>
         <a class="runpod-btn" id="sideDeploy" href="https://console.runpod.io/deploy?type=GPU&amp;gpu=RTX+5090&amp;count=1&amp;template=bdrdew7hxw&amp;ref=vkb387ep"
-          target="_blank" rel="noopener" title="Run Fizgig on a rented GPU: RunPod's Fizgig template, ready to train"><i></i><span>Deploy on RunPod</span></a>
+          target="_blank" rel="noopener" title="Run Fizgig on a rented GPU: the Pods tab's Rent a pod (pick a card, then add a 300 GB Volume disk on RunPod's page)"><i></i><span>Deploy on RunPod</span></a>
         <a class="runpod-btn files-btn" id="sideFiles" target="_blank" rel="noopener" style="display:none"><i></i><span>File manager</span></a>
         <button class="about-btn" id="aboutBtn" title="About Fizgig"><i></i><span>About</span></button>
         <a class="coffee-btn" href="https://buymeacoffee.com/lorasandlenses" target="_blank" rel="noopener"
@@ -102,6 +103,10 @@
             <p>Train LoRAs and fine-tunes: pick a model and your training folder, set the previews,
               then start a run and watch it here.</p>
           </div>
+          <div class="section-card news-card" id="newsCard" style="display:none">
+            <div class="card-title">News</div>
+            <div class="card-content" id="newsBody"></div>
+          </div>
           <div class="section-card accent-card">
             <div class="card-title">Model</div>
             <div class="card-desc">What you're training. The Samples, Training and Preferences tabs follow it (Samples and
@@ -114,8 +119,9 @@
           </div>
           <div class="section-card accent-card">
             <div class="card-title">Training folder</div>
-            <div class="card-desc">The pictures (or clips, or songs) to train on, each with a caption file beside it.
-              Captions and Training read from here.</div>
+            <div class="card-desc">The folder this run trains on: your pictures (or clips, or songs), each with its
+              caption file. Pick one from <b>Your training data</b> below, or press <b>Choose…</b> for a folder
+              anywhere else.</div>
             <div class="card-content">
               <div class="field-row"><span class="field-label">Folder:</span>
                 <input type="text" id="imageFolder" class="w-path" placeholder="/workspace/datasets/my_subject">
@@ -127,7 +133,7 @@
           <div class="section-card" id="datasetsCard">
             <div class="card-title"><span>Your training data</span>
               <button class="btn btn-sm" id="datasetsReload">Reload</button></div>
-            <div class="card-desc" id="datasetsDesc">The folders in your training data folder. Click one to train on it.</div>
+            <div class="card-desc" id="datasetsDesc">A shortcut: the folders in your training data folder. Click one to make it the training folder above.</div>
             <div class="card-content">
               <div class="field-row" id="datasetsSearchRow" style="display:none"><span class="field-label">Search:</span>
                 <input type="text" id="datasetsSearch" class="w-path" placeholder="folder name"></div>
@@ -153,8 +159,6 @@
             <div class="card-title">Upload a training folder</div>
             <div class="card-desc">The folder above is on the machine running Fizgig. If your training data (pictures, clips or
               songs) is on the computer you're using now, upload it here, with the caption .txt files (a .zip works too).</div>
-            <div class="card-desc">On the computer running Fizgig? There's no need to use this: Choose… above picks
-              your folder directly.</div>
             <div class="card-content" id="uploadBody">
               <div class="field-row"><span class="field-label">New folder name:</span>
                 <input type="text" id="uploadName" class="w-combo-lg" placeholder="my_subject"></div>
@@ -248,6 +252,28 @@
                   <input type="text" id="prepPadding" class="w-num" value="20">
                   <span class="field-hint">% around the face</span>
                 </div>
+                <details class="tc-box prep-chars" id="prepChars">
+                  <summary>Anime/furry/drawn characters</summary>
+                  <div class="field-hint">Face close-ups, the Look Filter and likeness scores are made for people's
+                    faces. For anime, furry or drawn characters (fursuits too), pick Anime/furry/drawn for both
+                    choices here. People's sets need nothing changed. More in docs/FACE_BACKENDS.md.</div>
+                  <div class="field-row prep-opts">
+                    <span class="field-label">Face finder:</span><select id="prepDetector" class="w-combo-lg"></select>
+                  </div>
+                  <div class="field-hint" id="prepDetectorHint"></div>
+                  <div class="field-row prep-opts">
+                    <span class="field-label">Look match:</span><select id="prepIdentity" class="w-combo-lg"></select>
+                  </div>
+                  <div class="field-hint" id="prepIdentityHint"></div>
+                  <div id="prepYoloRow">
+                    <div class="field-row prep-opts" id="prepYoloPick">
+                      <span class="field-label">YOLO face model:</span>
+                      <input type="text" id="prepYolo" class="w-path" placeholder="Blank: the built-in choice (below)">
+                    </div>
+                    <div class="field-hint" id="prepYoloHint"></div>
+                  </div>
+                  <div class="field-hint" id="prepFaceMsg"></div>
+                </details>
                 <div class="field-hint" id="prepNoFaces" style="display:none">Face detection isn't installed on the
                   Fizgig computer: run install_fizgig.py there to add it. Resize only still works.</div>
                 <div class="field-hint">Sizing is by target area (megapixels), not longest side: this matches how
@@ -289,7 +315,8 @@
             <div class="card-title">Final step: Look Consistency Filter (faces)</div>
             <div class="card-desc">Run this last, after every other prep stage: it scores the finished training
               folder. Pick three baseline pictures that nail the look you want; every picture's face is scored against
-              all three and averaged (ArcFace similarity), so no one photo's angle, expression or light sets the bar.
+              all three and averaged (face similarity; for anime, furry or drawn characters see "Anime/furry/drawn
+              characters" in step 1), so no one photo's angle, expression or light sets the bar.
               It finds pictures that drifted off-look, the near-misses a loss curve can't see. Click pictures to mark
               them, or let Auto-Suggest flag the outliers, then move the marked ones out in one go (to an
               excluded_by_look subfolder; nothing is deleted). The scores are saved with the dataset, so low scorers
@@ -303,6 +330,7 @@
               <div class="field-hint" id="lookStatus">Each score is the average similarity to your 3 baselines. The
                 same person typically lands at 30–70%, the baselines included (each is scored against the other two
                 as well as itself).</div>
+              <div class="field-hint" id="lookDecision"></div>
               <div id="lookPicker" class="look-grid" style="display:none"></div>
               <div class="field-row" id="lookTools" style="display:none">
                 <button class="btn" id="lookSuggest">Auto-Suggest drift</button>
@@ -445,6 +473,7 @@
               <select class="w-combo-lg family-pick"></select>
               <span class="field-hint">The same choice as the Start tab's: change it here or there.</span></div></div>
           </div>
+          <div class="helper-strip" id="samplesHelper" style="display:none"></div>
           <div id="samplesForm"></div>
           <div class="section-card" id="galleryCard">
             <div class="card-title">Previews so far</div>
@@ -463,6 +492,7 @@
                 <div class="lik-run" id="likRun"></div>
                 <canvas id="likChart" height="150"></canvas>
               </div>
+              <div class="preview-mode" id="galleryMode" style="display:none"></div>
               <div class="gallery" id="gallery"></div>
             </div>
           </div>
@@ -476,8 +506,10 @@
           <div class="section-card model-strip">
             <div class="card-content"><div class="field-row"><span class="field-label">Model:</span>
               <select class="w-combo-lg family-pick"></select>
-              <span class="field-hint">The same choice as the Start tab's: change it here or there.</span></div></div>
+              <span class="field-hint">The same choice as the Start tab's: change it here or there.</span></div>
+              <div class="family-status" style="display:none"></div></div>
           </div>
+          <div class="helper-strip" id="trainHelper" style="display:none"></div>
           <div class="section-card">
             <div class="card-title">Presets</div>
             <div class="card-content"><div class="field-row preset-row">
@@ -496,7 +528,12 @@
                 <span class="field-hint" id="runWhen"></span></div>
               <div class="run-bar run-bar-lg"><span id="runBar"></span></div>
               <div class="run-tiles" id="runTiles"></div>
+              <div class="run-helper" id="runHelper" style="display:none"></div>
+              <div class="field-hint" id="runPodNote" style="display:none">This run trains on the pod: close this
+                window or switch off your computer and it keeps going. Open the pod again to see it. Stopping the pod
+                itself mid-run loses what it trained since its last save: press Pause first.</div>
               <div id="runLoss"></div>
+              <div class="il-box" id="runImageLoss" style="display:none"></div>
               <div class="field-row">
                 <button class="btn" id="btnCheck" title="Runs Start's checks without starting: lists anything missing or wrong, else the stages a run would go through">Check settings</button>
                 <button class="btn btn-primary" id="btnStart">Start Training</button>
@@ -504,12 +541,15 @@
                 <button class="btn btn-sm" id="btnQueueCancel" style="display:none">Cancel edit</button>
                 <button class="btn btn-warning" id="btnPause">Pause</button>
                 <button class="btn" id="btnSampleNow" style="display:none" title="Make the previews now, after the current training step, without waiting for the epoch to end">Sample now</button>
+                <button class="btn" id="btnImageLoss" style="display:none" title="Each training image's loss by epoch, against the rest of the dataset: which images are still being learned, which are done, and what the loss watch decided about each">Per-image loss</button>
                 <button class="btn" id="btnSaveNow" style="display:none" title="Save the LoRA as it is now, after the current training step (as name-stepNNNNNNN.safetensors)">Save now</button>
                 <button class="btn btn-primary" id="btnResume">Resume</button>
+                <button class="btn" id="btnMove" style="display:none" title="Carry on training this run on another computer running Fizgig (a pod, a laptop) while you use this one: it pauses here and resumes there, and comes back the same way">Move to…</button>
                 <button class="btn btn-danger" id="btnStop">Stop</button>
                 <span class="field-hint" id="runStatus"></span>
               </div>
               <div class="field-row resume-choice" id="resumeChoice" style="display:none"></div>
+              <div class="run-move" id="runMove" style="display:none"></div>
               <div class="field-hint" id="runNowSay"></div>
               <div class="slider-live" id="sliderLive" style="display:none">
                 <div class="slider-live-head"><b>Slider prompts</b><span class="field-hint">Steer the slider while it
@@ -565,6 +605,7 @@
             <div class="card-content">
               <div class="field-row"><span class="field-label">Model:</span><select id="stFamily" class="w-combo"></select>
                 <span class="field-hint" id="stDitNote"></span></div>
+              <div class="field-row" id="stRender" style="display:none"></div>
               <div class="field-row" id="stDitRow"><span class="field-label">Preview with:</span>
                 <label class="radio-label"><input type="radio" name="stDit" value="fast" checked> <span id="stDitFast"></span></label>
                 <label class="radio-label"><input type="radio" name="stDit" value="full"> <span id="stDitFull"></span></label></div>
@@ -605,7 +646,7 @@
                 <div class="field-row"><span class="field-label"></span><span class="field-hint" id="stDmixInfo"></span></div>
               </div>
               <div class="field-row"><span class="field-label">Prompt:</span>
-                <textarea id="stPrompt" rows="2" placeholder="Include the LoRA's trigger word"></textarea></div>
+                <textarea id="stPrompt" rows="2" spellcheck="false" placeholder="Include the LoRA's trigger word"></textarea></div>
               <div id="stAudioRows" style="display:none">
                 <div class="field-row"><span class="field-label"></span>
                   <label class="checkbox-label"><input type="checkbox" id="stPbOn"> Blend in a Prompt B</label>
@@ -613,7 +654,7 @@
                   <label class="checkbox-label" title="The model hears a recording (30 s of it: a piece from the start, middle and end) and makes the song sound like it - the voice, the instruments, the mix. Works with or without a song to start from."><input type="checkbox" id="stSndOn"> Sound like a recording (reference)</label></div>
                 <div id="stPbRows" style="display:none">
                   <div class="field-row"><span class="field-label">Prompt B:</span>
-                    <textarea id="stPromptB" rows="2" placeholder="e.g. jazz trio, upright bass, brushed drums, warm"></textarea></div>
+                    <textarea id="stPromptB" rows="2" spellcheck="false" placeholder="e.g. jazz trio, upright bass, brushed drums, warm"></textarea></div>
                   <div class="field-row"><span class="field-label"></span>
                     <span class="st-inline" title="Every step runs the model with both prompts and mixes the two: 0 = Prompt A alone, 1 = Prompt B alone. Baseline gets the same blend, so Baseline vs Tweaked still shows only the sliders. Keep Prompt A's lyrics: Prompt B changes the style while A's words are sung.">
                       <span class="field-hint">A</span><input type="range" id="stPbBlend" min="0" max="1" step="0.05" value="0.5">
@@ -665,7 +706,7 @@
                     <label class="checkbox-label" title="Put up the pass-2 estimate in the Tweaked pane while the remaining passes run"><input type="checkbox" id="stH3Early" checked> Show early</label></span></div>
               </div>
               <div class="field-row" id="stNegRow"><span class="field-label">Negative:</span>
-                <textarea id="stNeg" rows="2"></textarea></div>
+                <textarea id="stNeg" rows="2" spellcheck="false"></textarea></div>
               <div class="field-row" id="stRefRow"><span class="field-label">Reference:</span>
                 <input type="text" id="stRef" class="w-path" placeholder="optional: a reference picture">
                 <button class="btn" id="stRefPick">Choose…</button><button class="btn" id="stRefClear">Clear</button>
@@ -817,6 +858,7 @@
             <div class="card-content">
               <div class="field-row"><span class="field-label">Model:</span><select id="pfFamily" class="w-combo"></select>
                 <span class="field-hint">Choosing a LoRA switches to its model.</span></div>
+              <div class="field-row" id="pfRenderChoice" style="display:none"></div>
               <div class="field-row"><span class="field-label">LoRA:</span>
                 <input type="text" id="pfLora" class="w-path" placeholder="the LoRA to profile (.safetensors)"><span id="pfLoraBtns"></span></div>
             </div>
@@ -874,6 +916,7 @@
             <div class="card-content">
               <div class="field-row"><span class="field-label">Model:</span><select id="ryFamily" class="w-combo"></select>
                 <span class="field-hint">Follows the checkpoints' own model.</span></div>
+              <div class="field-row" id="ryRender" style="display:none"></div>
               <div class="field-row"><span class="field-label">Source:</span>
                 <label class="radio-label"><input type="radio" name="rySource" value="folder" checked> Training folder (compare epochs)</label>
                 <label class="radio-label"><input type="radio" name="rySource" value="single"> Single LoRA</label></div>
@@ -1097,7 +1140,7 @@
                 crossfade) - fill in Trigger so the no-LoRA column drops it. Every epoch: one column per epoch of the render at the
                 top (render it first); Epochs keeps it readable - blank = all, "every 4", or "4,8,12". Every cell is a fresh render, so 3
                 prompts across 5 epochs is 15 renders: keep the prompt list short the first time.</div>
-              <div class="field-row"><span class="field-label">Prompts:</span><textarea id="ryCPrompts" rows="4"
+              <div class="field-row"><span class="field-label">Prompts:</span><textarea id="ryCPrompts" rows="4" spellcheck="false"
                 placeholder="one per line - each becomes a row"></textarea></div>
               <div class="field-row"><span class="field-label">Columns:</span><select id="ryCMode" class="w-combo">
                 <option>Without / with LoRA</option><option>Every epoch</option></select>
@@ -1213,7 +1256,7 @@
             <div class="card-desc">The left picture is your setup; the right is the same seed without it (rendered once and
               kept while its settings hold). Click a still to see it full size.</div>
             <div class="card-content">
-              <div class="field-row rm-top"><span class="field-label">Prompt:</span><textarea id="rmPrompt" rows="3" class="w-path rm-prompt"></textarea>
+              <div class="field-row rm-top"><span class="field-label">Prompt:</span><textarea id="rmPrompt" rows="3" spellcheck="false" class="w-path rm-prompt"></textarea>
                 <button class="btn btn-sm" id="rmHints" title="Append every active mod's 'concept_type: description' - the Loader node's prompt_hint output">+ mod hints</button></div>
               <div class="field-row"><span class="field-label"></span>
                 <label class="checkbox-label" title="Each active mod is shown to the text encoder as a numbered picture or video, the way the pack's H3 RefMod Text Encode node does, so the prompt can say 'the woman in <Picture 1>'. Costs a decode per mod."><input type="checkbox" id="rmNumbered"> Numbered references (Text Encode node)</label>
@@ -1446,7 +1489,8 @@
           <div class="tab-banner">
             <h1>Pods</h1>
             <p>Train on a rented GPU from here. A pod runs Fizgig in the cloud; open it and it's this same app, on a
-              bigger card, while your own computer stays free. Closing it doesn't stop a run.</p>
+              bigger card, while your own computer stays free. Closing it doesn't stop a run. (Rented GPUs: RunPod and
+              Vast.ai supported, see the bottom of this tab)</p>
           </div>
           <div class="section-card">
             <div class="card-title"><span>Your pods</span><button class="btn btn-sm" id="podsReload">Reload</button></div>
@@ -1483,10 +1527,22 @@
             <div class="card-title">Rent a pod</div>
             <div class="card-desc">Fizgig's RunPod template is ready to train, with nothing to install. With your API key,
               this lists the cards RunPod has free right now, their price, and roughly what a run costs on each. Deploy
-              opens RunPod's page with that card and the template chosen: give it a 100 GB+ volume and press Deploy
-              there. Once it has started it shows above by itself (with your key), or paste its ID.</div>
+              opens RunPod's page with that card and the template chosen. Once it has started it shows above by itself
+              (with your key), or paste its ID.</div>
             <div class="card-content">
+              <div class="pick-disk"><b>On RunPod's page, add a disk before you deploy</b> (it isn't added for you):
+                <ol>
+                  <li>On the right of RunPod's page, in the box called <b>Nothing mounted at the template's
+                    path</b>, press <b>Add volume</b>.</li>
+                  <li>Click <b>Volume disk</b> (marked Legacy). The dialog opens on <b>Global volume</b>: that one
+                    doesn't work for Fizgig.</li>
+                  <li>Leave <b>Size</b> at <b>300 GB</b>, press <b>Add volume disk</b>, then <b>Deploy Pod</b>.</li>
+                </ol>
+                Without it, your models and LoRAs are on the pod's small container disk and are lost when it stops.
+                <a href="https://github.com/shootthesound/Fizgig/blob/master/docker/README.md#give-it-a-disk-on-runpods-deploy-page" target="_blank" rel="noopener">See an explanation with screenshots</a></div>
               <div class="pick-row">
+                <label title="Two cards in one pod: on the pod, Helpers &gt; Add a helper &gt; Use it as a helper beside its other GPU, then Training share">GPUs
+                  <select id="pickCount"><option value="1" selected>1</option><option value="2">2</option></select></label>
                 <label>Memory <select id="pickVram" title="32 GB trains Krea 2 with no block swap; a smaller card swaps blocks and runs slower">
                   <option value="24">24 GB+</option><option value="32" selected>32 GB+</option>
                   <option value="48">48 GB+</option><option value="80">80 GB+</option></select></label>
@@ -1500,10 +1556,84 @@
                   <select id="pickVol"></select></label>
               </div>
               <div class="pods-list" id="pickList"></div>
-              <div class="field-hint" id="pickNote"></div>
-              <div class="field-hint">Every Deploy link here is a referral one: it supports Fizgig's development at no
-                extra cost to you. <a href="https://github.com/shootthesound/Fizgig/blob/master/docker/README.md"
-                target="_blank" rel="noopener">The pod guide</a></div>
+              <div class="pick-info" id="pickNote"></div>
+              <div class="pick-links">
+                <span class="pick-pill pick-pill-note">⚡ Every Deploy link is a referral one: it supports Fizgig at no
+                  cost to you</span>
+                <a class="pick-pill" href="https://github.com/shootthesound/Fizgig/blob/master/docker/README.md" target="_blank" rel="noopener">RunPod pod guide</a>
+                <a class="pick-pill pick-pill-vast" href="https://cloud.vast.ai/?ref_id=757773&amp;creator_id=757773&amp;name=Fizgig%20LoRa%20Training%20and%20Fine-tuning" target="_blank" rel="noopener">Fizgig on Vast.ai ↗</a>
+                <a class="pick-pill" href="https://github.com/shootthesound/Fizgig/blob/master/docs/VAST.md" target="_blank" rel="noopener">Vast.ai guide</a>
+              </div>
+              <div class="pick-vast-note">Vast.ai: start Fizgig's template on Vast's site (its link is a referral one
+                too), then paste its address into <b>Add a pod</b> above.</div>
+            </div>
+          </div>
+        </section>
+
+        <section id="tab-helpers" class="tab-panel">
+          <div class="tab-banner">
+            <h1>Helpers</h1>
+            <p>Other Fizgigs that take work off this one's GPU: another computer on your network, a pod, or a computer on
+              Tailscale. A helper renders this computer's previews, so training never stops for them, or trains a share
+              of the images alongside it, or takes over a run while you need this computer (Move to… on the run card).
+              (The Pods tab is for using another computer instead of this one.)
+              <a href="https://github.com/shootthesound/Fizgig/blob/master/docs/HELPERS.md"
+              target="_blank" rel="noopener">The helpers guide</a></p>
+          </div>
+          <div class="helper-here" id="helpHere" style="display:none"></div>
+          <div class="section-card">
+            <div class="card-title"><span>Your helpers</span><button class="btn btn-sm" id="helpReload">Reload</button></div>
+            <div class="card-content">
+              <div id="helpList" class="helper-list"></div>
+              <div class="field-hint" id="helpNote"></div>
+            </div>
+          </div>
+          <div class="section-card">
+            <div class="card-title">Add a helper</div>
+            <div class="card-desc">Computers running Fizgig on your network, and your pods from the Pods tab, are
+              listed below; add any other by its address. A helper needs a web password (its Preferences &gt; Web UI)
+              and the same Fizgig version as this one.</div>
+            <div class="card-content">
+              <div id="helpLocal" class="pods-list"></div>
+              <div id="helpFound" class="pods-list"></div>
+              <div class="helper-add">
+                <input type="text" id="helpAddUrl" class="w-path" placeholder="or its address: 192.168.0.20, 100.101.12.7 on Tailscale, or a pod's (port 8081 unless you changed it)" spellcheck="false">
+                <input type="password" id="helpAddPw" class="w-combo-md" placeholder="its password" autocomplete="off">
+                <button class="btn btn-primary" id="helpAdd">Add</button>
+              </div>
+              <div class="field-hint" id="helpAddNote"></div>
+              <div class="pick-vast-note">A Vast.ai instance: paste its address (<code>http://its-IP:its-port</code>, the
+                port Vast mapped 8081 to) and its password above; one added on the Pods tab is listed already.
+                <a href="https://github.com/shootthesound/Fizgig/blob/master/docs/VAST.md" target="_blank" rel="noopener">The Vast.ai guide</a></div>
+            </div>
+          </div>
+          <div class="section-card">
+            <div class="card-title">Help another Fizgig with this GPU</div>
+            <div class="card-desc">For a run training on a pod: your GPU renders its previews or trains a share of
+              each epoch, so the pod's time goes on training. A pod can't reach your computer, so this computer
+              connects to it. Starting a run here stops the helping. <b>Its checkpoints</b> brings the run's epochs
+              here to try your own prompts on them in LoRA Royale, and <b>Bring its checkpoints home</b> brings each
+              one here as it's saved (deleting the pod once they're all home, if you tick that).</div>
+            <div class="card-content">
+              <div id="helpOut" class="pods-list"></div>
+              <div class="field-hint" id="helpOutNote"></div>
+            </div>
+          </div>
+          <div class="section-card">
+            <div class="card-title">What goes where</div>
+            <div class="card-content helper-where">
+              <div><b>Models</b>: a helper that doesn't have a model a job needs downloads it itself, from Hugging
+                Face, before it starts the job. No model goes from this computer.</div>
+              <div><b>Previews</b>: each preview round, the epoch's LoRA (about 300 MB for MOSS-Image: the exact
+                weights that train), its encoded prompts and its preview settings go to the helper; the pictures come
+                back into the run's samples folder, labelled with where they were made. The helper needs no text
+                encoder.</div>
+              <div><b>Training share</b>: the training folder (pictures and captions) goes to the helper once and it
+                makes the run's cache itself, with this run's own model, VAE and text encoder (the same files, checked
+                by hash, fetched if it hasn't got them). Where it can't get the same text encoder, or with <b>Send this
+                computer's cache instead</b> ticked, the cache goes instead of the pictures. Then only the LoRA goes back
+                and forth, once a round (Combine every, on its tile). After each round the tile says whether it's
+                paying.</div>
             </div>
           </div>
         </section>
@@ -1557,7 +1687,7 @@
   </div>
 
   <div class="modal-backdrop" id="pickerModal">
-    <div class="modal-window" style="width: 640px;">
+    <div class="modal-window" style="width: 760px; max-width: 96vw;">
       <div class="modal-header"><span id="pickerTitle">Choose</span>
         <button class="btn" data-close="pickerModal">✕</button></div>
       <div class="modal-body">
@@ -1571,6 +1701,13 @@
           <button class="btn btn-primary" id="pickerNewMake">Create</button>
           <button class="btn" id="pickerNewCancel">Cancel</button></div>
         <div class="field-hint" id="pickerNewMsg"></div>
+        <div class="field-row"><input type="text" id="pickerFilter" placeholder="Filter names…" style="flex:1">
+          <span class="field-label">Sort by</span>
+          <select id="pickerSort"><option value="name">Name</option><option value="mtime">Date modified</option>
+            <option value="ctime">Date created</option><option value="size">Size</option><option value="type">Type</option></select>
+          <button class="btn btn-sm" id="pickerDir" title="Reverse the order">↑</button></div>
+        <div class="picker-head"><span data-sort="name">Name</span><span data-sort="mtime">Date modified</span>
+          <span data-sort="size">Size</span></div>
         <div id="pickerList" class="picker-list"></div>
       </div>
       <div class="modal-footer"><span class="field-hint upload-status" id="pickerUpMsg"></span>
@@ -1652,6 +1789,7 @@
           <p class="field-hint">Coming from Fizgig 7? Your folders, settings, presets and queued runs came across.</p>
           <p class="welcome-guides">Guides:
             <a href="https://github.com/shootthesound/Fizgig/blob/master/docs/WEB_UI.md#your-other-computers-use-ones-gpu-from-another" target="_blank" rel="noopener">Your other computers</a> ·
+            <a href="https://github.com/shootthesound/Fizgig/blob/master/docs/HELPERS.md" target="_blank" rel="noopener">Helpers</a> ·
             <a href="https://github.com/shootthesound/Fizgig/blob/master/docker/README.md" target="_blank" rel="noopener">Pods on RunPod</a> ·
             <a href="https://github.com/shootthesound/Fizgig/blob/master/docs/WEB_UI.md#on-your-phones-home-screen" target="_blank" rel="noopener">Your phone</a> ·
             <a href="https://github.com/shootthesound/Fizgig/blob/master/docs/WEB_UI.md" target="_blank" rel="noopener">Everything else</a></p>
@@ -1668,9 +1806,9 @@
     <div class="modal-window" style="width: 380px;">
       <div class="modal-header"><span>Log in</span></div>
       <div class="modal-body">
-        <div class="card-desc">Fizgig's password. On a RunPod pod it's the FIZGIG_PASSWORD (or VNC_PASSWORD) set in the
-          template, or, if none was set, the one printed in the pod's logs. On your own computer it's the one in
-          Preferences &gt; Web UI. No user name is needed.</div>
+        <div class="card-desc">Fizgig's password. On a rented GPU (RunPod or Vast.ai) it's the FIZGIG_PASSWORD (or
+          VNC_PASSWORD) set in the template, or, if none was set, the one printed in its log. On your own computer
+          it's the one in Preferences &gt; Web UI. No user name is needed.</div>
         <div class="field-row"><input type="password" id="loginPassword" class="w-path" autocomplete="current-password">
           <button class="btn btn-primary" id="loginButton">Log in</button></div>
         <label class="checkbox-label login-remember"><input type="checkbox" id="loginRemember" checked> Keep me logged in on this device
@@ -1684,7 +1822,7 @@
   <div class="lightbox" id="lightbox" style="display:none">
     <button class="btn lightbox-close" id="lightboxClose" title="Close (Esc)">✕</button>
     <button class="btn lightbox-step" id="lightboxPrev" title="Previous (←)">‹</button>
-    <figure class="lightbox-figure"><img id="lightboxImg" alt=""><figcaption id="lightboxName"></figcaption>
+    <figure class="lightbox-figure"><div class="lightbox-mode" id="lightboxMode" style="display:none"></div><img id="lightboxImg" alt=""><figcaption id="lightboxName"></figcaption>
       <div class="lightbox-cap" id="lightboxCap" style="display:none">
         <textarea id="lightboxCapText" rows="3" spellcheck="true"></textarea>
         <div class="lightbox-cap-row"><button class="btn btn-primary btn-sm" id="lightboxCapSave"

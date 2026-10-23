@@ -137,19 +137,30 @@ _net = []
 pod_stop.urllib.request.urlopen = lambda *a, **k: _net.append(a) or (_ for _ in ()).throw(AssertionError("network"))
 pod_stop.COUNTDOWN = 3600                      # never actually reaches _stop during this test
 
-for k in ("FIZGIG_POD", "RUNPOD_POD_ID"):
+# Upstream (b11296ab, Vast.ai): the pod image counts as a pod on any provider (FIZGIG_POD), but only a RunPod pod
+# (RunPod's API, the renter's key) or a Vast.ai instance (its own CONTAINER_API_KEY) can stop itself. A pod on any
+# other provider never starts a countdown that would end in nothing.
+_POD_ENV = ("FIZGIG_POD", "RUNPOD_POD_ID", "CONTAINER_API_KEY", "CONTAINER_ID")
+for k in _POD_ENV:
     os.environ.pop(k, None)
 pod_stop.maybe_start({"runpod_stop_when_done": "1"}, lambda t: None)
 ck("toggle on but NOT on a pod -> no countdown", pod_stop.status()["counting"] is False)
 os.environ["FIZGIG_POD"] = "1"
-pod_stop.maybe_start({"runpod_stop_when_done": "0"}, lambda t: None)
-ck("on a pod but the toggle off -> no countdown", pod_stop.status()["counting"] is False)
 pod_stop.maybe_start({"runpod_stop_when_done": "1"}, lambda t: None)
-st = pod_stop.status()
-ck("on a pod with the toggle on -> the countdown starts", st["counting"] is True and st["left"] > 0, st)
-ck("  Keep the pod running cancels it", pod_stop.cancel(lambda t: None) is True
-   and pod_stop.status()["counting"] is False)
-ck("  and a second cancel is a no-op", pod_stop.cancel(lambda t: None) is False)
+ck("the pod image on another provider (no RunPod id, not Vast) -> no countdown", pod_stop.status()["counting"] is False)
+for label, extra in (("RunPod", {"RUNPOD_POD_ID": "abc123"}),
+                     ("Vast.ai", {"CONTAINER_API_KEY": "k", "CONTAINER_ID": "42"})):
+    os.environ.update(extra)
+    pod_stop.maybe_start({"runpod_stop_when_done": "0"}, lambda t: None)
+    ck(f"{label}: the toggle off -> no countdown", pod_stop.status()["counting"] is False)
+    pod_stop.maybe_start({"runpod_stop_when_done": "1"}, lambda t: None)
+    st = pod_stop.status()
+    ck(f"{label}: the toggle on -> the countdown starts", st["counting"] is True and st["left"] > 0, st)
+    ck(f"  {label}: Keep the pod running cancels it", pod_stop.cancel(lambda t: None) is True
+       and pod_stop.status()["counting"] is False)
+    ck(f"  {label}: and a second cancel is a no-op", pod_stop.cancel(lambda t: None) is False)
+    for k in extra:
+        os.environ.pop(k, None)
 
 # --- 3b. the API key: never the pod-scoped one RunPod injects -----------------------------------
 os.environ["RUNPOD_API_KEY"] = "pod-scoped"

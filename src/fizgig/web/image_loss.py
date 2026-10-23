@@ -95,8 +95,8 @@ def caption_state(output_dir):
 def read_caption(folder, key, ext):
     p = os.path.join(folder or "", os.path.basename(key) + ext)
     try:
-        with open(p, encoding="utf-8-sig", errors="replace") as f:     # a BOM never rides into the embedding
-            return f.read().strip(), True
+        from fizgig.web.captions import read_text
+        return read_text(p).strip(), True                 # a BOM dropped, Windows-1252 and UTF-16 read right
     except OSError:
         return "", os.path.isdir(folder or "")
 

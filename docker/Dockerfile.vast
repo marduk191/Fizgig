@@ -1,0 +1,16 @@
+# Fizgig's pod image for Vast.ai: the RunPod image plus an HTTPS address. Vast serves an instance's ports as plain
+# http on a public address; Cloudflare quick tunnels (cloudflared, no account) give the web UI (8081) and the file
+# manager (8080) https://<name>.trycloudflare.com addresses, printed in the log and shown in Fizgig. The plain ports
+# stay open too. Everything else - the app, its dependencies, the startup - is the RunPod image's, unchanged.
+ARG BASE=ghcr.io/shootthesound/fizgig:latest
+FROM ${BASE}
+
+RUN curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+      -o /usr/local/bin/cloudflared \
+    && chmod +x /usr/local/bin/cloudflared \
+    && cloudflared --version
+
+ENV FIZGIG_HOST=vast
+COPY docker/entrypoint_vast.sh /usr/local/bin/entrypoint_vast.sh
+RUN chmod +x /usr/local/bin/entrypoint_vast.sh
+ENTRYPOINT ["/usr/local/bin/entrypoint_vast.sh"]

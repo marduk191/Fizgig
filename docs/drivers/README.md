@@ -94,6 +94,41 @@ The GUI never loads your driver to start a run. `launch.plan()` reads only the d
 
 These read LoRA files directly. They need your `LoRAFormat`, `alias_flat` and **`block_map()` called with no model loaded**. The default `block_map` works without one; if you override it, make sure yours does too. The Profiler's rendered measurements go through the workbench engine.
 
+## Text encoder builds
+
+Most text encoders ship in several builds: the full bf16 file, and smaller fp8, int8 or 4-bit ones (Comfy-Org's repos usually carry three or four), plus community variants such as abliterated fine-tunes. A description lists the builds its driver's loader takes in `text_encoder_builds`, each a `TextEncoderBuild` with its file, size, SHA-256 and how close its conditioning is to the default file's. Helpers use the list:
+
+- **A training share** needs both halves to encode captions exactly alike, so a helper making the run's cache uses the lead's own text encoder, found by hash. With the build listed, a helper that hasn't got it downloads it; without it, the lead sends its cache instead (slower on a home upload).
+- **Trying prompts on another computer's epochs** fetches the lightest build that conditions all but the same (cosine 0.99 and up, not a variant) when the computer has no text encoder.
+
+To index a family's builds:
+
+1. **List what's published.** The family's text encoder repo usually holds the other precisions beside the default file:
+   ```python
+   from huggingface_hub import HfApi
+   for s in HfApi().model_info("Comfy-Org/Krea-2", files_metadata=True).siblings:
+       if s.rfilename.startswith("text_encoders/"):
+           print(s.rfilename, s.size, s.lfs.sha256 if s.lfs else "")
+   ```
+   Keep only builds of the same encoder: the same model at another precision, or a variant of it. A repo often holds other models next to it (a prompt enhancer, a larger or smaller size); leave those out.
+2. **Check each against the default** with the family's own loader:
+   ```
+   python -m fizgig.scripts.check_te_builds --family krea2 --reference <default file>        --build <file or repo:path> [--build ...] --download_dir <scratch folder>
+   ```
+   It loads every build through `driver.load_text_encoder`, encodes the same prompts, and prints for each whether it loads, its cosine to the default (the real tokens only, where the encoder gives a mask), its worst token, its size, encode time, peak VRAM and SHA-256.
+3. **List the builds that load**, with the printed numbers:
+   ```python
+   text_encoder_builds=(
+       TextEncoderBuild("bf16", _COMFY, "text_encoders/qwen3vl_4b_bf16.safetensors", 8.88,
+                        "36f3ff44...", 0.99897),
+       TextEncoderBuild("Huihui abliterated, fp8", "cusiman/Huihui-Qwen3-VL-4B-Instruct-abliterated-comfy",
+                        "Huihui-Qwen3-VL-4B-Instruct-abliterated-fp8_scaled.safetensors", 5.24,
+                        "45fe15d3...", 0.99532, variant=True),
+   ),
+   ```
+   A build that fails to load stays out of the list, however official it is: Krea 2's loader doesn't take the int8 (convrot) Qwen3-VL-4B that Comfy-Org publishes. Mark a fine-tune of the encoder `variant=True`; its conditioning differs by design, so it is never picked as a lighter stand-in. A family whose encoder has one build only (Anima's, ACE-Step's) lists none.
+4. Run the public checks: `checks/` validates every listed build (a full hash, a size, a cosine between 0 and 1).
+
 ## When the layer is missing something
 
 Every model brings quirks: reference images, frames, sound, an unusual mask or quantisation. Ask first whether it's something other models will share.

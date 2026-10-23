@@ -5,7 +5,7 @@ Facts are the original trainer's (src/fizgig/krea2/trainer.py - removed with the
 """
 from fizgig.families.description import (
     GENERAL_NEGATIVE,
-    FamilyDescription, LoRAFormat, ModelFile, SamplingSettings, SpeedLoRA,
+    FamilyDescription, LoRAFormat, ModelFile, SamplingSettings, SpeedLoRA, TextEncoderBuild,
 )
 
 _COMFY = "Comfy-Org/Krea-2"
@@ -59,6 +59,23 @@ KREA2 = FamilyDescription(
                 "quietly fetches a few tiny helper files and keeps them, and from then on everything runs fully "
                 "offline. Setting up a machine that will never see the internet? Paste a complete HuggingFace model "
                 "folder into the text encoder field instead of a single file and nothing needs downloading at all."),
+    # measured 21 Oct 2026 with scripts/check_te_builds.py against qwen3vl_4b_fp8_scaled; the int8 (convrot) builds,
+    # Comfy-Org's and Huihui's, don't load in Krea 2's encoder loader
+    text_encoder_builds=(
+        TextEncoderBuild("bf16", _COMFY, "text_encoders/qwen3vl_4b_bf16.safetensors", 8.88,
+                         "36f3ff447ef59201722e8f9ce6020c9819fdcfba6aa2608c4e09b1c0ce114e34", 0.99897),
+        TextEncoderBuild("bf16 (Flux 3's copy)", "black-forest-labs/flux-3-image-klein-comfy",
+                         "text_encoders/qwen3vl_4b_bf16.safetensors", 8.88,
+                         "f0b24fc5c8d7c0ea6ca909da14c20af5cac53f22506be942c6c956f838b9630f", 0.99897),
+        TextEncoderBuild("Huihui abliterated, fp8", "ahmed22xa/Huihui-Qwen3-VL-4B-Instruct-abliterated-comfy",
+                         "Huihui-Qwen3-VL-4B-Instruct-abliterated-fp8_scaled.safetensors", 5.24,
+                         "45fe15d359fbc6fe8773f24cebc34acedf5696d96d41a0c9a3039611ece3b866", 0.99532, variant=True,
+                         note="an abliterated fine-tune of Qwen3-VL-4B (community build)"),
+        TextEncoderBuild("Huihui abliterated, bf16", "ahmed22xa/Huihui-Qwen3-VL-4B-Instruct-abliterated-comfy",
+                         "Huihui-Qwen3-VL-4B-Instruct-abliterated.safetensors", 8.88,
+                         "03590b45adf6a071dd5de231d4e2b697355746e36ce2d9368b4c0587ba014cd2", 0.99573, variant=True,
+                         note="an abliterated fine-tune of Qwen3-VL-4B (community build)"),
+    ),
     text_encoder_label="Qwen3-VL-4B",
     vae_label="Qwen-Image VAE",
 
@@ -167,6 +184,7 @@ KREA2 = FamilyDescription(
     preview_steps=8,
     preview_cfg=1.0,
     preview_negative=GENERAL_NEGATIVE,
+    text_cache_trim=True,
     preview_width=1024,
     preview_height=1024,
 

@@ -16,6 +16,7 @@ A family is ready when it trains, previews and saves correctly, and every abilit
 
 - [ ] **Parity with the reference implementation:** from the same starting noise and prompt, your `generate` matches the model's reference pipeline (diffusers, ComfyUI or the original repo) to bf16 precision. Measure it; a picture that "looks right" hides schedule and conditioning bugs. Compare stage by stage (text conditioning, one model prediction, the sigma schedule) from identical inputs. If your model code isn't the reference's code, compare in fp32: two correct bf16 implementations can differ by 1–2% per step, which compounds into a visibly different render.
 - [ ] A short run through the command line (cache latents, cache text, train two epochs with previews) finishes, and the previews move toward the training data.
+- [ ] **The clean-end share is measured:** the share of sampled training timesteps below 0.5, from 100,000 draws, is in the pull request. Below about 20%, check a likeness run for slow likeness and previews whose composition jumps between epochs ([STILLS.md](STILLS.md#the-training-step)).
 - [ ] **The LoRA loads in ComfyUI with every module.** ComfyUI's console lists any key it can't map ("lora key not loaded"); there must be none. The LoRA then changes ComfyUI's output the way the previews show.
 - [ ] Every built-in preset trains one epoch through the GUI (Load Preset, Start Training) and saves a LoRA.
 - [ ] `train_memory` figures are measured, at two resolutions per precision, from the trainer's logged peaks.
@@ -32,6 +33,7 @@ Most people train on 12–24 GB cards, so a family isn't finished until it has b
 - [ ] **Fine-tune plans fit**, if the family fine-tunes: `ft_spec`'s memory figures (`overhead_gb`, `stream_base_gb`, `calib_mp`, `act_gb_per_mp`) come from measured window peaks at two resolutions, and a fine-tune finishes under `FIZGIG_SIM_VRAM_GB=16` and `=24` with the fewest windows that fit.
 - [ ] **The workbench renders on a small card:** a Repair Studio render with Auto precision and swap under `FIZGIG_SIM_VRAM_GB=12`.
 - [ ] The text encoder fits the smallest card you support on its own (it runs alone while caching); if it doesn't, give it a quantised fallback as Qwen 2.1's does.
+- [ ] **Its other builds are indexed:** every published build of the text encoder that the driver's loader takes is in `text_encoder_builds`, measured with `scripts/check_te_builds.py` ([Text encoder builds](README.md#text-encoder-builds)), so helpers can fetch the exact build a run used and a lighter one to try prompts with.
 
 ## Workbench
 

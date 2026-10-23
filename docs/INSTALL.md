@@ -6,6 +6,8 @@
 
 Fizgig ships as a ready-made cloud image: the whole app in a browser tab, not a cut-down web version. Drag datasets in and LoRAs out with the built-in file manager, download models in one click, and optionally have the pod shut itself down when training finishes. Models and datasets persist between sessions.
 
+> **Before you press Deploy Pod:** RunPod doesn't add a disk for you: on its page press **Add volume**, click **Volume disk** (it opens on Global volume, which doesn't work), keep **300 GB**, press **Add volume disk**, then **Deploy Pod** ([see an explanation with screenshots](../docker/README.md#give-it-a-disk-on-runpods-deploy-page)).
+
 **[⚡ Deploy on RunPod →](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=bdrdew7hxw&ref=vkb387ep)**  ·  [Read the guide first](../docker/README.md)  ·  Need the old pod? [Fizgig Classic v7.x](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=faoq8ed6um&ref=vkb387ep)
 
 ## Requirements
@@ -125,7 +127,10 @@ Linux ROCm cache scripts import `fizgig.rocm.cache_exit` only when `FIZGIG_GPU_B
 ```bash
 python install_fizgig.py
 ./launch_fizgig.sh            # its own window (./launch_fizgig_browser.sh: in your web browser)
+./update_fizgig.sh            # later: update (git pull + dependencies)
 ```
+
+The installer also puts Qt in Fizgig's venv for the app window; without it, Fizgig opens in your browser. On Linux AMD, update by running `./install_fizgig_rocm.sh` again (`update_fizgig.sh` installs CUDA packages).
 
 Run it from your system Python, not a conda environment (`conda deactivate` first): conda bundles its own Tk, which can't see the system's fonts, so the app comes up with missing text. The installer refuses when conda is active; `FIZGIG_ALLOW_CONDA=1` overrides it.
 
@@ -135,7 +140,7 @@ NVIDIA uses `pynvml` / `nvidia-smi`; the AMD readers (`vram_monitor.read_amd_gpu
 
 ### Helper models
 
-Three small models download on first use: InsightFace `buffalo_l` (~300 MB, during install), Florence-2 (~500 MB–1.5 GB, first AI caption), and Helsinki-NLP `opus-mt-en-zh` (~300 MB, first bilingual translation).
+Three small models download on first use: InsightFace `buffalo_l` (~300 MB, during install), Florence-2 (~500 MB–1.5 GB, first AI caption), and Helsinki-NLP `opus-mt-en-zh` (~300 MB, first bilingual translation). If you use the furry / anime face backends, two more download on first use: the deepghs anime head model (~40 MB) and DINOv2-base (~350 MB). See [face backends](FACE_BACKENDS.md).
 
 ## Model downloads
 

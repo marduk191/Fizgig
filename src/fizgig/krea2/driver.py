@@ -68,6 +68,20 @@ class Krea2Driver(FamilyDriver):
         dit = load_krea2_dit(path, device=device, dtype=DTYPE, fp8_scaled=False, loading_device=device)
         return dit.eval().requires_grad_(False)
 
+    def stream_dit(self, path):
+        """For a short-RAM load (families/quant.py _stream_load): the model on meta, the open file and the dtype
+        load_dit reads it at. None for a pre-quantised fp8 file, which load_dit keeps fp8."""
+        from fizgig.krea2.model import SingleStreamDiT
+        from fizgig.krea2.safetensors_utils import MemoryEfficientSafeOpen
+        from fizgig.krea2.utils import is_prequantized_fp8, single_mmdit_large_wide
+        from fizgig.utils.safetensors import warm_file_cache
+        if is_prequantized_fp8(path):
+            return None
+        warm_file_cache(path)
+        with torch.device("meta"):
+            dit = SingleStreamDiT(single_mmdit_large_wide, attn_mode="torch", split_attn=False)
+        return dit, MemoryEfficientSafeOpen(path), DTYPE
+
     def max_blocks_to_swap(self, dit=None):
         return (len(dit.blocks) if dit is not None else self.description.n_blocks) - 2
 

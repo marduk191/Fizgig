@@ -9,7 +9,8 @@ What is pinned (all [fork] in src/fizgig/web/server.py):
   3. that check needs a real nvidia-smi listing: with none, or with only ROCm's synthetic "AMD GPU" row (#188, no
      uuid), the pin is exported untouched, as before;
   4. a CUDA_VISIBLE_DEVICES set where Fizgig was started wins over Preferences;
-  5. _chosen_gpu, unpinned, picks the card an unpinned run really lands on (_unpinned_gpu_uuid), not the first row.
+  5. _chosen_gpu, unpinned, picks the card an unpinned run really lands on (_unpinned_gpu_uuid), not the first row;
+  6. with a second Fizgig on the other GPU (helper_local_gpu), this one keeps the card that wasn't lent.
 
 list_gpus and _unpinned_gpu_uuid are stubbed: nothing here runs nvidia-smi or torch.
 
@@ -93,6 +94,24 @@ S._unpinned_gpu_uuid = lambda: ""
 ck("unpinned and unknown (one card, or torch couldn't say): the first row",
    (S._chosen_gpu(NVIDIA, "") or {}).get("uuid") == A)
 ck("no cards: None, not an error", S._chosen_gpu([], "") is None)
+
+# --- 6. a second Fizgig on this computer's other GPU (upstream's helpers.local_start) -------------------
+# helpers.local_gpus() lends every card but _chosen_gpu's pick for this Fizgig; unpinned, that pick is the card an
+# unpinned run opens (the 5090 here), so it lends the 3060 (index 0). Upstream then pinned this Fizgig to "0" -
+# nvidia-smi's first card, the 3060 again - and both Fizgigs would have trained on one card.
+S._unpinned_gpu_uuid = lambda: B
+S.list_gpus = lambda: NVIDIA
+e = S.gpu_env({}, {"cuda_device": "", "helper_local_gpu": 0})
+ck("helper on the 3060: this Fizgig keeps the 5090 (by uuid), not nvidia-smi's first card",
+   e.get("CUDA_VISIBLE_DEVICES") == B, e)
+e = S.gpu_env({}, {"cuda_device": "", "helper_local_gpu": 1})
+ck("  helper on the 5090: this Fizgig gets the other card, the 3060", e.get("CUDA_VISIBLE_DEVICES") == A, e)
+e = S.gpu_env({}, {"cuda_device": "1", "helper_local_gpu": 0})
+ck("  a pin in Preferences still wins", e.get("CUDA_VISIBLE_DEVICES") == "1", e)
+S.list_gpus = lambda: []
+e = S.gpu_env({}, {"cuda_device": "", "helper_local_gpu": 1})
+ck("  no nvidia-smi listing: upstream's first card, as before", e.get("CUDA_VISIBLE_DEVICES") == "0", e)
+S._unpinned_gpu_uuid = lambda: ""
 
 print("\n" + ("ALL PASS" if not fails else f"{len(fails)} FAILURE(S): " + ", ".join(fails)))
 sys.exit(1 if fails else 0)

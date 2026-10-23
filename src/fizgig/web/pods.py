@@ -18,10 +18,14 @@ TEMPLATE = "bdrdew7hxw"
 REF = "vkb387ep"                    # Fizgig's RunPod referral: every Deploy link carries it
 
 
-def deploy_url(gpu="RTX 5090") -> str:
-    """RunPod's deploy page with Fizgig's template and this GPU picked: the person presses Deploy there."""
+def deploy_url(gpu="RTX 5090", count=1) -> str:
+    """RunPod's deploy page with Fizgig's template and this GPU (one card or two) picked: the person presses Deploy
+    there."""
     return "https://console.runpod.io/deploy?" + urllib.parse.urlencode(
-        {"type": "GPU", "gpu": gpu, "count": 1, "template": TEMPLATE, "ref": REF})
+        {"type": "GPU", "gpu": gpu, "count": int(count or 1), "template": TEMPLATE, "ref": REF})
+
+
+MIN_CUDA = "12.8"                   # the pod image's PyTorch (cu128) needs a driver this new: stock on such hosts only
 
 
 DEPLOY = deploy_url()
@@ -69,7 +73,9 @@ def saved(prefs) -> list:
     for p in prefs.get("app_pods") or []:
         if isinstance(p, dict) and p.get("url"):
             out.append({"id": str(p.get("id") or ""), "url": str(p["url"]), "name": str(p.get("name") or ""),
-                        "last": float(p.get("last") or 0), "lan_id": str(p.get("lan_id") or "")})
+                        "last": float(p.get("last") or 0), "lan_id": str(p.get("lan_id") or ""),
+                        # False: a pod pasted in that the account's key didn't list (another account's); else ours
+                        "ours": p.get("ours") is not False})
     return out
 
 
@@ -209,6 +215,11 @@ def stop(key, pod_id):
     _gql(key, "mutation($id: String!) { podStop(input: {podId: $id}) { id desiredStatus } }", {"id": pod_id})
 
 
+def terminate(key, pod_id):
+    """podTerminate: the pod and its disk gone for good (once its run's checkpoints are home, helpers._home_delete)."""
+    _gql(key, "mutation($id: String!) { podTerminate(input: {podId: $id}) }", {"id": pod_id})
+
+
 def _lan_rows(rows, found, mine, save):
     """The Fizgigs that answered on the network, into the list: a saved computer whose address changed takes its new
     one (and keeps it), the rest are listed as found, ready to open."""
@@ -232,7 +243,7 @@ def _lan_rows(rows, found, mine, save):
                           "version": f.get("version") or "", "build": _build_word(mine, f.get("commit")),
                           "state": "ready"}
     if moved and save:
-        save({"app_pods": [{k: r.get(k) for k in ("id", "url", "name", "last", "lan_id")}
+        save({"app_pods": [{k: r.get(k) for k in ("id", "url", "name", "last", "lan_id", "ours")}
                            for r in rows.values() if r.get("saved")]})
 
 
@@ -260,7 +271,7 @@ def listing(prefs, key, save=None, mine=""):
     the Fizgigs that answer on this network."""
     from fizgig.web import lan
     finding = concurrent.futures.ThreadPoolExecutor(max_workers=1).submit(lan.discover, 1.0)
-    rows, err = {}, ""
+    rows, err, listed = {}, "", False
     for r in saved(prefs):
         rows[r["url"]] = {**r, "saved": True, "account": False}
     if key:
@@ -269,6 +280,7 @@ def listing(prefs, key, save=None, mine=""):
                 hit = rows.get(a["url"])
                 rows[a["url"]] = {**(hit or {"last": 0, "saved": False}), **a,
                                   "name": (hit or {}).get("name") or a["name"], "account": True}
+            listed = True
         except ValueError as e:
             err = str(e)
     try:
@@ -277,17 +289,31 @@ def listing(prefs, key, save=None, mine=""):
     except Exception:
         pass
     items = list(rows.values())
-    live = [r for r in items if not r.get("account") or r.get("running")]
+    # a saved pod of this account's that the account no longer has was deleted: it can never come back, so it's
+    # forgotten (RunPod's proxy still answers its address, which read as starting). One pasted in from another
+    # account (never listed by this key) is said to be not on your account, and kept.
+    if listed:
+        dead = [r for r in items if r.get("saved") and not r.get("account") and PROXY.match(r["url"]) and r.get("ours")]
+        if dead:
+            items = [r for r in items if r not in dead]
+            if save:
+                save({"app_pods": [{k: r.get(k) for k in ("id", "url", "name", "last", "lan_id", "ours")}
+                                   for r in items if r.get("saved")]})
+        for r in items:
+            if not r.get("account") and PROXY.match(r["url"]):
+                r["gone"] = True
+    live = [r for r in items if not r.get("gone") and (not r.get("account") or r.get("running"))]
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         states = dict(zip([r["url"] for r in live],
                           ex.map(lambda r: probe(r["url"], 3.0 if r.get("lan") else 6.0), live)))
     for r in items:
-        st = states.get(r["url"], "stopped" if r.get("account") and not r.get("running") else "off")
+        st = "gone" if r.get("gone") else states.get(r["url"], "stopped" if r.get("account") and not r.get("running")
+                                                      else "off")
         # found on the network but its page doesn't answer: its firewall lets the question in, not the web UI
         r["state"] = ("ready" if st == "ready" else "blocked") if r.get("lan") else st
         if r["state"] == "off" and r.get("lan_id"):  # a computer of yours that didn't answer: off, asleep or Fizgig closed
             r["state"] = "away"
-    rank = {"ready": 0, "blocked": 1, "waiting": 1, "stopped": 2, "away": 3, "off": 3}
+    rank = {"ready": 0, "blocked": 1, "waiting": 1, "stopped": 2, "away": 3, "off": 3, "gone": 4}
     items.sort(key=lambda r: (rank.get(r["state"], 3), -(r.get("last") or 0), (r.get("name") or "").lower()))
     return {"pods": items, "error": err, "deploy": DEPLOY}
 
@@ -314,20 +340,24 @@ def _trains(g) -> bool:
     return gid.startswith("NVIDIA") and "V100" not in gid and "MIG" not in name
 
 
-def offers(key, dc="") -> dict:
+def offers(key, dc="", count=1) -> dict:
     """Every card Fizgig can train on, with its live price and stock in Secure and Community Cloud (in one data
-    centre when `dc` is set: where a network volume lives), and the account's network volumes. Asked again at most
-    once a minute."""
+    centre when `dc` is set: where a network volume lives), for pods of `count` cards, on hosts whose driver runs the
+    pod image (MIN_CUDA: RunPod's plain stock counts every host, so a card could show free and then not deploy), and
+    the account's network volumes. Asked again at most once a minute."""
+    count = 2 if str(count) == "2" else 1
     if not key:
-        return {"key": False, "volumes": [], "gpus": [{"gpu": n, "vram": v, "speed": SPEED.get(n), "url": deploy_url(n)}
-                                                      for n, v in SHORTLIST]}
-    hit = _offers_cache.get((key, dc))
+        return {"key": False, "volumes": [], "count": count, "gpus": [
+            {"gpu": n, "vram": v, "speed": SPEED.get(n), "url": deploy_url(n, count)} for n, v in SHORTLIST]}
+    hit = _offers_cache.get((key, dc, count))
     if hit and time.time() - hit[0] < 60:
         return hit[1]
     where = f', dataCenterId: "{dc}"' if re.match(r"^[A-Z0-9-]{3,20}$", dc or "") else ""
     d = _gql(key, "{ myself { networkVolumes { id name size dataCenterId } } gpuTypes { id displayName memoryInGb "
-                  f"s: lowestPrice(input: {{gpuCount: 1, secureCloud: true{where}}}) {{ uninterruptablePrice stockStatus }} "
-                  f"c: lowestPrice(input: {{gpuCount: 1, secureCloud: false{where}}}) {{ uninterruptablePrice stockStatus }} }} }}")
+                  f's: lowestPrice(input: {{gpuCount: {count}, secureCloud: true, minCudaVersion: "{MIN_CUDA}"{where}}}) '
+                  "{ uninterruptablePrice stockStatus } "
+                  f'c: lowestPrice(input: {{gpuCount: {count}, secureCloud: false, minCudaVersion: "{MIN_CUDA}"{where}}}) '
+                  "{ uninterruptablePrice stockStatus } } }")
     gpus = []
     for g in d.get("gpuTypes") or []:
         if not _trains(g):
@@ -335,7 +365,8 @@ def offers(key, dc="") -> dict:
         name = g["displayName"]
         if name not in SPEED:                    # not on RunPod's deploy page
             continue
-        row = {"gpu": name, "vram": int(g.get("memoryInGb") or 0), "speed": SPEED.get(name), "url": deploy_url(name)}
+        row = {"gpu": name, "vram": int(g.get("memoryInGb") or 0), "speed": SPEED.get(name),
+               "url": deploy_url(name, count)}
         for cloud, k in (("secure", "s"), ("community", "c")):
             lp = g.get(k) or {}
             if lp.get("uninterruptablePrice"):
@@ -343,6 +374,6 @@ def offers(key, dc="") -> dict:
         gpus.append(row)
     vols = [{"id": v["id"], "name": v.get("name") or v["id"], "size": v.get("size"), "dc": v.get("dataCenterId") or ""}
             for v in (d.get("myself") or {}).get("networkVolumes") or []]
-    out = {"key": True, "gpus": gpus, "volumes": vols, "dc": dc if where else ""}
-    _offers_cache[(key, dc)] = (time.time(), out)
+    out = {"key": True, "gpus": gpus, "volumes": vols, "dc": dc if where else "", "count": count}
+    _offers_cache[(key, dc, count)] = (time.time(), out)
     return out

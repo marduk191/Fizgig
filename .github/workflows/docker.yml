@@ -18,6 +18,11 @@ on:
       tag:
         description: "Extra tag to publish (e.g. test)"
         required: false
+      vast_only:
+        description: "Build only the Vast.ai image (on the published latest)"
+        type: boolean
+        required: false
+        default: false
 
 env:
   REGISTRY: ghcr.io
@@ -25,6 +30,7 @@ env:
 
 jobs:
   build:
+    if: ${{ !inputs.vast_only }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -74,3 +80,44 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  # The Vast.ai image: this image plus cloudflared (HTTPS addresses) and docker/entrypoint_vast.sh. A small layer on
+  # top, so it can't drift from the RunPod image. On a release it builds on the image just pushed; by hand, with a
+  # test tag, on the published latest (only the Vast image is pushed then, under that tag).
+  vast:
+    needs: build
+    if: ${{ always() && (needs.build.result == 'success' || needs.build.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: base
+        run: |
+          repo="${GITHUB_REPOSITORY,,}"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then tag="${GITHUB_REF#refs/tags/v}"; else tag=latest; fi
+          echo "image=${{ env.REGISTRY }}/${repo}:${tag}" >> "$GITHUB_OUTPUT"
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}-vast
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.vast
+          push: true
+          build-args: |
+            BASE=${{ steps.base.outputs.image }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

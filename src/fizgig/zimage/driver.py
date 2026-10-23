@@ -63,7 +63,10 @@ class ZImageDriver(FamilyDriver):
         return P.load_vae(path, device)
 
     def load_text_encoder(self, path, device):
-        return P.TextEncoder(path, device)
+        """Qwen3-4B in bf16 (about 8 GB) when it fits the free VRAM with room to run, else 8-bit weights (about 4.5 GB),
+        as Flux 3's Qwen3-VL-4B."""
+        from fizgig.families.quant import free_vram_gb
+        return P.TextEncoder(path, device, int8=free_vram_gb() < 11.0)
 
     def unload_text_encoder(self, te):
         te.unload()

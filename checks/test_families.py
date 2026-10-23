@@ -29,3 +29,19 @@ def test_preview_speed_lora_has_a_file_row(key):
 def test_presets_are_named_and_distinct(key):
     names = [n for n, _ in registry.get(key).presets]
     assert len(names) == len(set(names)), f"{key}: two presets share a name"
+
+
+@pytest.mark.parametrize("key", FAMILIES)
+def test_text_encoder_builds_are_complete(key):
+    """Every listed text encoder build has its file, a full SHA-256, a size and a measured cosine, and none repeats
+    the family's own file (docs/drivers/README.md, "Text encoder builds")."""
+    import re
+    d = registry.get(key)
+    own = {(m.repo, m.path) for m in d.model_files if m.role == "text_encoder"}
+    seen = set()
+    for b in d.text_encoder_builds:
+        assert b.label and b.repo and b.path.endswith(".safetensors"), b
+        assert re.fullmatch(r"[0-9a-f]{64}", b.sha256), (b.label, b.sha256)
+        assert b.size_gb > 0 and 0 < b.cosine <= 1, b
+        assert (b.repo, b.path) not in own and b.sha256 not in seen, b
+        seen.add(b.sha256)

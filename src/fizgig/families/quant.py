@@ -38,37 +38,102 @@ def quantize(dit, driver, precision, compute_device, store_device=None):
         raise ValueError(f"precision must be one of {PRECISIONS}, got {precision!r}")
     compute_device = torch.device(compute_device)
     targets = _targets(dit, driver)
+    for _, m in targets:
+        _quantize_one(m, driver, precision, compute_device, store_device)
     if precision == "int8":
-        from fizgig.modules.int8_train import int8_train_forward
-        from fizgig.modules.nf4 import _dequantize_source_weight
-        fp32 = getattr(driver, "int8_fp32_scales", True)
-        for _, m in targets:
-            w = _dequantize_source_weight(m).to(compute_device)
-            w = w.float() if fp32 else w.contiguous()         # a driver may keep its original trainer's bf16 scales
-            scale = w.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127.0
-            m.weight.requires_grad_(False)
-            q = (w / scale).round_().clamp_(-127, 127).to(torch.int8).contiguous()
-            m.weight.data = q if store_device is None else q.to(store_device)
-            m.register_buffer("_int8_wscale", scale.reshape(1, -1).to(torch.float32), persistent=False)
-            m._is_int8 = True
-            m._int8_grad_mode = "bf16"
-            m.forward = int8_train_forward.__get__(m, type(m))
-            del w
         dit._int8_quantized = True
     else:
-        from bitsandbytes.functional import quantize_nf4
-        from fizgig.modules.nf4 import _dequantize_source_weight, nf4_linear_forward_patch
-        for _, m in targets:
-            packed, state = quantize_nf4(_dequantize_source_weight(m).to(compute_device).contiguous())
-            m._nf4_packed, m._nf4_state, m._is_nf4 = packed, state, True
-            m.weight.data = torch.empty(0, device=compute_device, dtype=torch.bfloat16)
-            m.weight.requires_grad_(False)
-            m.forward = nf4_linear_forward_patch.__get__(m, type(m))
         dit._nf4_quantized = True
     gc.collect()
     torch.cuda.empty_cache()
     logger.info(f"[precision] {precision}: {len(targets)} block Linears quantised; everything else stays bf16")
     return len(targets)
+
+
+@torch.no_grad()
+def _quantize_one(m, driver, precision, compute_device, store_device=None):
+    """One block-map Linear to `precision` ("int8" or "nf4"), in place - the step quantize() takes for each."""
+    from fizgig.modules.nf4 import _dequantize_source_weight
+    if precision == "int8":
+        from fizgig.modules.int8_train import int8_train_forward
+        w = _dequantize_source_weight(m).to(compute_device)
+        # a driver may keep its original trainer's bf16 scales
+        w = w.float() if getattr(driver, "int8_fp32_scales", True) else w.contiguous()
+        scale = w.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127.0
+        m.weight.requires_grad_(False)
+        q = (w / scale).round_().clamp_(-127, 127).to(torch.int8).contiguous()
+        m.weight.data = q if store_device is None else q.to(store_device)
+        m.register_buffer("_int8_wscale", scale.reshape(1, -1).to(torch.float32), persistent=False)
+        m._is_int8 = True
+        m._int8_grad_mode = "bf16"
+        m.forward = int8_train_forward.__get__(m, type(m))
+        del w
+    else:
+        from bitsandbytes.functional import quantize_nf4
+        from fizgig.modules.nf4 import nf4_linear_forward_patch
+        packed, state = quantize_nf4(_dequantize_source_weight(m).to(compute_device).contiguous())
+        m._nf4_packed, m._nf4_state, m._is_nf4 = packed, state, True
+        m.weight.data = torch.empty(0, device=compute_device, dtype=torch.bfloat16)
+        m.weight.requires_grad_(False)
+        m.forward = nf4_linear_forward_patch.__get__(m, type(m))
+
+
+STREAM_HEADROOM_GB = 6.0     # what the rest of the run takes in RAM beside the model file while it loads
+
+
+def _ram_short(path):
+    """The bf16 model file would not fit in the RAM that's free (on a pod, its own limit, via container_ram): the
+    one case the base is streamed. With RAM to spare the whole-file load runs as it always has."""
+    try:
+        import psutil
+        return os.path.getsize(path) / 1e9 + STREAM_HEADROOM_GB > psutil.virtual_memory().available / 1e9
+    except Exception:
+        return False
+
+
+@torch.no_grad()
+def _stream_load(driver, path, device, precision, swap):
+    """The base built a tensor at a time, each block-map Linear quantised as soon as its weight is read, so the
+    bf16 model is never whole in RAM. Same result as load_dit on the CPU + quantize(); None when the driver can't
+    stream this file (it then loads the usual way)."""
+    got = driver.stream_dit(path)
+    if got is None:
+        return None
+    dit, f, dtype = got                    # the model on meta, the open file, the dtype load_dit gives its weights
+    with f:
+        _stream_fill(dit, driver, f, dtype, path, device, precision, swap)
+    dit.eval().requires_grad_(False)
+    gc.collect()
+    torch.cuda.empty_cache()
+    logger.info(f"[precision] {precision}: {len(_targets(dit, driver))} block Linears quantised; everything else stays bf16")
+    return dit
+
+
+def _stream_fill(dit, driver, f, dtype, path, device, precision, swap):
+    keys = f.keys()
+    read = lambda k: f.get_tensor(k, device=torch.device("cpu"), dtype=dtype)    # noqa: E731 - as load_dit reads
+    expected = set(dit.state_dict().keys())
+    if set(keys) != expected:
+        raise RuntimeError(f"{os.path.basename(path)}: {len(set(keys) - expected)} unexpected and "
+                           f"{len(expected - set(keys))} missing weights for this model")
+    targets = dict(_targets(dit, driver))
+    owned = {}
+    for k in keys:
+        mod = k.rpartition(".")[0]
+        if mod in targets:
+            owned.setdefault(mod, []).append(k)
+    rest = [k for k in keys if k.rpartition(".")[0] not in targets]
+    logger.info(f"[precision] RAM is short for the whole {os.path.getsize(path) / 1e9:.0f} GB file: "
+                f"loading it a Linear at a time and quantising each to {precision} as it arrives")
+    dit.load_state_dict({k: read(k) for k in rest}, strict=False, assign=True)
+    compute_device, store_device = torch.device(device), ("cpu" if swap else None)
+    for name, m in targets.items():
+        m.load_state_dict({k.rpartition(".")[2]: read(k) for k in owned.get(name, ())}, strict=True, assign=True)
+        _quantize_one(m, driver, precision, compute_device, store_device)
+    if precision == "int8":
+        dit._int8_quantized = True
+    else:
+        dit._nf4_quantized = True
 
 
 def move(dit, device):
@@ -100,8 +165,12 @@ def load_base(driver, path, device, precision="bf16", blocks_to_swap=0, supports
     if getattr(driver, "loads_quantized", False):     # the file is already the base precision
         dit = driver.load_dit(path, device)
         return dit, 0
-    dit = driver.load_dit(path, "cpu" if (swap or precision != "bf16") else device)
-    quantize(dit, driver, precision, device, store_device="cpu" if swap else None)
+    dit = None
+    if precision != "bf16" and hasattr(driver, "stream_dit") and _ram_short(path):
+        dit = _stream_load(driver, path, device, precision, swap)
+    if dit is None:
+        dit = driver.load_dit(path, "cpu" if (swap or precision != "bf16") else device)
+        quantize(dit, driver, precision, device, store_device="cpu" if swap else None)
     if swap:
         driver.enable_block_swap(dit, swap, device, supports_backward)
         logger.info(f"[block swap] {swap} blocks stream between CPU and GPU")
@@ -126,13 +195,18 @@ def _peak(entry, megapixels):
     return y0 + (y1 - y0) * (megapixels - x0) / (x1 - x0)
 
 
+TIGHT_MARGIN_GB = 0.5      # nf4 with no swap beats a swapped int8 base down to this much headroom
+
+
 def plan(desc, driver, precision="auto", blocks_to_swap=-1, free_gb=None, margin_gb=1.5, megapixels=1.0):
     """Resolve 'auto' precision and/or block swap (-1) from free VRAM and the description's measured training
     memory (desc.train_memory: {precision: (peak GB at no swap, GB saved per swapped block)}).
 
     Auto precision takes the most precise base that fits without swap (bf16, then int8, then nf4), since swap costs
-    far more speed than quantisation. Only if nothing fits does it swap (int8, the smaller swappable base). An
-    explicit precision with auto swap gets the fewest blocks that fit. Returns (precision, blocks_to_swap, reason)."""
+    far more speed than quantisation. If none fits with the full margin, nf4 still goes first when it fits with a
+    small one: swapping int8 instead cost 4.4x the step time and 4x the CPU on a 16 GB card (#216; measured July
+    2026). Only if nothing fits does it swap (int8, the smaller swappable base). An explicit precision with auto swap
+    gets the fewest blocks that fit. Returns (precision, blocks_to_swap, reason)."""
     if free_gb is None:
         free_gb = free_vram_gb()
     mem = {p: (_peak(v, megapixels), v[1]) for p, v in (desc.train_memory or {}).items()}
@@ -156,6 +230,9 @@ def plan(desc, driver, precision="auto", blocks_to_swap=-1, free_gb=None, margin
         for p in offered:
             if p in mem and mem[p][0] <= budget:
                 return p, 0 if blocks_to_swap < 0 else blocks_to_swap, f"{p} fits {free_gb:.1f} GB free"
+        if "nf4" in offered and "nf4" in mem and mem["nf4"][0] <= free_gb - TIGHT_MARGIN_GB:
+            return "nf4", 0 if blocks_to_swap < 0 else blocks_to_swap, (f"nf4 fits {free_gb:.1f} GB free, closely "
+                                                                        "(block swap would be far slower)")
         swappable = [p for p in ("int8", "bf16") if p in offered and p in mem]
         if swappable and cap > 0:
             p = swappable[0]

@@ -24,7 +24,9 @@ QWEN3_4B = dict(vocab_size=151936, hidden_size=2560, intermediate_size=9728, num
 
 
 class TextEncoder:
-    def __init__(self, path, device, dtype=torch.bfloat16, tokenizer=None):
+    def __init__(self, path, device, dtype=torch.bfloat16, tokenizer=None, int8=False):
+        """int8: the Linears as 8-bit weights with one scale per 64 (Qwen Image 2.1's and Flux 3's), about 4.5 GB
+        instead of 8, for a card that can't hold the bf16 encoder with room to run; matmuls stay bf16."""
         from safetensors.torch import load_file
         from transformers import AutoTokenizer, Qwen3Config, Qwen3Model
         from fizgig.utils.hf_cache import from_pretrained_cache_first
@@ -37,7 +39,12 @@ class TextEncoder:
         missing, unexpected = model.load_state_dict(sd, strict=False)
         if missing or [k for k in unexpected if not k.startswith("lm_head")]:
             raise RuntimeError(f"not Z-Image's Qwen3-4B file: missing {missing[:5]}, unexpected {unexpected[:5]}")
-        self.model = model.to(device, dtype).eval().requires_grad_(False)
+        model = model.to(dtype)
+        if int8:
+            from fizgig.qwen_image21.embedder import _int8_weights
+            n = _int8_weights(model, "layers.", device)
+            print(f"[text encoder] 8-bit weights: {n} Linears (low-VRAM card); matmuls stay bf16", flush=True)
+        self.model = model.to(device).eval().requires_grad_(False)
         self.device = device
 
     def template(self, prompt):

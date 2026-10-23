@@ -4,7 +4,7 @@
 Sources: the model cards (huggingface.co/black-forest-labs/flux-3-image-klein, -base, -comfy) and the reference code
 (github.com/black-forest-labs/flux-3-image-klein, Apache-2.0).
 """
-from fizgig.families.description import FamilyDescription, LoRAFormat, ModelFile, SamplingSettings
+from fizgig.families.description import FamilyDescription, LoRAFormat, ModelFile, SamplingSettings, TextEncoderBuild
 
 _COMFY = "black-forest-labs/flux-3-image-klein-comfy"
 _CARD = "https://huggingface.co/black-forest-labs/flux-3-image-klein"
@@ -53,6 +53,15 @@ FLUX3 = FamilyDescription(
         ModelFile("flux3_distilled_dit", "Flux 3 Image Klein (distilled, previews)", False, _COMFY,
                   "diffusion_models/flux3_image_klein_sd_bf16.safetensors", 11.10,
                   "16 steps, no CFG: fast previews and the workbench.", role="preview_dit", gated=True),
+    ),
+    # measured 21 Oct 2026 with scripts/check_te_builds.py against qwen3vl_4b_bf16 (the same weights as Krea 2's
+    # Qwen3-VL-4B; the fp8 build re-measured 22 Oct: cosine 1.00000, worst token 0.9945); the int8 (convrot) build
+    # doesn't load in Flux 3's encoder loader
+    text_encoder_builds=(
+        TextEncoderBuild("bf16 (Krea 2's copy)", "Comfy-Org/Krea-2", "text_encoders/qwen3vl_4b_bf16.safetensors", 8.88,
+                         "36f3ff447ef59201722e8f9ce6020c9819fdcfba6aa2608c4e09b1c0ce114e34", 1.0),
+        TextEncoderBuild("fp8 (scaled)", "Comfy-Org/Krea-2", "text_encoders/qwen3vl_4b_fp8_scaled.safetensors", 5.24,
+                         "54bd5144df0bbc25dd6ccadfcb826b521445a1b06ae5a42570bdd2974ca87094", 1.0),
     ),
     text_encoder_label="Qwen3-VL-4B",
     vae_label="FLUX.2 autoencoder",

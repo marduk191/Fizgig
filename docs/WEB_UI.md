@@ -14,7 +14,9 @@ The **Pods** tab in Fizgig on your own computer opens your RunPod pods. Add a po
 
 <p align="center"><img src="assets/screenshots/pods.png" alt="The Pods tab: a laptop found on the network, and a RunPod pod" width="800"></p>
 
-With your RunPod API key (RunPod > Settings > API Keys, pasted into the tab), your Fizgig pods are listed without adding them, and **Start and open** / **Stop** work from the tab: a stopped pod starts and opens by itself once its Fizgig answers. A pod can take a few minutes to start; if it isn't ready after that, check it on RunPod (its Logs show what it's doing). The key is saved on your computer only. In the app window, a pod whose template sets `FIZGIG_PASSWORD` logs you in by itself (the Pods tab says "logs you in"): the window reads the password from the pod's settings on RunPod each time and never saves it. A password kept as a RunPod secret, or one the pod made up itself, can't be read that way, so you type it as usual, and if the one it finds doesn't work the login box says so. A pod on an older Fizgig than your computer's still opens, with a note to restart it once its run is done (a pod takes the newest Fizgig every time it starts), so updating your own copy never cuts you off from a long run. A pod on a newer one shows what to update, with **Open anyway**. No pod yet? The tab's **Rent a pod** card lists the cards RunPod has free right now (with your key), cheapest per run first, with each one's price and roughly what a run costs on it; **Deploy** opens RunPod's page with that card and Fizgig's template chosen, and you press Deploy there.
+With your RunPod API key (RunPod > Settings > API Keys, pasted into the tab), your Fizgig pods are listed without adding them, and **Start and open** / **Stop** work from the tab: a stopped pod starts and opens by itself once its Fizgig answers. A pod can take a few minutes to start; if it isn't ready after that, check it on RunPod (its Logs show what it's doing). The key is saved on your computer only. In the app window, a pod whose template sets `FIZGIG_PASSWORD` logs you in by itself (the Pods tab says "logs you in"): the window reads the password from the pod's settings on RunPod each time and never saves it. A password kept as a RunPod secret, or one the pod made up itself, can't be read that way, so you type it as usual, and if the one it finds doesn't work the login box says so. A pod on an older Fizgig than your computer's still opens, with a note to restart it once its run is done (a pod takes the newest Fizgig every time it starts), so updating your own copy never cuts you off from a long run. A pod on a newer one shows what to update, with **Open anyway**. No pod yet? The tab's **Rent a pod** card lists the cards RunPod has free right now (with your key), cheapest per run first, with each one's price and roughly what a run costs on it; **Deploy** opens RunPod's page with that card and Fizgig's template chosen; there, add a 300 GB **Volume disk** (**Add volume** > **Volume disk**: it opens on Global volume, which doesn't work) and press **Deploy Pod** ([see an explanation with screenshots](../docker/README.md#give-it-a-disk-on-runpods-deploy-page)). It counts only hosts whose driver runs Fizgig's image, so a card shown free deploys, and its **GPUs** choice lists two-card pods (use the second card as a helper on the pod's Helpers tab). A pod you deleted on RunPod shows as deleted, with **Forget** to take it off the list.
+
+**Vast.ai** works too: rent from [Fizgig's Vast.ai template](VAST.md), then paste the instance's address into **Add a pod**. Its run card, helpers and moves work as with a pod; Vast.ai's own card in Preferences can stop the instance when a run finishes.
 
 <p align="center"><img src="assets/screenshots/rent_a_pod.png" alt="Rent a pod: RunPod's free cards, cheapest per run first, each with Deploy" width="800"></p>
 
@@ -23,6 +25,8 @@ On a pod in the Fizgig window, the Start tab's **From this computer** card lists
 On a pod, the sidebar's **File manager** button opens the pod's file manager (port 8080) in a new tab: drag folders in, take big files out, anywhere in `/workspace`. Log in as `admin` with the pod's password; if it refused that password as too common, the button's tooltip says what to use instead. The Start tab's upload card and Runs & outputs link to it too.
 
 Logging in on a pod, tick **Keep me logged in on this device** and it remembers you for 30 days, through pod restarts.
+
+A run on a pod keeps training with the window closed or your computer off: open the pod again to see it. Stopping the pod itself mid-run loses what it trained since its last save, so press **Pause** first.
 
 ## Your other computers: use one's GPU from another
 
@@ -50,6 +54,10 @@ If the desktop doesn't appear, add it by hand: under **Add a pod**, paste its ad
 Keep Fizgig running on the desktop: if you started it with **Launch Fizgig.bat**, closing its window stops it. Training runs on the desktop, so you can close the laptop's window, or switch the laptop off, and open it again later to check in. Keep both computers on the same version of Fizgig. If the desktop's is older, it still opens, with a note naming it, so a run on it isn't interrupted: update it when it's free. If yours is the older one, the window says to update this computer, with **Open anyway** if you'd rather carry on.
 
 This is for your own network. To reach the desktop from outside your home, use a VPN such as Tailscale (then use the address Tailscale gives the desktop), not a port forwarded on your router: see [The password](#the-password).
+
+## Helpers: previews and training on another GPU
+
+A second computer can also work *alongside* this one rather than instead of it: on the **Helpers** tab, add it as a helper and it renders this computer's previews (training never stops for them) or trains a share of each epoch's images, and a run can move to it while you need this computer. A second GPU in this computer can be a helper too (**Use it as a helper**), and your home GPU can do the same for a run on a pod, bringing its checkpoints home as they're saved. See [Helpers](HELPERS.md).
 
 ## On your own computer
 
@@ -112,7 +120,7 @@ On a RunPod pod the web UI always uses 8081, the port the pod's proxy forwards.
 
 ## Model downloads
 
-Preferences lists each model's files. **⬇ Download models for me** at the foot of a model's section downloads every file it needs, plus the Captions tab's Qwen3-VL captioner and the small helper models, and fills in the paths when they land. A progress bar shows each file; Cancel stops it, and downloading again resumes where it left off. Files go into the `models` folder in Fizgig (on a pod, `/workspace/models` on the volume).
+Preferences lists each model's files. **⬇ Download models for me** at the foot of a model's section downloads every file it needs, plus the Captions tab's Qwen3-VL captioner and the small face and captioning models, and fills in the paths when they land. A progress bar shows each file; Cancel stops it, and downloading again resumes where it left off. Files go into the `models` folder in Fizgig (on a pod, `/workspace/models` on the volume). Where a row offers two builds, pick one beside the button. A row that already points at a file of your own keeps it, and the download log says so.
 
 Some models are gated: their makers require each user to accept the licence on Hugging Face. Their section shows the licence pages and a token box: accept each licence, create a read token, and paste it in. The token is used for that download only and never saved. On a machine or pod with `HF_TOKEN` set, leave the token box empty.
 

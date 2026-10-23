@@ -118,6 +118,24 @@ ck("  the trigger word is still found", MP.caption_trigger(m) == "zwxem", MP.cap
 ck("  and every caption is read, decoded", sorted(MP._captions(m, ".txt")) ==
    ["zwxem, a woman smiling", "zwxem, a woman’s portrait"], MP._captions(m, ".txt"))
 
+# --- 2c. upstream's own reader (#225) and the edit run's instruction ------------------------------
+# Upstream adopted the any-encoding read for the Captions tab and Find & Replace (captions.read_text); the checks
+# above run on it. Its text must match training's.
+_rt = CAP.read_text(os.path.join(d, "a.txt"))
+ck("captions.read_text reads a cp1252 caption as training does", _rt == "the girl’s worm’s-eye angle", _rt)
+from fizgig.families import launch as LA  # noqa: E402
+e_dir = tempfile.mkdtemp(prefix="fizgig_capenc_edit_")
+Image.new("RGB", (8, 8)).save(os.path.join(e_dir, "a.png"))
+with open(os.path.join(e_dir, "a.txt"), "wb") as f:
+    f.write("make it the girl’s style\nsecond line".encode("cp1252"))
+try:
+    got = LA.edit_instruction({"image_folder": e_dir, "caption_ext": ".txt"})
+    ck("an edit run's preview instruction reads a cp1252 caption (Start used to fail)",
+       got == "make it the girl’s style", got)
+except Exception as ex:
+    ck("an edit run's preview instruction reads a cp1252 caption (Start used to fail)", False,
+       f"{type(ex).__name__}: {ex}")
+
 # --- 3. the server stays torch-free ---------------------------------------------------------
 # Run in a fresh interpreter, from a folder with no fizgig.py in it (the repo root's would shadow the package).
 r = subprocess.run([sys.executable, "-c", "import sys; import fizgig.web.server, fizgig.web.captions; "

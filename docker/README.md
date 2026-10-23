@@ -2,15 +2,19 @@
 
 [**⚡ Deploy Fizgig on RunPod →**](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=bdrdew7hxw&ref=vkb387ep)
 
+> **Before you press Deploy Pod:** RunPod doesn't add a disk for you: on its page press **Add volume**, click **Volume disk** (it opens on Global volume, which doesn't work), keep **300 GB**, press **Add volume disk**, then **Deploy Pod**. [See an explanation with screenshots](#give-it-a-disk-on-runpods-deploy-page).
+
 Fizgig in your browser: the pod runs the app and you open it as a web page, from your computer or your phone. Training, Studio, LoRA Royale, Profiler, Extract and the sample gallery are all there. Nothing to install, and your own GPU stays free while it trains.
 
 *That link is a referral one — it supports Fizgig's development at no extra cost to you.*
+
+Prefer Vast.ai? The same image runs there too: [Fizgig on Vast.ai](https://cloud.vast.ai/?ref_id=757773&creator_id=757773&name=Fizgig%20LoRa%20Training%20and%20Fine-tuning) (also a referral link) · [the Vast.ai guide](../docs/VAST.md).
 
 ## Quick start: nothing installed on your computer
 
 You don't need Fizgig on your own computer for this. You need a RunPod account and a web browser.
 
-1. **Click [Deploy on RunPod](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=bdrdew7hxw&ref=vkb387ep).** It opens RunPod with the Fizgig template and an RTX 5090 chosen. Keep the template's 300 GB disk and press **Deploy**. (Other cards: [Which GPU](#which-gpu).)
+1. **Click [Deploy on RunPod](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=bdrdew7hxw&ref=vkb387ep).** It opens RunPod with the Fizgig template and an RTX 5090 chosen. **Add a 300 GB Volume disk** before you press **Deploy Pod**: RunPod doesn't add one for you, and its dialog opens on the wrong kind ([see an explanation with screenshots](#give-it-a-disk-on-runpods-deploy-page)). (Other cards: [Which GPU](#which-gpu).)
 2. **Wait for "Ready".** Open the pod's **Logs** tab. The first start downloads the image and takes a few minutes. It's ready when the log ends with `Ready. Open the pod's HTTP port 8081 for Fizgig.` and the password on the line under it.
 3. **Open Fizgig in your browser.** In the pod's **Connect** menu, click **HTTP port 8081** and log in with that password (there's no user name). That page is Fizgig, the whole app.
 4. **Download a model.** **Preferences → ⬇ Download models for me.** Krea 2 needs no Hugging Face account.
@@ -24,15 +28,32 @@ Close the tab whenever you like: the run carries on, and you can come back from 
 
 ## Storage
 
-**Give it 300 GB (the template's default), mounted at `/workspace`.** Each model's files run to tens of GB,
+### Give it a disk on RunPod's deploy page
+
+RunPod's deploy page doesn't add a disk by itself. On the right of the page, a box called **Nothing mounted at the template's path** says so:
+
+<p align="center"><img src="../docs/assets/screenshots/runpod_storage_sidebar.png" alt="RunPod's deploy summary: Nothing mounted at the template's path, This template recommends 300 GB of persistent storage at /workspace, Add volume" width="300"></p>
+
+1. Press **Add volume** in that box.
+2. In **Create storage**, click **Volume disk** (marked Legacy). The dialog opens with **Global volume** selected, and that one doesn't work for Fizgig (see below).
+3. Leave **Size** at **300 GB** and press **Add volume disk**.
+
+<p align="center"><img src="../docs/assets/screenshots/runpod_create_storage.png" alt="RunPod's Create storage dialog: Global volume, Network volume, and Volume disk (Legacy) selected, Size 300 GB, Add volume disk" width="800"></p>
+
+4. Press **Deploy Pod**.
+
+Skip this and the pod runs on its small container disk: the models download into it and everything is lost when the pod stops. The pod's log warns you if that happened (`Storage: only … GB free … that looks like container disk`).
+
+### How much, and which kind
+
+**Give it 300 GB (the template's recommendation), mounted at `/workspace`.** Each model's files run to tens of GB,
 so a few models, your datasets and their LoRAs fill 200 GB quickly; 100 GB is the least that works for one.
 
 Then the one thing to know: **stopping a pod keeps everything; terminating it does not.** Stop
 between sessions and your models, datasets and LoRAs are all still there when you start it again.
 Terminate and the disk goes with the pod.
 
-That's it for the default **Volume Disk**, which is what the template comes with and is perfectly
-fine to use.
+That's it for the **Volume disk**, the one the steps above add, and it's perfectly fine to use.
 
 A **Network Volume** is the upgrade if you want one: it's a separate thing that outlives any pod, so
 you can terminate freely and attach the same storage to a new pod later. The catch is that it's
@@ -65,7 +86,7 @@ hour, a card that's slightly dearer but four times faster is much cheaper per fi
 H100 and A100 work but are poor value here — LoRA training never touches 80 GB, and you'd pay
 several times more for it.
 
-**Let Fizgig pick.** The **Rent a pod** card on the **Pods** tab of Fizgig on your own computer lists the cards RunPod has free right now (with your RunPod API key saved there), filtered by memory, cloud and a top price per hour, cheapest per run first. Tell it how long your run takes on a 5090 and each row shows roughly what the same run costs on that card. **Deploy** opens RunPod's page with that card and this template chosen; you add the volume and press Deploy there. The speeds are a rough guide from public benchmarks; the prices and stock are RunPod's own.
+**Let Fizgig pick.** The **Rent a pod** card on the **Pods** tab of Fizgig on your own computer lists the cards RunPod has free right now (with your RunPod API key saved there), filtered by memory, cloud and a top price per hour, cheapest per run first. Tell it how long your run takes on a 5090 and each row shows roughly what the same run costs on that card. **Deploy** opens RunPod's page with that card and this template chosen; you add the volume and press Deploy there. The speeds are a rough guide from public benchmarks; the prices and stock are RunPod's own, counted only on hosts whose driver runs this image. Set **GPUs** to 2 for a two-card pod: on the pod, **Helpers** > **Use it as a helper** puts the second card to work on a training share.
 
 <p align="center"><img src="../docs/assets/screenshots/rent_a_pod.png" alt="Rent a pod: RunPod's free cards, cheapest per run first, each with Deploy" width="800"></p>
 
@@ -118,6 +139,8 @@ Closing the browser tab does **not** stop training. Fizgig runs on the pod, so c
 
 <p align="center"><img src="../docs/assets/screenshots/from_this_computer.png" alt="From this computer: your own training folders on the pod's page, ready to send" width="800"></p>
 
+**Your LoRAs, home as they're saved:** on your own computer, **Helpers** > **Help another Fizgig with this GPU** > **Bring its checkpoints home as they're saved** fetches each checkpoint as the pod saves it, and can delete the pod once the run has finished and they're all home ([how](../docs/HELPERS.md#a-pods-run-home-as-it-saves)). A run on a pod keeps training with the window closed.
+
 **Port 8080** is a file manager rooted at `/workspace`: the **File manager** button in Fizgig's sidebar opens it. Drag a dataset folder in from your desktop,
 download finished LoRAs from `output_loras/` the same way. No terminal, no SSH keys.
 
@@ -126,6 +149,12 @@ download finished LoRAs from `output_loras/` the same way. No terminal, no SSH k
 Prefer a terminal? `runpodctl` is preinstalled — `runpodctl send <path>` on the pod, then
 `runpodctl receive <code>` on your machine. `scp` and `rsync` over SSH work too, and rsync is the
 better bet for a large dataset since it resumes.
+
+## Your home GPU helping the pod
+
+Fizgig on your own computer can render a pod run's previews, so the pod's time goes on training, or train a share of each epoch's images, and bring the run's checkpoints home to try your own prompts on them: **Helpers** > **Help another Fizgig with this GPU** on your computer. A training share pays on big datasets only, as your home upload sets the transfer time: see [Helpers](../docs/TRAINING_SHARE.md#is-it-worth-it).
+
+<p align="center"><img src="../docs/assets/screenshots/helpers_pod.png" alt="Your home Fizgig helping a pod train, with its verdict, and the pod's checkpoints ready to bring home" width="800"></p>
 
 ## Where things live
 
@@ -148,6 +177,10 @@ It needs an API key, pasted into that same panel. Make one at **RunPod → Setti
 key RunPod gives a pod automatically is pod-scoped and cannot stop pods, which is a RunPod
 limitation rather than a Fizgig one. It's stored on your volume, not in any template.
 
+**Stopping a pod yourself mid-run** loses what the run trained since its last save: the pod gets a few seconds'
+notice, not the minutes an epoch can take. Press **Pause** first (it saves and stops at the end of the epoch), then
+stop the pod.
+
 ## Settings
 
 Environment variables, set on the deploy screen under **Edit Template**:
@@ -163,6 +196,10 @@ Nothing is compulsory — the defaults are the intended setup, and everything he
 inside the app instead.
 
 Two more exist for unusual cases: `FETCH_MODELS_EXTRA` passes extra flags to the downloader, and `FIZGIG_REPO` points the pod at a fork.
+
+## On Vast.ai
+
+The same image runs on Vast.ai, with its own template: see [Fizgig on Vast.ai](../docs/VAST.md).
 
 ## The classic template (remote desktop)
 

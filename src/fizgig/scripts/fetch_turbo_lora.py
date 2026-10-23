@@ -21,6 +21,16 @@ import struct
 import sys
 
 REPO_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+
+
+def _prefs_file(repo_dir):
+    """prefs.json: a second Fizgig on another GPU keeps its own (FIZGIG_USER_DATA); the model files stay shared."""
+    own = os.environ.get("FIZGIG_USER_DATA")
+    if own and os.path.normcase(os.path.abspath(repo_dir)) == os.path.normcase(REPO_DIR):
+        return os.path.join(own, "prefs.json")
+    return os.path.join(repo_dir, "user_data", "prefs.json")
+
+
 if os.path.join(REPO_DIR, "src") not in sys.path:      # the updater runs this file by path
     sys.path.insert(0, os.path.join(REPO_DIR, "src"))
 from fizgig import user_data  # noqa: E402
@@ -145,7 +155,7 @@ def ensure_lora(pref_key, filename, url, probe_key, min_size, label, replaces=Fa
     took over a pref that held another one); a tuple of file names = earlier versions of this file, moved to it
     (any other file there is the user's own choice and kept)."""
     try:
-        prefs_file = os.path.join(repo_dir, "user_data", "prefs.json")
+        prefs_file = _prefs_file(repo_dir)
         current = str(_load_prefs(prefs_file).get(pref_key) or "").strip()
         old = isinstance(replaces, (tuple, list)) and os.path.basename(current) in replaces
         if current and os.path.isfile(current) and not old and (replaces is not True
@@ -186,7 +196,7 @@ def qwen_turbo_dit_hint(repo_dir: str = REPO_DIR, log=print):
     """A Qwen Image 2.1 install without the Turbo DiT gets told how to fetch it (7.3 GB - too big for the
     updater to pull unasked). Runs after the update's git pull, so it reaches this update, not the next."""
     try:
-        prefs = _load_prefs(os.path.join(repo_dir, "user_data", "prefs.json"))
+        prefs = _load_prefs(_prefs_file(repo_dir))
         qwen = str(prefs.get("qwen21_dit") or "").strip()
         turbo = str(prefs.get("qwen21_turbo_dit") or "").strip()
         if qwen and os.path.isfile(qwen) and not (turbo and os.path.isfile(turbo)):

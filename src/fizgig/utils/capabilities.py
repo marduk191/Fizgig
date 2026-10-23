@@ -453,7 +453,12 @@ def _available_ram_gb():
             return ms.ullAvailPhys / 2**30, ms.ullTotalPhys / 2**30
         with open("/proc/meminfo") as f:
             info = {l.split(":")[0]: int(l.split()[1]) for l in f if ":" in l}
-        return info["MemAvailable"] / 2**20, info["MemTotal"] / 2**20
+        avail, total = info["MemAvailable"] / 2**20, info["MemTotal"] / 2**20
+        from fizgig.utils.container_ram import container_ram
+        c = container_ram()                       # a pod: its own limit, not the host's RAM
+        if c is not None and c[0] / 2**30 < total:
+            avail, total = min(avail, c[1] / 2**30), c[0] / 2**30
+        return avail, total
     except Exception:
         return None, None
 
