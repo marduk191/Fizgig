@@ -15,9 +15,44 @@ Everything on this page works on every model unless it says otherwise: [Klein 9B
 
 ## Dataset prep
 
-- **AI captioning with Krea 2's Qwen3-VL-4B** — every model's captions, on the Captions tab and in auto-recaption, come from it. It writes viewpoint-aware training captions in five editable preset styles (including **Style**, which describes everything *except* the look so your trigger word binds to it). Every preset's instruction is editable in plain English and persists. Florence-2 is the zero-setup option. **Bilingual captions** (English + Chinese via Helsinki-NLP) act as text-level augmentation — measurably better skin detail on Klein at identical loss.
+- **AI captioning with Krea 2's Qwen3-VL-4B** — every model's captions, on the Captions tab and in auto-recaption, come from it. It writes viewpoint-aware training captions in five editable preset styles (including **Style**, which describes everything *except* the look so your trigger word binds to it). Every preset's instruction is editable in plain English and persists. Auto-recaption uses them too: the Training tab's **First try uses** and **Second try uses** pick a task each (Training caption, then Exhaustive detail, by default). Both defaults are written for a person, so for a style or a concept set both to suit your LoRA, e.g. Style, or Custom with your own instruction. Florence-2 is the zero-setup option. **Bilingual captions** (English + Chinese via Helsinki-NLP) act as text-level augmentation — measurably better skin detail on Klein at identical loss.
 - **Image Prep** — batch resize, PNG conversion, face crops (InsightFace with gender targeting for people, or a YOLO face model such as Fdetailer for furry / anime characters: [face backends](FACE_BACKENDS.md)). Pairing a tight crop with a full shot adds a lot to a character dataset.
+- **Masks for masked training** — Image Prep makes a mask for every picture in a folder (the person, just the face and hair, the body without the face, and more), so training learns the part that matters, not the room around it. See [Masked training](MASKED_TRAINING.md).
 - **Look Consistency Filter** — pick the 3 images that best nail the look and every image is scored against them (ArcFace, or DINOv2 for furry / anime faces). Worst matches surface first; mark drifters or let Auto-Suggest flag the outliers, then move them out in one click — nothing is deleted, and the scores feed the trainer's [look-outlier warm-up](KREA2.md#the-trainer-curates-your-dataset-while-it-trains-experimental).
+- **Sub-folders (optional)** — tick **Also train on its sub-folders** on the Training tab and a big dataset can stay organised in folders (outfits, forms, sources), each trained with its own captions and cache. Off by default. See [Sub-folders](#sub-folders) below.
+
+## Sub-folders
+
+A training folder is read at its top level only. Tick **Also train on its sub-folders** on the Training tab (off by default) and the pictures in its sub-folders train too, so a big dataset can stay organised in folders: outfits, forms, sources, or the thousands of pictures of a fine-tune. The folder you choose on the Start tab stays the training folder; the tick only adds what is inside it.
+
+**What it trains.** Every sub-folder holding pictures (or clips or songs) is found, at any depth. Each trains as its own set beside the training folder, with its own captions next to its pictures and its own cache, so two folders can hold pictures with the same name. Every picture trains once an epoch, wherever it is: a folder with more pictures carries more weight, and nothing is evened out between folders. The training folder itself can hold no pictures at all, with everything in its sub-folders.
+
+**What it leaves out.** Fizgig's own folders (`excluded_by_look`, `originals`), hidden folders (a name starting with `.`), the LoRA output folder and the cache folder when they sit inside, and a fine-tune's regularisation folder (below), with everything under them.
+
+**The line under the tick** says what it will do before you press Start:
+- Unticked, when there are sub-folders: how many there are and how many more pictures they hold, which aren't trained on.
+- Ticked: how many folders and pictures will train, and first the folders whose pictures aren't captioned yet (the training folder's own too), with how many pictures each. **Show all folders** lists every folder with its count.
+- Start refuses a sub-folder whose pictures have no captions and names it, as it does for the training folder.
+
+**Captions and Image Prep** work on one folder at a time, and their lines say so when the training folder has sub-folders. To caption a sub-folder, make its masks, resize it or run the Look Consistency Filter on it, choose it as the training folder on the Start tab, then choose the top folder again to train. Each sub-folder's trigger word is the one you saved for it on the Captions tab, else the word its captions start with. With masked training on, each sub-folder's pictures use the masks in their own folder.
+
+**While it trains** (the Krea 2 loss watch, [details](KREA2.md#the-trainer-curates-your-dataset-while-it-trains-experimental)), every picture is kept with its own folder:
+- **Per-image loss** (on the run card while it trains, and on the run in Runs & outputs) names each picture with its folder (`outfits/red/03`), and a caption you edit there is written into that picture's own folder.
+- **Auto-recaption** writes the new caption into the picture's own folder, with that folder's trigger word.
+- **Exclusions** are saved in each folder's own `fizgig_excluded.json`, so they travel with its pictures.
+- The **look-outlier warm-up** reads each folder's own Look Filter scores (`fizgig_look_scores.json`, from a scan of that folder). Pictures moved into a sub-folder's `excluded_by_look` are left out.
+- Pause and Resume carry all of it on, and **Load settings from last train** brings the tick back.
+
+**Fine-tunes** train every folder in the tree, which is the main use: a dataset of thousands of pictures sorted into folders. If the folder you picked for **Regularisation images** sits inside your training folder, its photos are not trained as your own pictures: they are only used as regularisation images, as they would be from any other folder.
+
+**On a pod or another computer** the tick decides what goes:
+- **Upload a folder** on the Start tab keeps the sub-folders as they are when it is ticked. Unticked, the files of the sub-folders all go into the one new folder.
+- **Send to this pod** (the Fizgig window's **From this computer** card) sends the sub-folders too when it is ticked; each tile says whether its sub-folders go ("sent too" or "not sent"). Sending again sends only what isn't there yet.
+- **Move a run** takes the sub-folders with the run, and captions edited over there come back into each folder. See [Move a run](MOVE_RUN.md).
+
+**Not with** Subjects 2-4, DOP or Fizgig LoRA Isolation, which keep one folder per subject, nor Edit or slider training, which pair their files: the tick is hidden in those modes. To train several people, use Subjects; to train one subject's outfits or forms, use sub-folders or one folder with the outfit named in each caption.
+
+For the command line, see [CLI](CLI.md): each sub-folder is a `[[datasets]]` block with an `item_prefix`.
 
 ## Subjects: more than one person, and keeping them to their trigger
 

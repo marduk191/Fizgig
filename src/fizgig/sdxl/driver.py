@@ -17,7 +17,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from fizgig.families.driver import Block, BlockGroup, FamilyDriver
+from fizgig.families.driver import Block, BlockGroup, FamilyDriver, prior_base, weighted_loss, with_prior
 
 CONFIG_REPO = "stabilityai/stable-diffusion-xl-base-1.0"
 DTYPE = torch.bfloat16
@@ -213,11 +213,13 @@ class SDXLDriver(FamilyDriver):
         return self._unet(dit, xt, torch.tensor([state["t"]], device=xt.device), cond, h, w)
 
     def training_loss(self, dit, latents, cond, generator, *, min_t=0.0, max_t=1.0, refs=None, diff_ref=None,
-                      diff_weight=0.0):
+                      diff_weight=0.0, loss_mask=None, prior=None):
         st = self.noise_latents(latents, generator, min_t=min_t, max_t=max_t)
         a, x0, noise = st["a"], st["x0"], st["noise"]
+        base = prior_base(prior, loss_mask, lambda: self.predict(dit, st, cond))
         pred = self.predict(dit, st, cond).float()
         target = (a.sqrt() * noise - (1 - a).sqrt() * x0) if self._v_pred() else noise
+        wgt = None
         if diff_ref is not None and diff_weight > 0.0:
             # image-pair slider: latent cells where the two poles differ count more (Krea 2 / Qwen's formula)
             d = (x0 - diff_ref.to(x0.device).float()).abs().mean(dim=1).flatten(1)          # (1, h*w)
@@ -226,9 +228,13 @@ class SDXLDriver(FamilyDriver):
             wgt = (1.0 - float(diff_weight)) + float(diff_weight) * r
             wgt = wgt / wgt.mean(dim=1, keepdim=True).clamp_min(1e-8)
             wgt = torch.where(dm > 1e-6, wgt, torch.ones_like(wgt))   # identical pair: uniform, never all-zero
-            loss = ((pred - target).pow(2).mean(dim=1).flatten(1) * wgt).mean()
-        else:
+        mw = None if loss_mask is None else loss_mask.float().to(x0.device).flatten(1)        # (1, h*w)
+        if wgt is None and mw is None:
             loss = F.mse_loss(pred, target)
+        else:
+            loss = weighted_loss((pred - target).pow(2).mean(dim=1).flatten(1), wgt, mw)
+            if base is not None:
+                loss = with_prior(loss, prior, base, (pred - base).pow(2).mean(dim=1).flatten(1), mw, wgt)
         gamma = float(self.options.get("min_snr") or 0.0)
         if gamma:
             # Min-SNR weighting (Hang et al. 2023), the SDXL trainers' default gamma 5

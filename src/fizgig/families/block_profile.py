@@ -5,7 +5,7 @@ Two instruments, written into one report:
 * Weights (no model, instant): every module's real update dW = (alpha / rank) * up @ down, through its singular
   values - taken exactly from two QR factorisations and an r x r SVD, never forming dW (a LoKR's are the products of
   its factors' singular values). From them: each block's true size, and how much of the LoRA lives in its top 1, 2,
-  4, 8 ... directions - what a Fast SVD extract to that rank keeps.
+  4, 8 ... directions - what an Extract to that rank keeps.
 
 * Rendering (the workbench engine, a few minutes): the LoRA on fixed seeds whole, off, with each group of
   neighbouring blocks ALONE and with each group LEFT OUT (and, in the thorough pass, each single block left out).
@@ -260,23 +260,6 @@ def verdicts(abl):
     return out
 
 
-def repair_settings(abl, down=0.5):
-    """What the profile suggests for Repair Studio: ({block id: (enabled, strength)}, [notes]). Groups that give
-    more bleed than likeness are turned down to `down`; groups with little effect are switched off; every other
-    block stays as trained."""
-    vd = verdicts(abl)
-    blocks, notes = {}, []
-    for w, label, bs in abl["windows"]:
-        tag = vd[w][0]
-        if tag == "bleed":
-            blocks.update({b: (True, down) for b in bs})
-            notes.append(f"{label} at {down:g} (more bleed than likeness)")
-        elif tag == "quiet":
-            blocks.update({b: (False, 1.0) for b in bs})
-            notes.append(f"{label} off (little effect)")
-    return blocks, notes
-
-
 # ---- report -----------------------------------------------------------------------------------------------------
 _CSS = """
 body{font-family:Segoe UI,system-ui,sans-serif;background:#16181d;color:#e6e6e6;margin:0;padding:28px 34px;}
@@ -408,11 +391,11 @@ def write_report(desc, lora_path, stats, abl, output_html, labels):
             sug.append(", ".join(f"<b>{_html.escape(wl[w])}</b>" for w in quiet) + " barely change the picture: "
                        "switching them off in Repair Studio gives a smaller file that looks the same.")
         if bleeders or quiet:
-            sug.append("<b>Open in Repair Studio</b> on the Profiler tab loads the LoRA with these settings on the "
-                       "sliders, side by side with the original, ready to save as a new file.")
+            sug.append("To act on this, load the LoRA in Studio, turn those blocks down while you watch the "
+                       "preview beside the original, and save it as a new file.")
     if rf[0.95] < stats["max_rank"]:
         sug.append(f"95% of this LoRA's change fits in rank <b>{rf[0.95]}</b> (99% in rank {rf[0.99]}): "
-                   "Extract → Fast SVD at that rank gives a smaller file with almost nothing lost.")
+                   "Extract at that rank (type it in Target rank) gives a smaller file with almost nothing lost.")
     if sug:
         parts.append('<div class="card"><h2>What to do with it</h2><ul style="margin:6px 0 0;padding-left:18px;'
                      'line-height:1.7">' + "".join(f"<li>{s}</li>" for s in sug) + "</ul></div>")
@@ -494,7 +477,7 @@ def write_report(desc, lora_path, stats, abl, output_html, labels):
         rows.append(f"<tr><td>{_html.escape(lab(b))}</td>" + "".join(f"<td>{_pct(rv.get(k))}</td>" for k in ks) + "</tr>")
     parts.append(f'<div class="card"><h2>How much rank this LoRA uses</h2><p class="lead">The share of the LoRA\'s '
                  "change kept when it is cut to each rank: its real update, alpha included, through its singular "
-                 "values. This is exactly what Extract → Fast SVD keeps at that rank.</p>"
+                 "values. This is exactly what Extract keeps at that rank.</p>"
                  f'<table><tr><th></th>{head}</tr>{whole}</table><details><summary class="note" style="cursor:pointer">'
                  f'Every block</summary><table><tr><th></th>{head}</tr>{"".join(rows)}</table></details></div>')
 

@@ -45,3 +45,76 @@ def test_text_encoder_builds_are_complete(key):
         assert b.size_gb > 0 and 0 < b.cosine <= 1, b
         assert (b.repo, b.path) not in own and b.sha256 not in seen, b
         seen.add(b.sha256)
+
+
+@pytest.mark.parametrize("key", FAMILIES)
+def test_no_checkpointing_figures(key):
+    """train_memory_nogc: offered precisions only, rising points, never nf4; a swapped or uncompiled run, or one
+    the figure doesn't fit, keeps gradient checkpointing on."""
+    from fizgig.families import quant
+    d = registry.get(key)
+    monkey = pytest.MonkeyPatch(); monkey.setattr(quant, "card_gb", lambda: 96.0)   # behave like a big card
+    for k, pts in d.train_memory_nogc.items():
+        p, _, kind = k.partition(":")
+        assert p in d.precisions, f"{key}: {k}"
+        assert list(pts) == sorted(pts) and all(b[1] >= a[1] for a, b in zip(pts, pts[1:])), f"{key}: {k} points"
+        mp = pts[0][0]
+        assert quant.plan_checkpointing(d, p, 0, mp, free_gb=1000, kind=kind)[0] is False
+        assert quant.plan_checkpointing(d, p, 4, mp, free_gb=1000, kind=kind)[0] is True
+        # uncompiled: on for a family that compiles (its figures are compiled runs), off for one that never does (H3)
+        assert quant.plan_checkpointing(d, p, 0, mp, free_gb=1000, compiled=False, kind=kind)[0] is bool(d.compiles)
+        assert quant.plan_checkpointing(d, p, 0, mp, free_gb=pts[0][1], kind=kind)[0] is True
+        assert quant.plan_checkpointing(d, p, 0, pts[-1][0] + 0.5, free_gb=1000, kind=kind)[0] is True   # past the figures
+    if d.compiles:          # Krea 2's nf4 keeps its dequantised weights for backward: never without checkpointing
+        assert quant.plan_checkpointing(d, "nf4", 0, 0.25, free_gb=1000)[0] is True
+    monkey.undo()
+
+
+def test_small_cards_always_checkpoint(monkeypatch):
+    from fizgig.families import quant
+    monkeypatch.setattr(quant, "card_gb", lambda: 32.0)
+    for key in FAMILIES:
+        d = registry.get(key)
+        for p in d.train_memory_nogc:
+            assert quant.plan_checkpointing(d, p, 0, 0.25, free_gb=1000)[0] is True
+
+
+def test_ranks_past_the_measured_ones_checkpoint(monkeypatch):
+    from fizgig.families import quant
+    monkeypatch.setattr(quant, "card_gb", lambda: 96.0)
+    d = registry.get("qwen_image21")
+    assert quant.plan_checkpointing(d, "int8", 0, 1.0, free_gb=90, rank=32)[0] is False
+    assert quant.plan_checkpointing(d, "int8", 0, 1.0, free_gb=90, rank=64)[0] is True
+
+
+def test_partial_checkpointing_fits_with_the_margin(monkeypatch):
+    """Partial checkpointing: big cards only, never past the figures, never all blocks, the planned peak plus the
+    margin inside free VRAM; every block on without figures, on a small card, under swap or past rank 32."""
+    from fizgig.families import quant
+    for key in FAMILIES:
+        d = registry.get(key)
+        for k, (blocks, pts) in d.train_memory_partial.items():
+            p, _, kind = k.partition(":")
+            assert p in d.precisions and blocks > 1, f"{key}: {k}"
+            assert list(pts) == sorted(pts) and all(b[1] >= a[1] and b[2] >= a[2] > 0 for a, b in zip(pts, pts[1:])), k
+            monkeypatch.setattr(quant, "card_gb", lambda: 48.0)
+            for mp, on_gb, per in pts:
+                for free in (38.9, 44.5, 47.1, 79.0):
+                    n, _ = quant.plan_partial_checkpointing(d, p, 0, mp, free_gb=free, kind=kind)
+                    assert 0 <= n < blocks and (n == 0 or on_gb + n * per + quant.NOGC_MARGIN_GB <= free), (k, mp, free)
+                assert quant.plan_partial_checkpointing(d, p, 2, mp, free_gb=90, kind=kind)[0] == 0
+                assert quant.plan_partial_checkpointing(d, p, 0, mp, free_gb=90, kind=kind, rank=64)[0] == 0
+            assert quant.plan_partial_checkpointing(d, p, 0, pts[-1][0] + 0.5, free_gb=90, kind=kind)[0] == 0
+            monkeypatch.setattr(quant, "card_gb", lambda: 32.0)
+            assert quant.plan_partial_checkpointing(d, p, 0, pts[0][0], free_gb=1000, kind=kind)[0] == 0
+
+
+def test_share_shortfall_names_a_base_that_cannot_fit():
+    """A helper's share at the lead's precision: a base that can't swap (4-bit) and doesn't fit is named before the
+    model loads; one that fits with swap, or a family without figures, isn't."""
+    from fizgig.families import quant
+    d = registry.get("krea2")
+    assert quant.share_shortfall(d, None, "nf4", 0, 1.0, free_gb=14.5).startswith("needs ~15.0 GB")
+    assert quant.share_shortfall(d, None, "nf4", 0, 1.0, free_gb=22.0) == ""
+    assert quant.share_shortfall(d, None, "int8", 15, 1.0, free_gb=14.5) == ""
+    assert quant.share_shortfall(d, None, "fp8", 0, 1.0, free_gb=1.0) == ""

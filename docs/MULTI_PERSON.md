@@ -55,7 +55,7 @@ Clothes, setting, pose, light, expression: caption them the way you normally wou
 ## What Fizgig adds for you
 
 - It keeps each person out of prompts that don't use their word.
-- It adds 16 side-by-side training pictures per person: one of their photos next to one of 32 fixed strangers (about 21 MB), which come with any model's download in Preferences.
+- It adds 16 side-by-side training pictures per person: one of their photos next to one of 32 fixed strangers (about 21 MB), which come with any model's download in Preferences. It uses your Image Prep face crops first, so a folder that mixes face crops with outfit or full-body shots needs no splitting. Other photos are framed on the face, and shots without a face are used only if nothing else is left. Untick **Side-by-side pictures: face crops first** to pick from every photo.
 
 ## How long to train
 

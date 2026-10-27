@@ -1,5 +1,33 @@
 # Fizgig news
 
+## 25 Oct 2026: Masks from words with SAM 3.1
+
+**Make masks of anything by naming it.** On the Image Prep tab's masks card, choose **SAM 3.1: from words** and type what the masks show ("person", "hair", "the dog", "red dress"), and optionally what to leave out ("glasses"). Meta's Segment Anything model finds it, with much sharper edges than the person finder, around hair especially.
+
+Download it once from the card (1.75 GB), press **Preview on 2 random pictures** to check, then **Make masks**. It runs on the GPU, so make masks when nothing is training. Update Fizgig on your computers, and restart your pods. [Masked training guide](https://github.com/shootthesound/Fizgig/blob/master/docs/MASKED_TRAINING.md) · [Fizgig v8.9.9 release notes](https://github.com/shootthesound/Fizgig/releases/tag/v8.9.9)
+
+## 25 Oct 2026: Masked training
+
+**Train on the part of each picture that matters: the person, not the room around them.** A black-and-white mask beside a picture says which part counts. White is trained fully, grey partly, and black only as much as you choose. The picture itself still trains whole, so the LoRA sees your subject in their scene; it just stops copying the scene.
+
+**In our tests of character LoRAs, masks significantly raised both the best likeness a run reached, by eye and in likeness scores, and how quickly it got there, on every recent model. It seems especially effective on MOSS-Image with its default Clean-end share, Slide.** It works for Klein, Krea 2, Qwen Image 2.1, Flux 3, MOSS-Image, Z-Image, SDXL and Anima.
+
+**Make masks in one click** on the Image Prep tab: the person, the person without their clothes, just the face and hair, the body and clothes without the face, the body's skin only, just the clothes, everything but the faces, or just the background (for a place or scene LoRA). With several people in a picture, it can keep just your subject. Or paint your own, or bring masks from another trainer that uses the same naming.
+
+**Prior preservation outside the mask** came in 8.9.7: with **Outside the mask, keep the model's own picture** on, outside the mask the LoRA learns to draw what the model itself would there, so backgrounds and the model's look stay the model's own. [Fizgig v8.9.7 release notes](https://github.com/shootthesound/Fizgig/releases/tag/v8.9.7)
+
+Tick **Train on the parts your masks show** on the Training tab. Update Fizgig on your computers, and restart your pods. [Masked training guide](https://github.com/shootthesound/Fizgig/blob/master/docs/MASKED_TRAINING.md) · [Fizgig v8.9.6 release notes](https://github.com/shootthesound/Fizgig/releases/tag/v8.9.6)
+
+## 24 Oct 2026: Faster training on 40 GB+ cards
+
+**Training is faster on cards with 40 GB or more**, which is most pods: A100, A40, A6000, L40S, H100, RTX PRO 6000. Gradient checkpointing saves memory by working parts of each step out twice; a big card doesn't need the saving, so Auto now turns it off when the run fits with room to spare. That's 13–27 % faster per step, measured on Krea 2, Qwen Image 2.1, MOSS-Image, Z-Image and MiniMax H3 (stills and clips).
+
+**Where it doesn't all fit**, at bigger sizes, the last blocks go without it instead: 2–21 % faster.
+
+**Previews keep at least 4 GB free** either way. The figures behind it were measured on A100 80 GB, A40 48 GB (and one capped to 40 GB) and RTX PRO 6000 cards, from 0.25 to 2 MP. Cards of 32 GB and under, rank above 32, LoKR, fine-tunes and sliders keep checkpointing on, as before.
+
+Restart your pods to get it. [Fizgig v8.9.5 release notes](https://github.com/shootthesound/Fizgig/releases/tag/v8.9.5)
+
 ## 22 Oct 2026: Your other GPUs, at home or in the cloud, speeding up your run
 
 **▶ [Watch: Your other GPUs speeding up your run](https://www.youtube.com/watch?v=7Ao0gE2b2qw)** (2 minutes)

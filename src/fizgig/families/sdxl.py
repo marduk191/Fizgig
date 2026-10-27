@@ -29,6 +29,7 @@ def _preset(rank, lr=1e-4, adaptive=None, epochs=20, mp="1.0", alpha=None, slide
 
 SDXL = FamilyDescription(
     key="sdxl",
+    masked_training=True,
     arch_id="sdxl",
     display_name="SDXL",
     gui_label="SDXL (any checkpoint)",

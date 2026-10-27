@@ -5,6 +5,45 @@ _ARTICLE = "https://github.com/shootthesound/Fizgig/blob/master/docs/NEWS.md"
 
 NEWS = [
     {
+        "date": "25 Oct 2026",
+        "title": "Masks from words with SAM 3.1",
+        "body": (
+            "Make masks of anything by naming it: on the Image Prep tab's masks card, choose SAM 3.1 and type what "
+            "the masks show (person, hair, the dog) and what to leave out (glasses). Meta's Segment Anything finds "
+            "it, with much sharper edges than the person finder.\n\n"
+            "Download it once from the card (1.75 GB), preview it on two random pictures, then make masks."
+        ),
+        "links": [{"text": "Read more", "href": _ARTICLE + "#25-oct-2026-masks-from-words-with-sam-31"},
+                  {"text": "The guide", "href": "https://github.com/shootthesound/Fizgig/blob/master/docs/MASKED_TRAINING.md"}],
+    },
+    {
+        "date": "25 Oct 2026",
+        "title": "Masked training",
+        "body": (
+            "Train on the part of each picture that matters: the person, not the room around them. A "
+            "black-and-white mask beside a picture says which part counts; the picture still trains whole, so "
+            "the LoRA sees your subject in their scene but stops copying the scene. " + 'In our tests of character LoRAs, masks significantly raised both the best likeness a run reached, by eye and in likeness scores, and how quickly it got there, on every recent model. It seems especially effective on MOSS-Image with its default Clean-end share, Slide.'
+            + "\n\nTick it on the Training tab (Masked training card), and make masks for a whole folder on the "
+            "Image Prep tab, or paint your own. Since 8.9.7 it also has prior preservation outside the mask, so "
+            "backgrounds and the model's look stay the model's own."
+        ),
+        "links": [{"text": "Read more", "href": _ARTICLE + "#25-oct-2026-masked-training"},
+                  {"text": "The guide", "href": "https://github.com/shootthesound/Fizgig/blob/master/docs/MASKED_TRAINING.md"}],
+    },
+    {
+        "date": "24 Oct 2026",
+        "title": "Faster training on 40 GB+ cards",
+        "body": (
+            "On cards with 40 GB or more, which is most pods (A100, A40, A6000, L40S, H100, RTX PRO 6000), Auto now "
+            "turns gradient checkpointing off when the run fits with room to spare: 13-27 % faster per step on "
+            "Krea 2, Qwen Image 2.1, MOSS-Image, Z-Image and MiniMax H3. Where it doesn't all fit, the last blocks "
+            "go without it: 2-21 % faster.\n\n"
+            "Previews keep at least 4 GB free either way, and cards of 32 GB and under train as before. Restart "
+            "your pods to get it."
+        ),
+        "links": [{"text": "Read more", "href": _ARTICLE + "#24-oct-2026-faster-training-on-40-gb-cards"}],
+    },
+    {
         "date": "22 Oct 2026",
         "title": "Your other GPUs, at home or in the cloud, speeding up your run",
         "body": (

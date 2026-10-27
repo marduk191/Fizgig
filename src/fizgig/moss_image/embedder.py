@@ -282,6 +282,10 @@ def read_text_state_dict(path, dtype=torch.bfloat16, want=None) -> dict:
         from fizgig.minimax.convrot import dequantize_int8_convrot, parse_comfy_quant
         for base in quant:
             conf = parse_comfy_quant(sd.pop(base + ".comfy_quant"))
+            sd.pop(base + ".input_scale", None)       # an activation scale: these formats leave the input unquantised
+            if conf.get("format") == "asym_w4a8_int8":
+                sd[base + ".weight"] = _decode_w4a8(sd, base, conf, dtype)
+                continue
             if conf.get("format") != "int8_tensorwise":
                 raise ValueError(f"{base}: unsupported comfy quant format {conf.get('format')!r}")
             q, sc = sd.pop(base + ".weight"), sd.pop(base + ".weight_scale").float().reshape(-1, 1)
@@ -296,6 +300,23 @@ def read_text_state_dict(path, dtype=torch.bfloat16, want=None) -> dict:
     if not sd:
         raise ValueError(f"{path}: no Qwen3.5 language-model weights (language_model.* / model.language_model.*)")
     return {k: v.to(dtype) if v.is_floating_point() else v for k, v in sd.items()}
+
+
+def _decode_w4a8(sd, base, conf, dtype):
+    """ComfyUI's 4-bit GPTQ repack (qwen3.5_9b_w4a8_gptq): packed int4 codes [N, K/2], an fp8 scale per 16 weights,
+    an fp32 scale per row and a 16-level codebook, ConvRot-rotated. Decoded by comfy-kitchen's own plain-PyTorch
+    decoder (the one ComfyUI falls back to), in pieces of rows so a big layer doesn't spike fp32 copies."""
+    from comfy_kitchen.backends.eager.w4a8_int8 import dequantize_w4a8_int8_weight
+    q, s_rel = sd.pop(base + ".weight"), sd.pop(base + ".weight_s_rel")
+    s_ch, book = sd.pop(base + ".weight_s_channel"), sd.pop(base + ".weight_codebook", None)
+    if s_rel.dtype == torch.uint8:
+        s_rel = s_rel.view(torch.float8_e4m3fn)
+    group, rot = int(conf.get("group_size", 16)), int(conf.get("convrot_groupsize", 256))
+    w = torch.empty((q.shape[0], q.shape[1] * 2), dtype=dtype)
+    for i in range(0, q.shape[0], 4096):
+        w[i:i + 4096] = dequantize_w4a8_int8_weight(q[i:i + 4096], s_rel[i:i + 4096], s_ch[i:i + 4096], codebook=book,
+                                                    group_size=group, convrot_groupsize=rot, output_dtype=dtype)
+    return w
 
 
 def from_file_wanted(total_ram_gb=None):

@@ -347,7 +347,8 @@ def generate_caption(conditioner: "Qwen3VLConditioner", image_path, *,
     # image_path is a path OR an already-opened PIL image. The second form exists because a
     # MiniMax H3 training item can be a video clip, and what gets captioned is a frame decoded
     # from it — there is no file on disk to hand over.
-    src = Image.open(image_path) if isinstance(image_path, (str, os.PathLike)) else image_path
+    from fizgig.utils.upright import open_upright
+    src = open_upright(image_path) if isinstance(image_path, (str, os.PathLike)) else image_path
     im = conditioner._cap_image(src, megapixels)
     # An explicit instruction wins (the Captions tab's task menu, or a user-edited one); otherwise
     # the historical detailed/standard pair, so existing callers are unaffected.

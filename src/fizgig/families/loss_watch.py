@@ -36,6 +36,19 @@ def _find_key(d, key):
     return None
 
 
+def _folders(group, fallback=None):
+    """{key prefix: folder} of the run's watched datasets (every block but the regularisation set's): the training
+    folder's own pictures have no prefix, a sub-folder's or another subject's have theirs (ImageDataset.item_prefix)."""
+    out = {}
+    for ds in getattr(group, "datasets", None) or []:
+        d = getattr(ds, "image_directory", None)
+        if d and os.path.isdir(d) and not getattr(ds, "is_reg", False):
+            out.setdefault(str(getattr(ds, "item_prefix", "") or ""), d)
+    if not out and fallback:
+        out[""] = fallback
+    return out
+
+
 def _items(group):
     """item_key -> ItemInfo over every training bucket."""
     out = {}
@@ -53,11 +66,12 @@ class Watch:
 
     def __init__(self, output_dir, group, user_config, driver, *, log=False, per_image_lr=False, auto_recaption=False,
                  warmup_look=False, resume=False, start_epoch=0, te_path=None, trigger_word=None,
-                 trigger_position="start", recaption_instruction=None, recaption_instruction_detailed=None,
-                 captioner_path=None):
+                 trigger_position="start", recaption_triggers=None, recaption_instruction=None, recaption_instruction_detailed=None,
+                 captioner_path=None, recaption_task=None, recaption_task_detailed=None):
         from fizgig.training.loss_logger import PerImageLossWatch, is_enabled as env_on
         self.output_dir, self.group, self.driver, self.te_path = output_dir, group, driver, te_path
         self.trigger_word, self.trigger_position = trigger_word, trigger_position
+        self.triggers = dict(recaption_triggers or {})     # another folder's own trigger word, by key prefix
         self.instr, self.instr_detailed = recaption_instruction, recaption_instruction_detailed
         self.recaptioned = {}
         self.captioner_path = captioner_path
@@ -75,16 +89,25 @@ class Watch:
         self.caption_ext = _find_key(user_config, "caption_extension") or ".txt"
         if not (self.image_dir and os.path.isdir(self.image_dir)):
             self.image_dir = None
+        self.folders = _folders(group, self.image_dir)
+        if self.folders and not self.image_dir:
+            self.image_dir = next(iter(self.folders.values()))
         if auto_recaption and not self.image_dir:
             logger.warning("[auto-recaption] image_directory not found in the dataset config - auto-recaption off")
             auto_recaption = False
         self.auto_recaption = auto_recaption
         if auto_recaption:
-            logger.info(f"[auto-recaption] ON - stuck images re-captioned from {self.image_dir}"
+            logger.info(f"[auto-recaption] ON - stuck images re-captioned in their own folders "
+                        f"({len(self.folders)}: {', '.join(self.folders.values())})"
                         + (f" (trigger: '{trigger_word}')" if trigger_word else ""))
+            first = recaption_task or ("an instruction given on the command line" if recaption_instruction
+                                       else '"Training caption" (as shipped)')
+            second = recaption_task_detailed or ("an instruction given on the command line"
+                                                 if recaption_instruction_detailed else '"Exhaustive detail" (as shipped)')
+            logger.info(f"[auto-recaption] first try: {first}; second try: {second} (Captions tab instructions)")
         self.watch = PerImageLossWatch(output_dir, apply_lr=per_image_lr, write_jsonl=True,
                                        dataset_dir=self.image_dir, caption_ext=self.caption_ext,
-                                       family=self.driver.description.key)
+                                       family=self.driver.description.key, folders=self.folders)
         keys = set(_items(group))
         self.watch.preflight(keys)
         logger.info(f"[loss-watch] per-image loss watch ON (per_image_lr={per_image_lr})")
@@ -95,34 +118,29 @@ class Watch:
 
     # ---- setup helpers -------------------------------------------------------------------------------
     def _warmup(self, keys):
-        path = os.path.join(self.image_dir or "", "fizgig_look_scores.json")
-        try:
-            with open(path, encoding="utf-8") as f:
-                look = json.load(f)
-        except FileNotFoundError:
+        """Each folder's own Look Filter scores (a sub-folder or subject scanned on its own); a folder not scanned
+        simply has no warm-up."""
+        found, use = 0, set()
+        folders = getattr(self, "folders", None) or {"": self.image_dir or ""}
+        for prefix, folder in folders.items():
+            path = os.path.join(folder, "fizgig_look_scores.json")
+            try:
+                with open(path, encoding="utf-8") as f:
+                    look = json.load(f)
+            except FileNotFoundError:
+                if len(folders) > 1:
+                    logger.info(f"[look-warmup] {folder}: no Look Filter scan - no warm-up for its pictures")
+                continue
+            except Exception as e:
+                logger.warning(f"[look-warmup] could not load {path} ({e}) - no warm-up for its pictures")
+                continue
+            found += 1
+            use |= _warmup_keys(keys, look, prefix)
+        if not found:
             logger.warning("[look-warmup] fizgig_look_scores.json not found in the dataset folder - run the Look "
                            "Consistency Filter (Image Prep tab) first; warm-up off this run")
-            return
-        except Exception as e:
-            logger.warning(f"[look-warmup] could not load look scores ({e}) - warm-up off this run")
-            return
-        cut = look.get("cutoff")
-        # Scores carry the embedder that made them (ArcFace / DINOv2 - different scales); the cutoff was
-        # computed on that same scale when the scan ran, so it is used as is. Files from before the face backends
-        # have no "embedder" and are ArcFace.
-        emb = look.get("embedder_label") or look.get("embedder") or "ArcFace"
-        if cut is None:
-            logger.warning("[look-warmup] no cutoff in fizgig_look_scores.json (too few scored faces) - warm-up off")
-            return
-        outliers = {k for k, v in (look.get("scores") or {}).items() if isinstance(v, (int, float)) and v < float(cut)}
-        gone, use = sorted(outliers - keys), outliers & keys
-        if gone:
-            logger.info(f"[look-warmup] {len(gone)} scored outlier(s) not in the dataset (moved via the Look "
-                        f"Filter) - skipped")
         if use:
             self.watch.set_warmup_keys(use)
-            logger.info(f"[look-warmup] {len(use)} look-outlier image(s) on LR warm-up x0.4 -> x1.0 "
-                        f"({emb} scores, cutoff {float(cut):.2f})")
 
     def _resume(self, start_epoch):
         resets = {}
@@ -177,8 +195,9 @@ class Watch:
             for k in sorted(k for k, v in self.watch.verdicts.items() if v == "stuck"):
                 if k in updates or self.recaptioned.get(k, 0) >= 2:
                     continue
-                for ext in _IMG_EXTS:
-                    p = os.path.join(self.image_dir, os.path.basename(k) + ext)
+                _p, folder, name = self.watch.where(k)
+                for ext in (_IMG_EXTS if folder else ()):
+                    p = os.path.join(folder, name + ext)
                     if os.path.exists(p):
                         auto.append((k, p, self.recaptioned.get(k, 0) + 1))
                         break
@@ -244,7 +263,7 @@ class Watch:
         _ack(self.output_dir, todo, epoch)
         _remove(processing)
         logger.info(f"[caption-fix] {len(todo)} caption(s) re-encoded - next epoch trains on the fixed text. "
-                    f"Loss-watch history reset for: " + ", ".join(os.path.basename(k) for k, _, _, _ in todo))
+                    f"Loss-watch history reset for: " + ", ".join(k for k, _, _, _ in todo))
 
     def _recaption(self, auto, items, device):
         """Caption the stuck images with the shared captioner (Krea 2's Qwen3-VL-4B, loaded for the call and freed
@@ -266,22 +285,24 @@ class Watch:
             for k, img, attempt in auto:
                 try:
                     instr = (self.instr_detailed if attempt >= 2 else self.instr) or None
-                    cap = generate_caption(enc, img, detailed=attempt >= 2, instruction=instr)
-                    if self.trigger_word:
-                        cap = (f"{cap}, {self.trigger_word}" if str(self.trigger_position) == "end"
-                               else f"{self.trigger_word}, {cap}")
+                    # 160 tokens on the first try: room for the Detailed and Style tasks (a caption ends where it ends)
+                    cap = generate_caption(enc, img, detailed=attempt >= 2, instruction=instr, max_new_tokens=160)
+                    prefix = self.watch.where(k)[0] or ""
+                    trig = self.triggers.get(prefix, "") if prefix else self.trigger_word   # the picture's folder's
+                    if trig:
+                        cap = (f"{cap}, {trig}" if str(self.trigger_position) == "end" else f"{trig}, {cap}")
                     try:
-                        with open(os.path.join(self.image_dir, os.path.basename(k) + self.caption_ext), "w",
-                                  encoding="utf-8") as f:
+                        _p, folder, name = self.watch.where(k)
+                        with open(os.path.join(folder, name + self.caption_ext), "w", encoding="utf-8") as f:
                             f.write(cap)
                     except OSError:
                         logger.warning(f"[auto-recaption] could not write the .txt for {k} - this run is fixed, "
                                        "a future re-cache will use the old caption")
                     rows.append((k, items[k], cap, attempt))
-                    logger.info(f"[auto-recaption] {os.path.basename(k)} (attempt {attempt}/2"
-                                f"{', detailed' if attempt >= 2 else ''}): \"{cap[:110]}\"")
+                    logger.info(f"[auto-recaption] {k} (attempt {attempt}/2"
+                                f"{', detailed' if attempt >= 2 else ''}): \"{cap}\"")
                 except Exception:
-                    logger.warning(f"[auto-recaption] captioning failed for {os.path.basename(k)} - retry next "
+                    logger.warning(f"[auto-recaption] captioning failed for {k} - retry next "
                                    f"boundary", exc_info=True)
         finally:
             enc.to("cpu")
@@ -289,6 +310,27 @@ class Watch:
             gc.collect()
             torch.cuda.empty_cache()
         return rows
+
+
+def _warmup_keys(keys, look, prefix):
+    """One folder's look outliers among the training keys (its Look Filter scores, named as in that folder)."""
+    cut = look.get("cutoff")
+    # Scores carry the embedder that made them (ArcFace / DINOv2 - different scales); the cutoff was computed on that
+    # same scale when the scan ran, so it is used as is. Files from before the face backends have no "embedder" and
+    # are ArcFace.
+    emb = look.get("embedder_label") or look.get("embedder") or "ArcFace"
+    if cut is None:
+        logger.warning("[look-warmup] no cutoff in fizgig_look_scores.json (too few scored faces) - warm-up off")
+        return set()
+    outliers = {prefix + k for k, v in (look.get("scores") or {}).items() if isinstance(v, (int, float)) and v < float(cut)}
+    gone, use = sorted(outliers - keys), outliers & keys
+    if gone:
+        logger.info(f"[look-warmup] {len(gone)} scored outlier(s) not in the dataset (moved via the Look "
+                    f"Filter) - skipped")
+    if use:
+        logger.info(f"[look-warmup] {len(use)} look-outlier image(s) on LR warm-up x0.4 -> x1.0 "
+                    f"({emb} scores, cutoff {float(cut):.2f})")
+    return use
 
 
 def _cleanup(output_dir):

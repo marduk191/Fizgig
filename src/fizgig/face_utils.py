@@ -49,6 +49,7 @@ from PIL import Image
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 from fizgig import user_data
+from fizgig.utils.upright import upright
 
 _HERE = user_data.BASE_DIR          # the Fizgig folder: a relative face_yolo_model is relative to it
 PREFS_FILE = user_data.PREFS_FILE
@@ -159,7 +160,7 @@ def _pil_to_bgr(pil_image: Image.Image) -> np.ndarray:
 def _load_pil(path: str) -> Image.Image:
     """PIL, not cv2.imread: handles unicode paths on Windows."""
     with Image.open(path) as im:
-        return im.convert("RGB")
+        return upright(im).convert("RGB")
 
 
 def _box_iou(a, b) -> float:
@@ -967,7 +968,9 @@ IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
 
 def probe_sample(paths, max_n: int = AUTO_PROBE_MAX) -> List[str]:
     """Up to max_n images spread evenly over the (sorted, de-duplicated) list - deterministic for a given folder."""
-    ps = sorted({os.path.normpath(p) for p in paths if str(p).lower().endswith(IMAGE_EXTS) and os.path.isfile(p)})
+    from fizgig.dataset.masks import is_mask_file
+    ps = sorted({os.path.normpath(p) for p in paths if str(p).lower().endswith(IMAGE_EXTS) and os.path.isfile(p)
+                 and not is_mask_file(p)})
     if len(ps) <= max_n:
         return ps
     return [ps[round(i * (len(ps) - 1) / (max_n - 1))] for i in range(max_n)]

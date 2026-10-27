@@ -691,6 +691,9 @@ def plan_base_quant(free_gb: float, pruned: bool, mp: float = 0.25, adapter_gb: 
             f"int8's {i_swap}")
 
 
+_H3_CACHE_SUFFIX = "_minimaxh3.safetensors"     # {basename}_{WxH}_minimaxh3 - this family's own latent caches
+
+
 def _max_effective_mp(group):
     """The heaviest single ITEM in the dataset, as effective megapixels: T x H x W per file.
 
@@ -720,7 +723,7 @@ def _max_effective_mp(group):
         if _img_dir and os.path.isdir(_img_dir):
             _stems = {os.path.splitext(f)[0] for f in os.listdir(_img_dir)}
         for name in os.listdir(cache_dir):
-            if not name.endswith(".safetensors"):
+            if not name.endswith(_H3_CACHE_SUFFIX):     # the folder is shared: other families' latents are 8x, not 16x
                 continue
             if _stems is not None:
                 _stem = "_".join(name.split("_")[:-2])       # {basename}_{WxH}_{arch}
@@ -775,7 +778,7 @@ def _max_clip_act_item(group):
         if _img_dir and os.path.isdir(_img_dir):
             _stems = {os.path.splitext(f)[0] for f in os.listdir(_img_dir)}
         for name in os.listdir(cache_dir):
-            if not name.endswith(".safetensors"):
+            if not name.endswith(_H3_CACHE_SUFFIX):     # the folder is shared: other families' latents are 8x, not 16x
                 continue
             if _stems is not None:
                 _stem = "_".join(name.split("_")[:-2])       # {basename}_{WxH}_{arch}

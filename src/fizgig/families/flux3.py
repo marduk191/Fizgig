@@ -34,6 +34,7 @@ def _preset(rank, lr=1e-4, adaptive=None, epochs=30, mp="0.25", edit=False, slid
 
 FLUX3 = FamilyDescription(
     key="flux3",
+    masked_training=True,
     arch_id="flux3klein",
     display_name="Flux 3 Image Klein",
     gui_label="Flux 3 Image Klein",

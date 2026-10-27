@@ -33,8 +33,8 @@ python -m fizgig.scripts.fetch_models --family moss_image
 
 | Preset | Rank | Learning rate | Epochs | Size |
 |---|---|---|---|---|
+| **MOSS-Image Fast** (the default) | 16 | 1e-4 | 70 | 0.25 MP |
 | **MOSS-Image Standard** | 32 | 1e-4 | 70 | 1 MP |
-| **MOSS-Image Fast** | 16 | 1e-4 | 70 | 0.25 MP |
 | **MOSS-Image Style** | 16 | 5e-5 | 50 | 1 MP |
 | **MOSS-Image Slider** | 8 | 2e-4 | 20 | 1 MP |
 | **MOSS-Image Fine-tune** | — | 1e-5 | rotations | 1 MP |
@@ -44,6 +44,7 @@ python -m fizgig.scripts.fetch_models --family moss_image
 - **How long to train:** with Clean-end share at 30% (an earlier default; Slide is the default now), likeness arrives early and keeps improving. On the Standard preset a 62-image dataset reached 66% ArcFace likeness by epoch 12 and 72% by epoch 32, above the 71% that the dataset's own photos score against the same three reference photos, and it was still rising. By eye those epochs were superb. The presets run 70 epochs so smaller datasets get there too.
 - **Picking an epoch:** scrub the epochs in LoRA Royale to choose the best one, and look at the late ones before settling on an early peak.
 - **Clean-end share:** the share of training steps on nearly-clean images (noise below half), where faces and fine detail are refined. By default it's **Slide**: 60% until epoch 7, then down a few points each epoch to 30% by epoch 15, so likeness comes in early and composition after. Then, with **then every 2 epochs, one epoch at 60%** ticked (the default), every 2nd epoch after the slide (17, 19, 21 and on) goes back to 60% for one epoch. On a small dataset, likeness faded at a permanent 30%; the refresh epochs keep it up. That works well with datasets of up to about 55 images; with many more, start dropping below 60 earlier. **Single** sets one value for the whole run. The model's own schedule puts about 11% there and the rest on layout and composition, which made the picture jump from epoch to epoch and slowed likeness. As a single value, 40 did better than 30 in later testing, and 30 had composition and shape coming in sooner than 60; it's still an experimental figure, so share what you find. Empty the box for the model's own schedule. On a dataset that struggled, a sudden drop from 75 to 40 cost 11 points of likeness two epochs later; easing down cost 4. Of eight Slide settings tried there, the default led from epoch 12 on and still held 71% likeness at epoch 60. By eye the Clean-end pictures were also far sharper and more accurate, with no body horror, and the composition holds steady between epochs instead of hopping.
+- **Masked training:** it seems especially effective on MOSS-Image with the default Clean-end share, Slide. Make masks on the Image Prep tab and tick **Train on the parts your masks show** on the Training tab. [Masked training](MASKED_TRAINING.md)
 - **What the LoRA trains:** every Linear in all 42 blocks, block 22 included. Leaving block 22 out, as AI Toolkit does, cost likeness in side-by-side runs.
 
 ## Memory

@@ -20,6 +20,7 @@ import threading
 import time
 
 from fizgig.user_data import user_file  # noqa: E402  (Fizgig's own files: user_data/)
+from fizgig.dataset.masks import is_mask_file  # noqa: E402
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 JOB_DIR = user_file("caption_jobs")
 
@@ -137,7 +138,8 @@ def media_files(folder, clips, photos=True, audio=False):
     exts = (IMAGE_EXTS if photos else set()) | ({".mp4"} if clips else set()) | (AUDIO_EXTS if audio else set())
     try:
         return sorted(os.path.join(folder, n) for n in os.listdir(folder)
-                      if os.path.splitext(n)[1].lower() in exts and os.path.isfile(os.path.join(folder, n)))
+                      if os.path.splitext(n)[1].lower() in exts and os.path.isfile(os.path.join(folder, n))
+                      and not is_mask_file(n))
     except OSError:
         return []
 

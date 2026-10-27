@@ -22,9 +22,23 @@ You don't need Fizgig on your own computer for this. You need a RunPod account a
 
 Close the tab whenever you like: the run carries on, and you can come back from any browser, your phone included. **Stop** the pod between sessions to keep everything on its disk; terminating it deletes the disk ([Storage](#storage)). The rest of this page has the detail on each step.
 
+**Keep a pod on one version:** a pod updates to the newest Fizgig each time it starts. To keep it on one version in the middle of a job, set `FIZGIG_REF` ([how](#keep-a-pod-on-one-version)).
+
 **Need the old pod?** The previous template, with the classic app in a remote desktop, stays available as **[Fizgig Classic v7.x](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=faoq8ed6um&ref=vkb387ep)**: see [the classic template](#the-classic-template-remote-desktop) below. Pods you already have keep running as they are.
 
 ---
+
+## Keep a pod on one version
+
+**A pod runs the newest Fizgig each time it starts.** That is how it gets updates: stop and start it, or restart it, and it's up to date. In the middle of a job you may want it to stay exactly as it is. Set the environment variable `FIZGIG_REF` to a release's version, and the pod runs that version at every start until you change it:
+
+- **On RunPod, before you deploy:** on the deploy screen expand **Edit Template → Environment Variables**, add `FIZGIG_REF` with a version, for example `v8.9.92`, then **Deploy Pod**.
+- **On a pod you already have:** in the pod's menu choose **Edit Pod**, add `FIZGIG_REF` under **Environment Variables**, and save. RunPod restarts the pod, which starts on that version. Your volume and everything on it stay.
+- **On Vast.ai:** add `FIZGIG_REF` with the version to the template's environment before you rent.
+
+The versions are on the [Releases page](https://github.com/shootthesound/Fizgig/releases): use the tag as it's written there, with its `v`. To go back to updating at every start, set `FIZGIG_REF` to `master`, or remove it.
+
+A run you paused or moved resumes fine on the same version. Your computer and the pod don't have to be on the same version, but Send to this pod, Move a run and Helpers can need features that a pinned older pod doesn't have yet.
 
 ## Storage
 
@@ -135,7 +149,7 @@ Closing the browser tab does **not** stop training. Fizgig runs on the pod, so c
 
 ## Getting files in and out
 
-**From Fizgig on your own computer** (its Pods tab opens the pod in the Fizgig window): the Start tab's **From this computer** card sends any of your local training folders up in one click. Or upload a folder from the Start tab in any browser.
+**From Fizgig on your own computer** (its Pods tab opens the pod in the Fizgig window): the Start tab's **From this computer** card sends any of your local training folders up in one click. Or upload a folder from the Start tab in any browser. Both keep a folder's sub-folders when **Also train on its sub-folders** is ticked on the Training tab ([Sub-folders](../docs/TRAINING.md#sub-folders)).
 
 <p align="center"><img src="../docs/assets/screenshots/from_this_computer.png" alt="From this computer: your own training folders on the pod's page, ready to send" width="800"></p>
 
@@ -190,7 +204,7 @@ Environment variables, set on the deploy screen under **Edit Template**:
 | `FIZGIG_PASSWORD` | your choice (not a very common one) | Fizgig *and* the file manager. Generated on the first start if unset, then kept. (`VNC_PASSWORD`, the classic template's name, works too.) |
 | `HF_TOKEN` | `hf_…` | Only needed for Klein and Flux 3 Image Klein, which are gated. Krea 2 needs nothing. |
 | `FETCH_MODELS` | `krea2`, `klein`, `flux3`, `minimax`, `tools` — comma-separated | Download at boot instead of clicking the button in Preferences. `minimax` includes the Circlestone and both Ostris training adapters. `tools` is the Florence-2 captioner, the EN→ZH translator for bilingual captions, and the face model the Look Filter uses. |
-| `FIZGIG_REF` | branch or tag | Which Fizgig to run. Defaults to `master`, so the app updates itself at every pod start. |
+| `FIZGIG_REF` | branch or tag | Which Fizgig to run. Defaults to `master`, so the app updates itself at every pod start; a release's tag (`v8.9.92`) keeps the pod on that version ([Keep a pod on one version](#keep-a-pod-on-one-version)). |
 
 Nothing is compulsory — the defaults are the intended setup, and everything here can be done from
 inside the app instead.

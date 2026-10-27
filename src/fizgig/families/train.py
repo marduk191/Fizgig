@@ -67,6 +67,7 @@ from fizgig.training.metadata import (build_metadata, latest_sample_image, refre
                                       resolve_title, sample_for_epoch, thumbnail_data_uri)
 from fizgig.training.train_utils import LossRecorder, prune_state_dirs, validate_output_name  # noqa: E402
 from fizgig.training.step_log import StepLog, take_request  # noqa: E402
+from fizgig.utils.upright import open_upright
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +121,8 @@ def _save_state(output_dir, output_name, net, optimizer, *, epoch, global_step, 
         rng["cuda"] = torch.cuda.get_rng_state_all()
     torch.save(rng, os.path.join(state_dir, "rng.pt"))
     with open(os.path.join(state_dir, "training_state.json"), "w", encoding="utf-8") as f:   # commit marker, last
-        json.dump({"epoch": epoch, "global_step": global_step, "architecture": arch_id, **(extra or {})}, f)
+        json.dump({"epoch": epoch, "global_step": global_step, "architecture": arch_id,
+                   "optimizer": optimizer.__class__.__name__, **(extra or {})}, f)
     logger.info(f"[state] saved -> {state_dir}")
     return state_dir
 
@@ -209,7 +211,22 @@ def _load_state(state_dir, net, optimizer, device, arch, untagged_own=False, dri
             sd["state"] = {perm[int(k)]: v for k, v in sd["state"].items()}
             meta["legacy_perm"] = perm
             logger.info("[resume] an older trainer's state: optimizer moments remapped into this LoRA's order")
-        optimizer.load_state_dict(sd)
+        # another Optimizer Type than the run trained with (#246): its saved moments don't fit this one, so the LoRA's
+        # weights carry on with a fresh optimizer (a state from before the type was saved: as its groups tell)
+        was, now = meta.get("optimizer"), optimizer.__class__.__name__
+        if was and was != now:
+            why = f"it trained with {was}, and this resume uses {now}"
+        elif len(sd.get("param_groups") or []) != len(optimizer.param_groups):
+            why = "it trained with another Optimizer Type than this resume uses"
+        else:
+            why = ""
+        if why:
+            meta["fresh_optimizer"] = True
+            logger.info(f"[resume] {why}: continuing from the state's LoRA weights and epoch, with a fresh "
+                        f"optimizer (it settles within a few steps). To carry the optimizer on too, resume with "
+                        f"{was or 'the run' + chr(39) + 's own'} Optimizer Type.")
+        else:
+            optimizer.load_state_dict(sd)
     else:
         logger.info("[resume] this state was saved by another trainer: continuing from its LoRA weights, with a "
                     "fresh optimizer and weight average (they settle within a few steps)")
@@ -293,7 +310,10 @@ def _read_sample_override(output_dir):
                     return None
             steps, cfg, turbo = num("steps", int), num("cfg", float), num("turbo", float)
             look = d.get("look") if isinstance(d.get("look"), str) else None   # the look LoRA's path, "" = off
-            return {"prompts": prompts, "prompt": prompts[0], "seed": int(d.get("seed", 1234)),
+            # the preview-model tick (Qwen's Turbo, Klein's Distilled): its file's path when ticked, "" = the training
+            # model, None = not sent (the run keeps what it started with)
+            ck = d.get("checkpoint") if isinstance(d.get("checkpoint"), str) else None
+            return {"prompts": prompts, "prompt": prompts[0], "seed": int(d.get("seed", 1234)), "checkpoint": ck,
                     "width": int(d.get("width", 1024)), "height": int(d.get("height", 1024)),
                     "steps": steps if steps and steps > 0 else None, "cfg": cfg if cfg and cfg > 0 else None,
                     "turbo": turbo if turbo is not None and turbo >= 0 else None,
@@ -401,16 +421,24 @@ SLIDER_LIVE_APPLIED = ".slider_prompts_applied.json"   # what the trainer took, 
 
 
 def _read_slider_live(output_dir):
-    """A prompt slider's new prompts, set while it trains: {base, pos, neg, guidance} or None - the form's own three
-    (what the picture is, what each end adds), all needed, as at launch."""
+    """A prompt slider's new prompts, set while it trains: {base, pos, neg, guidance, anchors} or None - the form's own
+    three (what the picture is, what each end adds), all needed, as at launch; anchors may be empty."""
     try:
         with open(os.path.join(output_dir, SLIDER_LIVE), encoding="utf-8") as f:
             d = json.load(f)
         out = {"base": str(d.get("base") or "").strip(), "pos": str(d.get("pos") or "").strip(),
-               "neg": str(d.get("neg") or "").strip(), "guidance": float(d.get("guidance"))}
+               "neg": str(d.get("neg") or "").strip(), "guidance": float(d.get("guidance")),
+               "anchors": _anchor_lines(d.get("anchors"))}
         return out if out["base"] and out["pos"] and out["neg"] and out["guidance"] > 0 else None
     except (OSError, ValueError, TypeError):
         return None
+
+
+def _anchor_lines(raw):
+    """A prompt slider's anchor prompts from a list or one prompt per line, blanks dropped."""
+    if isinstance(raw, str):
+        raw = raw.splitlines()
+    return [str(x).strip() for x in (raw or []) if str(x).strip()]
 
 
 def _encode_override(driver, te_path, prompts, dit, device, parkable=True, references=None):
@@ -466,7 +494,8 @@ def _load_references(paths, width, height):
     photo_2 ...) keep their own shape at that area, as they are sized in training."""
     import numpy as np
     from PIL import Image, ImageOps
-    imgs = [Image.open(p).convert("RGB") for p in paths]
+    from fizgig.utils.upright import open_upright
+    imgs = [open_upright(p).convert("RGB") for p in paths]
     size = _reference_size(*imgs[0].size, width * height)
     return [np.array(ImageOps.fit(im, size if i == 0 else _reference_size(*im.size, width * height), Image.LANCZOS))
             for i, im in enumerate(imgs)], size
@@ -537,27 +566,39 @@ def _pair_slider_caption(user_config):
     return counts.most_common(1)[0][0] if counts else None
 
 
-def _prompt_slider_step(driver, dit, net, latents, enc, gen, *, guidance, min_t, max_t):
+def _prompt_slider_step(driver, dit, net, latents, enc, gen, *, guidance, min_t, max_t, anchor=None,
+                        anchor_weight=1.0):
     """Concept Sliders, textual form, on flow matching. With the adapter at 0 the frozen model predicts the
     neutral, positive and negative prompts at one noised practice latent; the adapter then trains at +1 toward
     v_neutral + guidance * (v_pos - v_neg) and at -1 toward the mirror. Each pole is backpropagated before the
-    flip (checkpointed blocks recompute at the strength of the moment). Returns the detached mean loss."""
+    flip (checkpointed blocks recompute at the strength of the moment).
+
+    An anchor (#252, a prompt the slider must leave alone, e.g. "a photo of a man" for a hair-length dial meant for
+    women): the frozen model's prediction for it at the same latent is a target at +1 and -1 too, weighted by
+    anchor_weight, so the dial learns its change without carrying it onto the anchor. Returns (the detached mean
+    slider loss, t, the anchor's mean loss or None)."""
     state = driver.noise_latents(latents, gen, min_t=min_t, max_t=max_t)
     n_c, p_c, g_c = enc
+    a_total = None
     try:
         net.set_trainable_multiplier(0.0)
         with torch.no_grad():
             v_n = driver.predict(dit, state, n_c).float()
             delta = float(guidance) * (driver.predict(dit, state, p_c).float() - driver.predict(dit, state, g_c).float())
+            v_a = driver.predict(dit, state, anchor).float() if anchor is not None else None
         total = 0.0
         for m in (1.0, -1.0):
             net.set_trainable_multiplier(m)
             loss = F.mse_loss(driver.predict(dit, state, n_c).float(), v_n + m * delta)
             (0.5 * loss).backward()
             total += 0.5 * loss.item()
+            if v_a is not None:          # its own forward and backward, so the peak is one prediction's, as before
+                a_loss = F.mse_loss(driver.predict(dit, state, anchor).float(), v_a)
+                (0.5 * float(anchor_weight) * a_loss).backward()
+                a_total = (a_total or 0.0) + 0.5 * a_loss.item()
     finally:
         net.set_trainable_multiplier(1.0)
-    return total, state["t"]
+    return total, state["t"], a_total
 
 
 def _dop_pairs(triggers, classes):
@@ -630,6 +671,29 @@ def _dop_step(driver, dit, net, latents, cond, gen, *, weight, min_t, max_t, acc
     loss = F.mse_loss(driver.predict(dit, state, cond).float(), target)
     (loss * weight / accum).backward()
     return loss.item()
+
+
+class _MaskPrior:
+    """Masked prior preservation (OneTrainer's masked_prior_preservation_weight, AI-Toolkit's inverted_mask_prior):
+    outside a picture's mask the target is the model's own prediction with the LoRA at 0, so the LoRA learns to
+    leave the rest of the picture as the base model draws it instead of only learning it less. The driver calls
+    base() with its forward at the step's noised input, before the training forward (families/driver.py
+    prior_base / with_prior)."""
+
+    def __init__(self, driver, dit, net, weight, swapped):
+        self.driver, self.dit, self.net, self.weight, self.swapped = driver, dit, net, float(weight), bool(swapped)
+
+    def base(self, forward):
+        try:
+            self.net.set_trainable_multiplier(0.0)
+            if self.swapped:     # a forward with no backward: streamed as inference, as DOP's is
+                self.driver.block_swap_mode(self.dit, inference=True)
+            with torch.no_grad():
+                return forward().detach().float()
+        finally:
+            self.net.set_trainable_multiplier(1.0)
+            if self.swapped:
+                self.driver.block_swap_mode(self.dit, inference=False)
 
 
 def _dop_ft_targets(driver, dit, loader, dop_cond, cond_for, device, *, samples, seed, min_t, max_t):
@@ -993,6 +1057,7 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                  sample_height=None, sample_steps=None, sample_cfg_scale=None, sample_negative=None,
                  sample_at_first=False, sample_seed=42, sample_reference=None, sample_image=None,
                  sample_strengths=(), slider_pairs=False, slider_diff_weight=1.0, slider_prompts=None, slider_guidance=3.0,
+                 slider_anchors=(), slider_anchor_weight=1.0,
                  train_blocks=None,
                  slider_bank=16, slider_bank_res=768,
                  metadata_title=None, metadata_author=None, metadata_description=None, metadata_license=None,
@@ -1000,16 +1065,16 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                  resume_state_dir=None, adaptive_lr=False, adaptive_lr_min=1e-4, adaptive_lr_max=2e-4,
                  max_grad_norm=1.0, ema_decay=0.0, optimizer_type="adamw", optimizer_args="",
                  lr_scheduler="constant", lr_warmup_steps=0, lr_scheduler_num_cycles=1, lr_scheduler_power=1.0,
-                 gradient_accumulation_steps=1, compile_blocks="auto", gradient_checkpointing=True, blocks_to_swap=0, network_type="lora", lokr_factor=8,
+                 gradient_accumulation_steps=1, compile_blocks="auto", gradient_checkpointing="auto", blocks_to_swap=0, network_type="lora", lokr_factor=8,
                  log_per_image_loss=False, per_image_lr=False, auto_recaption=False, warmup_look_outliers=False,
-                 trigger_word=None, trigger_position="start", recaption_instruction=None,
-                 recaption_instruction_detailed=None, captioner=None,
-                 finetune=False, ft_rotations=10, ft_save_every_rotations=1, ft_rotate_every=1, ft_max_parts=0,
+                 trigger_word=None, trigger_position="start", recaption_triggers=None, recaption_instruction=None,
+                 recaption_instruction_detailed=None, recaption_task=None, recaption_task_detailed=None,
+                 captioner=None, finetune=False, ft_rotations=10, ft_save_every_rotations=1, ft_rotate_every=1, ft_max_parts=0,
                  ft_start_window=0,
                  ft_epochs_done=0, ft_fused_backward=False, reg_lr_multiplier=0.2, preview_checkpoint=None,
                  preview_checkpoint_cache="auto", preview_int8=False, family_options=None,
                  dop=False, dop_trigger=None, dop_class="", dop_weight=1.0, dop_every=1, dop_ft_samples=8,
-                 lr_boost=None, share_worker=None):
+                 lr_boost=None, share_worker=None, masked_training=False, mask_floor=0.1, mask_prior=0.0):
     desc = get_family(family)
     if desc is None or not desc.training_ready:
         raise RuntimeError(f"unknown or untrainable family {family!r}")
@@ -1071,10 +1136,18 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
         else:
             logger.info("[slider] PROMPT-PAIR SLIDER: base '%s' | +1 -> '%s' | -1 -> '%s' (guidance %g)",
                         *slider_prompts, float(slider_guidance))
+            slider_anchors = _anchor_lines(slider_anchors)
+            if slider_anchors:
+                logger.info("[slider] %d anchor prompt(s), one a step in turn, weight %g - the dial leaves them "
+                            "as the model has them: %s", len(slider_anchors), float(slider_anchor_weight),
+                            " | ".join(slider_anchors))
             if not (te_path and vae_path):
                 raise RuntimeError("[slider] prompt pairs need the text encoder and VAE paths")
             if str(slider_prompts[0]).strip():     # the dial is shown on the picture it was trained on
-                sample_prompts = [str(slider_prompts[0]).strip()]
+                # and on the first anchor, whose strip should barely move
+                sample_prompts = [str(slider_prompts[0]).strip()] + slider_anchors[:1]
+    else:
+        slider_anchors = []
 
     # ---- full fine-tune (families/ft.py): the base model itself trains, a component window at a time -------------
     if finetune:
@@ -1119,10 +1192,40 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
         user_config = load_user_config(dataset_config)
         blueprint = BlueprintGenerator(ConfigSanitizer()).generate(user_config, argparse.Namespace(),
                                                                    architecture=arch)
+        if masked_training:
+            if not desc.masked_training:
+                raise RuntimeError(f"{desc.display_name} has no masked training - drop --masked_training")
+            from fizgig.dataset.image_dataset import ImageDataset
+            ImageDataset.loss_masks = True      # each still with a photo-masklabel.png gets its mask (dataset/masks.py)
         group = generate_dataset_group_by_blueprint(blueprint.dataset_group, training=True,
                                                     num_timestep_buckets=None, shared_epoch=shared_epoch)
     if group.num_train_items == 0:
         raise RuntimeError("No training items - run the cache stages (families/cache.py) first.")
+    masked_images = 0
+    if masked_training and slider_prompts:
+        logger.info("[masks] a prompt-pair slider trains on pictures it makes itself: masked training is off")
+        masked_training = False
+    elif masked_training:
+        masked_images = len({str(getattr(it, "mask_path", "")) for ds in group.datasets
+                             for b in ds.batch_manager.buckets.values() for it in b if getattr(it, "mask_path", None)})
+        logger.info(f"[masks] masked training: {masked_images} picture(s) with a mask, outside the mask counts "
+                    f"x{float(mask_floor):g}")
+    mask_prior = float(mask_prior or 0.0) if masked_training else 0.0
+    if mask_prior and (slider or finetune):
+        logger.info("[masks] keeping the model's own picture outside the mask needs a LoRA to switch off (not a "
+                    "slider or a fine-tune): it's off for this run")
+        mask_prior = 0.0
+    elif mask_prior:
+        logger.info(f"[masks] outside the mask, the LoRA is kept to the model's own picture at x{mask_prior:g} "
+                    "(one extra forward a step, without the LoRA)")
+
+    def _loss_mask(batch):
+        """The step's per-cell loss weights (masked training), or None: a picture without a mask trains as normal."""
+        m = batch.get("loss_mask") if masked_training else None
+        if m is None:
+            return None
+        from fizgig.dataset.masks import mask_weight
+        return mask_weight(m.to(device).float(), mask_floor)
     if slider_pairs:
         shared = _pair_slider_caption(user_config)
         if shared:                           # the dial is shown on what both ends of a pair have in common
@@ -1194,6 +1297,14 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
         else:
             precision, blocks_to_swap, why = quant.plan(desc, driver, precision, blocks_to_swap, megapixels=mp)
             why += f" at {mp:.2f} MP"
+            if share_worker is not None:
+                # a helper's share trains at the lead's precision (the same base numbers): say so plainly, before the
+                # model loads, when this card can't hold it even with the most blocks swapped (the lead trains on)
+                short = quant.share_shortfall(desc, driver, precision, blocks_to_swap, mp)
+                if short:
+                    raise SystemExit(f"[share] This GPU can't train the lead's {desc.precision_labels.get(precision, precision)} "
+                                     f"base: {short}. The lead trains every image itself. To share with this GPU, "
+                                     "train on the lead with a smaller base (Auto, int8 or 4-bit).")
         logger.info(f"[precision] Auto plan: {precision}, block swap {blocks_to_swap} ({why}); asked {req}")
 
     # ---- torch.compile (Krea 2's rule), decided here on the empty card as the original does - the free VRAM its
@@ -1221,13 +1332,41 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                         "is not compiled, and uncompiled that is the faster base for this file")
             precision = alt
 
+    # ---- gradient checkpointing: "auto" goes without it when the measured figure fits the empty card (LoRA only -
+    # LoKR without checkpointing measured 3-16 GB over a LoRA at 1 MP, Qwen edit pairs ~26 GB; fine-tunes, sliders, edit pairs and
+    # the mid-run captioner carry memory the figures don't cover)
+    gc_off_blocks = 0
+    if gradient_checkpointing == "auto":
+        paired = any(d.get("control_directory") for d in user_config.get("datasets", []))
+        if (quant.card_gb() < quant.NOGC_MIN_CARD_GB or finetune or slider or paired or auto_recaption
+                or str(network_type).lower() != "lora"
+                or gradient_accumulation_steps > 1):
+            gradient_checkpointing = True
+        else:
+            kind, mp_ck = driver.nogc_load(group)
+            gradient_checkpointing, why = quant.plan_checkpointing(
+                desc, precision, max(0, blocks_to_swap) if precision != "nf4" else 0, mp_ck, compiled=bool(do_compile),
+                kind=kind, rank=int(network_dim))
+            logger.info(f"[checkpointing] gradient checkpointing {why}")
+            if gradient_checkpointing:
+                gc_off_blocks, why = quant.plan_partial_checkpointing(
+                    desc, precision, max(0, blocks_to_swap) if precision != "nf4" else 0, mp_ck,
+                    compiled=bool(do_compile), kind=kind, rank=int(network_dim))
+                if gc_off_blocks:
+                    logger.info(f"[checkpointing] gradient checkpointing {why}")
+                    if do_compile:          # the partial figures are compiled with the checkpoint outside the graph
+                        do_compile = "outside"
+    gradient_checkpointing = bool(gradient_checkpointing)
+
     # ---- previews: encode prompts once, keep the VAE ---------------------------------------------
     encoded = neg = vae = ref_imgs = ref_latents = None
     slider_enc = slider_neg = None
+    anchor_enc = []
     if slider_prompts:
         te = driver.load_text_encoder(te_path, device)
-        slider_enc = [{k: v[None] for k, v in c.items()}
-                      for c in driver.encode_text(te, [str(x) for x in slider_prompts])]
+        _all = [{k: v[None] for k, v in c.items()}
+                for c in driver.encode_text(te, [str(x) for x in slider_prompts] + list(slider_anchors))]
+        slider_enc, anchor_enc = _all[:3], _all[3:]
         if sample_cfg_scale > 1.0 and desc.preview_negative is not None:
             # the practice pictures render as previews do: the Samples tab's negative (else the family's default)
             text = sample_negative if sample_negative is not None else desc.preview_negative
@@ -1325,7 +1464,7 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             logger.info(f"[sample] previews see {os.path.basename(sample_image)} through the text encoder's vision "
                         f"path")
             te = driver.load_text_encoder(te_path, device)
-            encoded = driver.encode_text_with_image(te, sample_prompts, Image.open(sample_image))
+            encoded = driver.encode_text_with_image(te, sample_prompts, open_upright(sample_image))
             if sample_cfg_scale > 1.0 or not desc.samples_cfg_free:
                 neg = driver.encode_text(te, [sample_negative or ""])[0]     # negatives stay text-only
         else:
@@ -1348,6 +1487,7 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
     dit, swapped = quant.load_base(driver, dit_path, device, precision, blocks_to_swap)
     if gradient_checkpointing:
         driver.enable_gradient_checkpointing(dit, True)
+        dit.gc_off_blocks = gc_off_blocks       # the compiled blocks / H3's loop leave the last ones un-checkpointed
     net = FamilyLoRA(dit, driver, device=device)
     driver.prepare_training(dit, group, net)
     if training_adapter:
@@ -1461,7 +1601,9 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                 else:
                     lat = driver.generate(dit, n_c, slider_bank_res, slider_bank_res, steps=desc.preview_steps,
                                           seed=seed + 1000 + i, cfg=sample_cfg_scale,
-                                          **({"neg_cond": slider_neg} if slider_neg is not None else {}))
+                                          # on the GPU with the prompt: SDXL joins the two before moving them
+                                          **({"neg_cond": {k: v[0].to(device) for k, v in slider_neg.items()}}
+                                             if slider_neg is not None else {}))
                 bank.append(driver.practice_latent(vae, lat, slider_bank_res))
         if use_speed:
             net.set_enabled(SPEED, False)
@@ -1555,7 +1697,8 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             global_step = start_epoch * steps_per_epoch
         if adaptive:
             adaptive.load_state_dict(meta.get("adaptive_lr_state"))
-        if optimizer is not None and meta.get("own_state") and not owns_its_rate(optimizer):
+        if (optimizer is not None and meta.get("own_state") and not meta.get("fresh_optimizer")
+                and not owns_its_rate(optimizer)):
             resume_lr(optimizer, _fresh_lrs, meta, box_learning_rate, adaptive)
         if ema is not None and meta["own_state"] and os.path.exists(os.path.join(resume_state_dir, "ema.pt")):
             _esd = torch.load(os.path.join(resume_state_dir, "ema.pt"), map_location="cpu")
@@ -1571,8 +1714,10 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                   auto_recaption=auto_recaption, warmup_look=warmup_look_outliers,
                   resume=bool(resume_state_dir), start_epoch=start_epoch, te_path=te_path,
                   trigger_word=trigger_word, trigger_position=trigger_position,
+                  recaption_triggers=json.loads(recaption_triggers) if recaption_triggers else None,
                   recaption_instruction=recaption_instruction,
-                  recaption_instruction_detailed=recaption_instruction_detailed, captioner_path=captioner)
+                  recaption_instruction_detailed=recaption_instruction_detailed, captioner_path=captioner,
+                  recaption_task=recaption_task, recaption_task_detailed=recaption_task_detailed)
     # Gradient accumulation (Krea 2's rule): N micro-batches average into one update - each loss is divided by N, the
     # optimizer steps every N and at every epoch end (a partial group is flushed), so updates per epoch are
     # ceil(steps / N) and the schedule runs in those updates. Sliders already backpropagate two poles per step: 1.
@@ -1597,26 +1742,30 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
 
     last_prompt = [None]
     slider_history = []                     # [{epoch, prompts, guidance}] - each live change, for the saved metadata
+    anchor_losses = []                      # this epoch's anchor losses (a prompt slider with anchors)
 
     def slider_live(done):
         """A prompt slider's new prompts (the web UI's Slider prompts panel), taken at an epoch boundary: the poles
         encoded again, and a new base renders a new practice bank and becomes the previews' prompt. Training goes on
         from where it is, toward the new ends."""
-        nonlocal slider_prompts, slider_guidance, slider_enc, encoded, sample_prompts
+        nonlocal slider_prompts, slider_guidance, slider_enc, encoded, sample_prompts, slider_anchors, anchor_enc
         new = _read_slider_live(output_dir) if slider_prompts else None
         if new is None:
             return
         # each end is the base and its own words, as the launch builds them (families/launch.py)
         prompts = [new["base"], f"{new['base']} {new['pos']}", f"{new['base']} {new['neg']}"]
-        if prompts == [str(x) for x in slider_prompts] and new["guidance"] == float(slider_guidance):
+        if (prompts == [str(x) for x in slider_prompts] and new["guidance"] == float(slider_guidance)
+                and new["anchors"] == list(slider_anchors)):
             return
         base_changed = prompts[0] != str(slider_prompts[0])
-        logger.info("[slider] new prompts from epoch %d: base '%s' | +1 -> '%s' | -1 -> '%s' (guidance %g)",
-                    done + 1, *prompts, new["guidance"])
+        logger.info("[slider] new prompts from epoch %d: base '%s' | +1 -> '%s' | -1 -> '%s' (guidance %g)%s",
+                    done + 1, *prompts, new["guidance"],
+                    f" | anchors: {' | '.join(new['anchors'])}" if new["anchors"] else " | no anchors")
         parked = []
         try:
-            enc = _encode_override(driver, te_path, prompts, dit, device, parkable=not swapped)
-            slider_enc = [{k: v[None] for k, v in c.items()} for c in enc]
+            enc = _encode_override(driver, te_path, prompts + new["anchors"], dit, device, parkable=not swapped)
+            _all = [{k: v[None] for k, v in c.items()} for c in enc]
+            slider_enc, anchor_enc = _all[:3], _all[3:]
             if base_changed:
                 if desc.preview_park_optimizer and optimizer is not None:     # room for the renders, as previews do
                     for st in optimizer.state.values():
@@ -1626,10 +1775,11 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                                 parked.append((st, k))
                     torch.cuda.empty_cache()
                 render_bank()
-                if prompts[0] and sample_prompts == [str(slider_prompts[0])]:   # the previews followed the old base
-                    sample_prompts = [prompts[0]]
-                    if encoded is not None and not sample_reference and not (sample_image and desc.preview_image):
-                        encoded = [enc[0]]                  # text-only previews: the new base's own encoding
+            # the previews followed the old base (and its first anchor): they follow the new ones
+            if prompts[0] and sample_prompts == [str(slider_prompts[0])] + list(slider_anchors[:1]):
+                sample_prompts = [prompts[0]] + new["anchors"][:1]
+                if encoded is not None and not sample_reference and not (sample_image and desc.preview_image):
+                    encoded = [enc[0]] + enc[3:4]           # text-only previews: the new prompts' own encodings
         except Exception as exc:
             logger.warning(f"[slider] could not take the new prompts ({type(exc).__name__}: {str(exc)[:200]}) - "
                            "training goes on with the ones it had", exc_info=True)
@@ -1637,12 +1787,14 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
         finally:
             for st, k in parked:
                 st[k] = st[k].to(device)
-        slider_prompts, slider_guidance = prompts, new["guidance"]
-        slider_history.append({"epoch": done, "prompts": prompts, "guidance": new["guidance"]})
+        slider_prompts, slider_guidance, slider_anchors = prompts, new["guidance"], new["anchors"]
+        slider_history.append({"epoch": done, "prompts": prompts, "guidance": new["guidance"],
+                               "anchors": new["anchors"]})
         try:
             with open(os.path.join(output_dir, SLIDER_LIVE_APPLIED), "w", encoding="utf-8") as f:
                 json.dump({"epoch": done, "base": new["base"], "pos": new["pos"], "neg": new["neg"],
-                           "guidance": new["guidance"], "practice_rerendered": base_changed, "at": time.time()}, f)
+                           "guidance": new["guidance"], "anchors": new["anchors"],
+                           "practice_rerendered": base_changed, "at": time.time()}, f)
         except OSError:
             pass
 
@@ -1672,12 +1824,20 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             if slider_prompts:
                 md.update({"ss_slider_prompts": json.dumps([str(x) for x in slider_prompts]),
                            "ss_slider_guidance": f"{float(slider_guidance):g}"})
+                if slider_anchors:
+                    md.update({"ss_slider_anchors": json.dumps(list(slider_anchors)),
+                               "ss_slider_anchor_weight": f"{float(slider_anchor_weight):g}"})
                 if slider_history:          # the prompts it was steered through, from which epoch
                     md.update({"ss_slider_prompt_history": json.dumps(slider_history)})
             else:
                 md.update({"ss_slider_diff_weight": f"{float(slider_diff_weight):g}"})
         if train_blocks:
             md.update({"ss_train_blocks": ",".join(train_blocks)})
+        if masked_training:
+            md.update({"ss_masked_training": "True", "ss_mask_floor": f"{float(mask_floor):g}",
+                       "ss_masked_images": str(masked_images)})
+            if mask_prior:
+                md["ss_mask_prior"] = f"{mask_prior:g}"
         md.update(driver.run_metadata())
         return md
 
@@ -1735,6 +1895,7 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             after = ov["after"] if ov.get("after") is not None else after
         return preview_due(done, every, until, after)
     speed_bad = [False]                      # the speed LoRA matched no layers: not tried again
+    ck_tried = [None]                        # the preview checkpoint a live change last asked for
     compared = [0]                           # the helper's last Check picture request this run answered
 
     def _previews(epoch):
@@ -1781,20 +1942,40 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             logger.warning(f"[sample] CFG {cfg_now:g} needs a negative prompt this run did not encode - this preview "
                            "renders at CFG 1")
             cfg_now = 1.0
+        nonlocal ckpt_previews
+        on_ck = ckpt_previews is not None
+        if ov and ov.get("checkpoint") is not None and not slider and encoded is not None:
+            # the Samples tab's preview-model tick, changed while the run goes: unticked = this round on the training
+            # model (with the tab's own steps and CFG), ticked = on the checkpoint, loaded the first time it's asked for
+            want = ov["checkpoint"]
+            if not want:
+                on_ck = False
+            elif ckpt_previews is None or os.path.normcase(ckpt_previews.path) != os.path.normcase(want):
+                if ck_tried[0] != want:         # asked once per file: a run that can't take it says so once
+                    ck_tried[0] = want
+                    ckpt_previews = _make_ckpt_previews(want) or ckpt_previews
+                on_ck = ckpt_previews is not None and os.path.normcase(ckpt_previews.path) == os.path.normcase(want)
         if speed_now is not None:       # the Turbo LoRA at this round's strength; 0 = this round without it
             if strength_now <= 0:
                 speed_now = None
-            elif ckpt_previews is None or slider:     # on the training model: loaded the first time it is asked for
+            elif not on_ck or slider:     # on the training model: loaded the first time it is asked for
                 if net.has(SPEED) or (not speed_bad[0] and _add_speed(strength_now)):
                     net.set_strength(SPEED, strength_now)
                 else:
                     speed_bad[0], speed_now = True, None
-        if ckpt_previews is not None and not slider:
+            if on_ck and speed_now is not None and ckpt_previews.speed is None:
+                speed_now = None                # the Turbo LoRA was added for the training model's previews
+        if on_ck and not slider:
             ck = desc.preview_checkpoint_sampling          # the checkpoint's own recipe (Distilled: 4 steps, no CFG)
             # a checkpoint that takes the speed LoRA (Kromoss): this round with it while its strength is above 0
             turbo_ck = ckpt_previews.speed is not None and speed_now is not None
             ck_steps = (steps_now if turbo_ck else (ask_steps or ck.steps))
             ck_cfg = (cfg_now if turbo_ck else (ck.cfg if ask_cfg is None else ask_cfg))
+            if not turbo_ck and ck.cfg <= 1.0 < ck_cfg:
+                # a guidance-distilled checkpoint (Qwen's Turbo, Klein's Distilled) renders burnt above CFG 1
+                logger.info(f"[sample] {os.path.basename(ckpt_previews.path)} renders at CFG 1 (it's distilled); the "
+                            f"CFG {ck_cfg:g} asked for is for the training model's previews")
+                ck_cfg = 1.0
 
             def _ck_render(m, fl, swp):
                 if turbo_ck and not fl.has(SPEED):     # loaded onto the checkpoint the first round that asks for it
@@ -1809,7 +1990,7 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                     speed=speed_desc.settings if turbo_ck else dataclasses.replace(ck, cfg=ck_cfg),
                     swapped=bool(swp), refs=ref_latents)
             ckpt_previews.render(dit, net, ema, _ck_render)
-            write_mode({"model": os.path.basename(preview_checkpoint), "steps": ck_steps, "cfg": ck_cfg,
+            write_mode({"model": os.path.basename(ckpt_previews.path), "steps": ck_steps, "cfg": ck_cfg,
                         "turbo": speed_desc.name if turbo_ck else "", "strength": strength_now if turbo_ck else 0},
                        epoch)
             last_prompt[0] = prompts[-1] if prompts else None
@@ -1895,27 +2076,29 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
         write_mode({"model": "", "steps": steps_now, "cfg": cfg_now, "turbo": speed_desc.name if speed_now else "",
                     "strength": strength_now if speed_now else 0}, epoch, look_now)
 
-    ckpt_previews = None
-    if preview_checkpoint and encoded is not None:
+    def _make_ckpt_previews(path):
+        """Previews on this preview checkpoint, or None (with the reason logged): at the start, or when the Samples
+        tab's tick turns it on mid-run."""
         if not desc.train_preview_checkpoint:
             logger.warning(f"[sample] {desc.display_name} has no checkpoint previews - ignoring --preview_checkpoint")
         elif finetune:      # the checkpoint carries a LoRA; a fine-tune changes the model itself, so it previews on that
             logger.info("[sample] a fine-tune previews on the model it trains, not the preview checkpoint")
-        elif not os.path.isfile(preview_checkpoint):
-            logger.warning(f"[sample] preview checkpoint {preview_checkpoint} not found - previews use the training "
-                           f"model")
+        elif not os.path.isfile(path):
+            logger.warning(f"[sample] preview checkpoint {path} not found - previews use the training model")
         else:
             from fizgig.families.base_check import checkpoint_takes_speed
-            ck_speed = speed_lora if (speed_lora and speed_desc and
-                                      checkpoint_takes_speed(desc, preview_checkpoint)) else None
-            ckpt_previews = _CheckpointPreviews(
-                driver, preview_checkpoint, device, preview_checkpoint_cache, preview_int8,
+            ck_speed = speed_lora if (speed_lora and speed_desc and checkpoint_takes_speed(desc, path)) else None
+            if ck_speed:
+                logger.info(f"[sample] {os.path.basename(path)} takes the {speed_desc.name}: previews on it use it "
+                            f"while its strength is above 0")
+            return _CheckpointPreviews(
+                driver, path, device, preview_checkpoint_cache, preview_int8,
                 context=(context_lora_path, context_lora_strength) if context_lora_path else None,
                 speed=(ck_speed, speed_desc.strength if speed_lora_strength is None else speed_lora_strength)
                 if ck_speed else None)
-            if ck_speed:
-                logger.info(f"[sample] {os.path.basename(preview_checkpoint)} takes the {speed_desc.name}: previews "
-                            f"on it use it while its strength is above 0")
+        return None
+
+    ckpt_previews = _make_ckpt_previews(preview_checkpoint) if (preview_checkpoint and encoded is not None) else None
     def write_mode(mode, epoch=None, look=False, helper=""):
         """What this run's previews render with now, for the gallery (<sample_dir>/.previews_<name>.json): written at
         the start and after each preview round, so a live change of steps, CFG or Turbo strength shows. After a round
@@ -1944,7 +2127,8 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             ck = desc.preview_checkpoint_sampling
             mode = {"model": os.path.basename(preview_checkpoint), "turbo": "",
                     "steps": asked_steps or (ck.steps if ck else sample_steps),
-                    "cfg": (ck.cfg if ck else sample_cfg_scale) if asked_cfg is None else asked_cfg}
+                    "cfg": (ck.cfg if ck else sample_cfg_scale) if asked_cfg is None
+                    else (1.0 if ck and ck.cfg <= 1.0 else asked_cfg)}
             if ckpt_previews.speed is not None and not speed_idle:
                 mode.update(turbo=speed_desc.name, strength=ckpt_previews.speed[1], steps=sample_steps,
                             cfg=sample_cfg_scale)
@@ -2112,6 +2296,7 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
     _share_keys = sorted({str(it.item_key) for ds in getattr(group, "datasets", [])
                           for b in getattr(getattr(ds, "batch_manager", None), "buckets", {}).values() for it in b})
     share_skip = [0]
+    share_off_said = [False]
     catching = [False]       # training a round's images the helper didn't bring back (counted once already)
 
     def _epoch_batches(epoch):
@@ -2154,7 +2339,10 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             progress.refresh()
 
     def _share_ok():
-        return not (slider or ftr is not None or dop_cond) and watch.watch is None and optimizer is not None
+        # gradient_checkpointing off (or partly): a big card planned this run without it, and a helper trains with it - the halves
+        # would differ, so no share (set a helper to share before the run starts and it keeps checkpointing)
+        return (not (slider or ftr is not None or dop_cond) and watch.watch is None and optimizer is not None
+                and gradient_checkpointing and not gc_off_blocks)
 
     def _worker_epochs():
         """--share_worker: each epoch the lead hands over (its job file: the start LoRA, the share, the LR), in turn;
@@ -2201,6 +2389,7 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                             + " (untick Start together on the Helpers tab to start now)")
                 _noted = time.time()
             time.sleep(2)
+    prior = _MaskPrior(driver, dit, net, mask_prior, swapped) if mask_prior else None
     for epoch in (_worker_epochs() if share_worker else range(start_epoch, max_train_epochs)):
         shared_epoch.value = epoch + 1
         driver.begin_epoch(epoch + 1 + (ftr.epochs_done if ftr is not None else 0))   # a continued fine-tune counts on
@@ -2230,6 +2419,12 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             if share_now[0] is not None and epoch + 1 > share_now[0]["last"]:
                 share_now[0] = None
             _hs = _helper_share(output_dir, output_name) if share_now[0] is None and _share_ok() else None
+            if ((not gradient_checkpointing or gc_off_blocks) and not share_off_said[0] and share_now[0] is None
+                    and _helper_share(output_dir, output_name)):
+                share_off_said[0] = True
+                logger.info("[share] a helper is ready to share, but this run trains without (all of) gradient checkpointing "
+                            "(a big card's plan) and a helper trains with it - the halves would differ, so this GPU "
+                            "trains every image. Set the helper to share before starting a run and both keep it on.")
             if _hs:                  # a helper trains its share of this round's epochs, from the same start
                 # the round: up to `every` epochs, ending early at any epoch that previews or saves (so the pictures
                 # and files hold both halves), at a pause, and at the run's end
@@ -2323,8 +2518,12 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                 optimizer.zero_grad(set_to_none=True)
                 _frozen_sl = _step_freeze(driver.step_frozen_blocks(batch))
                 if slider_prompts:
-                    _l, _t = _prompt_slider_step(driver, dit, net, latents, slider_enc, gen,
-                                                 guidance=slider_guidance, min_t=min_timestep, max_t=max_timestep)
+                    _l, _t, _al = _prompt_slider_step(
+                        driver, dit, net, latents, slider_enc, gen, guidance=slider_guidance, min_t=min_timestep,
+                        max_t=max_timestep, anchor=anchor_enc[global_step % len(anchor_enc)] if anchor_enc else None,
+                        anchor_weight=slider_anchor_weight)
+                    if _al is not None:
+                        anchor_losses.append(_al)
                 else:
                     cond = driver.batch_cond(batch, device)
                     _neg = batch.get("latents_control_0")
@@ -2332,13 +2531,15 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                         raise RuntimeError("[slider] this item has no pair image - an image-pair slider needs one in "
                                            "the second folder for every training image, matched by file name")
                     _neg = _neg.to(device)
+                    _lm = _loss_mask(batch)
                     _l = 0.0
                     try:
                         for m, a, b in ((1.0, latents, _neg), (-1.0, _neg, latents)):
                             net.set_trainable_multiplier(m)
                             _pl, _info = driver.training_loss(dit, a, cond, gen, min_t=min_timestep,
                                                               max_t=max_timestep, diff_ref=b,
-                                                              diff_weight=slider_diff_weight)
+                                                              diff_weight=slider_diff_weight,
+                                                              **({"loss_mask": _lm} if _lm is not None else {}))
                             (0.5 * _pl).backward()
                             _l += 0.5 * _pl.item()
                     finally:
@@ -2354,8 +2555,12 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                 # per-step routing (a family's step_frozen_blocks): those blocks' trainable weights sit out this
                 # step's forward and backward, so the backward stops at the first trained block and they get no grad
                 _frozen_now = _step_freeze(driver.step_frozen_blocks(batch))
+                _lm = _loss_mask(batch)
                 loss, _info = driver.training_loss(dit, latents, cond, gen, min_t=min_timestep, max_t=max_timestep,
-                                                   **({"refs": refs} if refs else {}))
+                                                   **({"refs": refs} if refs else {}),
+                                                   **({"loss_mask": _lm} if _lm is not None else {}),
+                                                   **({"prior": prior} if prior is not None and _lm is not None
+                                                      else {}))
                 if "lr_mult" in _info and lr_acc:
                     lr_acc[-1] *= _info["lr_mult"]     # where the step landed (the H3 noise-band LR)
                 if pending == 0 and optimizer is not None:
@@ -2489,6 +2694,10 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                 state(done, required=True)
             progress.close()
             sys.exit(0)
+        if anchor_losses:                # how far the dial moved its anchors this epoch (0 = not at all)
+            logger.info(f"[slider] anchor loss, epoch {done}: {sum(anchor_losses) / len(anchor_losses):.5f} "
+                        f"over {len(anchor_losses)} steps")
+            anchor_losses.clear()
         if slider_prompts and done < max_train_epochs:
             _tp = time.time()
             slider_live(done)
@@ -2550,8 +2759,12 @@ def setup_parser():
     p.add_argument("--auto_recaption", action="store_true", help="recaption stuck images (needs --captioner)")
     p.add_argument("--warmup_look_outliers", action="store_true", help="LR warm-up for Look Filter outliers")
     p.add_argument("--trigger_position", default="start", choices=("start", "end"))
+    p.add_argument("--recaption_triggers", default=None,
+                   help="auto-recaption's trigger word per other folder, as JSON {key prefix: word}")
     p.add_argument("--recaption_instruction", default=None)
     p.add_argument("--recaption_instruction_detailed", default=None)
+    p.add_argument("--recaption_task", default=None, help="the first try's Captions tab task, for the log")
+    p.add_argument("--recaption_task_detailed", default=None, help="the second try's Captions tab task, for the log")
     p.add_argument("--captioner", default=None,
                    help="auto-recaption's captioner: the Krea 2 Qwen3-VL-4B text encoder file (as the Captions tab)")
     p.add_argument("--lokr_factor", type=int, default=8, help="LoKR only: w1 is about factor x factor")
@@ -2610,6 +2823,10 @@ def setup_parser():
     p.add_argument("--slider_prompts", nargs=3, default=None, metavar=("NEUTRAL", "POSITIVE", "NEGATIVE"),
                    help="Slider from three prompts, no images (needs --text_encoder and --vae)")
     p.add_argument("--slider_guidance", type=float, default=3.0, help="Prompt-pair slider: how hard to push")
+    p.add_argument("--slider_anchors", nargs="+", default=None, metavar="PROMPT",
+                   help="Prompt-pair slider: prompts the dial must leave as they are (one a step, in turn)")
+    p.add_argument("--slider_anchor_weight", type=float, default=1.0,
+                   help="Prompt-pair slider: how much the anchors count against the dial's own loss")
     p.add_argument("--slider_bank", type=int, default=16, help="Prompt-pair slider: practice images to render")
     p.add_argument("--train_blocks", default="",
                    help="Comma-separated block ids (the driver's block map) to train; empty = every block")
@@ -2641,6 +2858,8 @@ def setup_parser():
                    help="step each weight as its gradient lands and free it (less VRAM; no clipping or accumulation)")
     p.add_argument("--reg_lr_multiplier", type=float, default=0.2,
                    help="fine-tune: LR multiplier for images in a dataset block marked is_reg = true")
+    p.add_argument("--gradient_checkpointing", default="auto", choices=("auto", "on"),
+                   help="auto: off for a compiled LoRA run with no block swap when the measured peak fits free VRAM")
     p.add_argument("--compile_blocks", default="auto", choices=("auto", "on", "outside", "off"),
                    help="torch.compile the DiT blocks (families with compiles=True); auto weighs warm-up vs run length")
     p.add_argument("--ema_decay", type=lambda v: v if str(v).lower().startswith("short") else float(v), default=0.0,
@@ -2666,6 +2885,14 @@ def setup_parser():
                    help="experimental: items whose name contains PATTERN train at MULT x the LR on their step")
     p.add_argument("--dop_ft_samples", type=int, default=8,
                    help="DOP on a fine-tune: the original model's predictions made per image before the first step")
+    p.add_argument("--masked_training", action="store_true",
+                   help="weight each picture's loss by its mask (photo-masklabel.png beside photo.png): white counts "
+                        "fully, grey partly, black at --mask_floor; pictures without a mask train as normal")
+    p.add_argument("--mask_floor", type=float, default=0.1,
+                   help="masked training: how much outside the mask counts (0 = nothing, 1 = as much as inside)")
+    p.add_argument("--mask_prior", type=float, default=0.0,
+                   help="masked training: outside the mask, keep the LoRA to the model's own prediction (LoRA at 0) "
+                        "at this weight (OneTrainer's masked prior preservation; 0 = off; one extra forward a step)")
     return p
 
 
@@ -2688,8 +2915,10 @@ def main():
         blocks_to_swap=a.blocks_to_swap, speed_lora_strength=a.speed_lora_strength, network_type=a.network_type, lokr_factor=a.lokr_factor,
         log_per_image_loss=a.log_per_image_loss, per_image_lr=a.per_image_lr, auto_recaption=a.auto_recaption,
         warmup_look_outliers=a.warmup_look_outliers, trigger_word=a.trigger_word, trigger_position=a.trigger_position,
+        recaption_triggers=a.recaption_triggers,
         recaption_instruction=a.recaption_instruction,
         recaption_instruction_detailed=a.recaption_instruction_detailed, captioner=a.captioner,
+        recaption_task=a.recaption_task, recaption_task_detailed=a.recaption_task_detailed,
         network_dim=a.network_dim, network_alpha=a.network_alpha, learning_rate=a.learning_rate,
         max_train_epochs=a.max_train_epochs, save_every_n_epochs=a.save_every_n_epochs,
         save_until_epoch=a.save_until_epoch, save_every_n_epochs_after=a.save_every_n_epochs_after, save_state=a.save_state,
@@ -2707,7 +2936,8 @@ def main():
         sample_strengths=tuple(float(x) for x in a.sample_strengths.split(",") if x.strip()),
         sample_reference=list(a.sample_reference) if a.sample_reference else None, sample_image=a.sample_image,
         slider_pairs=a.slider_pairs, slider_diff_weight=a.slider_diff_weight, slider_prompts=a.slider_prompts,
-        slider_guidance=a.slider_guidance, slider_bank=a.slider_bank, slider_bank_res=a.slider_bank_res,
+        slider_guidance=a.slider_guidance, slider_anchors=a.slider_anchors or (),
+        slider_anchor_weight=a.slider_anchor_weight, slider_bank=a.slider_bank, slider_bank_res=a.slider_bank_res,
         train_blocks=[b.strip() for b in a.train_blocks.split(",") if b.strip()] or None,
         metadata_title=a.metadata_title, metadata_author=a.metadata_author,
         metadata_description=a.metadata_description, metadata_license=a.metadata_license,
@@ -2718,6 +2948,7 @@ def main():
         lr_scheduler=a.lr_scheduler, lr_warmup_steps=a.lr_warmup_steps,
         lr_scheduler_num_cycles=a.lr_scheduler_num_cycles, lr_scheduler_power=a.lr_scheduler_power,
         gradient_accumulation_steps=a.gradient_accumulation_steps, compile_blocks=a.compile_blocks,
+        gradient_checkpointing=True if a.gradient_checkpointing == "on" else "auto",
         finetune=a.finetune, ft_rotations=a.ft_rotations, ft_save_every_rotations=a.ft_save_every_rotations,
         ft_rotate_every=a.ft_rotate_every, ft_max_parts=a.ft_max_parts, ft_start_window=a.ft_start_window, ft_epochs_done=a.ft_epochs_done,
         ft_fused_backward=a.ft_fused_backward, reg_lr_multiplier=a.reg_lr_multiplier,
@@ -2727,7 +2958,8 @@ def main():
         dop=a.dop, dop_trigger=a.dop_trigger, dop_class=a.dop_class, dop_weight=a.dop_weight, dop_every=a.dop_every,
         dop_ft_samples=a.dop_ft_samples,
         lr_boost=[(x.split("=", 1)[0], float(x.split("=", 1)[1])) for x in a.lr_boost if "=" in x] or None,
-        share_worker=a.share_worker)
+        share_worker=a.share_worker, masked_training=a.masked_training, mask_floor=a.mask_floor,
+        mask_prior=a.mask_prior)
 
 
 if __name__ == "__main__":

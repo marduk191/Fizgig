@@ -52,7 +52,8 @@ def load():
 
 def status():
     with _lock:
-        return {"items": [{k: i.get(k) for k in ("id", "family", "lora", "image_folder", "queued_at", "output_dir")}
+        return {"items": [{**{k: i.get(k) for k in ("id", "family", "lora", "image_folder", "queued_at", "output_dir")},
+                           "continues": bool((i.get("values") or {}).get("__continue"))}     # Continue on Runs & outputs
                           for i in _q["items"]],
                 "held": _q["held"], "reason": _q["reason"], "waiting": _q["waiting"]}
 

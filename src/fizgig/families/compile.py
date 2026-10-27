@@ -240,10 +240,13 @@ def compile_blocks(dit, blocks, blocks_to_swap: int = 0, fp8_scaled: bool = Fals
     # checkpointing the forward runs twice per step, so the boundary is worth 1.19x on a real block
     # (8.817 -> 7.428 ms/block-step).
     checkpointing = bool(getattr(dit, "gradient_checkpointing", False))
+    # partial checkpointing (a big card's plan, quant.plan_partial_checkpointing): the last `gc_off_blocks` blocks run
+    # without it, the rest keep it
+    last_ck = len(blocks) - int(getattr(dit, "gc_off_blocks", 0) or 0)
     n = 0
     if boundary == "outside":
         for i, block in enumerate(blocks):
-            blocks[i] = CheckpointedBlock(torch.compile(block, fullgraph=fullgraph), checkpointing)
+            blocks[i] = CheckpointedBlock(torch.compile(block, fullgraph=fullgraph), checkpointing and i < last_ck)
             n += 1
         logger.info("[compile] %d blocks compiled (checkpoint OUTSIDE the "
                     "compiled region — recompute reruns the compiled graph, so activation "
@@ -251,7 +254,7 @@ def compile_blocks(dit, blocks, blocks_to_swap: int = 0, fp8_scaled: bool = Fals
                     "step of each new shape pauses to compile", n)
         return
     for i, block in enumerate(blocks):
-        blocks[i] = torch.compile(CheckpointedBlock(block, checkpointing), fullgraph=fullgraph)
+        blocks[i] = torch.compile(CheckpointedBlock(block, checkpointing and i < last_ck), fullgraph=fullgraph)
         n += 1
     logger.info("[compile] %d blocks compiled (checkpoint inside the graph, "
                 "cache_size_limit=8192) — the first step of each new shape pauses to compile", n)

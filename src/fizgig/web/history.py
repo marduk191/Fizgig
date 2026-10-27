@@ -83,19 +83,22 @@ def last_values(lora, output_dir):
     return None
 
 
-def start(source, family, lora, output_dir, image_folder, values, resume=False):
+def start(source, family, lora, output_dir, image_folder, values, resume=False, carry=""):
     """Record a run that is starting; returns its id. A resume carries on the paused run's own record (the newest
-    paused one with the same LoRA name and folder, from either app) instead of listing the run twice."""
+    paused one with the same LoRA name and folder, from either app) instead of listing the run twice; Continue on
+    Runs & outputs carries on the record it was pressed on (carry: its id), however that run ended."""
     if resume:
         try:
             with _Lock():
                 runs = _read()
                 for r in reversed(runs):
-                    if _same_run(r, lora, output_dir):
-                        if r.get("result") != "paused":
+                    if (r.get("id") == carry) if carry else _same_run(r, lora, output_dir):
+                        if r.get("result") != "paused" and not carry:
                             break
                         r.update(result="running", ended_at=None, resumed_at=time.time(), server_pid=os.getpid(),
-                                 values=values or r.get("values") or {})    # e.g. a new Target Megapixels
+                                 values=values or r.get("values") or {},    # e.g. a new Target Megapixels
+                                 # where its pictures are now (a run moved to a pod again unpacks somewhere new)
+                                 image_folder=image_folder or r.get("image_folder"))
                         _write(runs)
                         return r["id"]
         except OSError:

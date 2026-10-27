@@ -579,9 +579,9 @@ def main():
                 from fizgig.web import local_bridge
                 return local_bridge.local_datasets()
 
-            def local_files(self, folder):
+            def local_files(self, folder, subfolders=False):
                 from fizgig.web import local_bridge
-                return local_bridge.local_files(folder)
+                return local_bridge.local_files(folder, bool(subfolders))
 
             def read_local(self, folder, name, offset, n):
                 from fizgig.web import local_bridge

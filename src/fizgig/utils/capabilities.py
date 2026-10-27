@@ -170,6 +170,14 @@ def detect() -> Capabilities:
     except Exception:
         caps.vram_free_gb = caps.vram_gb
         caps.notes.append("could not read free VRAM — using card total")
+    sim = os.environ.get("FIZGIG_SIM_VRAM_GB", "").strip()
+    if sim:                       # the small-card simulator: the compile checks see the simulated card, as planning does
+        try:
+            from fizgig.utils.device import plannable_free_vram
+            caps.vram_gb = min(caps.vram_gb, float(sim))
+            caps.vram_free_gb = min(caps.vram_free_gb, plannable_free_vram() * 1e9 / 1024 ** 3)
+        except ValueError:
+            pass
 
     caps.fp8_matmul = _probe_scaled_mm(torch.float8_e4m3fn) if not caps.is_rocm else False
     caps.int8_matmul = _probe_scaled_mm(torch.int8)     # expected False: _scaled_mm is fp8-only

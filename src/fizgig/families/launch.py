@@ -18,6 +18,9 @@ FAMILY_EDIT, ...) plus the values the app reads from its other tabs, all lower c
     recache                     unless its picture size changed (Target Megapixels): then they run, and keep what fits
     loss_watch                  {"detect", "per_image_lr", "warmup", "recaption": bool}
     captioner, caption_trigger, caption_overrides   auto-recaption: model path, trigger word, edited instructions
+    recaption_triggers          auto-recaption's trigger word for each other folder ({key prefix: word})
+    recaption_tasks             auto-recaption's (first try, second try) Captions tab task keys
+    keep_checkpointing          a helper is set to train a share: gradient checkpointing stays on (both halves match)
     samples                     {"enabled", "every", "width", "height", "steps", "cfg", "negative", "seed",
                                  "at_first": ..., "prompts": [lines as typed on the Samples tab]}
     samples_dir                 where preview prompt files go (the output folder's sample/)
@@ -40,6 +43,9 @@ already at Max Train Epochs.
 import os
 import re
 from dataclasses import dataclass, field
+from fizgig.utils.upright import upright_size
+
+from fizgig.dataset.masks import is_mask_file
 
 PRECISION_LABELS = {"auto": "Auto (fits your free VRAM)", "bf16": "bf16 (full precision)",
                     "int8": "INT8 (8-bit, fastest)", "nf4": "4-bit NF4 (smallest)",
@@ -61,6 +67,11 @@ class LaunchPlan:
     files: list = field(default_factory=list)       # (path, text) to write before the stages run
     console: list = field(default_factory=list)     # lines to show the user
     problems: list = field(default_factory=list)    # anything here and the run must not start
+
+
+def _toml_str(x):
+    """A TOML basic string's inside: backslashes and quotes escaped."""
+    return str(x).replace("\\", "\\\\").replace('"', '\\"')
 
 
 def _s(x):
@@ -262,7 +273,7 @@ def uncached_pictures(toml_text):
         te = {"_".join(f[:-len(".safetensors")].split("_")[:-2]) for f in names if f.endswith("_te.safetensors")}
         lat = {"_".join(f.split("_")[:-2]) for f in names
                if f.endswith(".safetensors") and not f.endswith("_te.safetensors")}
-        n += sum(1 for f in os.listdir(img) if os.path.splitext(f)[1].lower() in exts
+        n += sum(1 for f in os.listdir(img) if os.path.splitext(f)[1].lower() in exts and not is_mask_file(f)
                  and (os.path.splitext(f)[0] not in lat or os.path.splitext(f)[0] not in te))
     return n
 
@@ -295,11 +306,12 @@ def pairs(after_dir, before_dir, exts=PAIR_EXTS, limit=1):
     two folders, matched the way the dataset loader matches them: a partner of photo.png is photo.<ext> or
     photo_<anything>.<ext>, ignoring case. exts: what counts as an item (a clip family's sliders add .mp4). limit:
     partners a photo may have (a multi-reference edit: the family's edit_references)."""
-    befores = sorted(f for f in os.listdir(before_dir) if os.path.splitext(f)[1].lower() in exts)
+    befores = sorted(f for f in os.listdir(before_dir) if os.path.splitext(f)[1].lower() in exts
+                     and not is_mask_file(f))
     missing, multiple, first = [], [], None
     for f in sorted(os.listdir(after_dir)):
         b, e = os.path.splitext(f)
-        if e.lower() not in exts:
+        if e.lower() not in exts or is_mask_file(f):
             continue
         m = [x for x in befores if x.casefold().startswith(b.casefold() + ".")    # IMG_1 pairs with img_1
              or x.casefold().startswith(b.casefold() + "_")]
@@ -315,11 +327,12 @@ def pair_problems(after_dir, before_dir, caption_ext=".txt", exts=PAIR_EXTS):
     """(photos in after_dir without a caption, pairs whose shapes differ - photos only; a clip pair's size and
     length are checked when it is cached)."""
     from PIL import Image
-    befores = sorted(f for f in os.listdir(before_dir) if os.path.splitext(f)[1].lower() in exts)
+    befores = sorted(f for f in os.listdir(before_dir) if os.path.splitext(f)[1].lower() in exts
+                     and not is_mask_file(f))
     uncaptioned, shapes = [], []
     for f in sorted(os.listdir(after_dir)):
         b, e = os.path.splitext(f)
-        if e.lower() not in exts:
+        if e.lower() not in exts or is_mask_file(f):
             continue
         if not os.path.exists(os.path.join(after_dir, b + caption_ext)):
             uncaptioned.append(f)
@@ -328,7 +341,8 @@ def pair_problems(after_dir, before_dir, caption_ext=".txt", exts=PAIR_EXTS):
         if m and e.lower() in PAIR_EXTS:     # the original (the first): extra references may be any shape
             try:
                 with Image.open(os.path.join(after_dir, f)) as ia, Image.open(os.path.join(before_dir, m[0])) as ib:
-                    ra, rb = ia.width / ia.height, ib.width / ib.height
+                    (wa, ha), (wb, hb) = upright_size(ia), upright_size(ib)
+                    ra, rb = wa / ha, wb / hb
                 if abs(ra - rb) / ra > 0.02:
                     shapes.append(f)
             except OSError:
@@ -464,6 +478,12 @@ def problems(desc, inputs):
                 raise ValueError
         except (TypeError, ValueError):
             errors.append("Slider push strength must be a number above 0")
+        if _s(inputs.get("FAMILY_SLIDER_ANCHORS")):
+            try:
+                if float(_s(inputs.get("FAMILY_SLIDER_ANCHOR_WEIGHT")) or "1") <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                errors.append("Slider anchor strength must be a number above 0")
     need = [f for f in desc.model_files if f.required]
     if desc.training_adapter and inputs.get("FAMILY_TRAINING_ADAPTER", True):
         need += [f for f in desc.model_files if f.pref_key == desc.training_adapter]
@@ -482,9 +502,45 @@ def _media_count(folder):
     from fizgig.dataset.image_dataset import AUDIO_EXTENSIONS, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
     exts = {e.lower() for e in (*IMAGE_EXTENSIONS, *VIDEO_EXTENSIONS, *AUDIO_EXTENSIONS)}
     try:
-        return sum(1 for n in os.listdir(folder) if os.path.splitext(n)[1].lower() in exts)
+        return sum(1 for n in os.listdir(folder) if os.path.splitext(n)[1].lower() in exts and not is_mask_file(n))
     except OSError:
         return 0
+
+
+# Folders Fizgig itself makes inside a training folder: never trained on as sub-folders
+OWN_SUBFOLDERS = {"excluded_by_look", "originals"}
+
+
+def subfolders_on(desc, st):
+    """Also train on its sub-folders (the Training tab tick, off by default): a plain LoRA or a fine-tune - not with
+    Subjects 2-4, DOP or Fizgig LoRA Isolation (one folder per subject), nor an edit or a slider (paired files)."""
+    return bool(st.get("subfolders")) and not (st.get("multiconcept") or dop_on(desc, st) or multi_person_on(desc, st)
+                                               or edit_on(desc, st) or slider_on(desc, st))
+
+
+def subfolders(folder, skip=()):
+    """[(relative path with "/", folder)] of every sub-folder at any depth holding training items (photos, clips,
+    songs), sorted: Fizgig's own (excluded_by_look, originals), hidden ones, and any folder in `skip` (the output,
+    cache or regularisation folder when it sits inside), with everything under them, are left out."""
+    if not folder or not os.path.isdir(folder):
+        return []
+    norm = lambda f: os.path.normcase(os.path.abspath(f)).rstrip("\\/")
+    skip = {norm(f) for f in skip if f}
+    out = []
+    for root, dirs, _files in os.walk(folder):
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d.lower() not in OWN_SUBFOLDERS
+                         and norm(os.path.join(root, d)) not in skip)
+        if norm(root) != norm(folder) and _media_count(root):
+            out.append((os.path.relpath(root, folder).replace("\\", "/"), root))
+    return out
+
+
+def run_subfolders(desc, st):
+    """The run's sub-folders (subfolders), or [] when the tick is off or doesn't apply."""
+    if not subfolders_on(desc, st):
+        return []
+    return subfolders(_s(st.get("image_folder")), (_s(st.get("LORA_OUTPUT_DIR")), _s(st.get("cache_root")),
+                                                   ft_reg_dir(desc, st)))
 
 
 def _balance_repeats(folders):
@@ -505,6 +561,8 @@ def dataset_media(folder):
     img, vid, aud = ({e.lower() for e in x} for x in (IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, AUDIO_EXTENSIONS))
     for n in names:
         ext = os.path.splitext(n)[1].lower()
+        if is_mask_file(n):
+            continue
         kinds |= {"photo"} if ext in img else {"clip"} if ext in vid else {"voice"} if ext in aud else set()
     return kinds
 
@@ -656,6 +714,10 @@ def train_command(desc, inputs, plan):
         cmd += ["--context_lora_path", ctx,
                 "--context_lora_strength", _s(st.get("CONTEXT_LORA_STRENGTH") or "1.0") or "1.0"]
     mp_subs = [x[1] for x in multi_person_subjects(desc, st) if x[1]] if multi_person_on(desc, st) else []
+    if masked_on(desc, st):
+        cmd += ["--masked_training", "--mask_floor", f"{mask_floor(st):g}"]
+        if mask_prior(desc, st):
+            cmd += ["--mask_prior", f"{mask_prior(desc, st):g}"]
     if dop_on(desc, st) or mp_subs:
         trig, cls = dop_rules(st)
         if mp_subs:          # the captions are read fused: DOP swaps "zwxemwoman" for "a woman"
@@ -684,6 +746,8 @@ def train_command(desc, inputs, plan):
         cb = str(st.get("COMPILE_BLOCKS", "auto") or "auto").lower()
         if cb in ("auto", "on", "off", "outside"):
             cmd += ["--compile_blocks", cb]
+    if st.get("keep_checkpointing"):
+        cmd += ["--gradient_checkpointing", "on"]
     try:
         if int(float(str(st.get("GRADIENT_ACCUMULATION", "") or 1))) > 1:
             cmd += ["--gradient_accumulation_steps", str(int(float(st["GRADIENT_ACCUMULATION"])))]
@@ -735,11 +799,16 @@ def train_command(desc, inputs, plan):
             trig = _s(st.get("caption_trigger"))
             if trig and trig.lower() != "trigger_word":
                 cmd += ["--trigger_word", trig]      # leads each AI caption, as the Captions tab writes it
+            if st.get("recaption_triggers"):         # the other folders' own: {key prefix: trigger word}
+                import json as _json
+                cmd += ["--recaption_triggers", _json.dumps(st["recaption_triggers"])]
+            from fizgig.krea2.caption_text import RECAPTION_DEFAULTS, recaption_instruction
             ovr = st.get("caption_overrides") or {}
-            for key, flag in (("training", "--recaption_instruction"), ("exhaustive", "--recaption_instruction_detailed")):
-                instr = str(ovr.get(key, "") or "").strip()
-                if instr:
-                    cmd += [flag, instr]
+            tasks = tuple(st.get("recaption_tasks") or RECAPTION_DEFAULTS)
+            for key, (flag, task_flag) in zip(tasks, (("--recaption_instruction", "--recaption_task"),
+                                                      ("--recaption_instruction_detailed", "--recaption_task_detailed"))):
+                label, instr, edited = recaption_instruction(key, ovr)
+                cmd += [flag, instr, task_flag, f'"{label}"' + (" (your edit)" if edited else " (as shipped)")]
     elif any(lw.get(key) for key, _ in watch):
         plan.console.append("[loss-watch] per-image features skipped - they need Batch Size 1.\n")
     if any(lw.get(key) for key, _ in watch) and "--text_encoder" not in cmd:
@@ -795,6 +864,10 @@ def train_command(desc, inputs, plan):
             cmd += ["--slider_prompts", base, f"{base} {_s(st.get('FAMILY_SLIDER_POS'))}",
                     f"{base} {_s(st.get('FAMILY_SLIDER_NEG'))}",       # the user's own comma, if any
                     "--slider_guidance", _s(st.get("FAMILY_SLIDER_GUIDANCE")) or f"{desc.slider_guidance:g}"]
+            anchors = [a.strip() for a in str(st.get("FAMILY_SLIDER_ANCHORS") or "").splitlines() if a.strip()]
+            if anchors:                  # prompts the dial must leave alone (#252)
+                cmd += ["--slider_anchors", *anchors,
+                        "--slider_anchor_weight", _s(st.get("FAMILY_SLIDER_ANCHOR_WEIGHT")) or "1"]
             try:        # the practice pictures (and so the training) at Target Megapixels, a square on the 16 px grid
                 side = int((float(st.get("megapixels")) * 1_000_000) ** 0.5) // 16 * 16
                 if side >= 256:
@@ -1008,6 +1081,8 @@ def dataset_toml(desc, inputs):
                 lines.append(f"caption_replace = {_json.dumps(mp[f][0]['rules'])}")
             if isolation_photos_only(desc):  # a clip / voice family trains Isolation's subjects from their stills
                 lines.append("photos_only = true")
+    subs = run_subfolders(desc, inputs)
+    head = len(lines)
     lines += ["", "[[datasets]]", f'image_directory = "{folder.replace(chr(92), "/")}"']
     if reps.get(folder, 1) > 1:
         lines.append(f"num_repeats = {reps[folder]}")
@@ -1021,8 +1096,15 @@ def dataset_toml(desc, inputs):
     root = _s(inputs.get("cache_root"))
     if root and folder:
         lines.append(f'cache_directory = "{cache_dir_for(root, folder).replace(chr(92), "/")}"')
-    for f in extra:                      # Multi Concept: each subject its own block and cache folder
-        lines += ["", "[[datasets]]", f'image_directory = "{f.replace(chr(92), "/")}"']
+    if subs and not _media_count(folder):     # everything is in the sub-folders: the training folder has no block
+        del lines[head:]
+    for rel, f in subs:                  # Also train on its sub-folders: each its own block and cache folder
+        lines += ["", "[[datasets]]", f'image_directory = "{f.replace(chr(92), "/")}"',
+                  f'item_prefix = "{_toml_str(rel + "/")}"']
+        if root:
+            lines.append(f'cache_directory = "{cache_dir_for(root, f).replace(chr(92), "/")}"')
+    for n, f in enumerate(extra, start=2):   # Multi Concept: each subject its own block and cache folder
+        lines += ["", "[[datasets]]", f'image_directory = "{f.replace(chr(92), "/")}"', f'item_prefix = "s{n}:"']
         if reps.get(f, 1) > 1:
             lines.append(f"num_repeats = {reps[f]}")
         _fuse(f)
@@ -1036,7 +1118,7 @@ def dataset_toml(desc, inputs):
             lines.append(f'cache_directory = "{cache_dir_for(root, w).replace(chr(92), "/")}"')
     reg = ft_reg_dir(desc, inputs)
     if reg:                              # a fine-tune's regularisation set: its own block (and cache folder)
-        lines += ["", "[[datasets]]", f'image_directory = "{reg.replace(chr(92), "/")}"']
+        lines += ["", "[[datasets]]", f'image_directory = "{reg.replace(chr(92), "/")}"', 'item_prefix = "reg:"']
         if root:
             lines.append(f'cache_directory = "{cache_dir_for(root, reg).replace(chr(92), "/")}"')
         lines.append("is_reg = true")
@@ -1108,6 +1190,50 @@ def dop_on(desc, st):
     """DOP (the Subjects card's "Leave the rest of the model alone", and under Fizgig LoRA Isolation): a family that
     offers it (description subject_isolation), never an edit or a slider."""
     return bool(st.get("FAMILY_DOP")) and desc.subject_isolation and not (slider_on(desc, st) or edit_on(desc, st))
+
+
+MASK_FLOORS = ("0 - not at all", "0.05", "0.1 (recommended)", "0.2", "0.3", "0.5")
+# masked prior preservation (OneTrainer's weight): outside the mask, the model's own picture at this weight
+MASK_PRIORS = ("Off", "0.5", "1", "2")
+
+
+def masked_on(desc, st):
+    """Masked training (fizgig/dataset/masks.py): the tick on, a family whose driver takes masks, a run that trains on
+    pictures (a prompt slider makes its own)."""
+    return bool(st.get("MASKED_TRAINING")) and desc.masked_training and not slider_on(desc, st, "prompts")
+
+
+def mask_floor(st):
+    """How much outside a mask counts, from the Training tab's choice (0.1 unless it reads as a number 0-1)."""
+    try:
+        v = float(str(st.get("MASK_FLOOR") or "0.1").split()[0])
+    except ValueError:
+        return 0.1
+    return min(1.0, max(0.0, v))
+
+
+def mask_prior(desc, st):
+    """Outside the mask, keep the model's own picture: the Training tab's weight, 0 when off - and for a slider or
+    a fine-tune (it switches the LoRA off for a step: there's none to switch)."""
+    if slider_on(desc, st) or ft_on(desc, st):
+        return 0.0
+    try:
+        return max(0.0, float(str(st.get("MASK_PRIOR") or "Off").split()[0]))
+    except ValueError:
+        return 0.0
+
+
+def mask_folders(desc, st):
+    """The folders whose pictures train (and so whose masks count): the training folder, its sub-folders when
+    they train, and Multi Concept's others."""
+    extra = [_s(f) for f in (st.get("extra_folders") or []) if _s(f)] if desc.multi_concept else []
+    return [f for f in [_s(st.get("image_folder"))] + [f for _r, f in run_subfolders(desc, st)] + extra if f]
+
+
+def mask_report(desc, st):
+    from fizgig.dataset.image_dataset import IMAGE_EXTENSIONS
+    from fizgig.dataset.masks import folder_report
+    return folder_report(mask_folders(desc, st), IMAGE_EXTENSIONS)
 
 
 def multi_person_on(desc, st):
@@ -1233,9 +1359,19 @@ def start_problems(desc, inputs):
         exts |= {e.lower() for e in VIDEO_EXTENSIONS}       # the clip formats the dataset layer reads
     if "voice" in desc.media:
         exts |= {e.lower() for e in AUDIO_EXTENSIONS}
-    out += checks.training_folder(_s(v.get("image_folder")), _s(v.get("caption_ext", ".txt")),
-                                  check_captions=not slider_on(desc, inputs, "prompts"), media_exts=exts)
-    out += clip_problems(desc, _s(v.get("image_folder")))
+    subs = run_subfolders(desc, v)
+    if not (subs and not _media_count(_s(v.get("image_folder")))):   # all in the sub-folders: nothing to check here
+        out += checks.training_folder(_s(v.get("image_folder")), _s(v.get("caption_ext", ".txt")),
+                                      check_captions=not slider_on(desc, inputs, "prompts"), media_exts=exts)
+        out += clip_problems(desc, _s(v.get("image_folder")))
+    for rel, f in subs:                  # Also train on its sub-folders: each one's captions and clips too
+        out += checks.training_folder(f, _s(v.get("caption_ext", ".txt")), media_exts=exts,
+                                      label=f"the sub-folder {rel}")
+        out += clip_problems(desc, f)
+    if masked_on(desc, v) and not mask_report(desc, v)["with"]:
+        out.append("Masked training is on, but no picture in the training folder has a mask it can use. Save each "
+                   "mask beside its picture with -masklabel added to the name (photo.jpg -> photo-masklabel.png: "
+                   "white = train, black = mostly ignore), or untick Masked training.")
     return out
 
 
@@ -1302,6 +1438,8 @@ def plan(desc, inputs):
     if people:                          # the side-by-side pictures: people only (an animal or a style has none)
         cmd = [inputs["python"], os.path.join(inputs["repo_dir"], "src", "fizgig", "scripts", "multi_person.py"),
                "--ext", _s(inputs.get("caption_ext")) or ".txt"]
+        if not inputs.get("FAMILY_MP_FACECROPS_FIRST", True):
+            cmd.append("--no_face_first")
         for f, s, w in people:
             cmd += ["--subject", f, s["fused"], w]
         p.stages.append(Stage("Multi-person composites", cmd))

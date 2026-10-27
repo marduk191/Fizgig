@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-from fizgig.families.driver import Block, BlockGroup, FamilyDriver
+from fizgig.families.driver import Block, BlockGroup, FamilyDriver, prior_base, weighted_loss, with_prior
 
 DTYPE = torch.bfloat16
 _DOUBLE_MODULES = ("img_attn.qkv", "img_attn.proj", "img_mlp.0", "img_mlp.2",
@@ -197,15 +197,18 @@ class KleinDriver(FamilyDriver):
             pred = dit(x=x, x_ids=x_ids, timesteps=ts, ctx=ctx, ctx_ids=ctx_ids, guidance=guidance)
         return rearrange(pred[:, :n], "b (h w) c -> b c h w", h=h, w=w)
 
-    def loss_at(self, dit, latents, noise, t, cond, *, refs=None, diff_ref=None, diff_weight=0.0):
+    def loss_at(self, dit, latents, noise, t, cond, *, refs=None, diff_ref=None, diff_weight=0.0, loss_mask=None,
+                prior=None):
         """The training loss for a given latent, noise and t - the old trainer's arithmetic in its dtype order.
         training_loss draws noise and t; tests call this directly to compare with the old trainer."""
         t = t.to(latents.device)
         t_ = t.view(-1, 1, 1, 1)
         noise = noise.to(device=latents.device, dtype=latents.dtype)
         noisy = (1 - t_) * latents + t_ * noise
+        base = prior_base(prior, loss_mask, lambda: self._forward(dit, noisy, t, cond, refs))
         pred = self._forward(dit, noisy, t, cond, refs)
         target = noise - latents.to(torch.float32)
+        wt = None
         if diff_ref is not None and diff_weight > 0.0:
             # slider disentanglement, per latent token (Krea 2's formula)
             d = (latents.float() - diff_ref.to(latents.device).float()).abs().mean(dim=1).flatten(1)   # (1, N)
@@ -214,16 +217,21 @@ class KleinDriver(FamilyDriver):
             wt = (1.0 - float(diff_weight)) + float(diff_weight) * r
             wt = wt / wt.mean(dim=1, keepdim=True).clamp_min(1e-8)
             wt = torch.where(dm > 1e-6, wt, torch.ones_like(wt))
-            se = (pred.float() - target).pow(2).mean(dim=1).flatten(1)
-            return (se * wt).mean()
-        return F.mse_loss(pred.to(torch.float32), target)
+        mw = None if loss_mask is None else loss_mask.float().flatten(1)              # (1, N): one cell per token
+        if wt is None and mw is None:
+            return F.mse_loss(pred.to(torch.float32), target)
+        loss = weighted_loss((pred.float() - target).pow(2).mean(dim=1).flatten(1), wt, mw)
+        if base is not None:
+            loss = with_prior(loss, prior, base, (pred.float() - base).pow(2).mean(dim=1).flatten(1), mw, wt)
+        return loss
 
     def training_loss(self, dit, latents, cond, generator, *, min_t=0.0, max_t=1.0, refs=None, diff_ref=None,
-                      diff_weight=0.0):
+                      diff_weight=0.0, loss_mask=None, prior=None):
         h, w = latents.shape[-2:]
         noise = torch.randn(latents.shape, generator=generator)
         t = self._sample_t(h * w, generator, min_t, max_t)
-        loss = self.loss_at(dit, latents, noise, t, cond, refs=refs, diff_ref=diff_ref, diff_weight=diff_weight)
+        loss = self.loss_at(dit, latents, noise, t, cond, refs=refs, diff_ref=diff_ref, diff_weight=diff_weight,
+                            loss_mask=loss_mask, prior=prior)
         return loss, {"t": float(t.mean())}
 
     def noise_latents(self, latents, generator, *, min_t=0.0, max_t=1.0):

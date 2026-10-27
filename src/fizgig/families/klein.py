@@ -28,6 +28,7 @@ _STYLE_COMP = tuple(f"double_{i}" for i in range(8)) + ("single_0", "single_1")
 
 KLEIN = FamilyDescription(
     key="klein",
+    masked_training=True,
     arch_id="klein9bdrv",
     display_name="Klein 9B",
     gui_label="Flux 2 Klein Base 9B",

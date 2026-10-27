@@ -17,6 +17,9 @@ import os
 import shutil
 
 from PIL import Image
+from fizgig.utils.upright import open_upright, upright_size
+
+from fizgig.dataset.masks import is_mask_file
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
 LOOK_EXTS = ('.png', '.jpg', '.jpeg', '.webp', '.bmp')
@@ -78,14 +81,20 @@ def face_mode_of(label):
 def image_files(folder):
     """The folder's images (top level), sorted."""
     return [os.path.join(folder, f) for f in sorted(os.listdir(folder))
-            if os.path.isfile(os.path.join(folder, f)) and os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS]
+            if os.path.isfile(os.path.join(folder, f)) and os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS
+            and not is_mask_file(f)]
 
 
 def load_image(path):
-    img = Image.open(path)
+    img = open_upright(path)
     if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
         return img.convert('RGBA')
     return img.convert('RGB')
+
+
+def _rotated(path):
+    from fizgig.dataset.masks import exif_rotated
+    return exif_rotated(path)
 
 
 def atomic_png_save(img, output_path):
@@ -107,14 +116,15 @@ def source_stats(folder, max_sample=40):
     """(image count, median area, median size) of the folder's top-level images, from headers only (cheap)."""
     exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
     try:
-        files = [os.path.join(folder, f) for f in os.listdir(folder) if os.path.splitext(f)[1].lower() in exts]
+        files = [os.path.join(folder, f) for f in os.listdir(folder) if os.path.splitext(f)[1].lower() in exts
+                 and not is_mask_file(f)]
     except OSError:
         return 0, None, None
     sizes = []
     for p in files[:max_sample]:
         try:
             with Image.open(p) as im:
-                sizes.append(im.size)
+                sizes.append(upright_size(im))
         except Exception:
             pass
     if not sizes:
@@ -223,6 +233,42 @@ class Prep:
             os.makedirs(d, exist_ok=True)
             shutil.move(filepath, os.path.join(d, os.path.basename(filepath)))
 
+    def keep_mask(self, filepath, output_path, folder, replace, crop=None):
+        """Masked training: a picture's mask (photo-masklabel.png) follows it. A cropped picture's mask gets the same
+        crop (crop: the mask -> its cropped version) and the output's name, its original going to originals/ with the
+        picture (unless replacing); otherwise it only takes the output's name if that changed. Called after the
+        picture is saved and its original handled."""
+        from fizgig.dataset.masks import MASK_SUFFIX, mask_for, read_mask
+        m = mask_for(filepath)
+        if not m:
+            return
+        out_mask = os.path.join(os.path.dirname(output_path),
+                                os.path.splitext(os.path.basename(output_path))[0] + MASK_SUFFIX + ".png")
+        if crop is None:
+            if os.path.normcase(m) != os.path.normcase(out_mask) and not os.path.exists(out_mask):
+                os.replace(m, out_mask)                  # photo.jpg -> photo_2.png: its mask takes the new name
+            return
+        cropped = crop(read_mask(m))
+        if not replace:
+            d = self._originals_for(folder)
+            os.makedirs(d, exist_ok=True)
+            shutil.copy2(m, os.path.join(d, os.path.basename(m)))
+        if os.path.normcase(m) != os.path.normcase(out_mask):
+            os.remove(m)
+        atomic_png_save(cropped, out_mask)
+        self.log(f"  its mask: cropped the same way -> {os.path.basename(out_mask)}\n")
+
+    def crop_mask_for(self, filepath, size, face, padding, crop_path):
+        """Masked training: a face close-up made from a picture with a mask gets that mask, cropped the same way."""
+        from fizgig.dataset.masks import MASK_SUFFIX, mask_for, read_mask
+        from fizgig.face_utils import crop_to_face
+        m = mask_for(filepath)
+        if not m:
+            return
+        mk = read_mask(m)
+        mk = crop_to_face(mk.resize(size) if mk.size != size else mk, face, padding)
+        atomic_png_save(mk, os.path.splitext(crop_path)[0] + MASK_SUFFIX + ".png")
+
     # ---- faces ----
     def select_face(self, faces, face_mode):
         """(FaceInfo or None, note) by the face target."""
@@ -277,7 +323,7 @@ class Prep:
                 img, resized = resize_image(img, area)
                 w, h = img.size
                 output_path = os.path.join(output, os.path.splitext(filename)[0] + ".png")
-                if filepath == output_path and ext == '.png' and not resized:
+                if filepath == output_path and ext == '.png' and not resized and not _rotated(filepath):
                     self.log(f"Skipped (no changes): {filename}\n")
                     skipped += 1
                     img.close()
@@ -290,6 +336,7 @@ class Prep:
                 converted += 1
                 img.close()
                 self.handle_original(filepath, output_path, output, replace)
+                self.keep_mask(filepath, output_path, output, replace)
             except Exception as e:
                 self.log(f"Error ({filename}): {e}\n")
                 errors += 1
@@ -305,7 +352,7 @@ class Prep:
             try:
                 img = load_image(filepath)
                 original = img.size
-                cropped, crop_info = False, ""
+                cropped, crop_info, crop_mask = False, "", None
                 try:
                     faces = self.detector.detect_from_pil(img)
                     if faces:
@@ -314,6 +361,9 @@ class Prep:
                             self.log(note)
                         if sel:
                             img = crop_to_face(img, sel, face_padding)
+                            # the same box on the mask, at the picture's own size
+                            crop_mask = (lambda mk, sel=sel, size=original:
+                                         crop_to_face(mk.resize(size) if mk.size != size else mk, sel, face_padding))
                             cropped = True
                             face_crops += 1
                             crop_info = f" [face: {sel.gender}]"
@@ -325,7 +375,8 @@ class Prep:
                 img, resized = resize_image(img, area)
                 w, h = img.size
                 output_path = os.path.join(output, os.path.splitext(filename)[0] + ".png")
-                if filepath == output_path and ext == '.png' and not resized and not cropped:
+                if filepath == output_path and ext == '.png' and not resized and not cropped \
+                        and not _rotated(filepath):
                     self.log(f"Skipped (no changes): {filename}\n")
                     skipped += 1
                     img.close()
@@ -338,6 +389,7 @@ class Prep:
                 converted += 1
                 img.close()
                 self.handle_original(filepath, output_path, output, replace)
+                self.keep_mask(filepath, output_path, output, replace, crop_mask)
             except Exception as e:
                 self.log(f"Error ({filename}): {e}\n")
                 errors += 1
@@ -375,6 +427,8 @@ class Prep:
                             crop, _ = resize_image(crop, area)
                             crop_name = f"FaceCrop_{crop_index:03d}.png"
                             crop.save(os.path.join(output, crop_name), "PNG")
+                            self.crop_mask_for(filepath, original_img.size, sel, face_padding,
+                                               os.path.join(output, crop_name))
                             cw, ch = crop.size
                             self.log(f"Face crop: {crop_name} ({cw}x{ch}) from {filename} "
                                      f"({original[0]}x{original[1]}) [{sel.gender}]\n")
@@ -391,7 +445,7 @@ class Prep:
                 img, resized = resize_image(original_img, area)
                 w, h = img.size
                 output_path = os.path.join(output, base + ".png")
-                if filepath == output_path and ext == '.png' and not resized:
+                if filepath == output_path and ext == '.png' and not resized and not _rotated(filepath):
                     self.log(f"OK (no changes): {filename}\n")
                     skipped += 1
                     img.close()
@@ -404,6 +458,7 @@ class Prep:
                 converted += 1
                 img.close()
                 self.handle_original(filepath, output_path, output, replace)
+                self.keep_mask(filepath, output_path, output, replace)
             except Exception as e:
                 self.log(f"Error ({filename}): {e}\n")
                 errors += 1
@@ -432,9 +487,11 @@ def verdict(sim, thresholds=None):
 
 
 def look_files(folder):
-    """The folder's images to score, normpath'd (baselines are compared by path)."""
+    """The folder's images to score, normpath'd (baselines are compared by path) - not the masks beside them
+    (photo-masklabel.png, #247)."""
     return sorted(os.path.normpath(os.path.join(folder, f)) for f in os.listdir(folder)
-                  if os.path.isfile(os.path.join(folder, f)) and os.path.splitext(f)[1].lower() in LOOK_EXTS)
+                  if os.path.isfile(os.path.join(folder, f)) and os.path.splitext(f)[1].lower() in LOOK_EXTS
+                  and not is_mask_file(f))
 
 
 def cutoff(scores, floor=0.25):
@@ -510,6 +567,10 @@ def move_out(folder, paths, caption_exts=(".txt",)):
                 cap = os.path.splitext(p)[0] + cext
                 if os.path.exists(cap):
                     shutil.move(cap, os.path.splitext(target)[0] + cext)
+            from fizgig.dataset.masks import MASK_SUFFIX, mask_for
+            mk = mask_for(p)                             # its mask goes with it
+            if mk:
+                shutil.move(mk, os.path.splitext(target)[0] + MASK_SUFFIX + os.path.splitext(mk)[1])
             moved.append(p)
         except Exception as e:
             try:

@@ -63,6 +63,7 @@ def model_eq_gain(path):
 EPOCH = "epoch_"                    # + the epoch number: one adapter per blended epoch (the primary keeps PRIMARY)
 
 from fizgig.families.epochs import _EPOCH_RE, ema_weights, run_epochs   # noqa: F401 (the workbench's own names)
+from fizgig.utils.upright import upright
 
 
 class RenderCancelled(Exception):
@@ -546,7 +547,7 @@ class WorkbenchEngine:
         import numpy as np
         from PIL import Image, ImageOps
         with Image.open(path) as im:
-            return np.array(ImageOps.fit(im.convert("RGB"), (int(width), int(height)), Image.LANCZOS))
+            return np.array(ImageOps.fit(upright(im).convert("RGB"), (int(width), int(height)), Image.LANCZOS))
 
     def _reference_latents(self, path, width, height):
         """The edit reference's latents (CPU, batch dim), cached per picture and size."""
@@ -587,7 +588,7 @@ class WorkbenchEngine:
                     if kind == "vision":
                         from PIL import Image
                         with Image.open(ref) as im:
-                            conds = self.driver.encode_text_with_image(te, list(need), im.convert("RGB"),
+                            conds = self.driver.encode_text_with_image(te, list(need), upright(im).convert("RGB"),
                                                                        megapixels=ref_mp)
                     elif kind == "edit":
                         pic = self._fit_reference(ref, *size)

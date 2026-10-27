@@ -657,6 +657,7 @@ class MiniMaxH3DiT(nn.Module):
         self.final_layer = FinalLayer(c.hidden_size, c.time_embed_dim, video_patch_dim,
                                       c.audio_latents_dim, c.final_norm_eps, apply_silu=_silu)
         self._gradient_checkpointing = False
+        self.gc_off_blocks = 0      # partial checkpointing: the last N blocks run without it
         self._swap_from = len(self.blocks)          # blocks >= this index live on CPU between uses
         self._h2d_requested = False                 # H2D-only streaming (#73) — int8 bases
         self._h2d_offloader = None
@@ -1027,7 +1028,7 @@ class MiniMaxH3DiT(nn.Module):
                 _full = (h, cos, sin, mod_row)
                 _k = route[2]
                 h, cos, sin, mod_row = h[_k], cos[_k], sin[_k], mod_row[_k]
-            if use_ckpt:
+            if use_ckpt and i < len(self.blocks) - self.gc_off_blocks:
                 h = torch.utils.checkpoint.checkpoint(
                     _run_block, self.blocks, i, self._swap_from, h, t_emb, mod_row, cos, sin,
                     use_reentrant=False)

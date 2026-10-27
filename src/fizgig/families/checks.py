@@ -163,7 +163,7 @@ def run(v, *, blocks_swap, swap_max, arch_label, name_error):
     return out
 
 
-def training_folder(image_dir, caption_ext, *, check_captions=True, media_exts=()):
+def training_folder(image_dir, caption_ext, *, check_captions=True, media_exts=(), label="the training folder"):
     """The training folder must exist; its photos (and clips) need captions - none at all, or some missing, and
     the run would quietly leave them out. check_captions is off for runs that read none (a RefMod plain encode,
     a prompt slider)."""
@@ -174,17 +174,18 @@ def training_folder(image_dir, caption_ext, *, check_captions=True, media_exts=(
         # glob.escape: a folder like "[subject] photos" otherwise finds no captions at all
         caption_files = glob.glob(os.path.join(glob.escape(image_dir), "*" + caption_ext))
         if not caption_files:
-            out.append(f"No caption files (*{caption_ext}) found in {image_dir}. "
+            out.append(f"No caption files (*{caption_ext}) found in {image_dir if label == 'the training folder' else label}. "
                        f"Use the Captions tab to generate them first.")
         else:
+            from fizgig.dataset.masks import is_mask_file      # photo-masklabel.png is a mask, not a picture
             stems = {os.path.splitext(os.path.basename(p))[0] for p in caption_files}
             uncaptioned = sorted(f for f in os.listdir(image_dir)
                                  if os.path.splitext(f)[1].lower() in media_exts
-                                 and os.path.splitext(f)[0] not in stems)
+                                 and os.path.splitext(f)[0] not in stems and not is_mask_file(f))
             if uncaptioned:
                 shown = ", ".join(uncaptioned[:6]) + (f" … and {len(uncaptioned) - 6} more"
                                                       if len(uncaptioned) > 6 else "")
-                out.append(f"{len(uncaptioned)} file(s) in the training folder have no {caption_ext} caption and "
+                out.append(f"{len(uncaptioned)} file(s) in {label} have no {caption_ext} caption and "
                            f"would be left out of the run: {shown}. Caption them on the Captions tab (clips are "
                            f"captioned from their middle frame), or move them out of the folder.")
     return out

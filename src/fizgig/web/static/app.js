@@ -51,7 +51,7 @@ document.addEventListener("error", (e) => {
 
 // ---- start-up ----------------------------------------------------------------------------------------------
 async function boot() {
-  try { S.schema = await api("/api/schema"); } catch (e) { return; }
+  try { S.schema = await api("/api/schema"); } catch (e) { if (e.message === "login") return; throw e; }
   // Fizgig was updated while this web UI kept running the old server: some new parts won't work until it restarts
   $("outdatedBanner").style.display = S.schema.outdated ? "" : "none";
   const st = await api("/api/state");
@@ -83,6 +83,7 @@ async function boot() {
   }
   await chooseFamily(st.family && S.schema.order.includes(st.family) ? st.family : S.schema.order[0]);
   showTab("start");                // Fizgig always opens on Start (its News card), never the last tab used
+  $("bootCover").classList.add("done");    // the forms are there: the page is usable
   newsCard();
   wire();
   $("podsTabBtn").style.display = S.onPod ? "none" : "";      // on a pod there's nothing to connect to
@@ -233,10 +234,19 @@ function triggerCheckBlock() {
 
 function renderSections(tab, host) {
   host.innerHTML = "";
+  if (!S.secShut) S.secShut = {};
   for (const sec of S.fam.form.sections.filter((s) => s.tab === tab)) {
-    const body = el("div", {class: "card-content" + (sec.collapsed ? " collapsed" : "")});
-    const head = el("div", {class: "card-title collapsible-header", onclick: () => body.classList.toggle("collapsed")},
-      el("span", {text: (sec.collapsed ? "▶ " : "▼ ") + sec.title}));
+    // open or closed as the form says, or as you left it this session (a family switch redraws the cards)
+    const key = tab + ":" + sec.id, shut = key in S.secShut ? S.secShut[key] : !!sec.collapsed;
+    const body = el("div", {class: "card-content" + (shut ? " collapsed" : "")});
+    const label = el("span");
+    const head = el("div", {class: "card-title collapsible-header"}, label);
+    const show = () => {
+      const c = body.classList.contains("collapsed");
+      label.textContent = (c ? "▶ " : "▼ ") + sec.title;
+      card.classList.toggle("sec-open", !c);
+    };
+    head.onclick = () => { body.classList.toggle("collapsed"); S.secShut[key] = body.classList.contains("collapsed"); show(); };
     if (sec.help) {         // the card's video, a link across the top of the card
       body.append(el("a", {class: "sec-video", href: sec.help.href, target: "_blank", rel: "noopener"},
         el("span", {class: "sec-video-play", text: "▶"}),
@@ -245,7 +255,12 @@ function renderSections(tab, host) {
     }
     for (const r of sec.rows) body.append(renderRow(r));
     if (sec.id === "subjects" && !S.family.startsWith("acestep")) body.append(triggerCheckBlock());
-    host.append(el("div", {class: "section-card", id: "sec-" + sec.id, "data-section": sec.id}, head, body));
+    const card = el("div", {class: "section-card", id: "sec-" + sec.id, "data-section": sec.id}, head, body);
+    show();
+    if (sec.extras) host.append(el("div", {class: "extras-divider", "data-extras": "1"}, el("span", {text: "✦ Extras ✦"})));
+    if (sec.extras) card.classList.add("sec-extra");
+    else if (host.querySelector(".extras-divider")) card.classList.add("sec-extra");
+    host.append(card);
   }
 }
 
@@ -279,6 +294,7 @@ function renderRow(r) {
   let input;
   const set = (val) => onValue(r, val);
   if (r.kind === "blocks") return blockPicker(r, wrap);
+  if (r.lines) return promptLines(r, wrap);
   if (r.kind === "cadence") return cadenceRow(r, wrap);
   if (r.kind === "split") return splitRow(r, wrap);
   if (r.kind === "check") {
@@ -515,6 +531,80 @@ function splitRow(r, wrap) {
   return wrap;
 }
 
+// a list of prompts, one numbered box each (the gallery's Prompt 1, 2, 3…), saved as the one-per-line text it always was
+function promptLines(r, wrap) {
+  const list = el("div", {class: "prompt-lines"});
+  const boxes = () => [...list.querySelectorAll("textarea")];
+  const save = () => onValue(r, boxes().map((b) => b.value).join("\n"));
+  const grow = (b) => {                     // to its text; a hidden tab measures 0, so it waits to be seen
+    if (!b.offsetParent) return;
+    b.style.height = "auto"; b.style.height = b.scrollHeight + 2 + "px";
+  };
+  new ResizeObserver(() => boxes().forEach(grow)).observe(list);     // shown at last, or a wider window
+  const renumber = () => list.querySelectorAll(".prompt-num").forEach((n, i) => { n.textContent = i + 1; });
+  function line(text, after) {
+    const box = el("textarea", {rows: 1, spellcheck: "false", "aria-label": "Prompt"});
+    box.value = text;
+    const item = el("div", {class: "prompt-line"}, el("span", {class: "prompt-num"}), box,
+      el("button", {class: "prompt-del", text: "×", title: "Remove this prompt", tabindex: -1, onclick: () => {
+        if (boxes().length > 1) item.remove(); else box.value = "";
+        renumber(); save();
+      }}));
+    box.addEventListener("input", () => { grow(box); save(); });
+    box.addEventListener("keydown", (e) => {
+      const at = box.selectionStart, flat = at === box.selectionEnd;
+      if (e.key === "Enter" && !e.isComposing) {           // the rest of the line starts the next prompt
+        e.preventDefault();
+        const rest = box.value.slice(box.selectionEnd);
+        box.value = box.value.slice(0, at); grow(box);
+        const next = line(rest, item);
+        next.setSelectionRange(0, 0); next.focus();
+        renumber(); save();
+      } else if (e.key === "Backspace" && flat && at === 0 && item.previousElementSibling) {   // join the one above
+        e.preventDefault();
+        const prev = item.previousElementSibling.querySelector("textarea"), end = prev.value.length;
+        prev.value += box.value; grow(prev);
+        item.remove(); prev.focus(); prev.setSelectionRange(end, end);
+        renumber(); save();
+      }
+    });
+    box.addEventListener("paste", (e) => {                 // pasted lines become prompts of their own
+      const text = (e.clipboardData || window.clipboardData).getData("text");
+      if (!/\r?\n/.test(text)) return;
+      e.preventDefault();
+      const parts = text.split(/\r?\n/);
+      const head = box.value.slice(0, box.selectionStart), tail = box.value.slice(box.selectionEnd);
+      box.value = head + parts[0]; grow(box);
+      let last = item, lastBox = box;
+      for (const p of parts.slice(1)) { lastBox = line(p, last); last = lastBox.parentNode; }
+      const end = lastBox.value.length;
+      lastBox.value += tail; grow(lastBox);
+      lastBox.focus(); lastBox.setSelectionRange(end, end);
+      renumber(); save();
+    });
+    if (after) after.after(item); else list.append(item);
+    requestAnimationFrame(() => grow(box));
+    return box;
+  }
+  function draw() {
+    list.replaceChildren();
+    const v = String(S.values[r.key] ?? "").split(/\r?\n/);
+    for (const t of v) line(t);
+    renumber();
+  }
+  const sync = el("input", {type: "hidden", id: "f_" + r.key});    // syncInputs (a preset, Last Train) redraws it
+  sync._sync = draw;
+  const add = el("button", {class: "btn btn-sm", text: "+ Add prompt", onclick: () => {
+    const last = list.lastElementChild;
+    line("", last).focus(); renumber(); save();
+  }});
+  wrap.append(el("span", {class: "field-label", text: r.label + ":"}), list, add, sync);
+  if (r.hint) wrap.append(el("div", {class: "field-hint", text: r.hint}));
+  wrap.append(el("div", {class: "field-hint row-note", id: "note_" + r.key}));
+  draw();
+  return wrap;
+}
+
 // Model Area to Train > Custom: the model's blocks as ticks (All / None / an area's blocks), as the desktop's
 function blockPicker(r, wrap) {
   const sel = () => ({...(S.values[r.key] || {})});
@@ -546,7 +636,7 @@ function onValue(r, val) {
   if (r.key === "__SAMPLE_LIVE" || (S.values.__SAMPLE_LIVE &&
       ["SAMPLE_PROMPT", "SAMPLE_SEED", "SAMPLE_WIDTH", "SAMPLE_HEIGHT", "SAMPLE_STEPS", "SAMPLE_CFG_SCALE",
        "FAMILY_TURBO_STRENGTH", "SAMPLE_EVERY_N_EPOCHS", "SAMPLE_LATER", "SAMPLE_UNTIL_EPOCH",
-       "SAMPLE_EVERY_AFTER", "FAMILY_PREVIEW_LOOK"].includes(r.key))) sampleLiveSoon();
+       "SAMPLE_EVERY_AFTER", "FAMILY_PREVIEW_LOOK", "SAMPLE_CHECKPOINT"].includes(r.key))) sampleLiveSoon();
   if (r.key === "CAPTION_TRIGGER_WORD") { S.trigger = String(val).trim(); $("capTrigger").value = S.trigger; saveTriggerSoon(S.trigger); }
   const extra = r.sets && r.sets[val];            // a kind of training that also sets others (Fine-tune's LR)
   if (extra) { Object.assign(S.values, extra); syncInputs(Object.keys(extra)); }
@@ -640,6 +730,10 @@ async function refreshState() {
   });
   document.querySelectorAll(".section-card[data-section]").forEach((c) => {
     c.style.display = hidden.has(c.dataset.section) ? "none" : "";
+  });
+  document.querySelectorAll(".extras-divider").forEach((d) => {    // no divider over nothing
+    const extras = [...d.parentNode.querySelectorAll(".section-card.sec-extra")];
+    d.style.display = extras.some((c) => c.style.display !== "none") ? "" : "none";
   });
   turboFollow();
   if (S.state.pending) setTimeout(refreshStateSoon, 2500);   // a note still being worked out (the fine-tune plan)
@@ -738,6 +832,7 @@ function renderPrefs() {
   host.innerHTML = "";
   if (S.pod) host.append(podCard());
   host.append(webPortCard());
+  if (!S.pod) host.append(networkCard());
   host.append(dataFolderCard());
   host.append(outputFolderCard());
   host.append(foldersCard());
@@ -1205,6 +1300,29 @@ function firewallRow() {
   return box;
 }
 
+// what Fizgig does on the network by itself (issue #236): finding your other computers and being found by them (a
+// broadcast on the local network while the Helpers or Pods tab is open, and an answer to theirs), and the release check
+function networkCard() {
+  const box = (key, label) => {
+    const on = el("input", {type: "checkbox"});
+    on.checked = String(S.set[key] ?? "1") !== "0";
+    on.addEventListener("change", () => api("/api/prefs", {changes: {[key]: on.checked}})
+      .then(() => { S.set[key] = on.checked ? "1" : "0"; }));
+    return el("label", {class: "checkbox-label"}, on, " " + label);
+  };
+  return el("div", {class: "section-card"}, el("div", {class: "card-title"}, el("span", {text: "Network"})),
+    el("div", {class: "card-desc", text: "What Fizgig does on the network without being asked. Pods, RunPod and " +
+      "computers added by their address work either way."}),
+    el("div", {class: "card-content"},
+      box("lan_discovery", "Find Fizgig on my other computers"),
+      el("div", {class: "field-hint", text: "While the Helpers or Pods tab is open, this computer asks the local network " +
+        "which computers run Fizgig, and it answers theirs (with a web password set). Nothing leaves your network. " +
+        "Off: no asking and no answering."}),
+      box("update_check", "Check for new releases"),
+      el("div", {class: "field-hint", text: "Once at start-up, Fizgig asks GitHub for its newest release tag (the About " +
+        "box says when one is out). Off: no check unless you press Check for updates in the About box."})));
+}
+
 // the web UI's port: saved by the first launch (8081, or the next free port if 8081 was taken)
 function webPortCard() {
   const input = el("input", {type: "number", min: "1024", max: "65535", class: "w-port", value: S.webPort || 8081});
@@ -1290,11 +1408,25 @@ async function check() {
 }
 
 async function start(path, body) {
+  if (S.starting) return;                  // checking a run takes the server a few seconds: one press is one run
+  S.starting = true;
+  const btn = path === "/api/start" ? $("btnStart") : null;
+  if (btn) { btn.disabled = true; btn.dataset.label = btn.dataset.label || btn.textContent; btn.textContent = "Starting…"; }
   try {
     const r = await api(path, path === "/api/start" ? runBody() : (body || {}));
     showProblems(r.problems || (r.error ? [r.error] : []));    // stays up: the run line below refreshes itself
-    pollRun();
+    // the form went to a run that started: it isn't the queued run being edited any more (Save to queue would have
+    // put this run's settings in its place)
+    if (r.ok && S.editQueue) {
+      queueEditing(null);
+      $("runStatus").textContent = "Started. The queued run you were editing is left as it was.";
+    }
   } catch (e) { showProblems([e.message]); }
+  finally {
+    S.starting = false;
+    if (btn) btn.textContent = btn.dataset.label;
+    await pollRun();                        // sets Start's state from the run
+  }
 }
 
 // Resume: the paused run's own settings, unless the form now has another picture size for it (Target Megapixels,
@@ -1352,7 +1484,7 @@ async function pollRun() {
   $("runCardBadge").dataset.state = r.state;
   showProgress(r.progress, r.state, r.lora, r.stage);
   const moveBusy = !!(r.move && ["moving", "back", "moved"].includes(r.move.state));
-  $("btnStart").disabled = live || moveBusy;
+  $("btnStart").disabled = live || moveBusy || !!S.starting;
   $("btnPause").disabled = !r.running;
   // a model that can't pause (a RefMod is made in one go): no Pause button for its runs
   const runFam = S.schema.families.find((f) => f.key === (r.family || S.family)) || {};
@@ -1362,9 +1494,17 @@ async function pollRun() {
   renderWebQueue(r.web_queue || {items: []});
   queueSummary(r.web_queue || {items: []}, r);
   runLossTick(live);
-  // Per-image loss on the run card while a run with the per-image loss tick trains (Runs & outputs has it after)
-  const ilOn = live && r.history_id && (r.values || {}).KREA2_LOSS_WATCH;
-  $("btnImageLoss").style.display = ilOn ? "" : "none";
+  // Per-image loss on the run card while a run with the loss watch trains (Runs & outputs has it after): any of its
+  // ticks runs the watch - per-image LR, the look warm-up and auto-recaption track every image too
+  // always there for a model with the loss watch: greyed (its hover says which ticks turn it on) until a run tracks it
+  const ilOn = live && r.history_id && ["KREA2_LOSS_WATCH", "KREA2_PER_IMAGE_LR", "KREA2_WARMUP_LOOK",
+    "KREA2_AUTO_RECAPTION"].some((k) => [true, "true", "True", "1", 1].includes((r.values || {})[k]));
+  const ilDesc = S.schema.families.find((f) => f.key === (live ? r.family : S.family));
+  const ilb = $("btnImageLoss");
+  ilb.style.display = ilDesc && ilDesc.loss_watch !== false ? "" : "none";
+  ilb.classList.toggle("is-off", !ilOn);
+  ilb.setAttribute("aria-disabled", ilOn ? "false" : "true");
+  ilb.title = ilOn ? IL_ON_TIP : IL_OFF_TIP;
   if (!ilOn) $("runImageLoss").style.display = "none";
   // Sample now / Save now: while a LoRA trains (a fine-tune saves and previews at whole rotations)
   const runDesc = S.schema.families.find((f) => f.key === r.family);
@@ -1408,7 +1548,7 @@ function renderChoiceDraw(id, L) {
 
 // every tab's box (and Studio's note) after a change, or a tab's model changing
 async function renderChoiceRefresh() {
-  for (const [id, sel] of [["stRender", "stFamily"], ["ryRender", "ryFamily"], ["pfRenderChoice", "pfFamily"]]) {
+  for (const [id, sel] of [["stRender", "stFamily"], ["ryRenderChoice", "ryFamily"], ["pfRenderChoice", "pfFamily"]]) {
     if (!$(id) || !$(sel) || !$(sel).value) continue;
     const r = await api("/api/studio/render_choice?family=" + encodeURIComponent($(sel).value)).catch(() => null);
     if (!r) continue;
@@ -1506,13 +1646,13 @@ async function moveOpen() {
 }
 
 // ---- a prompt slider's live prompts: edited here while it trains, taken by the trainer at its next epoch boundary
-const SL_FIELDS = {base: "slBase", pos: "slPos", neg: "slNeg", guidance: "slGuidance"};
+const SL_FIELDS = {base: "slBase", pos: "slPos", neg: "slNeg", guidance: "slGuidance", anchors: "slAnchors"};
 S.sl = {shown: null, edited: false};
 function sliderLiveDraw(sl) {
   const box = $("sliderLive");
   box.style.display = sl ? "" : "none";
   if (!sl) { S.sl = {shown: null, edited: false}; return; }
-  const now = JSON.stringify([sl.base, sl.pos, sl.neg, sl.guidance]);
+  const now = JSON.stringify([sl.base, sl.pos, sl.neg, sl.guidance, sl.anchors]);
   if (!S.sl.edited && S.sl.shown !== now) {           // the run's prompts, unless you're part-way through an edit
     for (const [k, id] of Object.entries(SL_FIELDS)) $(id).value = sl[k];
     S.sl.shown = now;
@@ -1535,18 +1675,42 @@ function wireSliderLive() {
   });
 }
 
-// the queue at a glance, from every tab (the sidebar, under the run) and at the top of the Run card: what's next, or
-// that it's held and why, with Start queue right there
+// A button whose job lasts as long as its request (a score, an export, a save): greyed from the press until it
+// answers, so a second press can't start it again (#249). Jobs the page polls grey their buttons from the status.
+function held(btn, fn) {
+  return async (...a) => {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    try { return await fn(...a); } finally { btn.disabled = false; }
+  };
+}
+
+// Per-image loss, on the run card and Runs & outputs: what it shows, and (greyed) how to turn it on
+const IL_ON_TIP = "Each training image's loss by epoch, against the rest of the dataset: which images are still being learned, which are done, and what the loss watch decided about each";
+const IL_OFF_TIP = "Each training image's loss by epoch, and what the loss watch decided about each. To use it, tick one of these on the Training tab before you press Start: Track how each image trains, per-image LR, the look warm-up or auto-recaption.";
+
+// the queue at a glance, from every tab (the sidebar, under the run, always there) and at the top of the Run card:
+// what's next, or that it's held and why, with Start queue right there; the queue itself is on Runs & outputs
 function toQueue() {
-  showTab("training");
+  showTab("outputs");
   setTimeout(() => $("webQueueCard").scrollIntoView({behavior: "smooth", block: "start"}), 50);
 }
 
 function queueSummary(q, r) {
   const items = q.items || [], n = items.length;
   const side = $("sideQueue"), up = $("runUpNext");
-  side.style.display = up.style.display = n ? "" : "none";
-  if (!n) { S.queueSumSig = null; return; }
+  up.style.display = n ? "" : "none";
+  if (!n) {
+    if (S.queueSumSig === "empty") return;
+    S.queueSumSig = "empty";
+    side.classList.remove("held");
+    $("sideQueueBadge").textContent = "Empty";
+    $("sideQueueBadge").dataset.state = "idle";
+    $("sideQueueList").replaceChildren(el("div", {class: "side-queue-empty", text: "Nothing queued"}));
+    $("sideQueueHeld").textContent = "";
+    $("sideQueueStart").style.display = "none";
+    return;
+  }
   const text = q.held ? `Queue held: ${q.reason || "press Start queue to carry on"}` :
     q.waiting ? `Queue waiting: ${q.waiting}` : "";
   const sig = JSON.stringify([text, q.held, q.reason, q.waiting, items.map((it) => [it.id, it.lora])]);
@@ -1572,19 +1736,19 @@ function queueSummary(q, r) {
 // the web UI's own queue: reorder, remove, start or hold
 function renderWebQueue(q) {
   const items = q.items || [];
-  $("webQueueCard").style.display = items.length ? "" : "none";
   const badge = $("webQueueBadge");
   badge.textContent = !items.length ? "" : q.held ? "Held" : q.waiting ? "Waiting" : `${items.length} queued`;
   badge.dataset.state = q.held ? "paused" : q.waiting ? "pausing" : "running";
   $("webQueueState").textContent = q.held ? q.reason : q.waiting ? q.waiting :
-    items.length ? "The first starts as soon as nothing else is training." : "";
+    items.length ? "The first starts as soon as nothing else is training." :
+    "Nothing queued. Add to queue on the Training tab lines a run up here.";
   $("webQueueStart").style.display = q.held ? "" : "none";
   $("webQueueHold").style.display = q.held || !items.length ? "none" : "";
   $("webQueueClear").style.display = items.length ? "" : "none";
   S.queueIds = items.map((it) => it.id);
   // rebuilt only when the queue changes: rebuilding on every poll replaced a button between press and release, and
   // the browser dropped that click (Remove sometimes did nothing)
-  const sig = JSON.stringify(items.map((it) => [it.id, it.lora, it.family, it.image_folder, it.queued_at]));
+  const sig = JSON.stringify(items.map((it) => [it.id, it.lora, it.family, it.image_folder, it.queued_at, it.continues]));
   if (sig === S.queueSig) return;
   S.queueSig = sig;
   const famName = (k) => ((S.schema.families.find((f) => f.key === k) || {}).display_name) || k;
@@ -1592,18 +1756,22 @@ function renderWebQueue(q) {
   host.innerHTML = "";
   items.forEach((it, i) => host.append(el("div", {class: "checkpoint-row queue-row"},
     el("span", {class: "checkpoint-name", text: `${i + 1}. ${it.lora}`}),
-    el("span", {class: "field-hint", text: `${famName(it.family)} · ${it.image_folder} · queued ${it.queued_at}`}),
+    el("span", {class: "field-hint", text: `${famName(it.family)} · ${it.image_folder} · queued ${it.queued_at}` +
+      (it.continues ? " · continues from its last save" : "")}),
     el("span", {class: "queue-actions"},
       el("button", {class: "btn btn-sm", text: "↑", title: "Earlier", disabled: i === 0,
         onclick: () => api("/api/queue/move", {id: it.id, delta: -1}).then(pollRun)}),
       el("button", {class: "btn btn-sm", text: "↓", title: "Later", disabled: i === items.length - 1,
         onclick: () => api("/api/queue/move", {id: it.id, delta: 1}).then(pollRun)}),
-      el("button", {class: "btn btn-sm", text: "Edit", title: "Load its settings into the form; Save to queue puts them back in its place",
+      el("button", {class: "btn btn-sm", text: "Edit",
+        title: "Load its settings into the form on the Training tab; Save to queue puts them back in its place",
         onclick: async () => {
           try {
             await loadIntoForm(await api("/api/queue/item?id=" + encodeURIComponent(it.id)));
-            queueEditing({id: it.id, n: i + 1});
-            $("runStatus").textContent = `Editing queued run ${i + 1} (${it.lora}): change what you like, then Save to queue.`;
+            queueEditing({id: it.id, n: i + 1, lora: it.lora});
+            showTab("training");
+            $("runStatus").textContent = `Editing queued run ${i + 1} (${it.lora}): change what you like, then Save to queue.` +
+              (it.continues ? " It still continues from its last save, so keep its LoRA name and output folder." : "");
           } catch (e) { $("runStatus").textContent = e.message; }
         }}),
       el("button", {class: "btn btn-sm", text: "Remove", onclick: () => {
@@ -1699,7 +1867,7 @@ function previewFigure(it, prompts, eager, byEpoch) {
   const own = byEpoch && it.epoch != null && byEpoch[String(it.epoch)];
   const prompt = it.idx == null ? "" : (own && own[it.idx]) || (prompts ? prompts[it.idx] : "");
   return withMode(el("figure", {class: "gallery-item", title: it.name}, mediaFor(it, eager && eager.has(it)),
-    el("figcaption", {}, el("b", {text: previewLabel(it)}), prompt ? el("span", {class: "preview-prompt", text: prompt}) : null,
+    el("figcaption", {}, el("b", {text: previewLabel(it)}), prompt ? el("span", {class: "preview-prompt", text: prompt, title: prompt}) : null,
       el("span", {class: "preview-file", text: it.name}))), it);
 }
 // the family's line on how this preview was made (the run's record), shown over it in the lightbox
@@ -1720,13 +1888,24 @@ function previewGrid(items, prompts, eager) {
   for (const i of idxs) {
     table.append(el("tr", {},
       el("th", {class: "prompt-head"}, el("b", {text: `Prompt ${i + 1}`}),
-        prompts[i] ? el("span", {class: "preview-prompt", text: prompts[i]}) : null),
+        prompts[i] ? el("span", {class: "preview-prompt", text: prompts[i], title: prompts[i]}) : null),
       ...epochs.map((e) => { const it = at.get(e + ":" + i);
         return el("td", {}, it ? withMode(el("figure", {class: "gallery-item", title: it.name}, mediaFor(it, eager && eager.has(it)),
           el("figcaption", {class: "visually-hidden"}, el("b", {text: previewLabel(it)}),
             prompts[i] ? el("span", {text: " · " + prompts[i]}) : null)), it) : null); })));
   }
-  return el("div", {class: "gallery prompt-grid-wrap"}, table);
+  // a second scroll bar over the grid, in step with the one under it (a long grid puts that one far down the page)
+  const wrap = el("div", {class: "gallery prompt-grid-wrap"}, table);
+  const spacer = el("div", {class: "prompt-grid-spacer"});
+  const top = el("div", {class: "prompt-grid-top"}, spacer);
+  const follow = (from, to) => from.addEventListener("scroll", () => {    // the echo finds them level and stops
+    if (to.scrollLeft !== from.scrollLeft) to.scrollLeft = from.scrollLeft; });
+  follow(top, wrap); follow(wrap, top);
+  new ResizeObserver(() => {
+    spacer.style.width = table.scrollWidth + "px";
+    top.hidden = table.scrollWidth <= wrap.clientWidth;
+  }).observe(table);
+  return el("div", {}, top, wrap);
 }
 
 async function loadGallery() {
@@ -1780,6 +1959,12 @@ async function loadGallery() {
 // ---- likeness to the subject (fizgig/web/gallery_likeness.py; the desktop gallery's likeness.json) ------------
 S.lik = {dir: "", picked: []};
 const LIK_PICS = /\.(png|jpe?g|webp)$/i;
+// ArcFace never reaches 100%: two photos of the same person score about 72% against each other. Shown wherever ArcFace
+// scores are (a scorer label that isn't ArcFace's means another embedder, on its own scale; none recorded = ArcFace).
+const ARC_PEAK = "Peak ArcFace is about 72%: that's what two photos of the same person score against each other, " +
+  "so no picture reaches 100%.";
+function arcPeak(label) { return !label || String(label).startsWith("ArcFace") ? ARC_PEAK : ""; }
+
 async function likenessShow(dir, items, run, view) {
   S.lik.dir = dir;
   const ask = S.lik.ask = (S.lik.ask || 0) + 1;     // an older refresh's answer arriving late changes nothing
@@ -1813,6 +1998,7 @@ async function likenessShow(dir, items, run, view) {
   }
   $("likPanel").style.display = epochs.length ? "" : "none";
   if (!epochs.length) return;
+  $("likPeak").textContent = arcPeak(d.embedder);
   $("likRun").textContent = `${run} - best so far: epoch ${bestEpoch} (${Math.round(avgs[best] * 100)}% average likeness)`;
   const cv = $("likChart");
   const w = cv.clientWidth || 900;
@@ -2078,6 +2264,14 @@ async function datasetPictures(d) {
   lightboxShow(0);
 }
 
+// Image Prep and Captions work on the one folder: a training folder with sub-folders says how to reach theirs
+function subfoldersHint() {
+  const norm = (p) => (p || "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+  const d = ((S.datasets || {}).datasets || []).find((x) => norm(x.path) === norm(S.imageFolder));
+  return d && d.sub_folders ? ` · This works on this folder only, not its ${d.sub_folders} sub-folder` +
+    `${d.sub_folders === 1 ? "" : "s"}: to caption or mask one, choose it as the training folder on the Start tab.` : "";
+}
+
 function renderDatasets() {
   const r = S.datasets;
   if (!r) return;
@@ -2113,7 +2307,10 @@ function renderDatasets() {
       el("div", {class: "dataset-meta"}, el("b", {text: d.name}),
         d.elsewhere ? el("span", {class: "dataset-where", text: d.path, title: "A folder you picked, outside the training data folder"}) : null,
         el("span", {text: what}),
-        el("span", {class: d.captioned >= total ? "ok" : "warn", text: caps}),
+        d.sub_items ? el("span", {class: "dataset-subs", text: `+ ${d.sub_items} in ${d.sub_folders} sub-folder` +
+          (d.sub_folders === 1 ? "" : "s"), title: "Trained on only when Also train on its sub-folders is ticked on " +
+          "the Training tab"}) : null,
+        total ? el("span", {class: d.captioned >= total ? "ok" : "warn", text: caps}) : null,
         el("span", {class: "dataset-when", text: d.time ? new Date(d.time * 1000).toLocaleDateString() : ""}),
         el("div", {class: "dataset-actions"},
           act("Captions", "Train on this folder and open it on the Captions tab", () => { choose(); showTab("captions"); }),
@@ -2174,6 +2371,55 @@ async function loadRuns() {
           $("runStatus").textContent = `Loaded the settings of ${run.lora || "that run"}: check them, then Start.`;
         } catch (e) { alertRow.textContent = e.message; }
       }});
+    // Continue: on from the run's newest save, with its own settings (only when that save is still there); a run that
+    // trained all it was set to asks how far to train first
+    const contBox = el("div", {class: "field-row", style: "display:none"});
+    const cp = run.continue;
+    let contGoing = false;
+    const contGo = async (more) => {
+      if (contGoing) return;
+      contGoing = true;
+      alertRow.textContent = "";
+      try {
+        const x = await api("/api/runs/continue", {id: run.id, more: more || ""});
+        if (x.need) { contAsk(x.error); return; }
+        if (x.problems) { alertRow.textContent = x.problems.join(" "); return; }
+        contBox.style.display = "none";
+        alertRow.textContent = x.queued ? "A run is training now: this one is on the queue, and continues when its " +
+          "turn comes." : `Continuing ${run.lora || "the run"}: it's on the Training tab.`;
+        pollRun();
+        if (!x.queued) {                    // to the run card itself, as the sidebar's run opens it
+          showTab("training");
+          setTimeout(() => document.querySelector(".run-card").scrollIntoView({behavior: "smooth", block: "start"}), 50);
+        } else loadRuns();
+      } catch (e) { alertRow.textContent = e.message; } finally { contGoing = false; }
+    };
+    const contAsk = (why) => {
+      const box = el("input", {type: "number", min: String(cp.done + 1), step: "1", class: "w-num",
+        value: String(cp.done + (cp.unit === "epoch" ? Math.max(1, Math.round(cp.done / 2)) : 1))});
+      contBox.replaceChildren(el("span", {class: "field-hint", text: why + " Train to:"}), box,
+        el("span", {class: "field-hint", text: cp.unit + "s"}),
+        el("button", {class: "btn btn-sm btn-primary", text: "Continue", onclick: () => {
+          const n = parseInt(box.value, 10);
+          if (!(n > cp.done)) { alertRow.textContent = `More than ${cp.done}, please.`; return; }
+          contGo(String(n));
+        }}),
+        el("button", {class: "btn btn-sm", text: "Cancel", onclick: () => { contBox.style.display = "none"; }}));
+      contBox.style.display = "";
+    };
+    const cont = cp ? el("button", {class: "btn btn-sm btn-primary",
+      text: cp.done >= cp.of ? "Continue…" : "Continue",
+      title: `Trains on from its newest save (${cp.unit} ${cp.done}${cp.of ? " of " + cp.of : ""}), with this run's own ` +
+        "settings, into this same run" + (cp.done >= cp.of ? `. It has trained all its ${cp.unit}s, so you choose how ` +
+        "far to take it first" : ""),
+      onclick: () => {
+        if (cp.done >= cp.of) {
+          if (contBox.style.display !== "none") { contBox.style.display = "none"; return; }
+          contAsk(`It has trained all ${cp.of} ${cp.unit}s.`);
+        } else contGo("");
+      }}) : null;
+    const contHint = cp ? el("span", {class: "field-hint",
+      text: `Saved at ${cp.unit} ${cp.done}${cp.of ? " of " + cp.of : ""}`}) : null;
     // Delete run: says what goes first (checkpoints, saved states, previews - never the training folder), then deletes
     const delBox = el("div", {class: "run-delete", style: "display:none"});
     const del = el("button", {class: "btn btn-sm btn-danger", text: "Delete run…", onclick: async () => {
@@ -2228,8 +2474,11 @@ async function loadRuns() {
       }}) : null;
     // per-image loss (a family with the loss watch, when the run kept its log)
     const ilBox = el("div", {class: "il-box", style: "display:none"});
-    const ilBtn = run.image_loss ? el("button", {class: "btn btn-sm", text: "Per-image loss",
-      title: "Each training image's loss by epoch, against the rest of the dataset - which images are hard, which are being learned, and what the loss watch decided about each.",
+    const ilFam = S.schema.families.find((f) => f.key === run.family);
+    const ilBtn = !run.image_loss && ilFam && ilFam.loss_watch !== false ? el("button", {
+      class: "btn btn-sm btn-lilac is-off", text: "Per-image loss", "aria-disabled": "true",
+      title: "This run didn't track it. " + IL_OFF_TIP}) :
+      run.image_loss ? el("button", {class: "btn btn-sm btn-lilac", text: "Per-image loss", title: IL_ON_TIP,
       onclick: async () => {
         if (ilBox.style.display !== "none") { ilBox.style.display = "none"; return; }
         ilBox.style.display = ""; ilBox.textContent = "Loading…";
@@ -2245,7 +2494,8 @@ async function loadRuns() {
         `${new Date(run.started_at * 1000).toLocaleString()} · ${dur(run.started_at, run.ended_at)}`, figs]
         .filter(Boolean).join("  ·  ")}),
       lossChart(run.curve),
-      el("div", {class: "field-row"}, showFiles, lgBtn, ilBtn, notesBtn, again, del), delBox, alertRow, notesBox, files,
+      el("div", {class: "field-row"}, cont, contHint, showFiles, lgBtn, ilBtn, notesBtn, again, del), contBox, delBox,
+      alertRow, notesBox, files,
       lgBox, ilBox));
   }
   if (!r.runs.length) host.append(el("div", {class: "field-hint", text: "No runs yet. Every run you start is listed here " +
@@ -2669,8 +2919,8 @@ async function royalePoll() {
   try { st = await api("/api/royale/status"); } catch (e) { return; }
   const running = st.state === "rendering";
   $("ryRender").disabled = running; $("ryStop").disabled = !running;
-  $("rySBadge").textContent = running ? "Rendering" : "";
-  $("rySBadge").dataset.state = running ? "running" : "idle";
+  $("rySetupBadge").textContent = running ? "Rendering" : "";
+  $("rySetupBadge").dataset.state = running ? "running" : "idle";
   const done = st.items.filter((x) => x.png).length;
   $("ryBar").style.width = running ? `${Math.round(100 * Math.max(done, 0.3) / Math.max(st.total, 1))}%` : "0";
   if (st.status) $("ryStatus").textContent = st.status + (st.error && st.state === "failed" ? ` ${st.error}` : "");
@@ -2719,6 +2969,7 @@ function royaleCurrent() { return Math.max(0, Math.min(Math.round(Number($("rySc
 
 async function royaleScore() {
   $("ryLikeStatus").textContent = "Scoring… (the first run loads the face model)";
+  $("ryLikePeak").textContent = "";
   try {
     const r = await api("/api/royale/score", {ref: $("ryLikeRef").value.trim()});
     S.ry.scores = r.scores; S.ry.best = r.best;
@@ -2728,6 +2979,7 @@ async function royaleScore() {
     $("ryLikeStatus").textContent = `Best: ${ryLabel(r.best).toLowerCase()} (${r.scores[r.best].toFixed(3)})` +
       (r.no_face ? `  (${r.no_face} no-face)` : "") +
       (r.embedder && !r.embedder.startsWith("ArcFace") ? `  · ${r.embedder}` : "");     // named when it isn't the usual one
+    $("ryLikePeak").textContent = arcPeak(r.embedder).replace("72%", "0.72 (72%)");
     royaleBest();
   } catch (e) { $("ryLikeStatus").textContent = e.message; }
 }
@@ -2770,22 +3022,22 @@ function wireRoyale() {
     $("ryStatus").textContent = "Model unloaded - the renders stay here until the next render.";
   });
   $("ryScrub").addEventListener("input", royaleScrub);
-  $("ryScore").addEventListener("click", royaleScore);
+  $("ryScore").addEventListener("click", held($("ryScore"), royaleScore));
   $("ryBest").addEventListener("click", royaleBest);
-  $("ryExport").addEventListener("click", () => royaleExport(false));
-  $("ryLikeExport").addEventListener("click", () => royaleExport(true));
-  $("ryStills").addEventListener("click", async () => {
+  $("ryExport").addEventListener("click", held($("ryExport"), () => royaleExport(false)));
+  $("ryLikeExport").addEventListener("click", held($("ryLikeExport"), () => royaleExport(true)));
+  $("ryStills").addEventListener("click", held($("ryStills"), async () => {
     $("ryExportStatus").textContent = "Saving stills…";
     try { const r = await api("/api/royale/stills", {out_dir: $("ryOut").value.trim()});
       $("ryExportStatus").textContent = `Saved ${r.saved.length} stills → ${$("ryOut").value.trim()}`; }
     catch (e) { $("ryExportStatus").textContent = e.message; }
-  });
-  $("ryPromote").addEventListener("click", async () => {
+  }));
+  $("ryPromote").addEventListener("click", held($("ryPromote"), async () => {
     try { const r = await api("/api/royale/promote", {i: royaleCurrent(), out_dir: $("ryOut").value.trim(),
       name: $("ryPromoteName").value.trim()});
       $("ryPromoteStatus").textContent = `Saved ${ryLabel(S.ry.items[royaleCurrent()].label).toLowerCase()} → ${r.path}`; }
     catch (e) { $("ryPromoteStatus").textContent = e.message; }
-  });
+  }));
 }
 
 // ---- Profiler: what a LoRA's blocks do (fizgig/web/tools.py runs scripts/profile_run.py, the desktop Profiler's job) ----
@@ -2846,7 +3098,7 @@ async function profilerRun() {
     await api("/api/profile/run", {family: $("pfFamily").value, lora: $("pfLora").value.trim(), mode: pfMode(),
       prompt: $("pfPrompt").value.trim(), class_prompt: $("pfClass").value.trim(), baselines: S.pf.photos,
       size: Number($("pfSize").value)});
-    $("pfReport").style.display = $("pfStudio").style.display = "none";
+    $("pfReport").style.display = "none";
     profilerPoll();
   } catch (e) { $("pfStatus").textContent = e.message; }
 }
@@ -2870,33 +3122,7 @@ async function profilerPoll() {
     $("pfReport").href = `/api/profile/report?path=${encodeURIComponent(res.report)}&t=${encodeURIComponent(TOKEN)}`;
     $("pfReport").style.display = "";
   }
-  S.pf.last = res && res.studio;
-  $("pfStudio").style.display = S.pf.last ? "" : "none";
   if (running && $("tab-profiler").classList.contains("active")) S.pf.poll = setTimeout(profilerPoll, 800);
-}
-
-async function profilerToStudio() {
-  // the desktop's "Open in Repair Studio": the LoRA on the same prompt, seed and size, the profile's suggestions on the
-  // sliders (bleed-heavy groups turned down, quiet ones off), so the change shows side by side and saves as a new file
-  const h = S.pf.last;
-  if (!h) return;
-  showTab("studio");                                 // opens Studio; wait for its model list and layout
-  for (let i = 0; i < 100 && !(S.st.familiesLoaded && S.st.layout); i++) await new Promise((r) => setTimeout(r, 100));
-  if ($("stFamily").value !== h.family) { $("stFamily").value = h.family; await studioFamily(); }
-  $("stPrimary").value = h.lora; $("stPrompt").value = h.prompt; $("stSeed").value = String(h.seed);
-  const [hw, hh] = Array.isArray(h.size) ? h.size : [h.size, h.size];
-  if ([...$("stW").options].some((o) => o.value === String(hw))) $("stW").value = String(hw);
-  if ([...$("stH").options].some((o) => o.value === String(hh))) $("stH").value = String(hh);
-  for (const [id, b] of Object.entries(S.st.blocks)) {
-    const [on, strength] = h.blocks[id] || [true, 1.0];
-    b.pe = !!on; b.ps = Number(strength);
-  }
-  studioSync(); studioCommit(); stRemember();
-  let msg = h.notes.length ? "From the profile: " + h.notes.join("; ") + "." :
-    "The profile found no group to turn down or switch off: the likeness and any bleed sit in the same blocks, so the sliders stay as trained.";
-  if (h.class_prompt) msg += ` To see the bleed, set the prompt to "${h.class_prompt}".`;
-  $("stSetupMsg").textContent = msg;                // stays put while the status line follows the load
-  await studioStart();
 }
 
 function wireProfiler() {
@@ -2914,7 +3140,6 @@ function wireProfiler() {
   $("pfPhotosClear").addEventListener("click", () => { S.pf.photos = []; pfPhotosDraw(); pfRemember(); });
   $("pfRun").addEventListener("click", profilerRun);
   $("pfStop").addEventListener("click", () => api("/api/profile/stop", {}).then(profilerPoll));
-  $("pfStudio").addEventListener("click", profilerToStudio);
 }
 
 // ---- Extract: a LoRA reduced to a lower rank (exact weight SVD from the file; fizgig/web/tools.py runs it) ----
@@ -2937,12 +3162,20 @@ function exMode(mode) {
   exRemember();
 }
 
+// Target rank: the dropdown shows the rank when it's one it lists, else Other… with the number in the box beside it
+function exRankShow() {
+  const v = String($("exRank").value), listed = [...$("exRankPick").options].some((o) => o.value === v);
+  $("exRankPick").value = listed ? v : "__other";
+  $("exRank").style.display = listed ? "none" : "";
+}
+
 async function extractOpen() {
   if (!S.ex.wired) wireExtract();
   const sv = exSaved();
   if (!S.ex.info) {
     if (sv.source) $("exSource").value = sv.source;
     if (sv.rank) $("exRank").value = sv.rank;
+    exRankShow();
     const on = new Set(sv.ftRanks || [32, 64]);
     $("exFtRanks").replaceChildren(...EX_FT_RANKS.map((r) => { const c = el("input", {type: "checkbox", value: r, onchange: exRemember});
       c.checked = on.has(r); return el("label", {class: "checkbox-label"}, c, " " + r); }));
@@ -3026,9 +3259,11 @@ async function extractRun() {
   const custom = $("exPreset").value === "Custom";
   const blocks = custom ? [...$("exCustom").querySelectorAll("input:checked")].map((c) => c.value) : [];
   if (custom && !blocks.length) { $("exStatus").textContent = "Custom is selected but no blocks are ticked."; return; }
+  const rank = Number($("exRank").value);
+  if (!Number.isInteger(rank) || rank < 1) { $("exStatus").textContent = "Target rank is a whole number, 1 or more."; return; }
   try {
     const r = await api("/api/extract/run", {family: $("exFamily").value, source: $("exSource").value.trim(),
-      name: $("exName").value.trim(), out_dir: $("exOutDir").value.trim(), rank: Number($("exRank").value),
+      name: $("exName").value.trim(), out_dir: $("exOutDir").value.trim(), rank,
       preset: custom || !(S.ex.info.presets || []).length ? "" : $("exPreset").value, blocks});
     $("exStatus").textContent = `Extracting to ${r.output}…`;
     $("exDone").replaceChildren();
@@ -3062,9 +3297,17 @@ async function extractPoll() {
 
 function wireExtract() {
   S.ex.wired = true;
+  exRankShow();
   $("exFamily").addEventListener("change", () => { extractFamily($("exFamily").value, $("exPreset").value); exRemember(); });
   $("exPreset").addEventListener("change", extractPresetChanged);
-  $("exRank").addEventListener("change", () => { extractName(); exRemember(); });
+  for (const ev of ["change", "input"]) $("exRank").addEventListener(ev, () => { extractName(); exRemember(); });
+  $("exRankPick").addEventListener("change", () => {      // a listed rank, or Other… and a box for any number
+    const other = $("exRankPick").value === "__other";
+    if (!other) $("exRank").value = $("exRankPick").value;
+    $("exRank").style.display = other ? "" : "none";
+    if (other) { $("exRank").focus(); $("exRank").select(); }
+    extractName(); exRemember();
+  });
   $("exSource").addEventListener("change", () => extractSource($("exSource").value.trim()));
   const up = uploadButton({kind: "path", key: "EXTRACT_SOURCE"}, $("exSource"), extractSource);
   $("exSourceBtns").replaceChildren(el("button", {class: "btn", text: "Choose…", onclick: () =>
@@ -3335,6 +3578,13 @@ async function runLossTick(training) {
   host.replaceChildren(lossGraph(d));
 }
 
+// a form value as the tab shows it: the row's default while it's never been set
+function valueOrDefault(key) {
+  if (S.values[key] !== undefined) return S.values[key];
+  for (const s of S.fam.form.sections) for (const r of s.rows) if (r && r.key === key) return r.default;
+  return undefined;
+}
+
 // the Samples tab's "Change the previews of the run going now": its prompts, seed, size, steps, CFG and Turbo
 // strength go to the run as the
 // trainer's sample override while ticked (sent again on every change), and come off when it's unticked
@@ -3345,7 +3595,7 @@ const sampleLiveSoon = debounce(async () => {
       seed: v.SAMPLE_SEED, width: v.SAMPLE_WIDTH, height: v.SAMPLE_HEIGHT, steps: v.SAMPLE_STEPS,
       cfg: v.SAMPLE_CFG_SCALE, turbo: v.FAMILY_TURBO_STRENGTH, every: v.SAMPLE_EVERY_N_EPOCHS,
       until: v.SAMPLE_LATER ? v.SAMPLE_UNTIL_EPOCH : 0, after: v.SAMPLE_LATER ? v.SAMPLE_EVERY_AFTER : 0,
-      look: !!v.FAMILY_PREVIEW_LOOK});
+      look: !!v.FAMILY_PREVIEW_LOOK, checkpoint: !!valueOrDefault("SAMPLE_CHECKPOINT")});
     if (note) note.textContent = r.on ? "Sent: the run's next previews use these." : "The run is back on its own prompts.";
   } catch (e) {
     if (note) note.textContent = S.run && (S.run.running || S.run.state === "starting") ? e.message : liveIdleText();
@@ -3383,10 +3633,16 @@ async function loadIntoForm(s) {
 }
 
 // a queued run being edited: Add to queue saves it back in its place
+// editing a queued run: a bar at the bottom of the window, on every tab, with Save to queue and Cancel edit, until
+// one of them (or a Start) ends it; the Training tab's Add to queue steps aside meanwhile
 function queueEditing(item) {
   S.editQueue = item;
   $("btnQueue").textContent = item ? `Save to queue (run ${item.n})` : "Add to queue";
-  $("btnQueueCancel").style.display = item ? "" : "none";
+  $("btnQueue").style.display = item ? "none" : "";
+  $("queueEditBar").style.display = item ? "" : "none";
+  $("queueEditText").replaceChildren(...(item ? [el("b", {text: `Editing queued run ${item.n}`}),
+    el("span", {text: (item.lora ? `: ${item.lora}. ` : ". ") + "Change what you like on the tabs, then Save to " +
+      "queue puts it back in its place. Cancel edit leaves it as it was."})] : []));
 }
 
 // a run's previews and checkpoints, from its output folder
@@ -3526,11 +3782,454 @@ async function loadPrep() {
     $("prepNoFaces").style.display = o.face_tools ? "none" : "";
     faceSettingsShow(o.face_settings);
   }
-  $("prepFolder").textContent = S.imageFolder ? `Folder: ${S.imageFolder}  (set on the Start tab)` :
-    "Choose the training folder on the Start tab first.";
+  $("prepFolder").textContent = (S.imageFolder ? `Folder: ${S.imageFolder}  (set on the Start tab)` :
+    "Choose the training folder on the Start tab first.") + subfoldersHint();
   await prepSummary();
   pollPrep();
   lookPoll();
+  maskInfo();
+}
+
+// Image Prep's Make masks (fizgig/dataset/automask.py through prep_jobs.start_masks): the same job and log as a prep run
+const MASK_HINTS = {
+  person: "For a person LoRA: the room and the background count far less.",
+  no_clothes: "For a person LoRA that shouldn't learn their outfits: their clothes and the background both count far less.",
+  body: "For a body or skin LoRA (skin texture, tattoos) that shouldn't learn the face: face, hair, clothes and background count far less.",
+  body_clothes: "For an outfit or body LoRA that shouldn't learn the face: face, hair and background count far less.",
+  head: "For likeness only: the body, clothes and background all count far less.",
+  clothes: "For an outfit LoRA: the person wearing it and the background count far less.",
+  not_faces: "For an outfit, a body or a style LoRA that shouldn't learn anyone's face.",
+  background: "For a place or scene LoRA: the people in the pictures count far less."};
+async function maskInfo() {
+  if (!S.imageFolder) { $("maskInfo").textContent = ""; return; }
+  // the editor follows the folder, and the masks a run just made
+  if ($("maskEdit").open && S.me && !S.me.dirty && (S.me.folder !== S.imageFolder || S.me.wantList)) {
+    S.me.wantList = false; meOpen();
+  }
+  const r = await api("/api/masks/info?folder=" + encodeURIComponent(S.imageFolder)).catch(() => null);
+  if (!r) return;
+  if (!$("maskKinds").childElementCount) {
+    const sv = S.prepSaved || {};
+    $("maskSam").checked = !!sv.maskSam;
+    if (sv.maskSamInclude != null) $("maskSamInclude").value = sv.maskSamInclude;
+    if (sv.maskSamExclude != null) $("maskSamExclude").value = sv.maskSamExclude;
+    $("maskMethod").querySelectorAll("button").forEach((b) => b.addEventListener("click", () => {
+      $("maskSam").checked = b.dataset.sam === "1"; maskSamSave(); maskShow(S.prep.maskOpts || r); }));
+    $("maskSamInclude").addEventListener("change", maskSamSave);
+    $("maskSamExclude").addEventListener("change", maskSamSave);
+    $("maskSamPreview").addEventListener("click", maskSamPreview);
+    const saved = (S.prepSaved || {}).maskKind || "person";
+    for (const [k, label] of Object.entries(r.kinds)) {
+      $("maskKinds").append(el("label", {class: "radio-label"}, el("input", {type: "radio", name: "maskKind", value: k,
+        checked: k === saved, onchange: () => { S.prepSaved = {...(S.prepSaved || {}), maskKind: k};
+          api("/api/state", {prep: S.prepSaved}).catch(() => {}); maskShow(r); }}), " " + label),
+        el("div", {class: "field-hint radio-hint", text: MASK_HINTS[k] || ""}));
+    }
+  }
+  S.prep.maskOpts = r;
+  maskShow(r);
+}
+// SAM 3.1 on the masks card: words instead of the person finder's choices; its file is downloaded from here
+function maskSamShow(r) {
+  const on = $("maskSam").checked, sam = r.sam || {}, f = sam.fetch || {};
+  $("maskSamBox").style.display = on ? "" : "none";
+  $("maskKinds").style.display = on ? "none" : "";
+  $("maskMethod").querySelectorAll("button").forEach((b) => b.classList.toggle("active", (b.dataset.sam === "1") === on));
+  $("maskMethodHint").textContent = on ? "Meta's Segment Anything: type what to mask (\"person\", \"hair\", " +
+    "\"the dog\") and it finds it, with sharper edges. A 1.75 GB download, once; it runs on the GPU." :
+    "Google's person finder: pick a part of the person below. Small and quick, on the CPU.";
+  $("maskRunHint").textContent = on ? "It runs on the GPU, a fraction of a second a picture once loaded (several " +
+    "seconds a picture without a GPU). Make masks when nothing is training." :
+    "It runs on the CPU, a fraction of a second a picture. The first time, it downloads Google's person finder (16 MB).";
+  const st = $("maskSamState");
+  st.style.display = on ? "" : "none";
+  if (f.state === "running") {
+    st.replaceChildren(`Downloading SAM 3.1: ${f.gb} of ${f.of} GB …`);
+    clearTimeout(S.prep.samTimer);
+    S.prep.samTimer = setTimeout(maskInfo, 2000);
+  } else if (sam.path) {
+    st.replaceChildren("SAM 3.1 is downloaded.");
+  } else {
+    st.replaceChildren(el("button", {class: "btn btn-primary",
+      text: f.state === "failed" ? "Try the download again" : `Download SAM 3.1 (${sam.gb || 1.75} GB)`, onclick: async () => {
+        await api("/api/masks/sam_fetch", {}).catch((e) => { st.textContent = e.message; });
+        maskInfo(); }}), el("span", {class: "field-hint", text: f.state === "failed" ? ` The download failed: ${f.error}` :
+        " Needed once, before the first masks."}));
+  }
+  $("maskSamPreview").disabled = !on || !sam.path || !r.pictures || S.prep.running;
+}
+async function maskSamPreview() {
+  $("maskSamPrevState").textContent = "Finding them (the first time loads SAM 3.1, a few seconds) …";
+  $("maskSamPreview").disabled = true;
+  try {
+    // two pictures not shown yet in this folder, until every one has been: then a fresh round
+    if (S.prep.samShownFor !== S.imageFolder) { S.prep.samShown = []; S.prep.samShownFor = S.imageFolder; }
+    const r = await api("/api/masks/sam_preview", {folder: S.imageFolder, include: $("maskSamInclude").value,
+      exclude: $("maskSamExclude").value, shown: S.prep.samShown});
+    S.prep.samShown = r.fresh ? r.fresh : [...S.prep.samShown, ...r.pictures.map((p) => p.name)];
+    $("maskSamPreviews").replaceChildren(...r.pictures.map((p) => el("figure", {class: "mask-sam-shot"},
+      el("img", {src: p.src, alt: p.name}),
+      el("figcaption", {text: p.cover ? `${p.name} · ${Math.round(p.cover * 100)}% masked` : `${p.name} · nothing found`}))));
+    $("maskSamPrevState").textContent = "Blue is what the LoRA learns; nothing is saved yet. Press again for two " +
+      `more (${Math.min(S.prep.samShown.length, r.of)} of ${r.of} seen).`;
+  } catch (e) { $("maskSamPrevState").textContent = e.message; }
+  $("maskSamPreview").disabled = false;
+}
+function maskSamSave() {
+  S.prepSaved = {...(S.prepSaved || {}), maskSam: $("maskSam").checked, maskSamInclude: $("maskSamInclude").value,
+    maskSamExclude: $("maskSamExclude").value};
+  api("/api/state", {prep: S.prepSaved}).catch(() => {});
+}
+function maskShow(r) {
+  const kind = (document.querySelector('input[name="maskKind"]:checked') || {}).value || "person";
+  maskSamShow(r);
+  const sam = $("maskSam").checked;
+  $("maskInfo").textContent = !r.available && !sam ? "Making masks needs an update: run update_fizgig to add its one new " +
+    "package (ai-edge-litert)." : r.pictures ? `${r.with_mask} of ${r.pictures} pictures have a mask.` : "";
+  const subj = $("maskSubject");
+  subj.disabled = !r.baselines || !r.faces || (!sam && (kind === "not_faces" || kind === "background"));
+  if (subj.disabled) subj.checked = false;
+  $("maskSubjectHint").textContent = sam ? (!r.faces ? "Needs face detection, which isn't installed here (run install_fizgig.py)." :
+    r.baselines ? "Finds your subject by their face, with the Look Filter's 3 baselines, and keeps only what's on them." :
+    "Needs the Look Filter's 3 baselines: choose them and scan the folder (the last card on this tab), then come back.") :
+    kind === "not_faces" ? "Not for Everything but the faces: every face is left out." :
+    kind === "background" ? "Not for Just the background: every person is left out." :
+    !r.faces ? "Needs face detection, which isn't installed here (run install_fizgig.py)." :
+    r.baselines ? "Finds your subject by their face, with the Look Filter's 3 baselines; everyone else counts as background." :
+    "Needs the Look Filter's 3 baselines: choose them and scan the folder (the last card on this tab), then come back.";
+  $("maskRun").disabled = (sam ? !(r.sam || {}).path : !r.available) || !r.pictures || S.prep.running;
+}
+async function maskRun() {
+  if (!S.imageFolder) { $("maskState").textContent = "Choose the training folder on the Start tab first."; return; }
+  const kind = (document.querySelector('input[name="maskKind"]:checked') || {}).value || "person";
+  try {
+    await api("/api/masks/make", {folder: S.imageFolder, kind, subject_only: $("maskSubject").checked,
+      sam: $("maskSam").checked, include: $("maskSamInclude").value, exclude: $("maskSamExclude").value,
+      overwrite: $("maskReplace").checked});
+    S.prep.masking = true;
+    $("maskLog").textContent = ""; $("maskLog").style.display = "";
+    $("prepLog").textContent = ""; S.prep.logSize = 0;
+    pollPrep();
+  } catch (e) { $("maskState").textContent = e.message; }
+}
+
+// ---- Image Prep's mask editor (web/mask_edit.py): a picture at a time, its mask painted on a working canvas (at most
+// 4 MP: training reads masks at the latent grid's size, far below that) and saved back at the picture's own size
+const ME_MAX_PX = 4e6, ME_UNDO = 20;
+function meState() {
+  if (!S.me) S.me = {list: [], at: -1, name: "", pic: null, mask: null, dirty: false, undo: [], redo: [],
+                     tool: "brush", view: "over", zoom: 1, ox: 0, oy: 0, folder: ""};
+  return S.me;
+}
+function meShown() {
+  const m = meState(), f = $("meFilter").value;
+  return m.list.filter((p) => f === "all" || (f === "mask") === p.mask);
+}
+async function meOpen() {
+  const m = meState();
+  if (!S.imageFolder) { $("meState").textContent = "Choose the training folder on the Start tab first."; return; }
+  try {
+    const r = await api("/api/masks/edit/list?folder=" + encodeURIComponent(S.imageFolder));
+    m.list = r.pictures; m.folder = S.imageFolder;
+  } catch (e) { $("meState").textContent = e.message; return; }
+  const shown = meShown();
+  const keep = shown.findIndex((p) => p.name === m.name);
+  await meGo(keep >= 0 ? keep : 0, true);
+}
+async function meGo(i, force) {
+  const m = meState(), shown = meShown();
+  if (!shown.length) {
+    m.at = -1; m.name = ""; m.pic = null;
+    $("meCount").textContent = "0 of 0"; $("meName").textContent = "No pictures here.";
+    meDraw(); return;
+  }
+  i = (i + shown.length) % shown.length;
+  if (!force && shown[i].name === m.name) return;
+  if (m.dirty && !(await meSave())) return;           // moving on saves the one you were on
+  m.at = i; m.name = shown[i].name;
+  $("meCount").textContent = `${i + 1} of ${shown.length}`;
+  $("meName").textContent = m.name;
+  $("meState").textContent = "Loading…";
+  const q = `folder=${encodeURIComponent(S.imageFolder)}&name=${encodeURIComponent(m.name)}&t=${encodeURIComponent(TOKEN)}`;
+  const pic = await meImage("/api/masks/edit/picture?" + q).catch(() => null);
+  if (!pic || m.name !== shown[i].name) { $("meState").textContent = pic ? "" : "Couldn't load the picture."; return; }
+  const k = Math.min(1, Math.sqrt(ME_MAX_PX / (pic.naturalWidth * pic.naturalHeight)));
+  const w = Math.max(1, Math.round(pic.naturalWidth * k)), h = Math.max(1, Math.round(pic.naturalHeight * k));
+  const mask = el("canvas", {width: w, height: h});
+  if (shown[i].mask) {
+    const mimg = await meImage("/api/masks/edit/mask?" + q + "&v=" + Date.now()).catch(() => null);
+    if (mimg) meFromGray(mask, mimg);
+  }
+  m.pic = pic; m.mask = mask; m.dirty = false; m.undo = []; m.redo = [];
+  meStateLine();
+  $("meState").textContent = shown[i].mask ? "" : "No mask yet: paint one with the Brush.";
+  meFit();
+}
+function meImage(src) {
+  return new Promise((ok, bad) => { const im = new Image(); im.onload = () => ok(im); im.onerror = bad; im.src = src; });
+}
+function meFromGray(canvas, img) {
+  // the saved mask (grey = how much is learned) -> the working canvas: white, with that much opacity
+  const c = canvas.getContext("2d");
+  c.drawImage(img, 0, 0, canvas.width, canvas.height);
+  const d = c.getImageData(0, 0, canvas.width, canvas.height), a = d.data;
+  for (let p = 0; p < a.length; p += 4) { const v = a[p]; a[p] = a[p + 1] = a[p + 2] = 255; a[p + 3] = v; }
+  c.putImageData(d, 0, 0);
+}
+function meFit() {
+  const m = meState(), cv = $("meCanvas"), st = $("meStage");
+  cv.width = st.clientWidth || 800;
+  cv.height = Math.max(300, Math.min(window.innerHeight * 0.7, 900));
+  if (m.mask) {
+    m.zoom = Math.min(cv.width / m.mask.width, cv.height / m.mask.height);
+    m.ox = (cv.width - m.mask.width * m.zoom) / 2; m.oy = (cv.height - m.mask.height * m.zoom) / 2;
+  }
+  meDraw();
+}
+function meLayers() {
+  // the mask as two layers over the picture: blue where it's learned, black where it isn't (each as much as the mask)
+  const m = meState(), w = m.mask.width, h = m.mask.height;
+  if (!m.tint || m.tint.width !== w || m.tint.height !== h) {
+    m.tint = el("canvas", {width: w, height: h}); m.dim = el("canvas", {width: w, height: h});
+  }
+  const t = m.tint.getContext("2d");
+  t.globalCompositeOperation = "copy"; t.drawImage(m.mask, 0, 0);
+  t.globalCompositeOperation = "source-in"; t.fillStyle = "rgb(90,170,255)"; t.fillRect(0, 0, w, h);
+  t.globalCompositeOperation = "source-over";
+  const d = m.dim.getContext("2d");
+  d.globalCompositeOperation = "copy"; d.fillStyle = "#000"; d.fillRect(0, 0, w, h);
+  d.globalCompositeOperation = "destination-out"; d.drawImage(m.mask, 0, 0);
+  d.globalCompositeOperation = "source-over";
+  return [m.tint, m.dim];
+}
+function meDraw() {
+  const m = meState(), cv = $("meCanvas"), c = cv.getContext("2d");
+  c.setTransform(1, 0, 0, 1, 0, 0);
+  c.fillStyle = "#0b0e12"; c.fillRect(0, 0, cv.width, cv.height);
+  if (!m.pic || !m.mask) return;
+  c.setTransform(m.zoom, 0, 0, m.zoom, m.ox, m.oy);
+  c.imageSmoothingEnabled = m.zoom < 2;
+  const w = m.mask.width, h = m.mask.height, show = Number($("meShow").value) / 100;
+  if (m.view === "mask") {
+    c.fillStyle = "#000"; c.fillRect(0, 0, w, h); c.drawImage(m.mask, 0, 0);
+  } else {
+    c.drawImage(m.pic, 0, 0, w, h);
+    if (m.view === "over") {
+      const [tint, dim] = meLayers();
+      c.globalAlpha = show * 0.8; c.drawImage(dim, 0, 0);       // what isn't learned dimmed...
+      c.globalAlpha = show * 0.6; c.drawImage(tint, 0, 0);      // ...and what is, tinted blue
+      c.globalAlpha = 1;
+    }
+  }
+  if (m.samAt) {                                       // SAM at work: a ring pulsing at the click
+    const ph = (performance.now() % 1000) / 1000;
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    c.strokeStyle = `rgba(90,170,255,${1 - ph})`; c.lineWidth = 3;
+    c.beginPath(); c.arc(m.samAt[0], m.samAt[1], 6 + ph * 22, 0, Math.PI * 2); c.stroke();
+    c.fillStyle = "rgb(90,170,255)"; c.beginPath(); c.arc(m.samAt[0], m.samAt[1], 4, 0, Math.PI * 2); c.fill();
+  }
+  if (m.cursor && !m.panning && m.tool !== "sam") {    // the brush, its size on screen
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    c.strokeStyle = "rgba(255,255,255,.9)"; c.lineWidth = 1;
+    c.beginPath(); c.arc(m.cursor[0], m.cursor[1], Number($("meSize").value) / 2, 0, Math.PI * 2); c.stroke();
+  }
+}
+function meAt(e) {
+  const m = meState(), r = $("meCanvas").getBoundingClientRect();
+  const sx = (e.clientX - r.left) * ($("meCanvas").width / r.width), sy = (e.clientY - r.top) * ($("meCanvas").height / r.height);
+  return {sx, sy, x: (sx - m.ox) / m.zoom, y: (sy - m.oy) / m.zoom};
+}
+function meSnapshot() {
+  const m = meState(), copy = el("canvas", {width: m.mask.width, height: m.mask.height});
+  copy.getContext("2d").drawImage(m.mask, 0, 0);
+  return copy;
+}
+function mePush() {
+  const m = meState();
+  m.undo.push(meSnapshot()); if (m.undo.length > ME_UNDO) m.undo.shift();
+  m.redo = [];
+}
+function meRestore(from, to) {
+  const m = meState();
+  if (!from.length) return;
+  to.push(meSnapshot());
+  const c = m.mask.getContext("2d");
+  c.globalCompositeOperation = "copy"; c.drawImage(from.pop(), 0, 0); c.globalCompositeOperation = "source-over";
+  m.dirty = true; meStateLine(); meDraw();
+}
+function meDab(x, y) {
+  // one stamp of the brush on the mask: white with the strength's opacity, or that much taken away
+  const m = meState(), c = m.mask.getContext("2d");
+  const r = Number($("meSize").value) / 2 / m.zoom, soft = Number($("meSoft").value) / 100;
+  const a = Number($("meStrength").value) / 100;
+  const g = c.createRadialGradient(x, y, r * (1 - soft) * 0.999, x, y, r);
+  g.addColorStop(0, `rgba(255,255,255,${a})`); g.addColorStop(1, "rgba(255,255,255,0)");
+  c.globalCompositeOperation = m.tool === "erase" ? "destination-out" : "source-over";
+  c.fillStyle = soft > 0 ? g : `rgba(255,255,255,${a})`;
+  c.beginPath(); c.arc(x, y, r, 0, Math.PI * 2); c.fill();
+  c.globalCompositeOperation = "source-over";
+}
+function meStroke(from, to) {
+  const m = meState(), r = Math.max(0.5, Number($("meSize").value) / 2 / m.zoom);
+  const dx = to.x - from.x, dy = to.y - from.y, n = Math.max(1, Math.ceil(Math.hypot(dx, dy) / (r * 0.3)));
+  for (let k = 1; k <= n; k++) meDab(from.x + dx * k / n, from.y + dy * k / n);
+}
+function meStateLine() {
+  // the save status beside Save now: unsaved changes, saved, or no mask on this picture yet
+  const m = meState(), b = $("meSaved"), item = m.list.find((p) => p.name === m.name);
+  const st = !m.name ? "" : m.dirty ? "unsaved" : item && item.mask ? "saved" : "none";
+  b.dataset.state = st;
+  b.textContent = {unsaved: "● Unsaved changes", saved: "✓ Saved", none: "No mask yet", "": ""}[st];
+  $("meSave").disabled = !m.dirty;
+  $("meRevert").disabled = !m.dirty;
+}
+async function meSave() {
+  const m = meState();
+  if (!m.mask || !m.name) return true;
+  // the mask on opaque black, so grey is grey however it was painted
+  const out = el("canvas", {width: m.mask.width, height: m.mask.height}), c = out.getContext("2d");
+  c.fillStyle = "#000"; c.fillRect(0, 0, out.width, out.height); c.drawImage(m.mask, 0, 0);
+  try {
+    const r = await api("/api/masks/edit/save", {folder: m.folder || S.imageFolder, name: m.name,
+      png: out.toDataURL("image/png")});
+    m.dirty = false;
+    const item = m.list.find((p) => p.name === m.name);
+    if (item) item.mask = !r.removed;
+    meStateLine();
+    $("meState").textContent = r.removed ? "All black, so the mask was removed: this picture trains as normal." :
+      `Saved ${m.name.replace(/\.[^.]+$/, "")}-masklabel.png.`;
+    maskInfo();
+    return true;
+  } catch (e) { $("meState").textContent = e.message; return false; }
+}
+function meWire() {
+  const m = meState(), cv = $("meCanvas");
+  let last = null, pan = null, space = false;
+  $("maskEdit").addEventListener("toggle", () => {
+    if ($("maskEdit").open) meOpen(); else if (meState().dirty) meSave();      // closing it saves
+  });
+  window.addEventListener("beforeunload", (e) => {   // closing the window with edits not saved: ask first
+    if (S.me && S.me.dirty) { e.preventDefault(); e.returnValue = ""; }
+  });
+  $("mePrev").addEventListener("click", () => meGo(meState().at - 1));
+  $("meNext").addEventListener("click", () => meGo(meState().at + 1));
+  $("meFilter").addEventListener("change", () => meGo(0, true));
+  $("meTool").querySelectorAll("button").forEach((b) => b.addEventListener("click", () => meTool(b.dataset.tool)));
+  $("meView").querySelectorAll("button").forEach((b) => b.addEventListener("click", () => {
+    m.view = b.dataset.view;
+    $("meView").querySelectorAll("button").forEach((x) => x.classList.toggle("active", x === b));
+    meDraw();
+  }));
+  $("meShow").addEventListener("input", meDraw);
+  $("meFit").addEventListener("click", meFit);
+  $("meUndo").addEventListener("click", () => meRestore(m.undo, m.redo));
+  $("meRedo").addEventListener("click", () => meRestore(m.redo, m.undo));
+  const whole = (fn) => () => { if (!m.mask) return; mePush(); fn(m.mask.getContext("2d")); m.dirty = true; meStateLine(); meDraw(); };
+  $("meFill").addEventListener("click", whole((c) => { c.fillStyle = "#fff"; c.fillRect(0, 0, m.mask.width, m.mask.height); }));
+  $("meClear").addEventListener("click", whole((c) => c.clearRect(0, 0, m.mask.width, m.mask.height)));
+  $("meInvert").addEventListener("click", whole((c) => {
+    const d = c.getImageData(0, 0, m.mask.width, m.mask.height), a = d.data;
+    for (let p = 0; p < a.length; p += 4) { a[p] = a[p + 1] = a[p + 2] = 255; a[p + 3] = 255 - a[p + 3]; }
+    c.putImageData(d, 0, 0);
+  }));
+  $("meSave").addEventListener("click", meSave);
+  $("meRevert").addEventListener("click", () => { m.dirty = false; meGo(m.at, true); });
+  cv.addEventListener("pointerdown", (e) => {
+    if (!m.mask) return;
+    cv.setPointerCapture(e.pointerId);
+    const p = meAt(e);
+    if (e.button === 1 || space) { pan = {sx: p.sx, sy: p.sy, ox: m.ox, oy: m.oy}; m.panning = true; e.preventDefault(); return; }
+    if (m.tool === "sam") {                            // a click adds; right-click or Alt+click takes away
+      if (e.button === 0 || e.button === 2) meSamClick(p, e.button === 2 || e.altKey);
+      return;
+    }
+    if (e.button !== 0) return;
+    mePush(); meDab(p.x, p.y); last = p; m.dirty = true; meStateLine(); meDraw();
+  });
+  cv.addEventListener("pointermove", (e) => {
+    const p = meAt(e);
+    m.cursor = [p.sx, p.sy];
+    if (pan) { m.ox = pan.ox + p.sx - pan.sx; m.oy = pan.oy + p.sy - pan.sy; }
+    else if (last) { meStroke(last, p); last = p; }
+    meDraw();
+  });
+  const up = () => { last = null; pan = null; m.panning = false; meDraw(); };
+  cv.addEventListener("pointerup", up); cv.addEventListener("pointercancel", up);
+  cv.addEventListener("pointerleave", () => { m.cursor = null; meDraw(); });
+  cv.addEventListener("contextmenu", (e) => e.preventDefault());          // right-click is SAM click's "take away"
+  cv.addEventListener("wheel", (e) => {
+    if (!m.mask) return;
+    e.preventDefault();
+    // zooming out stops where the whole picture fits (smaller is never useful), and centres it there
+    const cv = $("meCanvas"), fit = Math.min(cv.width / m.mask.width, cv.height / m.mask.height);
+    const p = meAt(e), k = Math.exp(-e.deltaY * 0.0015), z = Math.min(40, Math.max(fit, m.zoom * k));
+    if (z <= fit) { meFit(); return; }
+    m.ox = p.sx - (p.sx - m.ox) * (z / m.zoom); m.oy = p.sy - (p.sy - m.oy) * (z / m.zoom); m.zoom = z;
+    meDraw();
+  }, {passive: false});
+  document.addEventListener("keydown", (e) => {
+    if (!$("maskEdit").open || !$("tab-prep").classList.contains("active")) return;
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement && document.activeElement.tagName) &&
+        document.activeElement.type !== "range") return;
+    const k = e.key;
+    if (k === " ") { space = true; e.preventDefault(); }
+    else if ((e.ctrlKey || e.metaKey) && k.toLowerCase() === "z") { e.preventDefault(); meRestore(m.undo, m.redo); }
+    else if ((e.ctrlKey || e.metaKey) && k.toLowerCase() === "y") { e.preventDefault(); meRestore(m.redo, m.undo); }
+    else if (k === "ArrowLeft") { e.preventDefault(); meGo(m.at - 1); }
+    else if (k === "ArrowRight") { e.preventDefault(); meGo(m.at + 1); }
+    else if (k === "[" || k === "]") {
+      const s = $("meSize"), v = Number(s.value);
+      s.value = Math.max(2, Math.min(400, Math.round(k === "[" ? v / 1.2 : v * 1.2 + 1))); meDraw();
+    }
+    else if (k === "b" || k === "B") meTool("brush");
+    else if (k === "e" || k === "E") meTool("erase");
+    else if (k === "s" || k === "S") meTool("sam");
+    else if (k === "0") meFit();
+  });
+  document.addEventListener("keyup", (e) => { if (e.key === " ") space = false; });
+  window.addEventListener("resize", () => { if ($("maskEdit").open) meFit(); });
+}
+async function meSamClick(p, takeAway) {
+  // SAM 3.1 finds the thing under the click; it's added to the mask (or, right-click, taken out of it)
+  const m = meState();
+  if (m.samBusy || !m.mask || p.x < 0 || p.y < 0 || p.x >= m.mask.width || p.y >= m.mask.height) return;
+  m.samBusy = true;
+  const name = m.name;
+  meBusy(m.samLoaded ? (takeAway ? "Finding what to take away…" : "Finding it…") :
+    "Loading SAM 3.1… (the first click takes a few seconds)", [p.sx, p.sy]);
+  $("meState").textContent = "";
+  try {
+    const r = await api("/api/masks/edit/sam_click", {folder: m.folder || S.imageFolder, name,
+      x: p.x * m.pic.naturalWidth / m.mask.width, y: p.y * m.pic.naturalHeight / m.mask.height});
+    if (m.name !== name) return;                       // moved on meanwhile
+    const found = el("canvas", {width: m.mask.width, height: m.mask.height});
+    meFromGray(found, await meImage(r.png));
+    mePush();
+    const c = m.mask.getContext("2d");
+    c.globalCompositeOperation = takeAway ? "destination-out" : "source-over";
+    c.drawImage(found, 0, 0);
+    c.globalCompositeOperation = "source-over";
+    m.dirty = true; m.samLoaded = true; meStateLine();
+    $("meState").textContent = takeAway ? "Taken away." : "Added.";
+  } catch (e) { $("meState").textContent = e.message; }
+  finally { m.samBusy = false; meBusy(""); meDraw(); }
+}
+function meBusy(text, at) {
+  // SAM at work: a line over the picture, a wait cursor, and a ring pulsing where you clicked
+  const m = meState();
+  $("meBusy").style.display = text ? "" : "none";
+  $("meBusyText").textContent = text;
+  $("meCanvas").style.cursor = text ? "wait" : (m.tool === "sam" ? "crosshair" : "none");
+  m.samAt = text ? at : null;
+  if (text) {
+    const tick = () => { if (!meState().samAt) return; meDraw(); requestAnimationFrame(tick); };
+    requestAnimationFrame(tick);
+  }
+}
+function meTool(t) {
+  meState().tool = t;
+  $("meCanvas").style.cursor = t === "sam" ? "crosshair" : "none";
+  $("meTool").querySelectorAll("button").forEach((b) => b.classList.toggle("active", b.dataset.tool === t));
 }
 
 async function prepSummary() {
@@ -3555,6 +4254,7 @@ async function pollPrep() {
   if (r) {
     if (r.size < S.prep.logSize) { $("prepLog").textContent = ""; S.prep.logSize = 0; }
     if (r.log) { $("prepLog").textContent += r.log; $("prepLog").scrollTop = $("prepLog").scrollHeight; }
+    if (r.log && S.prep.masking) { $("maskLog").textContent += r.log; $("maskLog").scrollTop = $("maskLog").scrollHeight; }
     S.prep.logSize = r.size;
     const was = S.prep.running;
     S.prep.running = r.state === "running";
@@ -3562,7 +4262,12 @@ async function pollPrep() {
     if (S.prep.running) $("prepRun").textContent = "Preparing…";
     $("prepState").textContent = S.prep.running ? "Working on the Fizgig computer: you can leave this page." :
       r.state === "done" ? "Done." : r.state === "failed" ? "It stopped with an error: see the log." : "";
-    if (was && !S.prep.running) { prepSummary(); loadDatasets(); }
+    if (S.prep.masking) {
+      $("maskState").textContent = S.prep.running ? "Making masks on the Fizgig computer: you can leave this page." :
+        r.state === "done" ? "Done." : r.state === "failed" ? "It stopped with an error: see below." : "";
+      $("maskRun").disabled = S.prep.running;
+    }
+    if (was && !S.prep.running) { if (S.prep.masking && S.me) S.me.wantList = true; prepSummary(); loadDatasets(); maskInfo(); S.prep.masking = false; }
   }
   if (S.prep.running) S.prep.timer = setTimeout(pollPrep, 1000);
 }
@@ -3688,16 +4393,17 @@ async function lookPickOpen() {
 function lookBasesShow() {
   $("lookBases").replaceChildren(...S.prep.bases.map((p) => el("img", {src: thumbOf(p), title: p, alt: ""})),
     el("span", {class: "field-hint", text: `${S.prep.bases.length} of 3 chosen`}));
-  $("lookScan").disabled = S.prep.bases.length !== 3;
+  $("lookScan").disabled = S.prep.bases.length !== 3 || !!S.prep.lookRunning;
 }
 
 async function lookScan() {
+  $("lookScan").disabled = true;                  // until the scan's status says it's over (#249)
   try {
     await api("/api/look/scan", {folder: S.imageFolder, baselines: S.prep.bases});
     S.prep.picking = false; $("lookPicker").style.display = "none";
     S.prep.marked = new Set(); S.prep.page = 0;
     lookPoll();
-  } catch (e) { $("lookStatus").textContent = e.message; }
+  } catch (e) { $("lookStatus").textContent = e.message; lookBasesShow(); }
 }
 
 async function lookPoll() {
@@ -3706,7 +4412,14 @@ async function lookPoll() {
   const r = await api("/api/look/status").catch(() => null);
   if (!r) return;
   S.prep.look = r;
+  // a scan that just finished saved the 3 baselines: the masks card's Only my subject can be ticked now (#242)
+  const wasRunning = S.prep.lookRunning;
+  S.prep.lookRunning = r.state === "running";
+  if (wasRunning && !S.prep.lookRunning) maskInfo();
+  $("lookScan").disabled = S.prep.lookRunning || S.prep.bases.length !== 3;
+  $("lookPick").disabled = S.prep.lookRunning;
   $("lookDecision").textContent = r.decision ? r.decision.replace("[faces] ", "") : "";
+  $("lookPeak").textContent = r.state === "done" && r.rows && r.rows.length ? arcPeak(r.embedder) : "";
   const mine = r.folder === S.imageFolder;        // the last scan may be of another folder
   if (r.state === "running") {
     $("lookStatus").textContent = r.progress[0] ? `Scoring faces… ${r.progress[0]}/${r.progress[1]}` :
@@ -3768,7 +4481,8 @@ function lookMoveAsk() {
     el("div", {class: "field-hint", text: `Move ${n} picture(s), with their captions, out of the dataset to ` +
       `${S.imageFolder}${sep}excluded_by_look? Nothing is deleted: move them back to put them in again.`}),
     el("div", {class: "field-row"},
-      el("button", {class: "btn btn-sm btn-danger", text: "Move", onclick: async () => {
+      el("button", {class: "btn btn-sm btn-danger", text: "Move", onclick: async (ev) => {
+        ev.currentTarget.disabled = true;           // the confirm goes when it's done; on an error it says why
         try {
           const r = await api("/api/look/move", {folder: S.imageFolder, paths: [...S.prep.marked], ext: capExt()});
           S.prep.marked = new Set();
@@ -3816,6 +4530,8 @@ function wirePrep() {
     r.addEventListener("change", () => { prepSummary(); savePrepSoon(); }));
   for (const id of ["prepMp", "prepFace", "prepPadding"]) $(id).addEventListener("change", () => { prepSummary(); savePrepSoon(); });
   $("prepRun").addEventListener("click", prepRun);
+  $("maskRun").addEventListener("click", maskRun);
+  meWire();
   $("prepTest").addEventListener("click", prepTest);
   faceSettingsWire();
   $("lookPick").addEventListener("click", lookPickOpen);
@@ -5654,7 +6370,8 @@ function openInstr() {
   $("capInstrBox").style.display = "";
   $("capInstr").value = t.instruction;
   $("capInstrHint").textContent = `What Qwen3-VL is told for "${t.label}"` + (t.edited ? " (edited)" : " (as shipped)") +
-    ". Saved here, the trainer's auto-recaption uses it too.";
+    ". Saved here. Auto-recaption uses it too when the Training tab's First try / Second try picks this task " +
+    "(by default Training caption first, then Exhaustive detail).";
   $("capInstrStatus").textContent = "";
 }
 
@@ -5757,8 +6474,8 @@ async function loadCaptions() {
     `&ext=${encodeURIComponent(capExt())}&t=${encodeURIComponent(TOKEN)}`;
   $("dsZip").href = zipUrl(false); $("dsZipCaps").href = zipUrl(true);
   for (const id of ["dsZip", "dsZipCaps"]) $(id).style.display = S.imageFolder ? "" : "none";
-  $("capFolder").textContent = S.imageFolder ? `Folder: ${S.imageFolder}  (set on the Start tab)` :
-    "Choose the training folder on the Start tab first.";
+  $("capFolder").textContent = (S.imageFolder ? `Folder: ${S.imageFolder}  (set on the Start tab)` :
+    "Choose the training folder on the Start tab first.") + subfoldersHint();
   if (!S.imageFolder) { $("captionsSummary").textContent = "Choose the training folder on the Start tab."; return; }
   const ext = $("captionExt").value.trim() || ".txt";
   const r = await api(`/api/captions?folder=${encodeURIComponent(S.imageFolder)}&ext=${encodeURIComponent(ext)}&family=${encodeURIComponent(S.family || "")}`);
@@ -5829,10 +6546,20 @@ function renderCaptions() {
       title: "Take it out of the training set: it and its caption move into the folder's removed subfolder (nothing is deleted).",
       onclick: () => capRemove(it, card, status)});
     const size = it.size ? `${it.size[0]}×${it.size[1]} · ${(it.size[0] * it.size[1] / 1e6).toFixed(1)} MP` : "";
+    // masked training: the picture's mask (photo-masklabel.png), shown in its place on a click
+    const pic = it.mask ? media.querySelector("img") || (media.tagName === "IMG" ? media : null) : null;
+    const maskBtn = pic ? el("button", {class: "btn btn-sm", text: "Show mask",
+      title: `${it.mask}: white trains fully, black only as much as the Training tab's Masked training card says.`,
+      onclick: () => {
+        const on = maskBtn.textContent === "Show mask";
+        if (on && !pic.dataset.picture) pic.dataset.picture = pic.src;
+        pic.src = on ? `/api/media?path=${encodeURIComponent(it.path.slice(0, it.path.length - it.name.length) + it.mask)}&t=${encodeURIComponent(TOKEN)}` : pic.dataset.picture;
+        maskBtn.textContent = on ? "Show picture" : "Show mask";
+      }}) : null;
     card.append(media, el("div", {class: "caption-card-body"},
       el("div", {class: "caption-card-title", text: mediaLabel(it)}),
-      size ? el("div", {class: "field-hint caption-card-size", text: size}) : null, ta,
-      el("div", {class: "field-row"}, save, recap, speech, remove, status)));
+      size ? el("div", {class: "field-hint caption-card-size", text: size + (it.mask ? " · has a mask" : "")}) : null, ta,
+      el("div", {class: "field-row"}, save, recap, speech, maskBtn, remove, status)));
     host.append(card);
   }
 }
@@ -5910,7 +6637,7 @@ function wireCaptions() {
   $("capStop").addEventListener("click", () => capRun("/api/captions/stop", {}));
   $("capUnload").addEventListener("click", () => capRun("/api/captions/unload", {}));
   $("frPreview").addEventListener("click", () => findReplace(false));
-  $("frApply").addEventListener("click", () => findReplace(true));
+  $("frApply").addEventListener("click", held($("frApply"), () => findReplace(true)));
   $("capSearch").addEventListener("input", debounce(() => { S.cap.page = 0; renderCaptions(); }, 250));
   $("capSort").addEventListener("change", () => { S.cap.page = 0; renderCaptions(); });
   $("capPrev").addEventListener("click", () => { S.cap.page--; renderCaptions(); window.scrollTo(0, 0); });
@@ -6772,8 +7499,8 @@ const svgEl = (s) => { const t = document.createElement("template"); t.innerHTML
 
 async function helpLoad(quiet) {
   if (!quiet) $("helpNote").textContent = "Checking your helpers...";
-  try { S.help.data = await api("/api/helpers"); } catch (e) { $("helpNote").textContent = e.message; return; }
-  const open = $("tab-helpers").classList.contains("active");
+  const open = $("tab-helpers").classList.contains("active");   // open: the network is searched too (off it, nothing)
+  try { S.help.data = await api("/api/helpers" + (open ? "?look=1" : "")); } catch (e) { $("helpNote").textContent = e.message; return; }
   if (!open) helpStrips();                // off the tab only its strips and the run card's line show
   else if (!S.help.typing) helpDraw();    // not while speeds are being typed: a redraw would empty the boxes
   clearTimeout(S.help.timer);           // every 3 s while one works, else every 15 s on the tab and 30 s off it
@@ -7178,6 +7905,7 @@ function tabsMenu(open) {
 }
 
 function showTab(name) {
+  if (name !== "prep" && S.me && S.me.dirty) meSave();      // leaving Image Prep saves the mask being edited
   const tb = document.querySelector(`.tab-item[data-tab="${name}"] span`);
   if (tb) $("tabsToggleName").textContent = tb.textContent;
   tabsMenu(false);
@@ -7333,8 +8061,11 @@ function podLocalDraw() {
         d.thumbs.length ? d.thumbs.map((src) => el("img", {alt: "", src})) :
           el("span", {class: "dataset-kind", text: d.songs ? "♪" : d.clips ? "▶" : ""})),
       el("div", {class: "dataset-meta"}, el("b", {text: d.name}), el("span", {text: `${what} · ${mb(d.bytes)}`}),
-        el("span", {class: d.captioned >= total ? "ok" : "warn",
-          text: d.captioned >= total ? "all captioned" : `${d.captioned} of ${total} captioned`}),
+        d.sub_items ? el("span", {class: "dataset-subs", text: `+ ${d.sub_items} in ${d.sub_folders} sub-folder` +
+          (d.sub_folders === 1 ? "" : "s") + ((S.values || {}).TRAIN_SUBFOLDERS ? " (sent too)" : " (not sent)"),
+          title: "Sent only when Also train on its sub-folders is ticked on the Training tab"}) : null,
+        total ? el("span", {class: d.captioned >= total ? "ok" : "warn",
+          text: d.captioned >= total ? "all captioned" : `${d.captioned} of ${total} captioned`}) : null,
         el("div", {class: "dataset-actions"}, send)));
   }));
   if (!list.length && !S.podLocal.busy && !$("podLocalStatus").textContent)
@@ -7347,9 +8078,11 @@ async function podLocalSend(d) {
   S.podLocal.busy = true;                     // one send at a time: every Send button waits, through a Refresh too
   podLocalDraw();
   try {
-    const files = await api_.local_files(d.path);
+    // its sub-folders go too when Also train on its sub-folders is ticked here (uploadFiles keeps them by rel)
+    const files = await api_.local_files(d.path, !!(S.values || {}).TRAIN_SUBFOLDERS);
     const CHUNK = 2 * 2 ** 20;                 // what one bridge read carries
-    const local = files.map((f) => ({name: f.name, size: f.size, lastModified: f.mtime * 1000,
+    const local = files.map((f) => ({name: f.name.split("/").pop(), rel: d.name + "/" + f.name, size: f.size,
+      lastModified: f.mtime * 1000,
       async read(a, b) {
         const parts = [];
         for (let o = a; o < b; o += CHUNK) {
@@ -7411,11 +8144,21 @@ async function uploadFiles(picked, opts = {}) {
     `train on (${video.slice(0, 3).join(", ")}${video.length > 3 ? ", …" : ""}): convert them to .mp4 first.`);
   if (other.length) notes.push(`Left out (not pictures, clips, songs, captions or zips): ` +
     `${other.slice(0, 5).join(", ")}${other.length > 5 ? ", …" : ""}.`);
+  // its sub-folders are kept only when the Training tab's Also train on its sub-folders is ticked; otherwise every
+  // file goes into the one folder, as before
+  const keepSubs = !!(S.values || {}).TRAIN_SUBFOLDERS;
+  const sub = (f) => {
+    const parts = String(f.webkitRelativePath || f.rel || "").split("/").slice(1, -1).map(tidyName).filter(Boolean);
+    return keepSubs ? parts.join("/") : "";
+  };
   const seen = new Map();
-  for (const f of files) seen.set(f.name, (seen.get(f.name) || 0) + 1);
+  for (const f of files) { const k = (sub(f) ? sub(f) + "/" : "") + f.name; seen.set(k, (seen.get(k) || 0) + 1); }
   const dupes = [...seen].filter(([, n]) => n > 1).map(([k]) => k);
   if (dupes.length) notes.push(`More than one file is named ${dupes.slice(0, 3).join(", ")}` +
-    `${dupes.length > 3 ? ", …" : ""} (from different subfolders); they all go into one folder, so the last one is kept.`);
+    `${dupes.length > 3 ? ", …" : ""} (from different subfolders); they all go into one folder, so the last one is kept. ` +
+    "To keep the sub-folders, tick Also train on its sub-folders on the Training tab and upload again.");
+  else if (keepSubs && files.some((f) => sub(f))) notes.push("Its sub-folders are kept, as Also train on its " +
+    "sub-folders is ticked on the Training tab.");
   const name = opts.name !== undefined ? opts.name : $("uploadName").value.trim();
   const say = opts.say || ((t, bad) => { $("uploadStatus").textContent = t; $("uploadStatus").classList.toggle("bad", !!bad); });
   if (!name) return say("Type a name for the new folder first.", true);
@@ -7441,7 +8184,7 @@ async function uploadFiles(picked, opts = {}) {
       inFlight.set(f, 0);
       show(f);
       try {
-        const r = await uploadResumable({folder: name, name: tidyName(f.name)}, f, (sent, note) => {
+        const r = await uploadResumable({folder: sub(f) ? name + "/" + sub(f) : name, name: tidyName(f.name)}, f, (sent, note) => {
           inFlight.set(f, sent);
           show(f, note || (sent >= f.size && f.name.toLowerCase().endsWith(".zip") ? "unpacking…" : ""));
         });
@@ -7652,7 +8395,7 @@ function wire() {
   $("presetSave").addEventListener("click", presetSaveOpen);
   $("btnImageLoss").addEventListener("click", async () => {      // the same view as Runs & outputs, for the run going now
     const box = $("runImageLoss"), id = S.run && S.run.history_id;
-    if (!id) return;
+    if (!id || $("btnImageLoss").classList.contains("is-off")) return;
     if (box.style.display !== "none") { box.style.display = "none"; return; }
     box.style.display = ""; box.textContent = "Loading…";
     try { imageLossPanel(box, await api("/api/runs/image_loss?id=" + encodeURIComponent(id)), {...S.run, id}); }
@@ -7804,7 +8547,7 @@ function wire() {
   });
   new MutationObserver(() => { if (!$("rvModal").classList.contains("active")) rvStop(); })
     .observe($("rvModal"), {attributes: true, attributeFilter: ["class"]});
-  $("likStart").addEventListener("click", () => likenessSet(S.lik.picked));
+  $("likStart").addEventListener("click", held($("likStart"), () => likenessSet(S.lik.picked)));
   $("likClear").addEventListener("click", () => likenessSet([]));
   document.querySelectorAll("#galleryView button").forEach((b) => b.addEventListener("click", () => {
     S.galleryView = b.dataset.view; loadGallery(); }));
@@ -7827,10 +8570,18 @@ function wire() {
           `Added to the queue as number ${r.position}` + (before ? `: it starts after ${before}` + (eta ? ` (about ${eta})` : "") :
           ": it starts as soon as nothing else is training") + ".");
         queueEditing(null);
-      } else showProblems(r.problems || (r.error ? [r.error] : []));
+      } else {
+        showProblems(r.problems || (r.error ? [r.error] : []));
+        if (ed) $("queueEditText").replaceChildren(el("b", {text: `Not saved: `}),   // the bar is where you pressed it
+          el("span", {text: (r.problems || [r.error]).join(" ")}));
+      }
       pollRun();
-    } catch (e) { showProblems([e.message]); }
+    } catch (e) {
+      showProblems([e.message]);
+      if (S.editQueue) $("queueEditText").replaceChildren(el("b", {text: "Not saved: "}), el("span", {text: e.message}));
+    }
   });
+  $("queueEditSave").addEventListener("click", () => $("btnQueue").click());
   $("btnQueueCancel").addEventListener("click", () => { queueEditing(null); $("runStatus").textContent = "Edit cancelled: the queued run is as it was."; });
   $("webQueueStart").addEventListener("click", () => api("/api/queue/start", {}).then(pollRun)
     .catch((e) => { $("runStatus").textContent = e.message; }));
@@ -7873,4 +8624,9 @@ function wire() {
 // the login box works before anything else: a page that needs a login stops boot() at its first request, before wire()
 $("loginButton").addEventListener("click", login);
 $("loginPassword").addEventListener("keydown", (e) => { if (e.key === "Enter") login(); });
-boot();
+boot().catch((e) => {             // a start that fails says so, rather than sitting on "Starting Fizgig…"
+  if (e && e.message === "login") return;
+  $("bootCoverText").textContent = "Fizgig didn't finish starting: " + (e && e.message || e) +
+    ". Reload the page; if it happens again, the console window says why.";
+  document.querySelector("#bootCover .boot-spin").style.display = "none";
+});

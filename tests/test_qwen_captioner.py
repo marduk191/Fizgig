@@ -120,11 +120,12 @@ from fizgig.families.registry import get as get_family  # noqa: E402
 K2 = get_family("krea2")
 
 
-def recaption_cmd(overrides):
+def recaption_cmd(overrides, **form_values):
     rows = {r["key"]: r for s in FORM.form(K2)["sections"] for r in s["rows"] if r.get("key")}
     vals = {k: r.get("default") for k, r in rows.items()}
     vals.update(LORA_NAME="t", LORA_OUTPUT_DIR=TMP, DATASET_CONFIG=os.path.join(TMP, "d.toml"), BATCH_SIZE="1",
                 LOSS_WATCH_DETECT=True, AUTO_RECAPTION=True)
+    vals.update(form_values)
     inp = FORM.inputs(K2, vals, models={k: "m" for k in FORM.model_keys(K2)}, python=sys.executable,
                       repo_dir=REPO, image_folder="", cache_root=TMP, samples_dir=TMP, captioner=FAKE_TE,
                       caption_overrides=overrides)
@@ -141,9 +142,26 @@ if "--captioner" in c:
        "--recaption_instruction_detailed" in c
        and c[c.index("--recaption_instruction_detailed") + 1] == "MY EXHAUSTIVE")
     ck("  an edit to any other preset never reaches the trainer", "ONLY SHORT" not in c)
+    # Upstream (#244) now always sends both tries' instructions, the shipped text when nothing was edited, and names
+    # the task for the log. So an edit to some other preset must leave both at their shipped text (it used to send
+    # nothing at all).
+    from fizgig.krea2.caption_text import CAPTION_TASKS as _CT
     c = recaption_cmd({"short": "ONLY SHORT"})
-    ck("  editing only a non-recaption preset sends no instruction at all",
-       "--recaption_instruction" not in c and "--recaption_instruction_detailed" not in c)
+    ck("  editing only a non-recaption preset leaves both tries at their shipped text",
+       "ONLY SHORT" not in c and c[c.index("--recaption_instruction") + 1] == _CT["training"][1]
+       and c[c.index("--recaption_instruction_detailed") + 1] == _CT["exhaustive"][1])
+    ck("  and the log names each task, 'as shipped' when unedited",
+       c[c.index("--recaption_task") + 1].endswith("(as shipped)")
+       and c[c.index("--recaption_task_detailed") + 1].endswith("(as shipped)"), c[c.index("--recaption_task") + 1])
+    c = recaption_cmd({"training": "MY TRAINING"})
+    ck("  an edited task is marked '(your edit)', the other stays 'as shipped'",
+       c[c.index("--recaption_task") + 1].endswith("(your edit)")
+       and c[c.index("--recaption_task_detailed") + 1].endswith("(as shipped)"))
+    # the pickers: any Captions tab task for each try
+    c = recaption_cmd({"short": "ONLY SHORT"}, RECAPTION_FIRST="Short caption", RECAPTION_SECOND="Short caption")
+    ck("  First try uses / Second try uses pick any task each: both tries use the edited Short text",
+       "--recaption_instruction" in c and c[c.index("--recaption_instruction") + 1] == "ONLY SHORT"
+       and c[c.index("--recaption_instruction_detailed") + 1] == "ONLY SHORT", c[c.index("--recaption_task") + 1])
 else:
     ck("auto-recaption reaches the command (Batch 1, captioner set)", False, "no --captioner in command")
 

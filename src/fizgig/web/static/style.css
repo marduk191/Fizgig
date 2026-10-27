@@ -6,6 +6,7 @@
   --bg-surface: #252D38;     /* Cards, panels, inputs */
   --bg-hover: #2A3542;       /* Hover state */
   --bg-inset: #1A2028;       /* Input backgrounds, dark inset */
+  --bg-row-alt: #2C3036;     /* Every other line of a list of boxes (the sample prompts) */
   --bg-header: #1A2028;      /* Notebook tab bar & titlebar background */
   --bg-section-hdr: #1A2028; /* CollapsibleFrame header (exact match to bg_header) */
   --text-primary: #F0F4F8;   /* Primary text */
@@ -611,6 +612,11 @@ input[type="checkbox"], input[type="radio"] {
   background: var(--accent-hover);
   border-color: var(--accent-hover);
 }
+/* Per-image loss (the run card and Runs & outputs): lilac, the loss watch's colour */
+.btn-lilac { background: var(--lilac); border-color: var(--lilac); color: var(--bg-deep); }
+.btn-lilac:hover { filter: brightness(1.08); border-color: var(--lilac); }
+.btn-lilac.is-off { opacity: .4; cursor: help; filter: none; }   /* greyed: its hover says which ticks turn it on */
+
 .btn-warning {
   background: var(--warning);
   border-color: var(--warning);
@@ -1285,7 +1291,7 @@ input[type="range"] {
 :root {
   --bg-deep: #12161D; --bg-side: #0E1218; --bg-surface: #1A2029; --bg-raised: #212834; --bg-hover: #252D3A;
   --bg-inset: #10141A; --bg-header: #0E1218; --border: #2A3341; --text-secondary: #93A3B5; --text-muted: #66778A;
-  --radius: 12px; --radius-sm: 8px;
+  --radius: 12px; --radius-sm: 8px; --bg-row-alt: #1F242B; --bg-sec-open: #1E2A3D; --lilac: #B9A3E8; --lilac-line: rgba(185, 163, 232, 0.45);
 }
 body { font-size: 13.5px; background: var(--bg-deep); }
 .window-titlebar { display: none; }
@@ -1344,6 +1350,9 @@ body { font-size: 13.5px; background: var(--bg-deep); }
 .side-queue-held { font-size: 11.5px; color: var(--warning); }
 .side-queue-held:empty { display: none; }
 .side-queue .btn { align-self: flex-start; }
+.side-queue-open { font-size: 11.5px; color: var(--accent); }
+.side-queue-empty { font-size: 12px; color: var(--text-secondary); }
+.side-run .side-queue-title { align-self: flex-start; }
 .run-upnext { font-size: 12.5px; color: var(--text-secondary); margin: 4px 0 8px; display: flex; flex-wrap: wrap;
   align-items: center; gap: 6px 10px; }
 .run-upnext.held { color: var(--warning); }
@@ -1389,6 +1398,9 @@ body { font-size: 13.5px; background: var(--bg-deep); }
 .card-title { font-size: 15px; padding: 16px 20px 4px; }
 .card-title.collapsible-header { border-radius: var(--radius) var(--radius) 0 0; background: transparent; padding: 14px 20px; }
 .card-title.collapsible-header:hover { background: var(--bg-hover); }
+/* a form card that's open has a blue-tinted heading; a closed one stays plain */
+.section-card.sec-open > .card-title.collapsible-header { background: var(--bg-sec-open); }
+.section-card.sec-open > .card-title.collapsible-header:hover { background: var(--bg-hover); }
 .card-desc { font-size: 13.5px; }
 .field-label { font-size: 13px; }
 .field-hint { font-size: 12.5px; font-style: normal; color: var(--text-secondary); }
@@ -1417,6 +1429,8 @@ input[type="checkbox"]:checked::after { transform: translateX(14px); }
 /* the training form: fields side by side on a wide screen, a long box or text across the card */
 .section-card[id^="sec-"] > .card-content:not(.collapsed) { display: grid; gap: 2px 28px;
   grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+/* the Subjects card's four switches sit in one row on a desktop; a narrower window takes them down to 3, 2, 1 */
+.section-card#sec-subjects > .card-content:not(.collapsed) { grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); }
 .section-card[id^="sec-"] .form-row .field-row { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 5px 8px; }
 .section-card[id^="sec-"] .form-row .field-row > .field-label { flex: 1 1 100%; }
 .section-card[id^="sec-"] .form-row .field-row > input, .section-card[id^="sec-"] .form-row .field-row > select,
@@ -1561,6 +1575,7 @@ input[type="radio"] { accent-color: var(--accent); width: 16px; height: 16px; ma
 .dataset-meta .ok { color: #6EE7B7; }
 .dataset-meta .warn { color: #FCD34D; }
 .dataset-when { color: var(--text-muted); }
+.dataset-subs { color: var(--text-secondary); }
 @media (max-width: 760px) { .dataset-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; } }
 .dataset-more { grid-column: 1 / -1; justify-self: center; }
 
@@ -1702,6 +1717,8 @@ input[type="radio"] { accent-color: var(--accent); width: 16px; height: 16px; ma
 .seg .btn.active { background: var(--accent); border-color: var(--accent); color: #FFFFFF; }
 .gallery.gallery-as-grid { display: block; }
 .prompt-grid-wrap { display: block; overflow-x: auto; }
+.prompt-grid-top { overflow-x: auto; overflow-y: hidden; }
+.prompt-grid-spacer { height: 1px; }
 .prompt-grid { border-collapse: separate; border-spacing: 6px; }
 .prompt-grid th { color: var(--text-secondary); font-size: 9pt; font-weight: 600; text-align: center; white-space: nowrap; }
 .prompt-grid th.prompt-head { text-align: left; white-space: normal; width: 180px; min-width: 140px; vertical-align: top; }
@@ -2036,6 +2053,13 @@ input[type="radio"] { accent-color: var(--accent); width: 16px; height: 16px; ma
 
 /* a pod's auto-stop countdown, over every tab */
 .pod-stop-bar { position: sticky; top: 0; z-index: 20; }
+/* editing a queued run: fixed to the bottom of the window, on every tab, until Save to queue or Cancel edit */
+.queue-edit-bar { position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%); z-index: 40;
+  width: min(900px, calc(100vw - 32px)); display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  padding: 12px 16px; border-radius: 10px; background: var(--bg-surface); border: 1px solid var(--accent);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, .45); color: var(--text-primary); font-size: 13px; }
+.queue-edit-bar #queueEditText { flex: 1 1 300px; }
+.queue-edit-actions { display: flex; gap: 8px; margin-left: auto; }
 .pod-stop-bar .btn { margin-left: 12px; }
 
 /* ACE: one song player under the two waveform pictures (the desktop's) */
@@ -2078,7 +2102,7 @@ input[type="radio"] { accent-color: var(--accent); width: 16px; height: 16px; ma
 .slider-live-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
 .slider-live-row { display: grid; grid-template-columns: 110px 1fr; align-items: center; gap: 10px; }
 .slider-live-row span { color: var(--text-secondary); }
-.slider-live-row input { width: 100%; box-sizing: border-box; }
+.slider-live-row input, .slider-live-row textarea { width: 100%; box-sizing: border-box; }
 .slider-live-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .slider-live-actions input.w-port { width: 72px; }
 @media (max-width: 760px) { .slider-live-row { grid-template-columns: 1fr; gap: 4px; } }
@@ -2267,3 +2291,79 @@ a.pick-pill-vast:hover { border-color: var(--success); }
 /* a single choice greyed in a row of pills */
 .checkbox-label.choice-off { opacity: 0.4; cursor: not-allowed; }
 .run-helper .pod-dot { display: inline-block; vertical-align: -1px; }
+
+/* the sample prompts: one numbered box each, every other one dark grey, across the card */
+.prompt-lines { display: flex; flex-direction: column; gap: 0; width: 100%; margin: 4px 0 6px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm); overflow: hidden; }
+.prompt-line { display: flex; align-items: flex-start; background: var(--bg-inset); }
+.prompt-line:nth-child(even) { background: var(--bg-row-alt); }
+.prompt-line + .prompt-line { border-top: 1px solid var(--border); }
+.prompt-num { flex: 0 0 34px; padding: 7px 8px 0 0; text-align: right; color: var(--text-muted);
+  font-size: 9pt; font-weight: 600; user-select: none; }
+.form-row .prompt-line textarea { flex: 1 1 auto; width: auto; max-width: none; min-height: 32px; resize: none;
+  overflow: hidden; background: transparent; border: none; border-radius: 0; box-shadow: none; padding: 6px 4px; }
+.form-row .prompt-line textarea:focus { background: rgba(59,130,246,.08); box-shadow: none; }
+.prompt-del { flex: 0 0 28px; height: 28px; margin: 2px 2px 0 0; background: none; border: none; cursor: pointer;
+  color: var(--text-muted); font-size: 14pt; line-height: 1; visibility: hidden; }
+.prompt-line:hover .prompt-del, .prompt-line:focus-within .prompt-del { visibility: visible; }
+.prompt-del:hover { color: var(--text-primary); }
+
+/* the Training tab's Extras: a lilac divider, and a lilac edge down each card under it */
+.extras-divider { display: flex; align-items: center; gap: 14px; margin: 22px 4px 12px; color: var(--lilac);
+  font-size: 10pt; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; }
+.extras-divider::before, .extras-divider::after { content: ""; flex: 1 1 auto; height: 1px;
+  background: linear-gradient(90deg, transparent, var(--lilac-line)); }
+.extras-divider::after { background: linear-gradient(90deg, var(--lilac-line), transparent); }
+.section-card.sec-extra { border-left: 3px solid var(--lilac); }
+
+#tab-extract input.ex-rank { width: 96px; flex: none; }
+
+/* the masks card's SAM preview: two pictures with their masks over them */
+.mask-sam-previews { display: flex; flex-wrap: wrap; gap: 10px; margin: 8px 0; }
+.mask-sam-shot { margin: 0; }
+.mask-sam-shot img { display: block; max-width: 320px; width: 100%; border-radius: var(--radius-sm); border: 1px solid var(--border); }
+.mask-sam-shot figcaption { color: var(--text-muted); font-size: 8.5pt; margin-top: 3px; }
+
+/* the masks card's steps: how they're made, what they show, options */
+.mask-step { margin: 18px 0 6px; color: var(--text-primary); font-weight: 600; font-size: 10.5pt; }
+#maskMethod { margin-bottom: 4px; }
+.mask-sam-state { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 10px 0 2px; }
+
+/* the masks card's Edit masks: a picture at a time with its mask, painted on a canvas */
+.mask-edit { margin-top: 18px; border-top: 1px solid var(--border); padding-top: 12px; }
+/* its heading: a bar that reads as something to open */
+.mask-edit > summary { list-style: none; cursor: pointer; display: flex; flex-wrap: wrap; align-items: baseline;
+  gap: 4px 12px; padding: 12px 16px 12px 40px; position: relative; border: 1px solid var(--border);
+  border-left: 4px solid var(--accent); border-radius: var(--radius-sm); background: var(--bg-raised); }
+.mask-edit > summary::-webkit-details-marker { display: none; }
+.mask-edit > summary::before { content: "▶"; position: absolute; left: 16px; top: 13px; color: var(--accent);
+  font-size: 10pt; }
+.mask-edit[open] > summary::before { content: "▼"; }
+.mask-edit > summary:hover { background: var(--bg-hover); }
+.mask-edit[open] > summary { margin-bottom: 8px; }
+.me-sum-title { font-weight: 600; color: var(--text-primary); font-size: 11pt; }
+.me-sum-sub { color: var(--text-secondary); font-size: 9.5pt; }
+.me-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 8px 0; }
+.me-count { min-width: 64px; text-align: center; color: var(--text-secondary); font-size: 9.5pt; }
+.me-name { color: var(--text-muted); font-size: 9pt; overflow-wrap: anywhere; }
+.me-slider { display: inline-flex; align-items: center; gap: 6px; color: var(--text-secondary); font-size: 9pt; }
+.me-slider input[type="range"] { width: 110px; }
+.me-stage { position: relative; width: 100%; border: 1px solid var(--border); border-radius: var(--radius-sm);
+  overflow: hidden; background: var(--bg-inset); }
+.me-busy { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); display: flex; align-items: center;
+  gap: 8px; padding: 6px 12px; border-radius: 999px; background: rgba(10, 14, 20, .85); border: 1px solid var(--border);
+  color: var(--text-primary); font-size: 9.5pt; pointer-events: none; }
+.me-spin { width: 14px; height: 14px; border-radius: 50%; border: 2px solid var(--border); border-top-color: var(--accent);
+  animation: me-spin .8s linear infinite; }
+@keyframes me-spin { to { transform: rotate(360deg); } }
+/* the start-up cover: over the page until boot() has built it; the login box sits above it */
+.boot-cover { position: fixed; inset: 0; z-index: 1500; background: var(--bg-deep); display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 14px; color: var(--text-secondary); font-size: 11pt; }
+.boot-cover.done { display: none; }
+.boot-spin { width: 28px; height: 28px; border-width: 3px; }
+.me-stage canvas { display: block; width: 100%; touch-action: none; cursor: none; }
+
+.me-saved { font-size: 9.5pt; font-weight: 600; }
+.me-saved[data-state="unsaved"] { color: var(--warning); }
+.me-saved[data-state="saved"] { color: var(--success); }
+.me-saved[data-state="none"] { color: var(--text-muted); font-weight: 400; }

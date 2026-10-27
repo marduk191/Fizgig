@@ -270,7 +270,8 @@ def listing(prefs, key, save=None, mine=""):
     """Everything the Pods tab shows: saved pods and the account's, merged by address, each probed in parallel, and
     the Fizgigs that answer on this network."""
     from fizgig.web import lan
-    finding = concurrent.futures.ThreadPoolExecutor(max_workers=1).submit(lan.discover, 1.0)
+    finding = (concurrent.futures.ThreadPoolExecutor(max_workers=1).submit(lan.discover, 1.0)
+               if lan.enabled(prefs) else None)          # Preferences > Network can switch the search off
     rows, err, listed = {}, "", False
     for r in saved(prefs):
         rows[r["url"]] = {**r, "saved": True, "account": False}
@@ -285,7 +286,7 @@ def listing(prefs, key, save=None, mine=""):
             err = str(e)
     try:
         me = str(prefs.get("lan_id") or "")     # this computer's other Fizgig (a second launch, another port) isn't a computer to open
-        _lan_rows(rows, [f for f in finding.result(timeout=5) if not me or f.get("id") != me], mine, save)
+        _lan_rows(rows, [f for f in (finding.result(timeout=5) if finding else []) if not me or f.get("id") != me], mine, save)
     except Exception:
         pass
     items = list(rows.values())

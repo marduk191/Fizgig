@@ -124,3 +124,17 @@ CAPTION_TASKS = {
                    STYLE_CAPTION_INSTRUCTION, 160),
 }
 DEFAULT_CAPTION_TASK = "training"
+
+# Auto-recaption's two pickers on the Training tab (first try, second try): every task above plus Custom, the
+# Captions tab's own instruction (stored under "custom"; the default task's text until edited).
+RECAPTION_CHOICES = [(key, label) for key, (label, _text, _tokens) in CAPTION_TASKS.items()] + [("custom", "Custom")]
+RECAPTION_DEFAULTS = ("training", "exhaustive")
+
+
+def recaption_instruction(key, overrides=None):
+    """(label, instruction, edited) of a recaption choice: the Captions tab's edited text when there is one."""
+    labels = dict(RECAPTION_CHOICES)
+    key = key if key in labels else DEFAULT_CAPTION_TASK
+    shipped = CAPTION_TASKS.get(key, CAPTION_TASKS[DEFAULT_CAPTION_TASK])[1]
+    edited = str((overrides or {}).get(key, "") or "").strip()
+    return labels[key], edited or shipped, bool(edited)

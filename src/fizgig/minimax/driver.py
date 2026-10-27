@@ -64,6 +64,15 @@ class MiniMaxDriver(FamilyDriver):
     def max_blocks_to_swap(self, dit=None):
         return 40                     # the old planner's cap (50 blocks, >= 10 resident)
 
+    def nogc_load(self, group):
+        """A clip dataset's heaviest clip as effective megapixels (spatial size x latent frames), read against the
+        clip figures; a stills dataset its largest bucket."""
+        from fizgig.minimax import common as T
+        eff, clip_t = T._max_effective_mp(group)
+        if clip_t > 1:
+            return "clips", eff
+        return super().nogc_load(group)
+
     def plan_run(self, precision, blocks_to_swap, *, group, run):
         """The old trainer's Auto plan, unchanged: the precision and the streamed-block count chosen together from
         free VRAM, the run's real adapter size (header shapes, optimizer, frozen LoRAs, EMA shadow) and the

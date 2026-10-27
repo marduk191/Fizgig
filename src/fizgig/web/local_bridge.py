@@ -35,7 +35,9 @@ def _wanted(name):
 def _thumb(path, side=96):
     try:
         from PIL import Image
+        from fizgig.utils.upright import upright
         with Image.open(path) as im:
+            im = upright(im)
             im.thumbnail((side, side))
             buf = io.BytesIO()
             im.convert("RGB").save(buf, "JPEG", quality=70)
@@ -53,19 +55,26 @@ def local_datasets():
             size = sum(e.stat().st_size for e in os.scandir(d["path"]) if e.is_file() and _wanted(e.name))
         except OSError:
             size = 0
-        out.append({**{k: d[k] for k in ("name", "path", "pictures", "clips", "songs", "captioned", "time")},
+        out.append({**{k: d.get(k, 0) for k in ("name", "path", "pictures", "clips", "songs", "captioned", "time", "sub_items",
+                                       "sub_folders")},
                     "bytes": size, "thumbs": [t for t in (_thumb(p) for p in d.get("thumbs", [])[:4]) if t]})
     return {"root": _root(), "datasets": out}
 
 
-def local_files(folder):
-    """A training folder's own files Fizgig trains on (pictures, clips, songs, their captions): name, size, mtime."""
+def local_files(folder, subfolders=False):
+    """A training folder's own files Fizgig trains on (pictures, clips, songs, their captions): name, size, mtime.
+    subfolders: its sub-folders' too (Also train on its sub-folders), named by their path inside it ("red/a.png")."""
     p = _folder(folder)
+    dirs = [("", p)]
+    if subfolders:
+        from fizgig.families import launch
+        dirs += [(rel + "/", d) for rel, d in launch.subfolders(p)]
     files = []
-    for e in sorted(os.scandir(p), key=lambda e: e.name.lower()):
-        if e.is_file() and _wanted(e.name) and not re.search(r"\.part$", e.name):
-            st = e.stat()
-            files.append({"name": e.name, "size": st.st_size, "mtime": st.st_mtime})
+    for rel, d in dirs:
+        for e in sorted(os.scandir(d), key=lambda e: e.name.lower()):
+            if e.is_file() and _wanted(e.name) and not re.search(r"\.part$", e.name):
+                st = e.stat()
+                files.append({"name": rel + e.name, "size": st.st_size, "mtime": st.st_mtime})
     return files
 
 
@@ -73,9 +82,11 @@ def read_local(folder, name, offset, n):
     """Up to 2 MB of one of a training folder's files, from `offset`, as base64."""
     p = _folder(folder)
     name = str(name or "")
-    if os.path.basename(name) != name or not _wanted(name):
+    parts = name.split("/")                  # a sub-folder's file: "red/a.png", plain names only
+    if any(not x or x in (".", "..") or os.path.basename(x) != x or x.startswith(".") for x in parts) \
+            or not _wanted(parts[-1]):
         raise ValueError("Not a training file.")
-    path = os.path.join(p, name)
+    path = os.path.join(p, *parts)
     if not os.path.isfile(path):
         raise ValueError(f"{name} isn't there any more.")
     with open(path, "rb") as f:

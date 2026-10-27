@@ -23,7 +23,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from fizgig.families.driver import Block, BlockGroup, FamilyDriver
+from fizgig.families.driver import Block, BlockGroup, FamilyDriver, prior_base, weighted_loss, with_prior
 from fizgig.moss_image import sampling as S
 
 logger = logging.getLogger(__name__)
@@ -59,11 +59,12 @@ def mu_for_clean_share(pct):
 
 
 class MOSSImageDriver(FamilyDriver):
+    _plain_reads = False         # load_dit's file read: plain reads (the preview checkpoint, beside the training model)
 
     # ---- models ---------------------------------------------------------------------------------
     def load_dit(self, path, device):
         from fizgig.moss_image.model import load_moss_dit
-        return load_moss_dit(path, device=device).eval().requires_grad_(False)
+        return load_moss_dit(path, device=device, plain=self._plain_reads).eval().requires_grad_(False)
 
     # ---- training previews on the SFT checkpoint (train_preview_checkpoint; after @Murf-Code, PR #195) -------------
     def park_for_preview(self, dit, device):
@@ -96,7 +97,12 @@ class MOSSImageDriver(FamilyDriver):
         if free < need:
             per_block = (size / 2 if precision == "int8" else size) / N_BLOCKS
             swap = min(self.max_blocks_to_swap(), max(1, int((need - free) / max(per_block, 1e-3)) + 2))
-        m, swapped = quant.load_base(self, path, device, precision, swap, supports_backward=False)
+        # plain reads: mapping the 10 GB file beside the loaded training model crashed Windows with 32 GB of RAM (#229)
+        self._plain_reads = True
+        try:
+            m, swapped = quant.load_base(self, path, device, precision, swap, supports_backward=False)
+        finally:
+            self._plain_reads = False
         if swapped:
             self.block_swap_mode(m, inference=True)
         logger.info(f"[sample] SFT checkpoint: {precision}, {swapped} blocks streamed"
@@ -264,15 +270,17 @@ class MOSSImageDriver(FamilyDriver):
         return dit(xt, tt, hidden.to(xt.device))
 
     def training_loss(self, dit, latents, cond, generator, *, min_t=0.0, max_t=1.0, refs=None, diff_ref=None,
-                      diff_weight=0.0):
+                      diff_weight=0.0, loss_mask=None, prior=None):
         if refs:
             raise RuntimeError("MOSS-Image has no edit (reference-image) conditioning")
         x0 = latents.float()
         noise = torch.randn(x0.shape, generator=generator).to(x0.device)
         t = self._sample_t(generator, min_t, max_t, self._t_mu())
         xt = (1 - t) * x0 + t * noise
+        base = prior_base(prior, loss_mask, lambda: self._forward(dit, xt, t, cond))
         pred = self._forward(dit, xt, t, cond).float()
         target = noise - x0
+        wgt = None
         if diff_ref is not None and diff_weight > 0.0:
             # image-pair sliders (Krea 2's weighting): each token's error weighted by how much the two poles differ
             # there, so the slider learns what changes between them, not what they share
@@ -283,9 +291,14 @@ class MOSSImageDriver(FamilyDriver):
             wgt = wgt / wgt.mean().clamp_min(1e-8)
             if float(dm) <= 1e-6:
                 wgt = torch.ones_like(wgt)                      # identical pair: uniform, never all-zero
-            return ((pred - target).pow(2).mean(dim=1) * wgt).mean(), {"t": t}
-        # report eq. 3: per-token mean over channels, no sigma weighting
-        return F.mse_loss(pred, target), {"t": t}
+        mw = None if loss_mask is None else loss_mask.float().to(x0.device)[:, 0]             # (1, h, w)
+        if wgt is None and mw is None:
+            # report eq. 3: per-token mean over channels, no sigma weighting
+            return F.mse_loss(pred, target), {"t": t}
+        loss = weighted_loss((pred - target).pow(2).mean(dim=1), wgt, mw)
+        if base is not None:
+            loss = with_prior(loss, prior, base, (pred - base).pow(2).mean(dim=1), mw, wgt)
+        return loss, {"t": t}
 
     def noise_latents(self, latents, generator, *, min_t=0.0, max_t=1.0):
         x0 = latents.float()

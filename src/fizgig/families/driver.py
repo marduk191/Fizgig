@@ -34,6 +34,40 @@ class BlockGroup:
     blocks: list = field(default_factory=list)
 
 
+def weighted_loss(se, *weights):
+    """The mean of per-position squared errors `se` under the per-position weights that apply (each se's shape, or
+    None): an image-pair slider's difference weights, a masked-training mask. Their product is scaled to mean 1 per
+    image, so a picture counts the same however little of it is weighted; se.mean() when none apply."""
+    ws = [w for w in weights if w is not None]
+    if not ws:
+        return se.mean()
+    w = ws[0].to(se.device, se.dtype)
+    for x in ws[1:]:
+        w = w * x.to(se.device, se.dtype)
+    if w.dim() > 1:
+        w = w / w.mean(dim=tuple(range(1, w.dim())), keepdim=True).clamp_min(1e-8)
+    else:
+        w = w / w.mean().clamp_min(1e-8)
+    return (se * w).mean()
+
+
+def prior_base(prior, loss_mask, forward):
+    """Masked prior preservation: the model's own prediction at this step's noised input with the LoRA at 0
+    (prior.base runs `forward` that way), or None - no prior asked for, or a picture without a mask. Taken BEFORE the
+    training forward, as OneTrainer does, so the backward that follows is the training forward's own."""
+    return None if prior is None or loss_mask is None else prior.base(forward)
+
+
+def with_prior(loss, prior, base, se_base, mw, *weights):
+    """loss plus masked prior preservation (OneTrainer's masked_losses_with_prior): outside the mask (1 - its weight,
+    so black counts 1 - floor) the prediction is pulled toward `base`, the model's own with the LoRA at 0, at the
+    prior's weight, normalised over that area as the inside is over its own. se_base: the per-position squared
+    error against base, the shape `loss` was taken over."""
+    if base is None or mw is None:
+        return loss
+    return loss + float(prior.weight) * weighted_loss(se_base, *weights, 1.0 - mw)
+
+
 class FamilyDriver:
     """Subclass per family. `description` is the family's FamilyDescription."""
 
@@ -194,11 +228,14 @@ class FamilyDriver:
 
     # ---- training -------------------------------------------------------------------------------
     def training_loss(self, dit, latents, cond: dict, generator, *, min_t: float = 0.0, max_t: float = 1.0,
-                      refs=None, diff_ref=None, diff_weight: float = 0.0):
+                      refs=None, diff_ref=None, diff_weight: float = 0.0, loss_mask=None, prior=None):
         """One training forward. latents (1, C, h, w) on device, cond = the cached dict (batched), refs = the pair's
         reference latents [(1, C, rh, rw), ...] (edit training) or None. diff_ref / diff_weight (image-pair
         sliders): weight each token's error by how much latents and diff_ref differ there, so the slider learns
-        what changes between the poles and not what they share.
+        what changes between the poles and not what they share. loss_mask (masked training, a family with
+        `masked_training` in its description): (1, 1, h, w) per-cell weights on the latent's grid - brought onto the
+        family's tokens as the slider weights are and combined through weighted_loss. prior (masked prior
+        preservation, with a loss_mask): prior_base() before the training forward, with_prior() on the loss.
         Returns (loss tensor, info dict e.g. {"t": 0.63}). Owns the family's noise/target/timestep rules."""
         raise NotImplementedError
 
@@ -410,6 +447,15 @@ class FamilyDriver:
         settings a family plans for reach it as its own options (set_options). Returns (precision, blocks_to_swap,
         why)."""
         return None
+
+    def nogc_load(self, group) -> tuple:
+        """What the checkpointing-off figures are read at: (kind, megapixels). kind "" reads
+        description.train_memory_nogc[precision], any other reads [f"{precision}:{kind}"]. Default: the largest
+        bucket, as stills."""
+        try:
+            return "", max(w * h / 1e6 for ds in group.datasets for (w, h) in ds.batch_manager.bucket_resos)
+        except Exception:
+            return "", 1.0
 
     def load_planned(self, path, device, precision: str, blocks_to_swap: int) -> Optional[tuple]:
         """Load the base at `precision` with `blocks_to_swap` streamed, the driver's own way - (dit, swapped) - or

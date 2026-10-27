@@ -5,8 +5,8 @@ workbench engine as Studio (families/block_profile.py), with likeness and bleed 
 Usage: python -m fizgig.scripts.profile_run <job.json>
 The job: {family, lora, mode ("weights" | "quick" | "thorough"), prompt, class_prompt, baselines [3 paths], size,
 plan (the engine's load arguments, fizgig.web.studio.plan's), settings (Samples-tab preview settings or null),
-profiles_dir}. Progress leaves as "@@P {json}" lines, the end as "@@DONE {json}" (report, summary lines, the Studio
-hand-off) or "@@FAIL {json}".
+profiles_dir}. Progress leaves as "@@P {json}" lines, the end as "@@DONE {json}" (report, sidecar, summary lines)
+or "@@FAIL {json}".
 """
 import json
 import os
@@ -43,7 +43,7 @@ def _embedder(baselines):
 def main(job_path):
     with open(job_path, encoding="utf-8") as f:
         job = json.load(f)
-    from fizgig.families.block_profile import (conditions, renders_needed, repair_settings, run_ablation, verdicts,
+    from fizgig.families.block_profile import (conditions, renders_needed, run_ablation, verdicts,
                                                weight_stats, write_report)
     from fizgig.families.registry import get as get_family
     desc = get_family(job["family"])
@@ -112,7 +112,6 @@ def main(job_path):
     lines = log + [f"{desc.display_name} profile complete.",
                    f"Rank: {stats['max_rank']} in the file; 95% of the change fits in rank {stats['rank_for'][0.95]}, "
                    f"99% in rank {stats['rank_for'][0.99]}."]
-    studio = None
     if abl is not None:
         vd = verdicts(abl)
         alone = abl["alone"]["trigger"]
@@ -133,10 +132,7 @@ def main(job_path):
             if cls.get(w, {}).get("score") is not None:
                 parts.append(f"gives {100 * max(cls[w]['score'], 0):.0f}% of the bleed")
             lines.append(f"  {l}: {', '.join(parts)}. {vd[w][1]}.")
-        settings, notes = repair_settings(abl)
-        studio = {"family": desc.key, "lora": lora, "prompt": prompt, "class_prompt": class_prompt, "seed": seeds[0],
-                  "size": size, "blocks": {b: list(v) for b, v in settings.items()}, "notes": list(notes)}
-    out("DONE", report=html, sidecar=sidecar, lines=lines, studio=studio)
+    out("DONE", report=html, sidecar=sidecar, lines=lines)
 
 
 if __name__ == "__main__":

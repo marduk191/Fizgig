@@ -87,7 +87,8 @@ def reference_image_for_latent(path_or_image, latent):
     from PIL import Image
 
     from fizgig.dataset.image_dataset import resize_image_to_bucket
-    img = (Image.open(path_or_image).convert("RGB")
+    from fizgig.utils.upright import open_upright
+    img = (open_upright(path_or_image).convert("RGB")
            if isinstance(path_or_image, str) else path_or_image.convert("RGB"))
     w, h = int(latent.shape[-1]) * VAE_SPATIAL, int(latent.shape[-2]) * VAE_SPATIAL
     return Image.fromarray(resize_image_to_bucket(img, (w, h)))

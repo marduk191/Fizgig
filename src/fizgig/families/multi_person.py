@@ -18,6 +18,9 @@ import json
 import os
 import random
 import re
+from fizgig.utils.upright import open_upright
+
+from fizgig.dataset.masks import is_mask_file
 
 from fizgig.dataset.caption_text import read_caption  # [fork] any encoding, as training reads them
 
@@ -254,22 +257,74 @@ def subject_as_written(trigger, cls="", kind="auto"):
             "kind": _kind(kind, phrase.split()[-1])}, ""
 
 
-def _square(im, size=PANEL):
+def _square(im, size=PANEL, center=None):
+    """The largest square, no zoom: centred on `center` (x, y) as far as the picture's edges allow, else the middle."""
     from PIL import Image
     w, h = im.size
     m = min(w, h)
-    left, top = (w - m) // 2, (h - m) // 2
+    cx, cy = center or (w / 2, h / 2)
+    left = int(min(max(cx - m / 2, 0), w - m))
+    top = int(min(max(cy - m / 2, 0), h - m))
     return im.crop((left, top, left + m, top + m)).resize((size, size), Image.LANCZOS)
 
 
-def build(subjects, ext=".txt", seed=42, log=print):
+FACECROP = "FaceCrop_"          # Image Prep's face crops (dataset/prep.py): already framed on the face, never re-cropped
+
+
+class _Faces:
+    """The largest face's centre in an upright picture, from Image Prep's own detector (CPU), or None when there is no
+    face or no detector - then the picture is centre-cropped as before."""
+
+    def __init__(self, log):
+        self.log, self.det, self.broken = log, None, False
+
+    def center(self, im):
+        if self.broken:
+            return None
+        try:
+            if self.det is None:
+                from fizgig.face_utils import FaceDetector
+                self.det = FaceDetector()
+                if not self.det.available:
+                    raise RuntimeError("no face detector installed")
+            f = self.det.get_largest(self.det.detect_from_pil(im))
+            return f.center if f else None
+        except Exception as e:      # no detector: centre crops, as before
+            self.broken = True
+            self.log(f"[multi-person] face detection unavailable ({e}) - side-by-sides use centre crops")
+            return None
+
+
+def _picks(photos, rng, face_first, faces, load):
+    """PER_SUBJECT (photo, face centre) picks, no photo twice until every usable one is used. face_first: Image Prep's
+    face crops first, then photos with a face found, photos without one only if nothing else is left; off: every
+    photo in one random order. A face crop is never cropped further (only trimmed square); others centre on the face."""
+    crops = [n for n in photos if n.startswith(FACECROP)]
+    rest = [n for n in photos if not n.startswith(FACECROP)]
+    rng.shuffle(crops)
+    rng.shuffle(rest)
+    out, faceless = [(n, None) for n in crops] if face_first else [], []
+    for n in (rest if face_first else rng.sample(photos, len(photos))):
+        if len(out) >= PER_SUBJECT:     # enough: the rest are never opened (detection only on what is used)
+            break
+        if n.startswith(FACECROP):
+            out.append((n, None))
+            continue
+        c = faces.center(load(n))
+        (out if c or not face_first else faceless).append((n, c))
+    out += faceless                     # face_first: photos without a face only as a last resort
+    return [out[k % len(out)] for k in range(PER_SUBJECT)]
+
+
+def build(subjects, ext=".txt", seed=42, log=print, face_first=True):
     """Each subject's composites: {"folder", "fused", "out", "index"} -> PER_SUBJECT side-by-sides in `out` (a
-    training photo next to a stranger, side at random, the caption stranger-first with the fused trigger). Rebuilt
-    only when what it was built from changes."""
+    training photo next to a stranger, side at random, the caption stranger-first with the fused trigger). The
+    training photo's half: see _picks. Rebuilt only when what it was built from changes."""
     from PIL import Image
     people = strangers()
+    faces = _Faces(log)
     for s in subjects:
-        photos = sorted(n for n in os.listdir(s["folder"]) if n.lower().endswith(_IMG))
+        photos = sorted(n for n in os.listdir(s["folder"]) if n.lower().endswith(_IMG) and not is_mask_file(n))
         if not photos:
             raise ValueError(f"no photos in {s['folder']}")
         stamps = []                              # a photo edited or replaced under the same name rebuilds them
@@ -277,7 +332,7 @@ def build(subjects, ext=".txt", seed=42, log=print):
             st = os.stat(os.path.join(s["folder"], n))
             stamps.append([n, int(st.st_mtime), st.st_size])
         sig = {"photos": stamps, "fused": s["fused"], "n": PER_SUBJECT, "seed": seed, "index": s["index"],
-               "revision": REVISION, "ext": ext}
+               "revision": REVISION, "ext": ext, "face_first": bool(face_first), "picking": 2}
         mark = os.path.join(s["out"], "fizgig_mp_built.json")
         try:
             with open(mark, encoding="utf-8") as f:
@@ -293,12 +348,17 @@ def build(subjects, ext=".txt", seed=42, log=print):
         rng = random.Random(seed * 1000 + s["index"])
         order = list(range(len(people)))
         rng.shuffle(order)
+        load = lambda n: open_upright(os.path.join(s["folder"], n)).convert("RGB")
+        picks = _picks(photos, rng, face_first, faces, load)
+        n_crops = sum(1 for n, _c in picks if n.startswith(FACECROP))
+        log(f"[multi-person] {s['fused']}: side-by-sides from {n_crops} face crop(s) and "
+            f"{PER_SUBJECT - n_crops} other photo(s)" + ("" if face_first else " (face crops not put first)"))
         for k in range(PER_SUBJECT):
             path, desc = people[order[k % len(order)]]
-            mine = rng.choice(photos)
+            mine, center = picks[k]
             left = rng.random() < 0.5
-            a = _square(Image.open(os.path.join(s["folder"], mine)).convert("RGB"))
-            b = _square(Image.open(path).convert("RGB"))
+            a = _square(load(mine), center=center)
+            b = _square(open_upright(path).convert("RGB"))
             sheet = Image.new("RGB", (2 * PANEL, PANEL))
             sheet.paste(a if left else b, (0, 0))
             sheet.paste(b if left else a, (PANEL, 0))

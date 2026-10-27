@@ -21,6 +21,8 @@ DISCOVERY_PORT = 47810
 ASK = b"FIZGIG?1"
 INSTANCE = secrets.token_hex(8)             # this process: its own answer is left out of its own list
 _info = [None]                              # () -> dict, the answer's facts (set by start())
+_answering = [False]                        # Preferences > Network "Find Fizgig on my other computers" (stop() ends it)
+_thread = [None]
 _NO_WINDOW = {"creationflags": 0x08000000} if os.name == "nt" else {}
 
 
@@ -45,12 +47,15 @@ def _serve():
     try:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("0.0.0.0", DISCOVERY_PORT))
+        s.settimeout(2)                     # wakes to see whether it was switched off
     except OSError:
         s.close()
         return                              # the port is someone else's: this Fizgig just isn't found by itself
-    while True:
+    while _answering[0]:
         try:
             data, src = s.recvfrom(512)
+        except socket.timeout:
+            continue
         except OSError:
             time.sleep(1)
             continue
@@ -62,12 +67,26 @@ def _serve():
             s.sendto(json.dumps(reply).encode("utf-8")[:1400], src)
         except Exception:
             pass
+    s.close()
 
 
 def start(info):
     """Answer other Fizgigs' questions from now on. `info` () -> {id, name, port, gpu, vram_gb, version, commit, busy}."""
     _info[0] = info
-    threading.Thread(target=_serve, daemon=True, name="fizgig-lan").start()
+    _answering[0] = True
+    if _thread[0] is None or not _thread[0].is_alive():
+        _thread[0] = threading.Thread(target=_serve, daemon=True, name="fizgig-lan")
+        _thread[0].start()
+
+
+def stop():
+    """Stop answering (the port closes within a couple of seconds)."""
+    _answering[0] = False
+
+
+def enabled(prefs) -> bool:
+    """Preferences > Network: find Fizgig on your other computers, and be found by them (on unless switched off)."""
+    return str(prefs.get("lan_discovery", "1")) != "0"
 
 
 def _broadcasts() -> list:

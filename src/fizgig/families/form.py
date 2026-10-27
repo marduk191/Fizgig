@@ -51,10 +51,11 @@ DEFAULTS = {
     "FAMILY_DOP_TRIGGER3": "", "FAMILY_DOP_CLASS3": "", "FAMILY_DOP_TRIGGER4": "", "FAMILY_DOP_CLASS4": "",
     "COMPILE_BLOCKS": "Auto", "SAVE_STATE": True,
     "FAMILY_SUBJECTS": "1 subject", "FAMILY_PEOPLE_MODE": "Off - a normal LoRA", "FAMILY_SUBJECT_FIX": False,
-    "FAMILY_MP_MANUAL": False, "FAMILY_SUBJECT_KIND": "From its captions", "FAMILY_SUBJECT_KIND2": "From its captions",
+    "FAMILY_MP_MANUAL": False, "FAMILY_MP_FACECROPS_FIRST": True, "FAMILY_SUBJECT_KIND": "From its captions", "FAMILY_SUBJECT_KIND2": "From its captions",
     "FAMILY_SUBJECT_KIND3": "From its captions", "FAMILY_SUBJECT_KIND4": "From its captions",
     "SAVE_STATE_ON_TRAIN_END": True, "KEEP_LAST_N_STATES": "2", "KREA2_LOSS_WATCH": False,
-    "KREA2_PER_IMAGE_LR": False, "KREA2_AUTO_RECAPTION": False, "CAPTION_TRIGGER_WORD": "", "KREA2_WARMUP_LOOK": False,
+    "KREA2_PER_IMAGE_LR": False, "KREA2_AUTO_RECAPTION": False, "TRAIN_SUBFOLDERS": False, "CAPTION_TRIGGER_WORD": "",
+    "RECAPTION_FIRST": "Training caption (viewpoint-aware)", "RECAPTION_SECOND": "Exhaustive detail", "KREA2_WARMUP_LOOK": False,
     "FAMILY_PRECISION": launch.PRECISION_LABELS["auto"], "FAMILY_EMA": "0.98 (recommended)",
     "FAMILY_TRAINING_ADAPTER": True, "FAMILY_KIND": "standard", "FAMILY_FAST_ID": False,
     "FAMILY_MULTICONCEPT": False, "FAMILY_CONCEPT_DIR": "", "FAMILY_CONCEPT_COUNT": "2 subjects",
@@ -62,11 +63,12 @@ DEFAULTS = {
     "FAMILY_EDIT_DIR": "", "FAMILY_EDIT_REF": "", "FAMILY_EDIT_CAPTION": "",
     "FAMILY_EDIT_PICTURES": launch.EDIT_PHOTO_ONLY, "FAMILY_EDIT_EXTRAS_DIR": "",
     "FAMILY_SLIDER_SOURCE": "pairs", "FAMILY_SLIDER_DIR": "", "FAMILY_SLIDER_CAPTION": "",
-    "FAMILY_SLIDER_BASE": "", "FAMILY_SLIDER_POS": "", "FAMILY_SLIDER_NEG": "", "FAMILY_SLIDER_ULTRA": False,
+    "FAMILY_SLIDER_BASE": "", "FAMILY_SLIDER_POS": "", "FAMILY_SLIDER_NEG": "", "FAMILY_SLIDER_ANCHORS": "",
+    "FAMILY_SLIDER_ANCHOR_WEIGHT": "1", "FAMILY_SLIDER_ULTRA": False,
     "FAMILY_FT_ROTATIONS": "10", "FAMILY_FT_SAVE_EVERY": "1", "FAMILY_FT_ROTATE_EVERY": "1",
     "FAMILY_FT_FUSED": True, "FAMILY_FT_REG_DIR": "", "FAMILY_FT_REG_MULT": "0.2",
     "DATASET_MEGAPIXELS": "0.25", "DATASET_CAPTION_EXT": ".txt", "ENABLE_BUCKET": True, "BUCKET_NO_UPSCALE": True,
-    "ENABLE_CACHE": True,
+    "ENABLE_CACHE": True, "MASKED_TRAINING": False, "MASK_FLOOR": "0.1 (recommended)", "MASK_PRIOR": "Off",
     "METADATA_TITLE": "", "METADATA_AUTHOR": "", "METADATA_DESCRIPTION": "", "METADATA_LICENSE": "",
     "METADATA_TAGS": "", "METADATA_TRIGGER_PHRASE": "", "METADATA_THUMBNAIL": "",
     "SAMPLE_ENABLED": True, "SAMPLE_PROMPT": "A high quality photo", "SAMPLE_SEED": "1234",
@@ -75,9 +77,23 @@ DEFAULTS = {
 }
 
 
+TRAINING_ORDER = ("model", "output", "params", "edit", "slider", "finetune", "memory", "optimizer", "other")
+# any other Training card (Masked training, Subjects) comes after these, under the Extras divider
+TRAINING_OPEN = ("output", "params")         # the Training tab's cards open when it opens; the rest start closed
+
+
 def _row(key, label, kind="entry", hint="", choices=(), default=None, **extra):
     return {"key": key, "label": label, "kind": kind, "hint": hint, "choices": list(choices),
             "default": DEFAULTS.get(key, "") if default is None else default, **extra}
+
+
+def _recaption_choices():
+    from fizgig.krea2.caption_text import RECAPTION_CHOICES      # text only: no torch to load
+    return RECAPTION_CHOICES
+
+
+def _recaption_key(label, default):
+    return next((k for k, lab in _recaption_choices() if lab == label), default)
 
 
 def _optimizers():
@@ -193,6 +209,7 @@ PEOPLE_HINT = ("Off: your subject's face can leak onto other people, even in pro
                "each subject, e.g. zwxemwoman.")
 VIDEO = "https://youtu.be/8uW5NdL5b20"          # the Subjects card video: setting up Fizgig LoRA Isolation
 GUIDE = "https://github.com/shootthesound/Fizgig/blob/master/docs/MULTI_PERSON.md"     # the multi-person captioning guide (docs/MULTI_PERSON.md)
+GUIDE_MASKS = "https://github.com/shootthesound/Fizgig/blob/master/docs/MASKED_TRAINING.md"   # making and using masks
 from fizgig.families.multi_person import KINDS as SUBJECT_KINDS  # noqa: E402
 KIND_HINT = ("What each subject is decides what Fizgig adds to its training.\n"
              "From its captions: Fizgig decides - a person if the captions say woman, man, girl or boy, otherwise an "
@@ -219,6 +236,8 @@ def form(desc):
     def add(sid, title, tab, rows, collapsed=False, help=None):
         """help: {"href", "text", "sub"?} - the card's video, a link across its top"""
         rows = [r for r in rows if r]
+        if tab == "training":                    # the Training tab opens on Output and Training Parameters only
+            collapsed = sid not in TRAINING_OPEN
         if rows:
             sections.append({"id": sid, "title": title, "tab": tab, "rows": rows, "collapsed": collapsed,
                              **({"help": help} if help else {})})
@@ -239,6 +258,7 @@ def form(desc):
              "note"),
         _row("FAMILY_KIND", "Kind of training", "radio", choices=[label for _, label in ks], default=ks[0][1],
              sets={label: kind_sets(desc, k) for k, label in ks if kind_sets(desc, k)}) if len(ks) > 1 else None,
+        _row("TRAIN_SUBFOLDERS", "Also train on its sub-folders", "check", SUBFOLDERS_HINT, default=False),
         _row("LEARNING_RATE", "Learning Rate", default=DEFAULTS["LEARNING_RATE"]),
     ]
     if desc.adaptive_lr:
@@ -314,6 +334,14 @@ def form(desc):
                  "epochs)", "check", "A stuck image gets a new caption written from what is in it, and a fresh start; "
                  "a second try goes into more detail. Still stuck after that, it is left out of training - edit its "
                  "caption to bring it back. Needs the Krea 2 text encoder set in Preferences."),
+            _row("RECAPTION_FIRST", "First try uses", "choice",
+                 "The Captions tab's instruction for that task, as you've edited it there. The defaults are written "
+                 "for a person (viewpoint, whether the face shows): for a style or a concept, set both tries to suit "
+                 "your LoRA, e.g. Style, or Custom with your own instruction.",
+                 [label for _key, label in _recaption_choices()]),
+            _row("RECAPTION_SECOND", "Second try uses", "choice",
+                 "Used when the first new caption didn't help. Set separately from the first try.",
+                 [label for _key, label in _recaption_choices()]),
             _row("CAPTION_TRIGGER_WORD", "Trigger word", hint="Used by Auto-recaption (below): it adds this word at the "
                  "end of a new caption. The training folder's word, the same as the Captions tab's."),
         ]
@@ -344,9 +372,7 @@ def form(desc):
            _row("FAMILY_SUBJECT_KIND3", "Subject 3 is", "choice", choices=SUBJECT_KINDS, default=SUBJECT_KINDS[0]),
            _row("FAMILY_CONCEPT_DIR4", "Subject 4", "folder", upload=True, start="data"),
            _row("FAMILY_SUBJECT_KIND4", "Subject 4 is", "choice", choices=SUBJECT_KINDS, default=SUBJECT_KINDS[0]),
-           _row("FAMILY_CONCEPT_BALANCE", "Balance the subjects (optional)", "check", "Repeats the smaller folders "
-                "so each subject gets about as many steps an epoch as the largest. Epochs get longer by the repeats.")]
-          if desc.multi_concept else []),
+           ] if desc.multi_concept else []),
         _row("FAMILY_PEOPLE_MODE", "Your subject and other people", "radio", PEOPLE_HINT, PEOPLE_MODES,
              default=PEOPLE_MODES[0], hint_labels=True,           # one line per choice, its name in bold
              sets={PEOPLE_MODES[0]: {"FAMILY_DOP": False, "FAMILY_MULTI_PERSON": False},
@@ -356,9 +382,17 @@ def form(desc):
              "No joining or guessing: Fizgig trains on your captions as they are. Write each subject's joined word "
              "(zwxemwoman) into the captions yourself. The side-by-side pictures and the training recipe stay on.",
              link={"href": GUIDE + "#captioning-it-yourself", "text": "How to caption for this"}),
+        _row("FAMILY_MP_FACECROPS_FIRST", "Side-by-side pictures: face crops first", "check",
+             "The 16 pictures of your subject beside a stranger use Image Prep's face crops (FaceCrop_ files) "
+             "first, then photos where a face is found. Untick to pick from every photo, e.g. for more body "
+             "shape. A face crop is never cropped further; other photos are framed on the face, never zoomed."),
         _row("FAMILY_SUBJECT_FIX", "Correct a trigger word, or what a subject is", "check",
              "Fizgig reads each subject's trigger word, and what they are, from their captions. Tick this only if "
              "the line under a subject shows the wrong word."),
+        # beside the card's other ticks (the tiles flow together): Use my captions, face crops first, Correct a trigger
+        *([_row("FAMILY_CONCEPT_BALANCE", "Balance the subjects (optional)", "check", "Repeats the smaller folders "
+                "so each subject gets about as many steps an epoch as the largest. Epochs get longer by the repeats.")]
+          if desc.multi_concept else []),
         *[r for n in (1, 2, 3, 4) for r in (
             _row("FAMILY_DOP_TRIGGER" + ("" if n == 1 else str(n)), f"Subject {n} - trigger word",
                  hint="The word your captions use for this subject, e.g. zwxem.\n"
@@ -380,8 +414,31 @@ def form(desc):
     # the on/off tiles together at the bottom of the card, under every plain box (Adaptive LR stays beside its Min/Max)
     TILES = ("KREA2_LOSS_WATCH", "KREA2_PER_IMAGE_LR", "KREA2_WARMUP_LOOK", "KREA2_AUTO_RECAPTION", "FAMILY_FAST_ID",
              "FAMILY_TRAINING_ADAPTER")
-    params = [r for r in params if not (r and r["key"] in TILES)] + [r for r in params if r and r["key"] in TILES]
+    UNDER = ("RECAPTION_FIRST", "RECAPTION_SECOND")      # Auto-recaption's pickers, straight under the tiles
+    params = ([r for r in params if not (r and r["key"] in TILES + UNDER)] + [r for r in params if r and r["key"] in TILES]
+              + [r for r in params if r and r["key"] in UNDER])
     add("params", "Training Parameters", "training", params)
+    if desc.masked_training:
+        add("masks", "Masked training", "training", [
+            _row("MASKED_TRAINING", "Train on the parts your masks show", "check",
+                 "For pictures where only part of the frame matters - the person, not the room around them.\n\n"
+                 "Save a black-and-white mask beside a picture, named after it with -masklabel added: photo.jpg -> "
+                 "photo-masklabel.png. White is trained fully, grey partly, black only as much as the setting "
+                 "below. The picture itself still trains whole.\n\n"
+                 "Pictures without a mask train as normal. Masks made in OneTrainer work as they are.",
+                 link={"href": GUIDE_MASKS, "text": "How to make masks"}),
+            _row("MASK_FLOOR", "How much outside the mask counts", "choice",
+                 "0.1 keeps a little of the background, so the LoRA still knows your subject sits in a scene. "
+                 "0 ignores it completely - then a very small mask trains hard on a few spots.", launch.MASK_FLOORS),
+            _row("MASK_PRIOR", "Outside the mask, keep the model's own picture", "choice",
+                 "Prior preservation outside the mask. "
+                 "Off: outside the mask the LoRA still learns your photos a little (as much as the setting above). "
+                 "On: there it learns to draw what the model itself would, so backgrounds and the model's look stay "
+                 "the model's own. It works with the setting above at 0 too: 0 stops the outside learning your photos, and this "
+                 "still keeps it to the model's own picture. Each step takes longer (up to about half again). The "
+                 "higher the number, the firmer.",
+                 launch.MASK_PRIORS),
+        ])
     add("subjects", "Subjects", "training", subjects,
         help={"href": VIDEO, "text": "How to set up Fizgig LoRA Isolation",
               "sub": "A step-by-step video of this card · Watch on YouTube"})
@@ -460,6 +517,14 @@ def form(desc):
                  hint="How hard the ends are pushed apart. Higher gives a stronger dial but changes more than the one "
                       f"thing you asked for (a frown can turn into a different, older man). Start on "
                       f"{desc.slider_guidance:g}. You can change the prompts and this while it trains, on the Run card."),
+            _row("FAMILY_SLIDER_ANCHORS", *pn.get("FAMILY_SLIDER_ANCHORS", ("5. Leave these alone (optional)", None))[:1],
+                 "text", hint=pn.get("FAMILY_SLIDER_ANCHORS", (None, None))[1] or "Prompts the dial must not change, one a line. For a hair-length dial meant for women, \"a photo "
+                      "of a man\" keeps men's hair as it is; for a smile dial, \"a photo of a dog\" keeps it to people. "
+                      "Each step checks one of them in turn, and the previews show the first one beside the dial, so "
+                      "you can see it stay put. Each one makes a step about half as long again. Empty = none."),
+            _row("FAMILY_SLIDER_ANCHOR_WEIGHT", pn.get("FAMILY_SLIDER_ANCHOR_WEIGHT", ("6. How firmly",))[0],
+                 default="1", hint=pn.get("FAMILY_SLIDER_ANCHOR_WEIGHT", (None, None))[1] or "How much keeping them as they are counts against the dial itself. 1 is equal weight; higher "
+                      "holds them tighter but can weaken the dial; lower lets a little of the change through."),
             _row("FAMILY_SLIDER_ULTRA", "Ultra mode", "check",
                  hint="Allows use at a much higher range of strengths. Affects fine detail less than a regular slider "
                       "LoRA. Best for sliders from prompts; with photo pairs, best when the change is compositional "
@@ -511,10 +576,11 @@ def form(desc):
              [labels[p] for p in precisions], default=labels["auto"]) if len(desc.precisions) > 1 else None,
         _row("COMPILE_BLOCKS", "Compile Blocks", "choice", desc.compile_hint, ["Auto", "On", "Off"])
         if desc.compiles else None,
-        _row("RESUME_TRAINING", "Resume Training", "folder", "Empty for a normal run. A state folder "
-             "(myLora-000012-state) continues that run, with its optimizer, learning rate and seed as they were. To "
-             "train a finished LoRA further, pick its last state and raise Max Train Epochs first, or it ends at once. "
-             "Pause and Resume fill this in for you."),
+        _row("RESUME_TRAINING", "Resume Training", "folder", "Empty for a normal run. The easy way to carry "
+             "a run on is Continue on Runs & outputs: from its newest save, with its own settings (a run that trained "
+             "all its epochs asks how far to go). Here, a state folder (myLora-000012-state) continues that run with "
+             "the settings on this tab, so keep them as the run had them - its Optimizer Type especially - and raise "
+             "Max Train Epochs to train a finished LoRA further, or it ends at once."),
         _row("SAVE_STATE", "Save state at each checkpoint", "check"),
         _row("SAVE_STATE_ON_TRAIN_END", "Save state at the end of training", "check"),
         _row("KEEP_LAST_N_STATES", "Keep last N states", hint="States are big (a LoRA plus its optimizer)."),
@@ -591,7 +657,8 @@ def form(desc):
         _row("_prompts_note", " ".join(t for k, t in desc.samples_text if k == "prompts"), "note")
         if any(k == "prompts" for k, _t in desc.samples_text) else None,
         _row("SAMPLE_PROMPT", "Prompts", "text", " ".join(t for k, t in desc.samples_text if k == "banner") or
-             "One prompt per line."),
+             "One prompt per line: Enter starts the next. The numbers are the gallery's Prompt 1, 2, 3…",
+             lines=True),
         _row("_overtrain_tip", "Tip - catch overtraining early: give one prompt something your dataset doesn't have, "
              "a pose, angle or setting none of your photos show. Early epochs follow it. When the LoRA starts to "
              "overtrain, that's the first thing to fail, as the previews drift back to your photos. The last epoch that "
@@ -647,6 +714,12 @@ def form(desc):
             _row("SAMPLE_CFG_SCALE", "CFG Scale", hint=desc.cfg_note(), default=str(desc.preview_cfg)),
             _row("SAMPLE_NEGATIVE", "Negative Prompt", "text", default=neg or "") if neg is not None else None,
         ])
+    # the Training tab's order: what every run sets, then (after the Extras divider) the features you choose to use
+    order = {sid: i for i, sid in enumerate(TRAINING_ORDER)}
+    sections.sort(key=lambda sec: (sec["tab"] != "training", order.get(sec["id"], len(order))))
+    first = next((sec for sec in sections if sec["tab"] == "training" and sec["id"] not in order), None)
+    if first:
+        first["extras"] = True               # the divider goes above it
     return {"sections": sections, "presets": [{"name": n, "values": dict(v)} for n, v in (desc.presets or ())]}
 
 
@@ -756,6 +829,62 @@ def _kind(desc, values):
     return next((k for k, lab in kinds(desc) if lab == label or k == label), "standard")
 
 
+SUBFOLDERS_HINT = ("Off: only the pictures directly in the training folder are used.\nOn: the pictures in its "
+                   "sub-folders are trained on too, at any depth, each sub-folder as its own set with its own captions "
+                   "and cache, so a big dataset can stay organised. Every picture trains once an epoch, wherever it "
+                   "is. Image Prep and Captions work on one folder at a time: to caption or mask a sub-folder, choose "
+                   "it as the training folder on the Start tab.")
+
+
+def subfolders_note(desc, values, image_folder):
+    """(the tick's line, its Show all folders / Hide the folders button or None): what it will train and which
+    folders still need captions (on), or what it is leaving out (off)."""
+    if not image_folder or not os.path.isdir(image_folder):
+        return "", None
+    # the form's values name the kind of training (a label), not FAMILY_FT: a fine-tune's regularisation folder
+    reg = _str(values.get("FAMILY_FT_REG_DIR")) if desc.finetune and _kind(desc, values) == "finetune" else ""
+    subs = launch.subfolders(image_folder, (_str(values.get("LORA_OUTPUT_DIR")), reg))
+    if not subs:
+        return ("This training folder has no sub-folders with pictures." if values.get("TRAIN_SUBFOLDERS") else ""), None
+    ext = _str(values.get("DATASET_CAPTION_EXT")) or ".txt"
+    counts = [(rel, launch._media_count(f), _uncaptioned(f, ext)) for rel, f in subs]
+    more = sum(n for _r, n, _u in counts)
+    if not values.get("TRAIN_SUBFOLDERS"):
+        return (f"{len(subs)} sub-folder{'s' if len(subs) != 1 else ''} with {more:,} more picture"
+                f"{'s' if more != 1 else ''} {'is' if more == 1 else 'are'} not trained on. Tick this to include "
+                f"them."), None
+    own = launch._media_count(image_folder)
+    rows = ([("the training folder", own, _uncaptioned(image_folder, ext))] if own else []) + counts
+    line = f"Training on {len(rows)} folders, {own + more:,} pictures."
+    bare = [(rel, u) for rel, _n, u in rows if u]
+    if bare:      # Start refuses a run with uncaptioned pictures: these come first
+        line += (" Not captioned yet, so Start will refuse them: "
+                 + " · ".join(f"{rel} ({u:,})" for rel, u in bare[:8])
+                 + (f" · and {len(bare) - 8} more folders" if len(bare) > 8 else "") + ".")
+    show = bool(values.get("_SUBFOLDER_LIST"))
+    if show:
+        line += " All folders: " + " · ".join(f"{rel} {n:,}" for rel, n, _u in rows) + "."
+    return line, {"label": "Hide the folders" if show else "Show all folders", "values": {"_SUBFOLDER_LIST": not show}}
+
+
+def _str(x):
+    return "" if x is None else str(x).strip()
+
+
+def _uncaptioned(folder, ext):
+    """Training items in a folder with no caption beside them."""
+    from fizgig.dataset.image_dataset import AUDIO_EXTENSIONS, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
+    from fizgig.dataset.masks import is_mask_file
+    exts = {e.lower() for e in (*IMAGE_EXTENSIONS, *VIDEO_EXTENSIONS, *AUDIO_EXTENSIONS)}
+    try:
+        names = os.listdir(folder)
+    except OSError:
+        return 0
+    caps = {os.path.splitext(n)[0] for n in names if n.lower().endswith(ext.lower())}
+    return sum(1 for n in names if os.path.splitext(n)[1].lower() in exts and not is_mask_file(n)
+               and os.path.splitext(n)[0] not in caps)
+
+
 def state(desc, values, image_folder="", captioner="", speed_file=False, checkpoint_file=False, base_file="",
           checkpoint_path="", look_file=False, look_fetch=("", None)):
     """What the current values hide, grey out or note (see the module docstring), and force: values the page sets
@@ -777,7 +906,32 @@ def state(desc, values, image_folder="", captioner="", speed_file=False, checkpo
             hidden.add("SAMPLE_STEPS")
     if not captioner:
         hidden |= {"KREA2_AUTO_RECAPTION", "CAPTION_TRIGGER_WORD"}
+    if not captioner or not values.get("KREA2_AUTO_RECAPTION"):
+        hidden |= {"RECAPTION_FIRST", "RECAPTION_SECOND"}
     kind = _kind(desc, values)
+    # Also train on its sub-folders: a plain LoRA or a fine-tune (Subjects 2-4, DOP and Isolation keep one folder per
+    # subject; an edit or a slider pairs files)
+    if kind in ("edit", "slider") or values.get("FAMILY_MULTICONCEPT") or values.get("FAMILY_DOP")             or values.get("FAMILY_MULTI_PERSON"):
+        hidden.add("TRAIN_SUBFOLDERS")
+    else:
+        notes["TRAIN_SUBFOLDERS"], act = subfolders_note(desc, values, image_folder)
+        if act:
+            actions["TRAIN_SUBFOLDERS"] = act
+    if desc.masked_training:
+        prompt_slider = kind == "slider" and launch.slider_on(desc, {"FAMILY_SLIDER": True, "FAMILY_SLIDER_SOURCE": (
+            "prompts" if values.get("FAMILY_SLIDER_SOURCE") == "Prompts" else "pairs")}, "prompts")
+        media = launch.dataset_media(image_folder) if image_folder else {"photo"}
+        if prompt_slider or (media and "photo" not in media):
+            hidden.add("masks")             # a prompt slider makes its own pictures; a folder of clips has none to mask
+        elif not values.get("MASKED_TRAINING"):
+            hidden |= {"MASK_FLOOR", "MASK_PRIOR"}
+        else:
+            note = _mask_note(desc, values, image_folder)
+            if note:
+                notes["MASKED_TRAINING"] = note
+            if kind in ("slider", "finetune"):      # it switches the LoRA off for a step: a slider or a fine-tune has none
+                disabled.add("MASK_PRIOR")
+                notes["MASK_PRIOR"] = "For a LoRA: a slider or a fine-tune trains without it."
     lokr = str(values.get("NETWORK_TYPE", "")).startswith("LoKR") and kind not in ("slider", "finetune")
     hidden |= {"NETWORK_DIM", "NETWORK_ALPHA"} if lokr else {"LOKR_FACTOR"}
     if lokr:
@@ -868,7 +1022,7 @@ def state(desc, values, image_folder="", captioner="", speed_file=False, checkpo
     if not dop:
         hidden.add("FAMILY_SUBJECT_FIX")
     if not (kind == "standard" and values.get("FAMILY_MULTI_PERSON")):
-        hidden.add("FAMILY_MP_MANUAL")
+        hidden |= {"FAMILY_MP_MANUAL", "FAMILY_MP_FACECROPS_FIRST"}
         hidden |= set(KIND_ROWS)            # what a subject is only changes the group-picture recipe
     if not (dop and values.get("FAMILY_SUBJECT_FIX")):
         hidden |= {"FAMILY_DOP_TRIGGER", "FAMILY_DOP_CLASS"} | DOP_EXTRA_ROWS
@@ -924,7 +1078,7 @@ def state(desc, values, image_folder="", captioner="", speed_file=False, checkpo
     pairs = (values.get("FAMILY_SLIDER_SOURCE") or SLIDER_SOURCES[srcs[0]]) != "Prompts" if len(srcs) > 1 \
         else srcs[0] == "pairs"
     hidden |= ({"FAMILY_SLIDER_BASE", "FAMILY_SLIDER_POS", "FAMILY_SLIDER_NEG", "FAMILY_SLIDER_GUIDANCE",
-                "_slider_help_prompts"} if pairs else {"_slider_plus_dir", "FAMILY_SLIDER_DIR", "FAMILY_SLIDER_CAPTION",
+                "FAMILY_SLIDER_ANCHORS", "FAMILY_SLIDER_ANCHOR_WEIGHT", "_slider_help_prompts"} if pairs else {"_slider_plus_dir", "FAMILY_SLIDER_DIR", "FAMILY_SLIDER_CAPTION",
                                                        "_slider_help_pairs"})
     if pairs:
         notes["_slider_plus_dir"] = image_folder or "Not chosen yet - pick it on the Start tab"
@@ -938,7 +1092,8 @@ def state(desc, values, image_folder="", captioner="", speed_file=False, checkpo
         hidden |= {"TARGET_LAYERS", "TRAINING_BLOCKS", "NETWORK_TYPE", "LOKR_FACTOR"}   # a slider is always a LoRA
     if kind == "slider":         # the trainer turns these off for a slider: a slider step has two targets, not one
         hidden |= {"ADAPTIVE_LR", "ADAPTIVE_LR_MIN", "ADAPTIVE_LR_MAX", "FAMILY_EMA", "KREA2_LOSS_WATCH",
-                   "KREA2_PER_IMAGE_LR", "KREA2_WARMUP_LOOK", "KREA2_AUTO_RECAPTION", "CAPTION_TRIGGER_WORD"}
+                   "KREA2_PER_IMAGE_LR", "KREA2_WARMUP_LOOK", "KREA2_AUTO_RECAPTION", "CAPTION_TRIGGER_WORD",
+                   "RECAPTION_FIRST", "RECAPTION_SECOND"}
     if kind == "finetune":       # the model itself trains: no LoRA (rank, alpha), every noise level, its own continue
         hidden |= {"MIN_TIMESTEP", "MAX_TIMESTEP", "NETWORK_DIM", "NETWORK_ALPHA", "RESUME_TRAINING"}
     if str(values.get("TARGET_LAYERS") or "") != "Custom":   # the block picker is Model Area's Custom
@@ -1040,7 +1195,8 @@ def _extras_found(desc, values, image_folder):
     try:
         found, orphans, misnamed = launch.edit_extras(image_folder, xdir,
                                                       test_photo=str(values.get("FAMILY_EDIT_REF") or ""))
-        total = sum(1 for f in os.listdir(image_folder) if os.path.splitext(f)[1].lower() in launch.PAIR_EXTS)
+        total = sum(1 for f in os.listdir(image_folder) if os.path.splitext(f)[1].lower() in launch.PAIR_EXTS
+                    and not launch.is_mask_file(f))
     except OSError:
         return ""
     counts = sorted(len(v) for v in found.values())
@@ -1075,6 +1231,26 @@ def _timestep_note(values):
 _lr_counts = {}                     # folder -> (modified time, pictures)
 
 
+def _mask_note(desc, values, image_folder):
+    """The line under Masked training: how many pictures have a mask, and any mask that won't be used."""
+    rep = launch.mask_report(desc, {**values, "image_folder": image_folder,
+                                    "extra_folders": [values.get(d) for d, _t, _c in CONCEPT_ROWS[:concept_count(values) - 1]]
+                                    if values.get("FAMILY_MULTICONCEPT") and _kind(desc, values) not in ("edit", "slider")
+                                    else []})
+    if not rep["total"]:
+        return ""
+    if not rep["with"] and not rep["bad"]:
+        line = ("No masks found in the training folder yet. Save one beside a picture as photo-masklabel.png "
+                "(for photo.jpg). Start won't run with this ticked and no masks.")
+    else:
+        line = f"Masks found for {rep['with']} of {rep['total']} pictures. The rest train as normal."
+    if rep["bad"]:
+        shown = rep["bad"][:5]
+        line += (f"\n\n{len(rep['bad'])} mask(s) won't be used, so their pictures train without one:\n"
+                 + "\n".join(shown) + (f"\n... and {len(rep['bad']) - 5} more" if len(rep["bad"]) > 5 else ""))
+    return line
+
+
 def _picture_count(image_folder):
     """The pictures in a training folder, cached until the folder changes; None when it can't be read."""
     try:
@@ -1086,7 +1262,8 @@ def _picture_count(image_folder):
         from fizgig.dataset.image_dataset import IMAGE_EXTENSIONS
         exts = {e.lower() for e in IMAGE_EXTENSIONS}
         try:
-            n = sum(1 for e in os.scandir(image_folder) if e.is_file() and os.path.splitext(e.name)[1].lower() in exts)
+            n = sum(1 for e in os.scandir(image_folder) if e.is_file() and os.path.splitext(e.name)[1].lower() in exts
+                    and not launch.is_mask_file(e.name))
         except OSError:
             n = 0
         hit = _lr_counts[image_folder] = (mt, n)
@@ -1161,6 +1338,8 @@ def inputs(desc, values, *, models, python, repo_dir, image_folder, cache_root, 
         FAMILY_TRAINING_ADAPTER=b("FAMILY_TRAINING_ADAPTER"),
         FAMILY_TURBO_STRENGTH=s("FAMILY_TURBO_STRENGTH"), FAMILY_TURBO_STEPS=s("FAMILY_TURBO_STEPS"),
         FAMILY_TURBO_PACE=s("FAMILY_TURBO_PACE"), FAMILY_PREVIEW_LOOK=b("FAMILY_PREVIEW_LOOK"),
+        MASKED_TRAINING=b("MASKED_TRAINING") and desc.masked_training, MASK_FLOOR=s("MASK_FLOOR"),
+        MASK_PRIOR=s("MASK_PRIOR"),
         python=python, repo_dir=repo_dir, models=models, image_folder=image_folder,
         caption_ext=s("DATASET_CAPTION_EXT") or ".txt", batch_size=1, megapixels=s("DATASET_MEGAPIXELS"),
         clip_megapixels=s("CLIP_MEGAPIXELS") if "clip" in desc.media else "",
@@ -1172,6 +1351,8 @@ def inputs(desc, values, *, models, python, repo_dir, image_folder, cache_root, 
                     "recaption": b("KREA2_AUTO_RECAPTION") and desc.loss_watch},
         captioner=captioner, caption_trigger=s("CAPTION_TRIGGER_WORD"),
         caption_overrides=caption_overrides,
+        recaption_tasks=(_recaption_key(s("RECAPTION_FIRST"), "training"),
+                         _recaption_key(s("RECAPTION_SECOND"), "exhaustive")),
         samples={"enabled": b("SAMPLE_ENABLED"), "every": s("SAMPLE_EVERY_N_EPOCHS"), "later": b("SAMPLE_LATER"),
                  "until": s("SAMPLE_UNTIL_EPOCH"), "after": s("SAMPLE_EVERY_AFTER"), "width": s("SAMPLE_WIDTH"),
                  "height": s("SAMPLE_HEIGHT"), "steps": s("SAMPLE_STEPS"), "cfg": s("SAMPLE_CFG_SCALE") or
@@ -1187,6 +1368,7 @@ def inputs(desc, values, *, models, python, repo_dir, image_folder, cache_root, 
         extra_folders=([s(d) for d, _t, _c in CONCEPT_ROWS[:concept_count(v) - 1]]
                        if b("FAMILY_MULTICONCEPT") and desc.multi_concept and kind not in ("edit", "slider") else []),
         concept_balance=b("FAMILY_CONCEPT_BALANCE"),
+        subfolders=b("TRAIN_SUBFOLDERS"),
         FAMILY_OPTIONS=_option_values(desc, v),
     )
     return d

@@ -249,6 +249,88 @@ def plan(desc, driver, precision="auto", blocks_to_swap=-1, free_gb=None, margin
     return precision, blocks_to_swap, "as set"
 
 
+def share_shortfall(desc, driver, precision, blocks_to_swap, megapixels, free_gb=None, margin_gb=0.5):
+    """Why `precision` with `blocks_to_swap` swapped won't fit this card ("needs ~X GB, Y GB free"), or "" when it
+    does or the description has no figure for it - read from the same train_memory figures Auto plans with."""
+    if precision not in (desc.train_memory or {}):
+        return ""
+    need, per_block = _peak(desc.train_memory[precision], megapixels), desc.train_memory[precision][1]
+    if free_gb is None:
+        free_gb = free_vram_gb()
+    left = need - max(0, blocks_to_swap) * per_block
+    if left <= free_gb - margin_gb:
+        return ""
+    return (f"needs ~{left:.1f} GB with {max(0, blocks_to_swap)} blocks swapped at {megapixels:.2f} MP, "
+            f"{free_gb:.1f} GB free")
+
+
+NOGC_MIN_CARD_GB = 38.0   # big cards only (40 GB and up; a 40 GB A100 reports ~39.4 GiB) - 32 GB and smaller always checkpoint
+NOGC_MARGIN_GB = 4.0     # over the measured no-checkpointing peak: rank, adapters, EMA, a Context LoRA, a busy desktop
+NOGC_MAX_RANK = 32       # rank 32 measured +0.6-1.8 GB over the figures (inside the margin); higher ranks unmeasured
+
+
+def card_gb():
+    """The card's size in GiB - the simulated card's when FIZGIG_SIM_VRAM_GB is set."""
+    sim = os.environ.get("FIZGIG_SIM_VRAM_GB", "").strip()
+    if sim:
+        return float(sim)
+    if not torch.cuda.is_available():
+        return 0.0
+    return torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+
+
+def plan_checkpointing(desc, precision, blocks_to_swap, megapixels, free_gb=None, compiled=True, kind="", rank=8):
+    """Gradient checkpointing on or off: (on, reason). Off only on a big card (NOGC_MIN_CARD_GB+), for a compiled run with no block swap whose measured
+    no-checkpointing peak (desc.train_memory_nogc, at the largest bucket) fits free VRAM with NOGC_MARGIN_GB to spare.
+    The figures are compiled runs - uncompiled blocks without checkpointing take more - and a swapped block's weights
+    would stay pinned through backward without the recompute."""
+    key = f"{precision}:{kind}" if kind else precision
+    pts = (getattr(desc, "train_memory_nogc", None) or {}).get(key)
+    if not pts:
+        return True, f"no measured figure for {key} without it"
+    if blocks_to_swap > 0:
+        return True, "blocks are swapped"
+    if not compiled and desc.compiles:       # a family that never compiles was measured uncompiled
+        return True, "the blocks aren't compiled this run"
+    if card_gb() < NOGC_MIN_CARD_GB:
+        return True, f"a {card_gb():.0f} GB card (only {NOGC_MIN_CARD_GB:.0f} GB+ cards go without it)"
+    if rank > NOGC_MAX_RANK:
+        return True, f"on: rank {rank} is past the measured ranks (up to {NOGC_MAX_RANK})"
+    if free_gb is None:
+        free_gb = free_vram_gb()
+    if megapixels > max(p[0] for p in pts) + 0.01:
+        return True, f"on: {megapixels:.2f} MP is past the measured sizes"
+    need = _peak((pts, 0.0), max(megapixels, min(p[0] for p in pts)))    # below the first point: that point's peak
+    if need + NOGC_MARGIN_GB <= free_gb:
+        return False, f"off: needs ~{need:.1f} GB at {megapixels:.2f} MP, {free_gb:.1f} GB free"
+    return True, f"on: off would need ~{need + NOGC_MARGIN_GB:.1f} GB at {megapixels:.2f} MP, {free_gb:.1f} GB free"
+
+
+def plan_partial_checkpointing(desc, precision, blocks_to_swap, megapixels, free_gb=None, compiled=True, kind="",
+                               rank=8):
+    """How many of the last blocks train without gradient checkpointing when full off doesn't fit a big card: (n, why).
+    Read from desc.train_memory_partial {key: (blocks, ((megapixels, GB with every block checkpointed, GB per block
+    without it), ...))} - reserved peaks, compiled with the checkpoint outside the graph, previews on - at the first
+    measured size at or above the run's (never between or past them), with NOGC_MARGIN_GB to spare. 0 = all on."""
+    key = f"{precision}:{kind}" if kind else precision
+    fig = (getattr(desc, "train_memory_partial", None) or {}).get(key)
+    if (not fig or blocks_to_swap > 0 or (not compiled and desc.compiles) or card_gb() < NOGC_MIN_CARD_GB
+            or rank > NOGC_MAX_RANK):
+        return 0, ""
+    blocks, pts = fig
+    at = [p for p in pts if p[0] + 0.01 >= megapixels]
+    if not at:
+        return 0, ""
+    mp, on_gb, per_block = min(at)
+    if free_gb is None:
+        free_gb = free_vram_gb()
+    n = max(0, min(blocks - 1, int((free_gb - NOGC_MARGIN_GB - on_gb) // per_block)))
+    if not n:
+        return 0, ""
+    return n, (f"partly off: the last {n} of {blocks} blocks without it (~{on_gb + n * per_block:.1f} GB at "
+               f"{megapixels:.2f} MP, {free_gb:.1f} GB free)")
+
+
 _SIM_OTHERS_GB = 0.8     # a simulated card also loses this to the desktop / other apps, as real cards do
 
 

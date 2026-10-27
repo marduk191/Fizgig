@@ -15,8 +15,8 @@ Two kinds of asset, handled differently:
 
   * WEIGHTS  — single .safetensors files. Downloaded into <repo>/models/ (or --models-dir)
                and written into prefs.json against the pref key the GUI reads.
-  * TOOLS    — Florence-2, the InsightFace face model, the EN->ZH translator and Gizmo's
-               Whisper transcriber. These are loaded BY NAME at runtime, not by path, so
+  * TOOLS    — Florence-2, the InsightFace face model, Make masks' person segmenter, the EN->ZH
+               translator and Gizmo's Whisper transcriber. These are loaded BY NAME at runtime, not by path, so
                there's nothing to put in prefs — "fetching" them means warming the cache
                they'll be loaded from, which turns a mid-workflow stall into a one-off
                up-front download (and, for Whisper, guarantees Gizmo transcribes offline).
@@ -196,6 +196,7 @@ TOOLS = [
     ("MiaoshouAI/Florence-2-base-PromptGen", 1.0, "Florence-2 captioner"),
     ("Helsinki-NLP/opus-mt-en-zh", 0.3, "EN->ZH translator (bilingual captions)"),
     ("insightface:buffalo_l", 0.3, "Face model — Look Filter + likeness scoring"),
+    ("masks:segmenter", 0.02, "Person segmenter — Image Prep's Make masks"),
     # hf-model: config + tokenizer + safetensors only. The repo also carries .bin/.msgpack/.h5
     # duplicates of the same weights — an unfiltered snapshot would pull 1.16 GB for a 0.3 GB
     # model. Gizmo checks this cache before loading (gizmo.py local_whisper_dir) and stays
@@ -407,6 +408,12 @@ def fetch_tool(spec, log=print, dry_run=False):
         if os.path.isdir(os.path.join(home, "models", name)):
             log(f"  [ok]   {model_id} — already present")
             return True
+    if model_id.startswith("masks:"):
+        from fizgig.dataset import automask
+        from fizgig.user_data import MODELS_DIR
+        if os.path.isfile(automask.model_path(MODELS_DIR)):
+            log(f"  [ok]   {model_id} — already present")
+            return True
     log(f"  [get]  {model_id} (~{gb:g} GB) — {note}")
     if dry_run:
         return True
@@ -419,6 +426,11 @@ def fetch_tool(spec, log=print, dry_run=False):
                                allowed_modules=["detection", "genderage"],
                                providers=["CPUExecutionProvider"])
             app.prepare(ctx_id=-1)
+        elif model_id.startswith("masks:"):
+            # Make masks' segmenter: the same download and hash check as its first use (dataset/automask.py)
+            from fizgig.dataset import automask
+            from fizgig.user_data import MODELS_DIR
+            automask.ensure_model(MODELS_DIR, log=lambda m: None)
         elif model_id.startswith("hf-config:"):
             # Tokenizer vocab + processor/config json only — NEVER the weights. The weights
             # repos here are multi-GB and the user already has them as local safetensors;
@@ -492,7 +504,7 @@ def fetch(families, models_dir=None, repo_dir=REPO_DIR, token=None, include_opti
     ok = True
     for fam in families:
         if fam == "tools":
-            log("Helper models (Florence-2, face model, translator, Whisper):")
+            log("Helper models (Florence-2, face model, person segmenter, translator, Whisper):")
             for spec in TOOLS:
                 fetch_tool(spec, log=log, dry_run=dry_run)   # never fails the run
             log("")

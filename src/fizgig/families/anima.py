@@ -26,6 +26,7 @@ def _preset(rank, lr, epochs=30, mp="1.0", slider=False):
 
 ANIMA = FamilyDescription(
     key="anima",
+    masked_training=True,
     arch_id="anima",
     display_name="Anima",
     gui_label="Anima",

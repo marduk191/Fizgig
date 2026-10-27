@@ -39,6 +39,7 @@ import torch
 import torch.nn.functional as F
 
 from fizgig.minimax.refmod_meta import NODE_META_KEY, NODE_TOKEN_CAP  # noqa: F401
+from fizgig.utils.upright import upright
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +263,7 @@ def reference_face_centres(refs, image_dirs, face_sizes: Optional[dict] = None) 
             # Opened with PIL, not cv2.imread: libpng's "iCCP: known incorrect sRGB profile"
             # line for every PNG with a stale colour profile came from OpenCV's reader.
             with _Image.open(path) as im:
+                im = upright(im)
                 W, H = im.size
                 faces = det.detect_from_pil(im.convert("RGB"))
             face = det.get_largest(faces) if faces else None

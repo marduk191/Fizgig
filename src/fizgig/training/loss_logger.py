@@ -20,6 +20,7 @@ typical LoRA default. For B>1 the step loss is the batch mean; we log it against
 and record the batch size so analysis can skip those.
 """
 import json
+import re
 import logging
 import os
 import time
@@ -135,6 +136,22 @@ class PerImageLossLogger:
             self._f = None
 
 
+def where(key, folders):
+    """(key prefix, folder, name in that folder) of a training key over {prefix: folder}, or (None, None, None).
+    A key is its folder's prefix ("" for the training folder, "outfits/red/" for a sub-folder, "s2:" for another
+    subject) + the picture's name without its extension; the longest matching prefix wins."""
+    key = str(key)
+    best = None
+    for p in folders or {}:
+        if key.startswith(p) and (best is None or len(p) > len(best)):
+            best = p
+    name = key[len(best):] if best is not None else ""
+    # a sub-folder's or another folder's picture whose folder isn't in the map is no picture of a folder that is
+    if best is None or "/" in name or re.match(r"(s\d+|reg):", name):
+        return None, None, None
+    return best, folders[best], name
+
+
 class PerImageLossWatch:
     """Online per-image difficulty watcher — the actionable layer on top of the passive logger.
 
@@ -167,7 +184,7 @@ class PerImageLossWatch:
                  exhausted_mult: float = 0.6, exhaust_drop_frac: float = 0.3, exhaust_on: int = 2,
                  stuck_floor: float = 0.1, escalate_every: int = 2,
                  dataset_dir: str = None, caption_ext: str = ".txt", healthy_min: int = 3,
-                 plateau_patience: int = 2, plateau_min_epochs: int = 8, family: str = ""):
+                 plateau_patience: int = 2, plateau_min_epochs: int = 8, family: str = "", folders=None):
         self.apply_lr = apply_lr
         self.warmup_epochs = warmup_epochs
         self.window = window
@@ -279,11 +296,13 @@ class PerImageLossWatch:
         # as past its two AI recaptions, so if it is confirmed stuck again it is excluded at once. Each entry
         # snapshots the caption; a changed .txt (fixed offline) re-admits it fully. Mid-run caption edits clear
         # it via reset_key, which also removes the entry. Entries from before per-family records count for every
-        # family.
-        self.dataset_dir = dataset_dir
+        # family. folders: {key prefix: folder} when the run trains several folders (sub-folders, other subjects):
+        # each folder keeps its own file, its entries named as in that folder, so the record travels with it.
+        self.folders = {p: d for p, d in (folders if folders is not None else {"": dataset_dir}).items()
+                        if d and os.path.isdir(d)}
+        self.dataset_dir = self.folders.get("")
         self.caption_ext = caption_ext
-        self._excl_file = (os.path.join(dataset_dir, "fizgig_excluded.json")
-                           if dataset_dir and os.path.isdir(dataset_dir) else None)
+        self._excl_file = bool(self.folders) or None
         self._excl_data: dict[str, dict] = {}
         self._load_persistent_exclusions()
 
@@ -293,10 +312,16 @@ class PerImageLossWatch:
 
     # ---- persistent exclusions -------------------------------------------------
 
+    def where(self, key: str):
+        """(key prefix, folder, name in that folder) of a training key, or (None, None, None) - the longest prefix
+        wins, so a sub-folder's pictures are never read as the training folder's own."""
+        return where(key, self.folders)
+
     def _current_caption(self, key: str):
-        if not self.dataset_dir:
+        _p, folder, name = self.where(key)
+        if not folder:
             return None
-        p = os.path.join(self.dataset_dir, os.path.basename(key) + self.caption_ext)
+        p = os.path.join(folder, name + self.caption_ext)
         try:
             # utf-8-sig + replace: a BOM or stray legacy byte must not make the caption-changed
             # comparison (the exclusion pardon) read as "unreadable" and keep an image excluded.
@@ -306,13 +331,17 @@ class PerImageLossWatch:
             return None
 
     def _load_persistent_exclusions(self) -> None:
-        if not self._excl_file or not os.path.exists(self._excl_file):
-            return
-        try:
-            with open(self._excl_file, encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            logger.warning("[loss-watch] could not read fizgig_excluded.json — ignoring")
+        data = {}
+        for prefix, folder in self.folders.items():
+            path = os.path.join(folder, "fizgig_excluded.json")
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data.update({prefix + str(k): v for k, v in json.load(f).items()})
+            except Exception:
+                logger.warning(f"[loss-watch] could not read {path} — ignoring")
+        if not data:
             return
         pruned = []
         for key, entry in dict(data).items():
@@ -338,13 +367,22 @@ class PerImageLossWatch:
     def _write_persistent_exclusions(self) -> None:
         if not self._excl_file:
             return
-        try:
-            tmp = self._excl_file + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self._excl_data, f, indent=2)
-            _atomic_replace(tmp, self._excl_file)
-        except Exception:
-            logger.warning("[loss-watch] could not write fizgig_excluded.json", exc_info=True)
+        per = {p: {} for p in self.folders}
+        for key, entry in self._excl_data.items():
+            prefix, _folder, name = self.where(key)
+            if prefix is not None:
+                per[prefix][name] = entry
+        for prefix, entries in per.items():
+            path = os.path.join(self.folders[prefix], "fizgig_excluded.json")
+            if not entries and not os.path.exists(path):
+                continue
+            try:
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(entries, f, indent=2)
+                _atomic_replace(tmp, path)
+            except Exception:
+                logger.warning(f"[loss-watch] could not write {path}", exc_info=True)
 
     def _record_exclusion(self, key: str, epoch: int) -> None:
         if not self._excl_file:

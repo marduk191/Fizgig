@@ -37,6 +37,9 @@
       <span class="window-title-text">Fizgig — LoRA &amp; Fine-tune Studio</span>
     </div>
   </header>
+  <!-- over the page until its forms are built: a slow start looks like a start, not a broken page (#249) -->
+  <div class="boot-cover" id="bootCover"><span class="me-spin boot-spin"></span>
+    <span id="bootCoverText">Starting Fizgig…</span></div>
 
   <div class="app-window-body">
     <main class="notebook-container">
@@ -66,16 +69,17 @@
           <button class="tab-item" data-tab="helpers"><i></i><span>Helpers</span></button>
         </nav>
         <button class="side-run" id="sideRun" data-goto="training" title="The run - open the Training tab">
+          <span class="side-queue-title">Training</span>
           <span class="side-run-top"><span class="run-badge" id="runBadge"></span><span id="sideRunName"></span></span>
           <span class="run-bar"><span id="sideRunBar"></span></span>
           <span class="side-run-text" id="sideRunText"></span>
         </button>
-        <div class="side-queue" id="sideQueue" role="button" tabindex="0" title="The queue - open it on the Training tab"
-          style="display:none">
-          <div class="side-queue-head"><span class="side-queue-title">Up next</span><span class="run-badge" id="sideQueueBadge"></span></div>
+        <div class="side-queue" id="sideQueue" role="button" tabindex="0" title="The queue - open it on Runs &amp; outputs">
+          <div class="side-queue-head"><span class="side-queue-title">Queue</span><span class="run-badge" id="sideQueueBadge"></span></div>
           <div class="side-queue-list" id="sideQueueList"></div>
           <div class="side-queue-held" id="sideQueueHeld"></div>
           <button class="btn btn-sm btn-primary" id="sideQueueStart" style="display:none">Start queue</button>
+          <span class="side-queue-open">Manage the queue ›</span>
         </div>
         <div class="gpu-monitor" id="statusBar"></div>
         <a class="runpod-btn" id="sideDeploy" href="https://console.runpod.io/deploy?type=GPU&amp;gpu=RTX+5090&amp;count=1&amp;template=bdrdew7hxw&amp;ref=vkb387ep"
@@ -87,6 +91,13 @@
       </aside>
 
       <div class="notebook-pane">
+        <div class="queue-edit-bar" id="queueEditBar" style="display:none" role="region" aria-label="Editing a queued run">
+          <span id="queueEditText"></span>
+          <span class="queue-edit-actions">
+            <button class="btn btn-primary" id="queueEditSave">Save to queue</button>
+            <button class="btn" id="btnQueueCancel">Cancel edit</button>
+          </span>
+        </div>
         <div class="section-card warning-card pod-stop-bar" id="podStopBar" style="display:none">
           <div class="card-content"><b>Training finished.</b> <span id="podStopText"></span>
             <button class="btn btn-primary" id="podStopKeep">Keep the pod running</button>
@@ -310,6 +321,96 @@
               <div class="card-title">Output log</div>
               <div class="card-content"><pre class="console-terminal prep-log" id="prepLog"></pre></div>
             </div>
+            <div class="section-card" id="maskCard">
+              <div class="card-title">Masks for masked training (optional)</div>
+              <div class="card-desc">Makes a black-and-white mask for each picture, for the Training tab's Masked
+                training: what you want the LoRA to learn is white, the rest black. Each is saved beside its picture as
+                photo-masklabel.png; the pictures themselves don't change.</div>
+              <div class="card-content">
+                <div class="field-hint" id="maskInfo"></div>
+                <div class="mask-step">1. How the masks are made</div>
+                <input type="checkbox" id="maskSam" hidden>
+                <span class="seg" id="maskMethod"><button class="btn" data-sam="0">Person finder</button><button
+                  class="btn" data-sam="1">SAM 3.1: from words</button></span>
+                <div class="field-hint" id="maskMethodHint"></div>
+                <div class="mask-sam-state" id="maskSamState" style="display:none"></div>
+                <div class="mask-step">2. What the masks show</div>
+                <div id="maskSamBox" style="display:none">
+                  <div class="field-row"><span class="field-label">Mask these:</span>
+                    <input type="text" id="maskSamInclude" class="w-path" placeholder="e.g. person" value="person"></div>
+                  <div class="field-row"><span class="field-label">Leave these out:</span>
+                    <input type="text" id="maskSamExclude" class="w-path" placeholder="optional, e.g. glasses, phone"></div>
+                  <div class="field-hint">A few words for each thing, separated by commas. Everything in Mask these is
+                    white, then anything in Leave these out is taken away.</div>
+                  <div class="field-row"><button class="btn" id="maskSamPreview">Preview on 2 random pictures</button>
+                    <span class="field-hint" id="maskSamPrevState"></span></div>
+                  <div class="mask-sam-previews" id="maskSamPreviews"></div>
+                </div>
+                <div id="maskKinds"></div>
+                <div class="mask-step">3. Options</div>
+                <label class="checkbox-label"><input type="checkbox" id="maskSubject">
+                  Only my subject, when there are several people</label>
+                <div class="field-hint radio-hint" id="maskSubjectHint">Finds your subject by their face, with the
+                  Look Filter's 3 baselines (the last card on this tab); everyone else counts as background.</div>
+                <label class="checkbox-label"><input type="checkbox" id="maskReplace"> Replace masks already there</label>
+                <div class="field-hint radio-hint">Off: masks already in the folder, including any you painted
+                  yourself, are kept.</div>
+                <div class="field-row" style="margin-top: 16px"><button class="btn btn-primary" id="maskRun">Make masks</button>
+                  <span class="field-hint" id="maskState"></span></div>
+                <div class="field-hint"><span id="maskRunHint">It runs on the CPU, a fraction of a second a picture.
+                  The first time, it downloads Google's person finder (16 MB).</span><br><br>Check the masks on the Captions tab: a picture
+                  with a mask has a Show mask button. A mask that's wrong can be painted over in any editor, or
+                  deleted (the picture then trains as normal).</div>
+                <pre class="console-terminal prep-log" id="maskLog" style="display:none"></pre>
+                <details class="mask-edit" id="maskEdit">
+                  <summary><span class="me-sum-title">4. Edit masks</span><span class="me-sum-sub">Check and fix
+                    the masks by hand: paint, erase, or click with SAM</span></summary>
+                  <div class="field-hint">Paint over a mask that's wrong, or make one by hand. White is what the LoRA
+                    learns. Each picture's mask is saved beside it as photo-masklabel.png: when you press
+                    <b>Save now</b>, and on its own when you move to another picture, change the filter, close Edit
+                    masks or leave this tab. A mask saved all black is deleted (the picture then trains as normal).</div>
+                  <div class="me-bar">
+                    <button class="btn btn-sm" id="mePrev" title="Previous picture (←)">←</button>
+                    <span class="me-count" id="meCount"></span>
+                    <button class="btn btn-sm" id="meNext" title="Next picture (→)">→</button>
+                    <select id="meFilter" class="w-combo st-small-select">
+                      <option value="all">All pictures</option><option value="mask">With a mask</option>
+                      <option value="none">Without a mask</option></select>
+                    <span class="me-name" id="meName"></span>
+                  </div>
+                  <div class="me-bar">
+                    <span class="seg" id="meTool"><button class="btn btn-sm active" data-tool="brush" title="Paint white: learned (B)">Brush</button><button
+                      class="btn btn-sm" data-tool="erase" title="Paint black: not learned (E)">Eraser</button><button
+                      class="btn btn-sm" data-tool="sam" title="Click a thing to add it to the mask, right-click or Alt+click to take it away (S). Needs SAM 3.1, downloaded on this card">SAM click</button></span>
+                    <label class="me-slider" title="Brush size ([ and ])">Size <input type="range" id="meSize" min="2" max="400" value="40"></label>
+                    <label class="me-slider" title="Soft edges: 0 is a hard edge">Softness <input type="range" id="meSoft" min="0" max="100" value="30"></label>
+                    <label class="me-slider" title="How white each stroke paints: below 100 paints grey (learned partly)">Strength <input type="range" id="meStrength" min="5" max="100" value="100"></label>
+                  </div>
+                  <div class="me-bar">
+                    <span class="seg" id="meView"><button class="btn btn-sm active" data-view="over">Picture + mask</button><button
+                      class="btn btn-sm" data-view="mask">Mask only</button><button class="btn btn-sm" data-view="pic">Picture only</button></span>
+                    <label class="me-slider" title="How strongly the mask shows over the picture">Mask shows <input type="range" id="meShow" min="10" max="90" value="55"></label>
+                    <button class="btn btn-sm" id="meFit" title="Fit the picture (0)">Fit</button>
+                    <button class="btn btn-sm" id="meUndo" title="Undo (Ctrl+Z)">Undo</button>
+                    <button class="btn btn-sm" id="meRedo" title="Redo (Ctrl+Y)">Redo</button>
+                    <button class="btn btn-sm" id="meFill" title="The whole picture white">Fill</button>
+                    <button class="btn btn-sm" id="meClear" title="The whole picture black">Clear</button>
+                    <button class="btn btn-sm" id="meInvert" title="Swap white and black">Invert</button>
+                  </div>
+                  <div class="me-stage" id="meStage"><canvas id="meCanvas"></canvas>
+                    <div class="me-busy" id="meBusy" style="display:none"><span class="me-spin"></span><span id="meBusyText"></span></div></div>
+                  <div class="me-bar">
+                    <span class="me-saved" id="meSaved"></span>
+                    <button class="btn btn-primary btn-sm" id="meSave" disabled>Save now</button>
+                    <button class="btn btn-sm" id="meRevert" title="Throw away the changes since the last save" disabled>Revert</button>
+                    <span class="field-hint" id="meState"></span>
+                  </div>
+                  <div class="field-hint">Scroll to zoom, hold Space and drag (or drag with the middle button) to move
+                    around. Keys: B brush, E eraser, S SAM click, [ ] size, Ctrl+Z / Ctrl+Y, 0 fit, ← → pictures. SAM click: click
+                    something to add it to the mask, right-click or Alt+click to take it away.</div>
+                </details>
+              </div>
+            </div>
           </div>
           <div class="section-card" id="lookCard">
             <div class="card-title">Final step: Look Consistency Filter (faces)</div>
@@ -331,6 +432,7 @@
                 same person typically lands at 30–70%, the baselines included (each is scored against the other two
                 as well as itself).</div>
               <div class="field-hint" id="lookDecision"></div>
+              <div class="field-hint" id="lookPeak"></div>
               <div id="lookPicker" class="look-grid" style="display:none"></div>
               <div class="field-row" id="lookTools" style="display:none">
                 <button class="btn" id="lookSuggest">Auto-Suggest drift</button>
@@ -490,6 +592,7 @@
               </div>
               <div class="lik-panel" id="likPanel" style="display:none">
                 <div class="lik-run" id="likRun"></div>
+                <div class="field-hint" id="likPeak"></div>
                 <canvas id="likChart" height="150"></canvas>
               </div>
               <div class="preview-mode" id="galleryMode" style="display:none"></div>
@@ -538,10 +641,9 @@
                 <button class="btn" id="btnCheck" title="Runs Start's checks without starting: lists anything missing or wrong, else the stages a run would go through">Check settings</button>
                 <button class="btn btn-primary" id="btnStart">Start Training</button>
                 <button class="btn" id="btnQueue" title="Checked like Start, then lined up: it starts when the runs before it finish">Add to queue</button>
-                <button class="btn btn-sm" id="btnQueueCancel" style="display:none">Cancel edit</button>
                 <button class="btn btn-warning" id="btnPause">Pause</button>
                 <button class="btn" id="btnSampleNow" style="display:none" title="Make the previews now, after the current training step, without waiting for the epoch to end">Sample now</button>
-                <button class="btn" id="btnImageLoss" style="display:none" title="Each training image's loss by epoch, against the rest of the dataset: which images are still being learned, which are done, and what the loss watch decided about each">Per-image loss</button>
+                <button class="btn btn-lilac is-off" id="btnImageLoss" style="display:none" title="Each training image's loss by epoch, against the rest of the dataset: which images are still being learned, which are done, and what the loss watch decided about each">Per-image loss</button>
                 <button class="btn" id="btnSaveNow" style="display:none" title="Save the LoRA as it is now, after the current training step (as name-stepNNNNNNN.safetensors)">Save now</button>
                 <button class="btn btn-primary" id="btnResume">Resume</button>
                 <button class="btn" id="btnMove" style="display:none" title="Carry on training this run on another computer running Fizgig (a pod, a laptop) while you use this one: it pauses here and resumes there, and comes back the same way">Move to…</button>
@@ -558,6 +660,8 @@
                   title="The base: each end's words are added after it with a space, as at the start"></label>
                 <label class="slider-live-row"><span>+1 end adds</span><input type="text" id="slPos"></label>
                 <label class="slider-live-row"><span>−1 end adds</span><input type="text" id="slNeg"></label>
+                <label class="slider-live-row"><span>Leave alone</span><textarea id="slAnchors" rows="2"
+                  spellcheck="false" title="Prompts the dial must not change, one a line (empty = none)"></textarea></label>
                 <div class="slider-live-row"><span>Push strength</span>
                   <div class="slider-live-actions"><input type="text" id="slGuidance" class="w-port">
                   <button class="btn btn-primary btn-sm" id="slApply">Apply at the next epoch</button>
@@ -567,18 +671,6 @@
               <div id="problems" class="problems"></div>
               <div class="run-upnext" id="runUpNext" style="display:none"></div>
               <pre class="console-terminal" id="console"></pre>
-            </div>
-          </div>
-          <div class="section-card" id="webQueueCard" style="display:none">
-            <div class="card-title"><span>Queue</span><span class="run-badge" id="webQueueBadge"></span></div>
-            <div class="card-desc">Runs lined up here, in order. Each starts when the one before it finishes; one that
-              fails, is stopped or pauses holds the queue until you press Start queue.</div>
-            <div class="card-content">
-              <div class="field-hint" id="webQueueState"></div>
-              <div id="webQueueList" class="checkpoint-list"></div>
-              <div class="field-row"><button class="btn btn-primary" id="webQueueStart">Start queue</button>
-                <button class="btn" id="webQueueHold">Hold</button>
-                <button class="btn" id="webQueueClear" title="Take every queued run off the queue (a run training now carries on)">Clear queue</button></div>
             </div>
           </div>
           <div class="section-card">
@@ -896,7 +988,6 @@
               <div class="field-row"><button class="btn btn-primary" id="pfRun">Profile LoRA</button>
                 <button class="btn" id="pfStop" disabled>Stop</button>
                 <a class="btn" id="pfReport" target="_blank" rel="noopener" style="display:none">📊 Open report</a>
-                <button class="btn" id="pfStudio" style="display:none">Open in Studio</button>
                 <span class="field-hint" id="pfStatus"></span></div>
               <div class="run-bar"><span id="pfBar" style="width:0"></span></div>
               <pre class="console-terminal" id="pfLog"></pre>
@@ -910,13 +1001,13 @@
             <p>Render every epoch of a training run on one seed, then crossfade between them to find the sweet spot.</p>
           </div>
           <div class="section-card">
-            <div class="card-title"><span>Setup</span><span class="run-badge" id="rySBadge"></span></div>
+            <div class="card-title"><span>Setup</span><span class="run-badge" id="rySetupBadge"></span></div>
             <div class="card-desc">Point at a training output folder. Renders use the model's preview model (its Turbo /
               distilled checkpoint when set).</div>
             <div class="card-content">
               <div class="field-row"><span class="field-label">Model:</span><select id="ryFamily" class="w-combo"></select>
                 <span class="field-hint">Follows the checkpoints' own model.</span></div>
-              <div class="field-row" id="ryRender" style="display:none"></div>
+              <div class="field-row" id="ryRenderChoice" style="display:none"></div>
               <div class="field-row"><span class="field-label">Source:</span>
                 <label class="radio-label"><input type="radio" name="rySource" value="folder" checked> Training folder (compare epochs)</label>
                 <label class="radio-label"><input type="radio" name="rySource" value="single"> Single LoRA</label></div>
@@ -984,6 +1075,7 @@
                 <button class="btn" id="ryBest" disabled>Jump to best</button>
                 <button class="btn" id="ryLikeExport" title="Score likeness first, then export a side-by-side clip: your subject image next to each epoch with its likeness score, morphing epoch by epoch. Uses the Format / Speed / Loop / Fizgig-tag settings below.">Export likeness clip</button>
                 <span class="field-hint" id="ryLikeStatus"></span></div>
+              <div class="field-hint" id="ryLikePeak"></div>
             </div>
           </div>
           <div data-ry="epochs" class="section-card ry-folder-only">
@@ -1382,11 +1474,14 @@
           </div>
           <div class="section-card" data-exmode="lora">
             <div class="card-title">Options</div>
-            <div class="card-desc">Target rank: the rank the extracted LoRA keeps (its strongest directions).</div>
+            <div class="card-desc">Target rank: the rank the extracted LoRA keeps (its strongest directions). Pick one or type
+              any number, such as the Profiler's "Rank holding 95%".</div>
             <div class="card-content">
               <div class="field-row"><span class="field-label">Target rank:</span>
-                <select id="exRank" class="w-combo st-small-select"><option>1</option><option>2</option><option selected>4</option>
-                  <option>8</option><option>16</option></select></div>
+                <select id="exRankPick" class="w-combo st-small-select"><option>1</option><option>2</option>
+                  <option selected>4</option><option>8</option><option>16</option><option>32</option><option>64</option>
+                  <option>128</option><option value="__other">Other…</option></select>
+                <input id="exRank" type="number" min="1" step="1" value="4" class="ex-rank" placeholder="Rank"></div>
             </div>
           </div>
           <div class="section-card">
@@ -1451,12 +1546,25 @@
         <section id="tab-outputs" class="tab-panel">
           <div class="tab-banner">
             <h1>Runs &amp; outputs</h1>
-            <p>Every run you've started, newest first: how it went, its previews and
-              checkpoints, and its settings to start again with. Below, every LoRA and fine-tune saved in Fizgig's
+            <p>The queue, then every run you've started, newest first: how it went, its previews and
+              checkpoints, Continue to train it on from its last save, and its settings to start again with. Below, every LoRA and fine-tune saved in Fizgig's
               output folders. Download sends a file to
               the device you're using now. Very large fine-tunes come off faster another way: on a pod, through its
               <a class="fm-link fm-text" target="_blank" rel="noopener">file manager</a>; on your own server, with scp or rsync
               from the folder shown.</p>
+          </div>
+          <div class="section-card" id="webQueueCard">
+            <div class="card-title"><span>Queue</span><span class="run-badge" id="webQueueBadge"></span></div>
+            <div class="card-desc">Runs lined up here, in order: <b>Add to queue</b> beside Start on the Training tab
+              puts one here, and so does Continue on a run below while another trains. Each starts when the one before
+              it finishes; one that fails, is stopped or pauses holds the queue until you press Start queue.</div>
+            <div class="card-content">
+              <div class="field-hint" id="webQueueState"></div>
+              <div id="webQueueList" class="checkpoint-list"></div>
+              <div class="field-row"><button class="btn btn-primary" id="webQueueStart">Start queue</button>
+                <button class="btn" id="webQueueHold">Hold</button>
+                <button class="btn" id="webQueueClear" title="Take every queued run off the queue (a run training now carries on)">Clear queue</button></div>
+            </div>
           </div>
           <div class="section-card">
             <div class="card-title"><span>Runs</span><button class="btn btn-sm" id="runsReload">Reload</button></div>

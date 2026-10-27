@@ -275,7 +275,7 @@ def _files(path):
     return [path]
 
 
-def read_state_dict(path, dtype=torch.bfloat16) -> dict:
+def read_state_dict(path, dtype=torch.bfloat16, plain=False) -> dict:
     """The DiT's tensors under this module's names, from any released layout:
     * ComfyUI's single file (Comfy-Org/MOSS-Image diffusion_models/moss_image_*_bf16): bare keys, q/k/v fused into
       proj.qkv = [q; k; v] (comfy/lora.py's MOSSImage branch maps LoRA thirds the same way) - split back here
@@ -287,9 +287,9 @@ def read_state_dict(path, dtype=torch.bfloat16) -> dict:
     from fizgig.moss_image.embedder import from_file_wanted
     sd = {}
     for f in _files(path):
-        if from_file_wanted():
-            # a computer under 30 GB of RAM: plain reads - load_file maps the whole file, which Windows counts against
-            # the commit limit on top of the copies
+        if plain or from_file_wanted():
+            # a computer under 30 GB of RAM, or a file loaded beside a live model (plain): plain reads - load_file maps
+            # the whole file, which Windows counts against the commit limit on top of the copies
             from fizgig.krea2.safetensors_utils import MemoryEfficientSafeOpen
             with MemoryEfficientSafeOpen(f) as fh:
                 sd.update({k: fh.get_tensor(k) for k in fh.keys()})
@@ -304,6 +304,7 @@ def read_state_dict(path, dtype=torch.bfloat16) -> dict:
         from fizgig.minimax.convrot import dequantize_int8_convrot, parse_comfy_quant
         for base in quant:
             conf = parse_comfy_quant(sd.pop(base + ".comfy_quant"))
+            sd.pop(base + ".input_scale", None)       # an activation scale: these formats leave the input unquantised
             if conf.get("format") != "int8_tensorwise":
                 raise ValueError(f"{base}: unsupported comfy quant format {conf.get('format')!r}")
             q, sc = sd.pop(base + ".weight"), sd.pop(base + ".weight_scale").float().reshape(-1, 1)
@@ -319,11 +320,11 @@ def read_state_dict(path, dtype=torch.bfloat16) -> dict:
     return {k: v.to(dtype) if v.is_floating_point() else v for k, v in out.items()}
 
 
-def load_moss_dit(path, device="cuda", dtype=torch.bfloat16, config=None) -> MOSSImageDiT:
+def load_moss_dit(path, device="cuda", dtype=torch.bfloat16, config=None, plain=False) -> MOSSImageDiT:
     """Load with a strict key match (no silent drops, as the reference's load_training_state_dict)."""
     with torch.device("meta"):
         model = MOSSImageDiT(**(config or MOSS_CONFIG))
-    sd = read_state_dict(path, dtype)
+    sd = read_state_dict(path, dtype, plain)
     missing, unexpected = model.load_state_dict(sd, strict=False, assign=True)
     if missing or unexpected:
         raise ValueError(f"MOSS-Image DiT keys mismatch: missing {missing[:8]} ({len(missing)}), "

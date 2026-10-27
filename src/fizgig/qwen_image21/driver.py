@@ -17,7 +17,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from fizgig.families.driver import FamilyDriver
+from fizgig.families.driver import FamilyDriver, prior_base, weighted_loss, with_prior
 from fizgig.qwen_image21 import sampling as S
 
 logger = logging.getLogger(__name__)
@@ -192,7 +192,7 @@ class QwenImage21Driver(FamilyDriver):
         return min_t + (max_t - min_t) * t
 
     def training_loss(self, dit, latents, cond, generator, *, min_t=0.0, max_t=1.0, refs=None, diff_ref=None,
-                      diff_weight=0.0):
+                      diff_weight=0.0, loss_mask=None, prior=None):
         device = latents.device
         h, w = latents.shape[-2:]
         n = h * w
@@ -209,7 +209,10 @@ class QwenImage21Driver(FamilyDriver):
         elif ref_mask is not None and ref_mask.any():
             raise RuntimeError("edit conditioning without its reference latents - re-cache the latents")
         tt = torch.tensor([t], device=device, dtype=torch.bfloat16)
+        base = prior_base(prior, loss_mask, lambda: dit(xt.to(torch.bfloat16), enc.to(torch.bfloat16), tt, [shapes],
+                                                         img_mask, enc_mask)[:, -n:])
         pred = dit(xt.to(torch.bfloat16), enc.to(torch.bfloat16), tt, [shapes], img_mask, enc_mask)[:, -n:]
+        w = None
         if diff_ref is not None and diff_weight > 0.0:
             # slider disentanglement: tokens where the two poles differ count more (Krea 2's formula)
             d = S.pack((latents.float() - diff_ref.to(device).float()).abs()).mean(dim=-1)     # (1, N)
@@ -218,9 +221,13 @@ class QwenImage21Driver(FamilyDriver):
             w = (1.0 - float(diff_weight)) + float(diff_weight) * r
             w = w / w.mean(dim=1, keepdim=True).clamp_min(1e-8)
             w = torch.where(dm > 1e-6, w, torch.ones_like(w))      # identical pair: uniform, never all-zero
-            se = (pred.float() - (noise - x0)).pow(2).mean(dim=-1)
-            return (se * w).mean(), {"t": t}
-        return F.mse_loss(pred.float(), noise - x0), {"t": t}
+        mw = None if loss_mask is None else S.pack(loss_mask.to(device).float()).mean(dim=-1)   # (1, N)
+        if w is None and mw is None:
+            return F.mse_loss(pred.float(), noise - x0), {"t": t}
+        loss = weighted_loss((pred.float() - (noise - x0)).pow(2).mean(dim=-1), w, mw)
+        if base is not None:
+            loss = with_prior(loss, prior, base, (pred.float() - base).pow(2).mean(dim=-1), mw, w)
+        return loss, {"t": t}
 
     def noise_latents(self, latents, generator, *, min_t=0.0, max_t=1.0):
         h, w = latents.shape[-2:]

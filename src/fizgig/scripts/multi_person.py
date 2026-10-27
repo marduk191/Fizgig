@@ -17,9 +17,10 @@ def main():
     p.add_argument("--subject", nargs=3, action="append", required=True, metavar=("FOLDER", "FUSED", "OUT"))
     p.add_argument("--ext", default=".txt")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--no_face_first", action="store_true", help="pick from every photo, not Image Prep's face crops first")
     a = p.parse_args()
     multi_person.build([{"folder": f, "fused": t, "out": o, "index": i} for i, (f, t, o) in enumerate(a.subject)],
-                       ext=a.ext, seed=a.seed, log=lambda m: print(m, flush=True))
+                       ext=a.ext, seed=a.seed, log=lambda m: print(m, flush=True), face_first=not a.no_face_first)
 
 
 if __name__ == "__main__":

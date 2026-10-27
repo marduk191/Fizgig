@@ -276,8 +276,9 @@ def thumbnail_data_uri(image_path: Optional[str], max_size: int = 512, quality: 
         return None
     try:
         from PIL import Image
+        from fizgig.utils.upright import upright
         with Image.open(image_path) as im:
-            im = im.convert("RGB")
+            im = upright(im).convert("RGB")
             im.thumbnail((max_size, max_size))
             buf = BytesIO()
             im.save(buf, format="JPEG", quality=quality)
