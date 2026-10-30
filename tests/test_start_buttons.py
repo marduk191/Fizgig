@@ -103,8 +103,12 @@ if dep:
        re.search(r'\$\("' + dep.get("id", "?") + r'"\)\.style\.display = S\.onPod \? "none" : ""', JS) is not None)
 # the last .runpod-btn rule that sets a background (later rules win; the phone layout's only re-spaces it)
 _rp = [m.group(1) for m in re.finditer(r"\.runpod-btn\s*\{([^}]*)\}", CSS) if "background" in m.group(1)]
-ck("  RunPod's violet, not a Fizgig accent",
-   bool(_rp) and re.search(r"background:\s*#7C3AED", _rp[-1], re.I) is not None, _rp[-1][:120] if _rp else None)
+# The stylesheet names the colour as a token now (background: var(--runpod)); resolve it, last :root definition wins.
+_tok = {k: v.upper() for blk in re.findall(r":root\s*\{([^}]*)\}", CSS)
+        for k, v in re.findall(r"--([a-z0-9-]+)\s*:\s*(#[0-9A-Fa-f]{6})", blk)}
+_bg = re.search(r"background:\s*(#[0-9A-Fa-f]{6}|var\(--([a-z0-9-]+)\))", _rp[-1]) if _rp else None
+_col = (_tok.get(_bg.group(2)) if _bg and _bg.group(2) else (_bg.group(1).upper() if _bg else None))
+ck("  RunPod's violet, not a Fizgig accent", _col == "#7C3AED", (_bg.group(1) if _bg else None, _col))
 for gpu in ("RTX 5090", "RTX 4090", "H100 80GB HBM3"):
     q = urllib.parse.parse_qs(urllib.parse.urlsplit(pods.deploy_url(gpu)).query)
     ck(f"the Pods tab's deploy link for {gpu} carries the referral and that GPU",

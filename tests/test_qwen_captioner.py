@@ -158,7 +158,8 @@ if "--captioner" in c:
        c[c.index("--recaption_task") + 1].endswith("(your edit)")
        and c[c.index("--recaption_task_detailed") + 1].endswith("(as shipped)"))
     # the pickers: any Captions tab task for each try
-    c = recaption_cmd({"short": "ONLY SHORT"}, RECAPTION_FIRST="Short caption", RECAPTION_SECOND="Short caption")
+    c = recaption_cmd({"short": "ONLY SHORT"}, RECAPTION_FIRST="Short caption (person or character)",
+                       RECAPTION_SECOND="Short caption (person or character)")
     ck("  First try uses / Second try uses pick any task each: both tries use the edited Short text",
        "--recaption_instruction" in c and c[c.index("--recaption_instruction") + 1] == "ONLY SHORT"
        and c[c.index("--recaption_instruction_detailed") + 1] == "ONLY SHORT", c[c.index("--recaption_task") + 1])

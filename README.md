@@ -167,12 +167,12 @@ Model files download from the **Preferences** tab: one **Download models for me*
 
 1. **[⚡ Deploy on RunPod](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=bdrdew7hxw&ref=vkb387ep)**, and add a **300 GB Volume disk** before **Deploy Pod**: RunPod doesn't add one for you ([how](docker/README.md#give-it-a-disk-on-runpods-deploy-page)).
 2. Wait for **Ready** in the pod's **Logs** tab; the password is printed under it.
-3. **Connect → HTTP port 8081**, and log in with that password.
+3. **Connect → HTTP port 8081**, and log in with that password. (Opened from Fizgig on your own computer, with your RunPod API key on its Pods tab, the pod logs you in by itself.)
 4. **Preferences → Download models for me**, upload your training folder on the **Start** tab, and press **Start** on the **Training** tab.
 
 Prefer Vast.ai? The same image runs there: **[Fizgig on Vast.ai](https://cloud.vast.ai/?ref_id=757773&creator_id=757773&name=Fizgig%20LoRa%20Training%20and%20Fine-tuning)** ([guide](docs/VAST.md)).
 
-Step by step: [Quick start](docker/README.md#quick-start-nothing-installed-on-your-computer). The pod also has a drag-and-drop file manager for big datasets and fine-tunes (the **File manager** button in the sidebar), one-click model downloads and an optional auto-stop when training finishes. A pod updates to the newest Fizgig each time it starts; to keep one on a version, [set `FIZGIG_REF`](docker/README.md#keep-a-pod-on-one-version). [The full pod guide](docker/README.md).
+Step by step: [Quick start](docker/README.md#quick-start-nothing-installed-on-your-computer). The pod also has a drag-and-drop file manager for big datasets and fine-tunes (the **File manager** button in the sidebar), one-click model downloads and an optional auto-stop when training finishes. Opened from your own Fizgig, a pod runs the same version as your computer ([which Fizgig a pod runs](docker/README.md#which-fizgig-a-pod-runs)). [The full pod guide](docker/README.md).
 
 Mid-job on the old pod with the remote desktop? It stays available as **[Fizgig Classic v7.x](https://console.runpod.io/deploy?type=GPU&gpu=RTX+5090&count=1&template=faoq8ed6um&ref=vkb387ep)**, and pods you already have keep running as they are.
 
@@ -234,6 +234,8 @@ Renting through the [RunPod link](https://console.runpod.io/deploy?type=GPU&gpu=
 Fizgig is open source under the **[Apache License 2.0](LICENSE)** — free to use, modify, and redistribute, including commercially, with attribution and no warranty. Third-party components under compatible permissive licenses (and other terms where noted) are listed in **[THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md)**.
 
 The **Automagic v3 optimizer**, the Krea 2 **MMDiT backbone and flow-matching sampler**, and Ostris's MiniMax H3 **training adapter** all come from **[@ostris](https://github.com/ostris)** — the first two from [AI-Toolkit](https://github.com/ostris/ai-toolkit) under the MIT licence, the adapter downloaded as a model rather than bundled. The default H3 training adapter comes from **[circlestone-labs](https://huggingface.co/circlestone-labs)**, also downloaded as a model. Anima's model code is adapted from kohya-ss's [sd-scripts](https://github.com/kohya-ss/sd-scripts) under the Apache licence, Z-Image's from Tongyi-MAI's [reference implementation](https://github.com/Tongyi-MAI/Z-Image), and Flux 3 Image Klein's from Black Forest Labs' [reference implementation](https://github.com/black-forest-labs/flux-3-image-klein), both Apache too.
+
+A few features came from looking at other trainers: starting a run at a smaller size, the run summary, the sidebar's disk and job meters and the captions table were inspired by [ZenTrainer](https://github.com/Nynxz/ZenTrainer) by @Nynxz.
 
 Copyright © 2026 Peter Neill.
 

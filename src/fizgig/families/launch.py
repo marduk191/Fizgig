@@ -18,6 +18,7 @@ FAMILY_EDIT, ...) plus the values the app reads from its other tabs, all lower c
     recache                     unless its picture size changed (Target Megapixels): then they run, and keep what fits
     loss_watch                  {"detect", "per_image_lr", "warmup", "recaption": bool}
     captioner, caption_trigger, caption_overrides   auto-recaption: model path, trigger word, edited instructions
+    caption_concept             the Captions tab's "The concept is" words, for a Concept task
     recaption_triggers          auto-recaption's trigger word for each other folder ({key prefix: word})
     recaption_tasks             auto-recaption's (first try, second try) Captions tab task keys
     keep_checkpointing          a helper is set to train a share: gradient checkpointing stays on (both halves match)
@@ -278,6 +279,52 @@ def uncached_pictures(toml_text):
     return n
 
 
+def start_checks(desc, st, image_folder):
+    """Warnings for Start, each one line, never a block (Start anyway goes on): pictures with no caption, captions
+    without the trigger word, a learning rate outside the model's usual band (description start_lr_bands)."""
+    out = []
+    folder = str(image_folder or "").strip()
+    if folder and os.path.isdir(folder) and not slider_on(desc, st, "prompts"):
+        from fizgig.dataset.image_dataset import AUDIO_EXTENSIONS, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
+        exts = {e.lower() for e in (*IMAGE_EXTENSIONS, *VIDEO_EXTENSIONS, *AUDIO_EXTENSIONS)}
+        cap = _s(st.get("DATASET_CAPTION_EXT")) or ".txt"
+        cap = cap if cap.startswith(".") else "." + cap
+        items = sorted(f for f in os.listdir(folder) if os.path.splitext(f)[1].lower() in exts and not is_mask_file(f))
+        texts = {}
+        for f in items:
+            p = os.path.join(folder, os.path.splitext(f)[0] + cap)
+            try:
+                with open(p, encoding="utf-8", errors="replace") as fh:
+                    texts[f] = fh.read()
+            except OSError:
+                texts[f] = None
+        none = [f for f, t in texts.items() if t is None or not t.strip()]
+        if none:
+            out.append(f"{len(none)} of {len(items)} pictures {'has' if len(none) == 1 else 'have'} no caption ({', '.join(none[:3])}"
+                       f"{', ...' if len(none) > 3 else ''}): {'it trains' if len(none) == 1 else 'they train'} on an empty caption.")
+        trig = _s(st.get("CAPTION_TRIGGER_WORD"))
+        if trig and trig.lower() != "trigger_word" and not multi_person_on(desc, st):
+            pat = re.compile(r"(?<!\w)" + re.escape(trig) + r"(?!\w)", re.I)
+            lack = [f for f, t in texts.items() if t and t.strip() and not pat.search(t)]
+            if lack:
+                out.append(f"{len(lack)} caption{'s don' if len(lack) != 1 else ' doesn'}'t contain the trigger word "
+                           f"'{trig}' ({', '.join(lack[:3])}{', ...' if len(lack) > 3 else ''}): "
+                           + ("that picture trains" if len(lack) == 1 else "those pictures train") + " without it.")
+    if not st.get("ADAPTIVE_LR") and "automagic" not in _s(st.get("OPTIMIZER_TYPE")).lower():
+        kind = "finetune" if ft_on(desc, st) else "slider" if slider_on(desc, st) else "lora"
+        band = next(((lo, hi) for k, lo, hi in (desc.start_lr_bands or ()) if k == kind), None)
+        try:
+            lr = float(_s(st.get("LEARNING_RATE")))
+        except ValueError:
+            lr = None
+        if band and lr is not None and not band[0] <= lr <= band[1]:
+            what = {"finetune": "a fine-tune", "slider": "a slider"}.get(kind, "a LoRA")
+            e = lambda x: (lambda m, x_: f"{float(m):g}e{int(x_)}")(*f"{x:.1e}".split("e"))   # 3e-5, not 3e-05
+            out.append(f"Learning rate {e(lr)} is {'below' if lr < band[0] else 'above'} {desc.display_name}'s usual "
+                       f"range for {what} ({e(band[0])} to {e(band[1])}, from its presets).")
+    return out
+
+
 def caches(desc, inputs):
     """Whether the cache stages run: not on a resume (the cache is already built) unless it trains at a different
     size from now on (recache: the latents that still fit are kept), not for a prompt slider (no photos), not with
@@ -507,8 +554,16 @@ def _media_count(folder):
         return 0
 
 
-# Folders Fizgig itself makes inside a training folder: never trained on as sub-folders
-OWN_SUBFOLDERS = {"excluded_by_look", "originals"}
+# Folders Fizgig itself makes inside a training folder: never trained on as sub-folders. Image Prep's Keep them safe
+# (originals, then originals_2, _3... on later runs), Exclude by look and the desktop's Remove. Matched in any case.
+OWN_SUBFOLDERS = {"excluded_by_look", "originals", "removed"}
+_OWN_NUMBERED = re.compile(r"originals(_\d+)?", re.IGNORECASE)
+
+
+def is_own_subfolder(name):
+    """A folder Fizgig made inside a training folder (originals, originals_2, excluded_by_look, removed)."""
+    n = os.path.basename(str(name).rstrip("\\/")).lower()
+    return n in OWN_SUBFOLDERS or bool(_OWN_NUMBERED.fullmatch(n))
 
 
 def subfolders_on(desc, st):
@@ -518,29 +573,43 @@ def subfolders_on(desc, st):
                                                or edit_on(desc, st) or slider_on(desc, st))
 
 
-def subfolders(folder, skip=()):
+def subfolders(folder, skip=(), skipped=None):
     """[(relative path with "/", folder)] of every sub-folder at any depth holding training items (photos, clips,
-    songs), sorted: Fizgig's own (excluded_by_look, originals), hidden ones, and any folder in `skip` (the output,
-    cache or regularisation folder when it sits inside), with everything under them, are left out."""
+    songs), sorted: Fizgig's own (originals, originals_2..., excluded_by_look, removed), hidden ones, and any folder in
+    `skip` (the output, cache or regularisation folder when it sits inside), with everything under them, are left out.
+    skipped: a list that gets the relative paths of the Fizgig folders left out (for the run's log)."""
     if not folder or not os.path.isdir(folder):
         return []
     norm = lambda f: os.path.normcase(os.path.abspath(f)).rstrip("\\/")
     skip = {norm(f) for f in skip if f}
     out = []
     for root, dirs, _files in os.walk(folder):
-        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d.lower() not in OWN_SUBFOLDERS
+        if skipped is not None:
+            skipped += sorted(os.path.relpath(os.path.join(root, d), folder).replace("\\", "/")
+                              for d in dirs if not d.startswith(".") and is_own_subfolder(d))
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and not is_own_subfolder(d)
                          and norm(os.path.join(root, d)) not in skip)
         if norm(root) != norm(folder) and _media_count(root):
             out.append((os.path.relpath(root, folder).replace("\\", "/"), root))
     return out
 
 
-def run_subfolders(desc, st):
+def run_subfolders(desc, st, skipped=None):
     """The run's sub-folders (subfolders), or [] when the tick is off or doesn't apply."""
     if not subfolders_on(desc, st):
         return []
     return subfolders(_s(st.get("image_folder")), (_s(st.get("LORA_OUTPUT_DIR")), _s(st.get("cache_root")),
-                                                   ft_reg_dir(desc, st)))
+                                                   ft_reg_dir(desc, st)), skipped)
+
+
+def own_skipped_line(desc, st):
+    """The run log's one line naming the Fizgig folders the sub-folder tick left out, or "" (none, or tick off)."""
+    skipped = []
+    run_subfolders(desc, st, skipped)
+    if not skipped:
+        return ""
+    return "[sub-folders] Not trained (Fizgig's own folders): " + ", ".join(skipped[:6]) + (
+        f" and {len(skipped) - 6} more" if len(skipped) > 6 else "")
 
 
 def _balance_repeats(folders):
@@ -658,11 +727,12 @@ def _dedupe_flags(cmd):
     return out[::-1]
 
 
-def cache_command(desc, inputs, stage):
-    """families/cache.py: latents with the family's VAE, text with its text encoder."""
+def cache_command(desc, inputs, stage, config=""):
+    """families/cache.py: latents with the family's VAE, text with its text encoder (config: another dataset TOML,
+    Start at a smaller size's)."""
     model = _model(inputs, desc, "vae" if stage == "latents" else "text_encoder")
     cmd = [inputs["python"], os.path.join(inputs["repo_dir"], desc.cache_script), "--family", desc.key,
-           "--stage", stage, "--dataset_config", inputs["DATASET_CONFIG"], "--model", model]
+           "--stage", stage, "--dataset_config", config or inputs["DATASET_CONFIG"], "--model", model]
     cmd += option_tokens(desc, inputs)[1]
     if stage == "latents":
         cmd.append("--skip_existing")   # validated against the current bucket
@@ -714,6 +784,8 @@ def train_command(desc, inputs, plan):
         cmd += ["--context_lora_path", ctx,
                 "--context_lora_strength", _s(st.get("CONTEXT_LORA_STRENGTH") or "1.0") or "1.0"]
     mp_subs = [x[1] for x in multi_person_subjects(desc, st) if x[1]] if multi_person_on(desc, st) else []
+    if float(st.get("CAPTION_DROPOUT") or 0) > 0 and desc.caption_dropout and not slider_on(desc, st, "prompts"):
+        cmd += ["--caption_dropout", f"{float(st['CAPTION_DROPOUT']):g}"]
     if masked_on(desc, st):
         cmd += ["--masked_training", "--mask_floor", f"{mask_floor(st):g}"]
         if mask_prior(desc, st):
@@ -807,7 +879,7 @@ def train_command(desc, inputs, plan):
             tasks = tuple(st.get("recaption_tasks") or RECAPTION_DEFAULTS)
             for key, (flag, task_flag) in zip(tasks, (("--recaption_instruction", "--recaption_task"),
                                                       ("--recaption_instruction_detailed", "--recaption_task_detailed"))):
-                label, instr, edited = recaption_instruction(key, ovr)
+                label, instr, edited = recaption_instruction(key, ovr, st.get("caption_concept") or "")
                 cmd += [flag, instr, task_flag, f'"{label}"' + (" (your edit)" if edited else " (as shipped)")]
     elif any(lw.get(key) for key, _ in watch):
         plan.console.append("[loss-watch] per-image features skipped - they need Batch Size 1.\n")
@@ -1012,11 +1084,34 @@ def _preview_flags(desc, st, plan, cmd):
                         "--preview_checkpoint_cache", _s(sm.get("checkpoint_cache")) or "auto"]
                 if sm.get("int8"):
                     out.append("--preview_int8")
+        if (desc.train_preview_checkpoint and ck and ck[1] and sm.get("checkpoint")
+                and "--preview_checkpoint" not in out):
+            # ticked, but this run previews on its own model (a fine-tune, a slider, no preview file): the boxes hold
+            # the checkpoint's Steps and CFG (the tick's follow - Z-Image Turbo's 8 and 1), which render the training
+            # model badly; its own come back for them, with its negative once CFG is above 1
+            _swap_sample_value(out, "--sample_steps", ck[1].steps, desc.preview_steps)
+            if _swap_sample_value(out, "--sample_cfg_scale", ck[1].cfg, desc.preview_cfg) and desc.preview_cfg > 1.0 \
+                    and "--sample_negative" not in out:
+                neg = _s(sm.get("negative")) or _s(desc.preview_negative)
+                if neg:
+                    out += ["--sample_negative", neg]
         look = desc.preview_look()
         if look is not None and st.get("FAMILY_PREVIEW_LOOK") and "--preview_checkpoint" not in out:
             # on the training model's previews only; a file still downloading is picked up at a later preview
             out += ["--preview_lora", look_path(desc, st), "--preview_lora_strength", f"{desc.preview_look_strength:g}"]
     return out
+
+
+def _swap_sample_value(out, flag, was, now) -> bool:
+    """The value after `flag` in a command list, replaced by `now` when it is `was` (as a number). True = replaced."""
+    try:
+        i = out.index(flag)
+        if float(out[i + 1]) == float(was) and float(was) != float(now):
+            out[i + 1] = f"{now:g}" if isinstance(now, float) else str(now)
+            return True
+    except (ValueError, IndexError):
+        pass
+    return False
 
 
 def look_path(desc, st):
@@ -1048,7 +1143,33 @@ def cache_dir_for(cache_root, image_dir):
     return os.path.join(cache_root, f"{nm}-{h}")
 
 
-def dataset_toml(desc, inputs):
+STAGE_BLEND = 0.1      # the share of the run the change from the smaller size to the full one blends over
+
+
+def stage_mp(desc, inputs):
+    """Start at a smaller size: its Target Megapixels, or 0 (off, not below Target Megapixels, or a run it isn't for:
+    an edit, a slider, a fine-tune, Fizgig LoRA Isolation)."""
+    try:
+        smp = float(_s(inputs.get("STAGE_MP")) or 0)
+        full = float(inputs.get("megapixels") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    if not (desc.resolution_stages and 0.25 <= smp < full):
+        return 0.0
+    if edit_on(desc, inputs) or slider_on(desc, inputs) or ft_on(desc, inputs) or multi_person_on(desc, inputs):
+        return 0.0
+    return smp
+
+
+def stage_until(inputs):
+    """The share of the run at the smaller size (the For the first choice)."""
+    try:
+        return max(0.05, min(0.9, float(_s(inputs.get("STAGE_UNTIL")).rstrip("%") or 30) / 100))
+    except ValueError:
+        return 0.3
+
+
+def dataset_toml(desc, inputs, cache_suffix=""):
     """The dataset TOML for the run: the training folder at Target Megapixels (a square of that area on the
     16-pixel grid), an edit's originals or a slider's -1 end as its control folder, and its own cache folder.
     Raises ValueError on a Target Megapixels that is not a number. Batch size is always 1 (one image a step)."""
@@ -1095,32 +1216,32 @@ def dataset_toml(desc, inputs):
         lines.append(f'control_directory = "{_s(inputs.get("FAMILY_SLIDER_DIR")).replace(chr(92), "/")}"')
     root = _s(inputs.get("cache_root"))
     if root and folder:
-        lines.append(f'cache_directory = "{cache_dir_for(root, folder).replace(chr(92), "/")}"')
+        lines.append(f'cache_directory = "{(cache_dir_for(root, folder) + cache_suffix).replace(chr(92), "/")}"')
     if subs and not _media_count(folder):     # everything is in the sub-folders: the training folder has no block
         del lines[head:]
     for rel, f in subs:                  # Also train on its sub-folders: each its own block and cache folder
         lines += ["", "[[datasets]]", f'image_directory = "{f.replace(chr(92), "/")}"',
                   f'item_prefix = "{_toml_str(rel + "/")}"']
         if root:
-            lines.append(f'cache_directory = "{cache_dir_for(root, f).replace(chr(92), "/")}"')
+            lines.append(f'cache_directory = "{(cache_dir_for(root, f) + cache_suffix).replace(chr(92), "/")}"')
     for n, f in enumerate(extra, start=2):   # Multi Concept: each subject its own block and cache folder
         lines += ["", "[[datasets]]", f'image_directory = "{f.replace(chr(92), "/")}"', f'item_prefix = "s{n}:"']
         if reps.get(f, 1) > 1:
             lines.append(f"num_repeats = {reps[f]}")
         _fuse(f)
         if root:
-            lines.append(f'cache_directory = "{cache_dir_for(root, f).replace(chr(92), "/")}"')
+            lines.append(f'cache_directory = "{(cache_dir_for(root, f) + cache_suffix).replace(chr(92), "/")}"')
     for f, (_s_, w) in mp.items():        # multi-person mode: each person's composites, already captioned fused
         if _s_["kind"] != "person":
             continue
         lines += ["", "[[datasets]]", f'image_directory = "{w.replace(chr(92), "/")}"']
         if root:
-            lines.append(f'cache_directory = "{cache_dir_for(root, w).replace(chr(92), "/")}"')
+            lines.append(f'cache_directory = "{(cache_dir_for(root, w) + cache_suffix).replace(chr(92), "/")}"')
     reg = ft_reg_dir(desc, inputs)
     if reg:                              # a fine-tune's regularisation set: its own block (and cache folder)
         lines += ["", "[[datasets]]", f'image_directory = "{reg.replace(chr(92), "/")}"', 'item_prefix = "reg:"']
         if root:
-            lines.append(f'cache_directory = "{cache_dir_for(root, reg).replace(chr(92), "/")}"')
+            lines.append(f'cache_directory = "{(cache_dir_for(root, reg) + cache_suffix).replace(chr(92), "/")}"')
         lines.append("is_reg = true")
     return "\n".join(lines) + "\n"
 
@@ -1432,6 +1553,16 @@ def plan(desc, inputs):
     if p.problems:
         return p                        # nothing to write or run
     p.files.append((inputs["DATASET_CONFIG"], p.dataset_toml))
+    smp = stage_mp(desc, inputs)
+    stage_cfg = ""
+    if smp:                             # Start at a smaller size: that size's dataset, in its own cache folder
+        stage_cfg = os.path.splitext(inputs["DATASET_CONFIG"])[0] + f"_stage{smp:g}.toml"
+        p.files.append((stage_cfg, dataset_toml(desc, {**inputs, "megapixels": smp}, f"-{smp:g}mp")))
+        p.console.append(f"[stages] the first {stage_until(inputs) * 100:.0f}% of the epochs at {smp:g} MP, then "
+                         f"{float(inputs['megapixels']):g} MP\n")
+    own = own_skipped_line(desc, inputs)
+    if own:
+        p.console.append(own)
     train = train_command(desc, inputs, p)
     people = [(f, s, w) for f, s, _why, w in multi_person_subjects(desc, inputs) if s and s["kind"] == "person"] \
         if multi_person_on(desc, inputs) else []
@@ -1452,5 +1583,11 @@ def plan(desc, inputs):
     if caches(desc, inputs):
         p.stages += [Stage("Cache Preparation", cache_command(desc, inputs, "latents")),
                      Stage("Text Encoder Caching", cache_command(desc, inputs, "text"))]
+    if stage_cfg:
+        if caches(desc, inputs):
+            p.stages += [Stage(f"Cache Preparation ({smp:g} MP)", cache_command(desc, inputs, "latents", stage_cfg)),
+                         Stage(f"Text Encoder Caching ({smp:g} MP)", cache_command(desc, inputs, "text", stage_cfg))]
+        train += ["--stage_dataset_config", stage_cfg, "--stage_until", f"{stage_until(inputs):g}",
+                  "--stage_blend", f"{STAGE_BLEND:g}"]
     p.stages.append(Stage("Training", train))
     return p
