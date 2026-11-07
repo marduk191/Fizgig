@@ -64,6 +64,10 @@
   --coffee-hover: #E5C700;
   --runpod: #7C3AED;
   --runpod-hover: #6D28D9;
+  --google-blue: #4285F4;
+  --google-red: #EA4335;
+  --google-yellow: #FBBC05;
+  --google-green: #34A853;
   --youtube: #CC0000;
   --youtube-hover: #990000;
   --win-close: #E81123;        /* The window's close button */
@@ -1244,7 +1248,7 @@ input[type="range"] {
 .rs-cell { display: flex; flex-direction: column; min-width: 0; }
 .rs-section:last-of-type .rs-cell { display: contents; }
 .rs-key { color: var(--text-secondary); font-size: 9pt; }
-.rs-val { font-family: var(--font-mono, monospace); font-size: 10.5pt; color: var(--text-primary); overflow-wrap: anywhere; }
+.rs-val { font-family: var(--font-mono); font-size: 10.5pt; color: var(--text-primary); overflow-wrap: anywhere; }
 .rs-full { max-height: 320px; overflow: auto; font-size: 9pt; background: var(--bg-inset); padding: 8px; border-radius: 6px;
   border: 1px solid var(--border); margin: 0; }
 /* the sidebar: the run card's loss line, what's loaded on the GPU, background jobs */
@@ -1517,7 +1521,8 @@ body { font-size: 13.5px; background: var(--bg-deep); }
   border-radius: var(--radius); font-size: 11.5px; color: var(--text-secondary); }
 .gpu-name { font-weight: 600; color: var(--text-primary); font-size: 12px; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; }
-.meter-head { display: flex; justify-content: space-between; margin-bottom: 3px; }
+.meter-head { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 3px; white-space: nowrap; }
+.meter-head span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .meter-bar { height: 5px; border-radius: 999px; background: var(--bg-inset); overflow: hidden; }
 .meter-bar > span { display: block; height: 100%; background: var(--accent); border-radius: 999px; transition: width .6s; }
 .meter.warn .meter-bar > span { background: var(--warning); }
@@ -1801,6 +1806,14 @@ input[type="radio"] { accent-color: var(--accent); width: 16px; height: 16px; ma
 .lightbox-mode { color: var(--text-primary); background: var(--bg-surface); border: 1px solid var(--border);
   border-radius: 8px; padding: 6px 12px; margin-bottom: 8px; font-size: 10pt; max-width: calc(100vw - 140px); }
 .lightbox-figure img { width: calc(100vw - 140px); height: calc(100vh - 80px); object-fit: contain; cursor: zoom-out; }
+/* a see-through picture (app.js marks it) on a checkerboard; in the lightbox at its own shape, so the board stops
+   at its edges instead of filling the letterbox */
+img.see-through { background: repeating-conic-gradient(var(--pic-text) 0 25%,
+  color-mix(in srgb, var(--pic-shade) 16%, var(--pic-text)) 0 50%) 0 0 / 16px 16px; }
+.lightbox-figure img.see-through { width: auto; height: auto; max-width: calc(100vw - 140px);
+  max-height: calc(100vh - 80px); }
+.lightbox.with-cap .lightbox-figure img.see-through { height: auto; max-height: calc(100vh - 330px); }
+.caption-card > img.see-through { width: auto; max-width: 100%; align-self: center; }
 .lightbox-figure figcaption { color: var(--text-secondary); font-size: 9pt; margin-top: 8px; overflow-wrap: anywhere;
   text-align: center; }
 .lightbox-close { position: absolute; top: 12px; right: 12px; }
@@ -1835,7 +1848,18 @@ input[type="radio"] { accent-color: var(--accent); width: 16px; height: 16px; ma
 .files-btn { background: var(--files); }
 .files-btn:hover { background: var(--files-hover); box-shadow: 0 4px 14px color-mix(in srgb, var(--files) 35%, transparent); }
 .files-btn i { --bolt: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='black'%3E%3Cpath d='M3 6a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z'/%3E%3C/svg%3E"); }
+.fm-login { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin-top: 8px; padding: 7px 12px;
+  border-radius: 14px; background: color-mix(in srgb, var(--files) 14%, var(--bg-surface));
+  border: 1px solid color-mix(in srgb, var(--files) 40%, transparent); font-size: 11px; color: var(--text-secondary); }
+.fm-login-head { flex: 0 0 100%; font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;
+  color: var(--text-secondary); }
+.fm-login b { color: var(--text-primary); font-family: var(--font-mono); user-select: all; word-break: break-all; }
+.fm-login b.fm-note { font-family: inherit; font-weight: 400; user-select: auto; }
+.fm-eye { margin-left: auto; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border);
+  background: transparent; color: var(--text-secondary); font-size: 11px; cursor: pointer; }
+.fm-eye:hover { color: var(--text-primary); }
 @media (max-width: 760px) {
+  .fm-login { display: none !important; }
   .runpod-btn { order: 2; margin: 0; padding: 7px 9px; border-radius: 999px; flex: 0 0 auto; }
   .runpod-btn span { display: none; }
 }
@@ -1930,6 +1954,7 @@ input[type="radio"] { accent-color: var(--accent); width: 16px; height: 16px; ma
 .st-label small { font-weight: 400; color: var(--text-muted); margin-left: 4px; }
 .st-row input[type="range"] { width: 100%; }
 .st-val { font-variant-numeric: tabular-nums; font-size: 9pt; text-align: right; }
+.st-row input.st-val { width: 100%; min-width: 0; height: 24px; padding: 0 4px; }
 .st-btns { display: flex; gap: 2px; }
 .st-btns { gap: 3px; }
 .st-btns .btn-sm { padding: 0 7px; height: 26px; min-width: 28px; font-size: 10.5pt; font-weight: 700; justify-content: center; }
@@ -2233,6 +2258,11 @@ input[type="radio"] { accent-color: var(--accent); width: 16px; height: 16px; ma
 .pod-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pod-main .field-hint { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pod-btns { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.pod-confirm { display: grid; gap: 6px; margin-top: 8px; padding: 8px 10px; border-radius: var(--radius);
+  border: 1px solid var(--danger); background: color-mix(in srgb, var(--danger) 8%, var(--bg-surface));
+  font-size: 12px; color: var(--text-secondary); white-space: normal; }
+.pod-confirm b { color: var(--text-primary); }
+.pod-confirm .pod-btns { justify-content: flex-start; }
 .pods-deploy { display: inline-flex; margin-top: 0; }
 .phone-row { display: flex; gap: 20px; align-items: center; flex-wrap: wrap; }
 .phone-qr { width: 176px; height: 176px; flex: 0 0 176px; background: var(--pic-text); border-radius: 12px; padding: 8px;
@@ -2390,6 +2420,9 @@ a.pick-pill-vast:hover { border-color: var(--success); }
 .loss-graph-svg .lg-axis { fill: var(--text-muted); font-size: 11px; }
 .loss-graph-svg .lg-lr-axis { fill: var(--special); }
 .loss-graph-svg .lg-best { fill: var(--success); }
+.loss-graph-svg .lg-lr-now { fill: var(--special); stroke: var(--bg-deep); stroke-width: 1.5; }
+.loss-graph-svg .lg-steps-fit .lg-raw { opacity: 0.18; }
+.loss-graph-svg .lg-steps-fit .lg-smooth { opacity: 0.35; }
 .loss-graph-svg .lg-cursor { stroke: var(--text-secondary); stroke-width: 1; vector-effect: non-scaling-stroke; }
 .loss-graph-read { min-height: 1.4em; }
 .lg-legend { display: flex; flex-wrap: wrap; gap: 4px 16px; margin: 6px 2px 0; font-size: 12px; color: var(--text-secondary); }
@@ -2399,6 +2432,11 @@ a.pick-pill-vast:hover { border-color: var(--success); }
 .lg-sw-smooth { border-color: var(--accent); }
 .lg-sw-lr { border-color: var(--special); border-top-style: dashed; }
 .lg-sw-best { width: 9px; height: 9px; border: 0; border-radius: 50%; background: var(--success); }
+.lg-sw-emean { border-color: var(--data-orange); border-top-width: 3px; }
+.lg-sw-ravg { border-color: var(--data-olive); border-top-width: 3px; }
+.lg-emean { fill: none; stroke: var(--data-orange); stroke-width: 2.5; }
+.lg-emean-dot { fill: var(--data-orange); stroke: var(--bg-deep); stroke-width: 1; }
+.lg-ravg { fill: none; stroke: var(--data-olive); stroke-width: 2.5; }
 .lg-sw-epoch { width: 0; height: 12px; border-top: 0; border-left: 1px solid var(--border); }
 .loss-graph-svg .lg-axis-title { font-weight: 600; }
 
@@ -2648,3 +2686,19 @@ a.pick-pill-vast:hover { border-color: var(--success); }
 .theme-pick small { grid-column: 2; font-size: 11px; color: var(--text-muted); line-height: 1.3; }
 .theme-swatch { width: 30px; height: 20px; border-radius: 3px; border: 1px solid var(--border-strong);
   background: linear-gradient(90deg, var(--sw-bg) 0 60%, var(--sw-accent) 60% 100%); }
+
+/* Rent a pod: a new RunPod user counts for Fizgig only when they sign up with Google (RunPod's referral rules) */
+.google-pill { display: inline-flex; align-items: center; gap: 9px; margin: 0 0 12px; padding: 7px 16px 7px 10px;
+  border-radius: 999px; background: var(--bg-surface); color: var(--text-primary); font-size: 13px;
+  border: 1px solid color-mix(in srgb, var(--google-blue) 45%, transparent);
+  box-shadow: 0 1px 6px color-mix(in srgb, var(--google-blue) 18%, transparent); }
+a.google-pill { text-decoration: none; transition: transform .12s, box-shadow .12s; }
+a.google-pill:hover { color: var(--text-primary); transform: translateY(-1px);
+  box-shadow: 0 4px 14px color-mix(in srgb, var(--google-blue) 30%, transparent); }
+a.google-pill:visited { color: var(--text-primary); }
+.google-pill svg { width: 17px; height: 17px; flex: 0 0 17px; }
+.google-pill b { color: var(--google-blue); font-weight: 700; }
+.google-pill .g-r { fill: var(--google-red); }
+.google-pill .g-b { fill: var(--google-blue); }
+.google-pill .g-y { fill: var(--google-yellow); }
+.google-pill .g-g { fill: var(--google-green); }

@@ -75,6 +75,8 @@ class _Handler:
     def json(self, payload):
         return payload
 
+    _caption_items = S.Handler._caption_items       # the real reader: _captions hands each folder's files to it
+
 
 def _listing():
     items = S.Handler._captions(_Handler(), d, ".txt")["items"]

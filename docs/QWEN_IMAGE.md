@@ -19,7 +19,7 @@ Fizgig's adapter is trained at a higher resolution than the existing Qwen 2.1 tr
 
 Qwen renders very sharp images. A LoRA pulls fine detail such as skin texture toward your dataset, so a long run on softer photos trades Qwen's sharpness for theirs. Training faster keeps more of it, and in our testing **0.5 MP is the sweet spot**: quicker than 1 MP, and it keeps more sharpness than 0.25 MP.
 
-All three presets train at 0.5 MP with adamw8bit, EMA 0.98 and the training adapter, for 30 epochs with every epoch saved:
+All three presets train at 0.5 MP with Muon, EMA 0.98 and the training adapter, for 30 epochs with every epoch saved:
 
 | Preset | Rank | Learning rate | For |
 |---|---|---|---|
@@ -61,6 +61,14 @@ The text encoder only encodes, and loads in 8-bit below about 20 GB free (about 
 Training previews render with the **Turbo LoRA** at strength 1, **8 steps, CFG 1** (both set in Preferences; the download button fetches them). Ticking **Use the Turbo model for samples** on the Samples tab renders them on the Turbo DiT instead, with the model being trained parked beside it. Without the Turbo LoRA they render on the plain model at **25 steps, CFG 3**. The training adapter is off for previews; a Context LoRA stays on.
 
 Repair Studio and LoRA Royale preview on the Turbo DiT (8 steps, CFG 1) when it's set; without it they follow the Samples tab.
+
+## Transparent pictures
+
+Qwen Image 2.1's VAE has an alpha channel, so it can learn and draw see-through pictures: stickers, cut-outs, logos, subjects on a transparent background.
+
+- **Training:** a PNG with transparency trains with its alpha. Pictures that are fully opaque train as before, so a folder can mix both. Image Prep keeps the alpha when it resizes or crops. Every other model trains a transparent PNG laid on white, as the captioner sees it.
+- **Captions:** use the model's own wording for transparent pictures, on either side of what's in the picture: `This is an RGBA image with transparency. A red fox sticker. The image has alpha channel and the background is transparent.` Write your sample prompts the same way.
+- **Previews:** a preview the model draws with transparency is saved as a PNG with its alpha. Fizgig shows it on a checkerboard in the gallery, the lightbox, Studio and LoRA Royale, and in ComfyUI the same file keeps its transparency.
 
 ## Edit LoRAs
 

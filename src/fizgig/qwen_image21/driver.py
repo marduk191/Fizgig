@@ -2,7 +2,7 @@
 
 Everything Qwen-specific the generic cache/train/preview code needs, behind the FamilyDriver interface:
 * conditioning: Qwen3-VL-8B last layer before the final RMSNorm, system tokens dropped -> {"hidden_states": (L, 4096)}
-* latents: RGBA VAE (RGB gets an opaque alpha), normalised with the checkpoint's latents_mean/std, (64, h, w) at /16
+* latents: RGBA VAE (a see-through picture keeps its alpha, an RGB one gets an opaque alpha), normalised with the checkpoint's latents_mean/std, (64, h, w) at /16
 * training: flow matching, x_t = (1 - t) x0 + t noise, target = noise - x0, logit-normal t with the checkpoint's
   resolution-dependent exponential shift (the sampler's mu); block-causal joint forward, keep the image tokens
 * sampling: FlowMatch Euler with the reference schedule (sampling.py)
@@ -17,7 +17,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from fizgig.families.driver import FamilyDriver, prior_base, weighted_loss, with_prior
+from fizgig.families.driver import FamilyDriver, picture_losses, prior_base, weighted_loss, with_prior
 from fizgig.qwen_image21 import sampling as S
 
 logger = logging.getLogger(__name__)
@@ -152,7 +152,9 @@ class QwenImage21Driver(FamilyDriver):
     # ---- encoding -------------------------------------------------------------------------------
     @torch.no_grad()
     def encode_images(self, vae, images):
-        x = torch.stack([torch.from_numpy(np.ascontiguousarray(a[..., :3])) for a in images])
+        # a see-through picture keeps its alpha (description rgba); an RGB one is opaque (encode_image)
+        x = torch.stack([torch.from_numpy(np.ascontiguousarray(
+            a if a.shape[-1] == 4 else np.concatenate([a, np.full_like(a[..., :1], 255)], -1))) for a in images])
         x = x.permute(0, 3, 1, 2).float().div(127.5).sub(1.0)
         p = next(vae.parameters())
         return [z.to(torch.bfloat16).cpu() for z in S.encode_image(vae, x.to(p.device, p.dtype))]
@@ -164,9 +166,11 @@ class QwenImage21Driver(FamilyDriver):
     @torch.no_grad()
     def encode_text_with_references(self, te, captions, references):
         from PIL import Image
+        from fizgig.utils.image import flatten
         out = []
         for cap, imgs in zip(captions, references):
-            h, m = te.encode_with_references(cap, [Image.fromarray(np.ascontiguousarray(a[..., :3])) for a in imgs])
+            # the vision pass sees a transparent before-image on white (its latent keeps the alpha)
+            h, m = te.encode_with_references(cap, [flatten(Image.fromarray(np.ascontiguousarray(a))) for a in imgs])
             out.append({"hidden_states": h.to(torch.bfloat16).cpu(), "ref_mask": m.cpu()})
         return out
 
@@ -229,6 +233,40 @@ class QwenImage21Driver(FamilyDriver):
             loss = with_prior(loss, prior, base, (pred.float() - base).pow(2).mean(dim=-1), mw, w)
         return loss, {"t": t}
 
+    def stack_conds(self, conds):
+        """Batch Size above 1: the captions zero-padded to the longest with a mask of each one's real tokens. The DiT
+        drops the padded keys and places each picture's image after its own real tokens, as its unpadded caption
+        would (QwenImage21DiT.forward)."""
+        if any("ref_mask" in c for c in conds):
+            return None                     # an edit's before-images: batch 1
+        hs = [c["hidden_states"][0] for c in conds]
+        L = max(h.shape[0] for h in hs)
+        return {"hidden_states": torch.stack([torch.cat([h, h.new_zeros(L - h.shape[0], h.shape[1])]) for h in hs]),
+                "mask": torch.stack([torch.arange(L, device=h.device) < h.shape[0] for h in hs])}
+
+    def training_loss_batch(self, dit, latents, cond, generator, *, min_t=0.0, max_t=1.0, loss_mask=None):
+        """Batch Size above 1: each picture's noise and t drawn as training_loss draws them, picture by picture, one
+        DiT call over the padded captions; the MSE (and a mask's per-picture weights) is the pictures' mean."""
+        device = latents.device
+        h, w = latents.shape[-2:]
+        n = h * w
+        x0 = S.pack(latents.float())
+        noises, ts = [], []
+        for i in range(x0.shape[0]):
+            noises.append(torch.randn(x0[i:i + 1].shape, generator=generator))
+            ts.append(self._sample_t(n, generator, min_t, max_t))
+        noise = torch.cat(noises).to(device)
+        t = torch.tensor(ts, device=device, dtype=torch.float32).view(-1, 1, 1)
+        xt = (1 - t) * x0 + t * noise
+        enc, enc_mask = cond["hidden_states"].to(device), cond["mask"].to(device)
+        L = enc.shape[1]
+        img_mask = torch.cat([torch.zeros(L, dtype=torch.bool), torch.ones(n // 4, dtype=torch.bool)])[None].to(device)
+        tt = torch.tensor(ts, device=device, dtype=torch.bfloat16)
+        pred = dit(xt.to(torch.bfloat16), enc.to(torch.bfloat16), tt, [[(1, h, w)]], img_mask, enc_mask)[:, -n:]
+        mw = None if loss_mask is None else S.pack(loss_mask.to(device).float()).mean(dim=-1)
+        per = picture_losses((pred.float() - (noise - x0)).pow(2).mean(dim=-1), mw)
+        return per.mean(), {"t": sum(ts) / len(ts), "per": per, "ts": [float(v) for v in ts]}
+
     def noise_latents(self, latents, generator, *, min_t=0.0, max_t=1.0):
         h, w = latents.shape[-2:]
         x0 = S.pack(latents.float())
@@ -282,5 +320,7 @@ class QwenImage21Driver(FamilyDriver):
     @torch.no_grad()
     def decode(self, vae, latents, width, height):
         from PIL import Image
-        img = S.decode(vae, latents, height, width)[0, :3].float().clamp(-1, 1)
-        return Image.fromarray(((img.permute(1, 2, 0).cpu().numpy() + 1) * 127.5).round().astype(np.uint8))
+        img = S.decode(vae, latents, height, width)[0].float().clamp(-1, 1)
+        px = ((img.permute(1, 2, 0).cpu().numpy() + 1) * 127.5).round().astype(np.uint8)
+        # RGBA when the model drew some transparency (a prompt asking for it), else RGB as every other family
+        return Image.fromarray(px, "RGBA") if (px[..., 3] < 250).mean() > 0.002 else Image.fromarray(px[..., :3])

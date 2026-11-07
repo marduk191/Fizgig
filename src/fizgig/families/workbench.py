@@ -20,7 +20,7 @@ Model EQ: a LoRA made from the model's own weights (scripts/extract_model_lora.p
 each block's slider s to (s - 1) x its gain - 1.0 and an unticked block are the stock model. Primary, donor or in a
 mix alike; a save bakes the mapped strengths into an ordinary LoRA without the marker.
 
-Turbo Preview (description.activation_cache, switched by the tab's tick through `turbo_preview`): a slider-only change
+Reuse unchanged blocks (description.activation_cache, switched by the tab's tick through `turbo_preview`): a slider-only change
 replays the blocks before the earliest changed one from the last render (families/act_cache.py).
 
 A LoRA's load strength (state.primary_scale / donor_scale) scales the whole file and every block slider is relative
@@ -63,6 +63,7 @@ def model_eq_gain(path):
 EPOCH = "epoch_"                    # + the epoch number: one adapter per blended epoch (the primary keeps PRIMARY)
 
 from fizgig.families.epochs import _EPOCH_RE, ema_weights, run_epochs   # noqa: F401 (the workbench's own names)
+from fizgig.utils.image import flatten
 from fizgig.utils.upright import upright
 
 
@@ -141,7 +142,7 @@ class WorkbenchEngine:
         self._cancel_event = threading.Event()
         self.on_step = None                 # (done, total) per denoising step, from the render thread
         self._baseline_key = self._baseline_img = None
-        # Turbo Preview: the activation cache (families/act_cache.py) when the description offers one and the tab's
+        # Reuse unchanged blocks: the activation cache (families/act_cache.py) when the description offers one and the tab's
         # tick is on
         self._turbo_enabled = False
         self._act = None
@@ -209,7 +210,7 @@ class WorkbenchEngine:
         from fizgig.families import quant
         if precision == "auto":
             try:
-                need = os.path.getsize(dit_path) / 1e9 + 6.0
+                need = self.driver.dit_gb(dit_path) + 6.0
             except OSError:
                 need = 20.0
             free = _free_vram_gb()
@@ -495,7 +496,7 @@ class WorkbenchEngine:
     def mark_blocks_changed(self, blocks):
         pass                                # the activation cache compares slider values itself
 
-    # ---- Turbo Preview ------------------------------------------------------------------------------
+    # ---- Reuse unchanged blocks ------------------------------------------------------------------------------
     @property
     def turbo_preview(self):
         return bool(self._turbo_enabled and getattr(self.desc, "activation_cache", False))
@@ -541,13 +542,14 @@ class WorkbenchEngine:
             mp = 1.0
         return (path, mp) if path and os.path.isfile(path) else ("", 1.0)
 
-    @staticmethod
-    def _fit_reference(path, width, height):
-        """An edit reference as uint8 (H, W, 3), cropped and scaled to the preview's size."""
+    def _fit_reference(self, path, width, height):
+        """An edit reference as uint8 (H, W, 3), or (H, W, 4) with its transparency, as training takes it, cropped and
+        scaled to the preview's size."""
         import numpy as np
         from PIL import Image, ImageOps
+        from fizgig.families.train import _as_trained
         with Image.open(path) as im:
-            return np.array(ImageOps.fit(upright(im).convert("RGB"), (int(width), int(height)), Image.LANCZOS))
+            return np.array(ImageOps.fit(_as_trained(upright(im), self.desc.rgba), (int(width), int(height)), Image.LANCZOS))
 
     def _reference_latents(self, path, width, height):
         """The edit reference's latents (CPU, batch dim), cached per picture and size."""
@@ -588,7 +590,7 @@ class WorkbenchEngine:
                     if kind == "vision":
                         from PIL import Image
                         with Image.open(ref) as im:
-                            conds = self.driver.encode_text_with_image(te, list(need), upright(im).convert("RGB"),
+                            conds = self.driver.encode_text_with_image(te, list(need), flatten(upright(im)),
                                                                        megapixels=ref_mp)
                     elif kind == "edit":
                         pic = self._fit_reference(ref, *size)
@@ -795,7 +797,7 @@ class WorkbenchEngine:
                         lat = _generate()
                 except torch.OutOfMemoryError:
                     # the cache's share of the card was the difference: give it back and render plainly
-                    logger.warning("Turbo Preview: out of memory with the cache - rendering without it")
+                    logger.warning("Reuse unchanged blocks: out of memory with the cache - rendering without it")
                     self._invalidate_activation_cache()
                     act = None
                     lat = _generate()
@@ -812,7 +814,7 @@ class WorkbenchEngine:
             except torch.OutOfMemoryError:
                 if self._act is None or not self._act.out:
                     raise
-                logger.warning("Turbo Preview: out of memory decoding beside the cache - cache dropped")
+                logger.warning("Reuse unchanged blocks: out of memory decoding beside the cache - cache dropped")
                 self._invalidate_activation_cache()
                 out = self.driver.decode(self.vae, lat, width, height)
             if source is not None and self.source_repaint is not None:
@@ -1079,6 +1081,8 @@ class WorkbenchEngine:
             if combined:
                 metadata["ss_repair_studio_combined_ranks"] = json.dumps(dict(sorted(combined.items())),
                                                                          separators=(",", ":"))
+        if self.desc.lora.save_fused:
+            sd = self.driver.export_lora_state_dict(sd)
         save_file(sd, out_path, metadata=metadata)
         kept = {self.driver.block_of(m) for m in ranks}
         dropped = sorted((self.primary_block_ids - kept) - blended)

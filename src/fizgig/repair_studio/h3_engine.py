@@ -173,7 +173,7 @@ class H3RepairEngine(ClipContract):
         # The community Turbo LoRA (6-step previews). Applied ONCE at ensure_pipeline and left
         # enabled — it conditions every render identically, so baseline-vs-tweaked comparisons
         # are apples to apples. (This is the ~780 MB preview accelerator, not Phase C's
-        # activation-cache "Turbo Preview".)
+        # activation-cache "Turbo Preview", now "Reuse unchanged blocks".)
         self._turbo_net = None
         self._turbo_adaln = []
         self._steps = 20               # 6 when the Turbo LoRA loads
@@ -643,7 +643,8 @@ class H3RepairEngine(ClipContract):
         the call, parked back to CPU after (it is only ever used at conditioning time)."""
         w, h = int(width), int(height)
         w, h = (w // 32) * 32, (h // 32) * 32          # even latent grid, like the sampler
-        img = image.convert("RGB")
+        from fizgig.utils.image import flatten
+        img = flatten(image)
         if img.size != (w, h):
             img = img.resize((w, h), Image.LANCZOS)
         import numpy as np
@@ -1292,7 +1293,7 @@ class H3RepairEngine(ClipContract):
             except sampling.PreviewAborted:
                 raise
             except Exception:
-                logger.exception("Turbo Preview failed — falling back to a full forward")
+                logger.exception("Reuse unchanged blocks failed — falling back to a full forward")
                 self._invalidate_activation_cache()
                 lat = _render(None)
         else:
@@ -1561,6 +1562,7 @@ class H3RepairEngine(ClipContract):
     # the shared video contract (families/video_workbench.py ClipContract); these are H3's hooks.
     default_clip_frames = H3_PREVIEW_FRAMES
     supports_keyframes = supports_base_modes = supports_banks = True
+    supports_show_early = True
 
     def _clip_regimes(self):
         from fizgig.families.minimax import MINIMAX

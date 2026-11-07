@@ -310,7 +310,27 @@ def start_checks(desc, st, image_folder):
                 out.append(f"{len(lack)} caption{'s don' if len(lack) != 1 else ' doesn'}'t contain the trigger word "
                            f"'{trig}' ({', '.join(lack[:3])}{', ...' if len(lack) > 3 else ''}): "
                            + ("that picture trains" if len(lack) == 1 else "those pictures train") + " without it.")
-    if not st.get("ADAPTIVE_LR") and "automagic" not in _s(st.get("OPTIMIZER_TYPE")).lower():
+    trig = _s(st.get("CAPTION_TRIGGER_WORD"))
+    for rel, d in (detail_crop_folders(desc, st) if trig and trig.lower() != "trigger_word" else []):
+        # the detail crops for this size: a caption edited without the trigger (the crop stage writes it in)
+        pat = re.compile(r"(?<!\w)" + re.escape(trig) + r"(?!\w)", re.I)
+        ext = _s(st.get("DATASET_CAPTION_EXT")) or ".txt"
+        lack = []
+        for f in (sorted(os.listdir(d)) if os.path.isdir(d) else []):
+            if not f.lower().endswith(ext.lower()):
+                continue
+            try:
+                with open(os.path.join(d, f), encoding="utf-8", errors="replace") as fh:
+                    text = fh.read()
+            except OSError:
+                continue
+            if text.strip() and not pat.search(text):
+                lack.append(f)
+        if lack:
+            out.append(f"{len(lack)} detail crop caption{'s' if len(lack) != 1 else ''} in {rel} don't contain the "
+                       f"trigger word '{trig}': those crops train without it.")
+    if (not st.get("ADAPTIVE_LR") and "automagic" not in _s(st.get("OPTIMIZER_TYPE")).lower()
+            and not (prodigy(st) and not ft_on(desc, st))):           # Prodigy's 1.0 is a multiplier
         kind = "finetune" if ft_on(desc, st) else "slider" if slider_on(desc, st) else "lora"
         band = next(((lo, hi) for k, lo, hi in (desc.start_lr_bands or ()) if k == kind), None)
         try:
@@ -556,7 +576,7 @@ def _media_count(folder):
 
 # Folders Fizgig itself makes inside a training folder: never trained on as sub-folders. Image Prep's Keep them safe
 # (originals, then originals_2, _3... on later runs), Exclude by look and the desktop's Remove. Matched in any case.
-OWN_SUBFOLDERS = {"excluded_by_look", "originals", "removed"}
+OWN_SUBFOLDERS = {"excluded_by_look", "originals", "removed", "fizgig_detail_crops", "detail_masters"}
 _OWN_NUMBERED = re.compile(r"originals(_\d+)?", re.IGNORECASE)
 
 
@@ -595,17 +615,85 @@ def subfolders(folder, skip=(), skipped=None):
 
 
 def run_subfolders(desc, st, skipped=None):
-    """The run's sub-folders (subfolders), or [] when the tick is off or doesn't apply."""
-    if not subfolders_on(desc, st):
+    """The run's sub-folders (subfolders, when the tick is on and applies), then its detail crops folder for the size
+    it trains at (detail_crops_on): each its own dataset block, item prefix and cache folder, so the per-image loss,
+    auto-recaption, a move and a training share treat a crop like a sub-folder's picture."""
+    subs = subfolders(_s(st.get("image_folder")), (_s(st.get("LORA_OUTPUT_DIR")), _s(st.get("cache_root")),
+                                                   ft_reg_dir(desc, st)), skipped) if subfolders_on(desc, st) else []
+    return subs + detail_crop_folders(desc, st)
+
+
+def item_prefix(rel):
+    """A sub-folder's item prefix in the dataset TOML (its key in the per-image loss and the auto-recaption triggers).
+    Detail crops share one for every size, so a crop keeps one loss history through Start at a smaller size and maps
+    to the folder of the size the run trains at."""
+    return "fizgig_detail_crops/" if rel.split("/")[0] == "fizgig_detail_crops" else rel + "/"
+
+
+def detail_crops_on(desc, st):
+    """The training folder is switched to Detail crops (Image Prep) and this run can take them: a standard LoRA of a
+    family with the ability (not an edit, a slider, a fine-tune or Fizgig LoRA Isolation)."""
+    from fizgig.dataset import detail_crops
+    folder = _s(st.get("image_folder"))
+    if not (desc.detail_crops and folder and detail_crops.is_on(folder)):
+        return False
+    return not (edit_on(desc, st) or slider_on(desc, st) or ft_on(desc, st) or multi_person_on(desc, st))
+
+
+def detail_crop_folders(desc, st):
+    """[(relative path, folder)] of the detail crops for the size this dataset trains at (st's megapixels)."""
+    if not detail_crops_on(desc, st):
         return []
-    return subfolders(_s(st.get("image_folder")), (_s(st.get("LORA_OUTPUT_DIR")), _s(st.get("cache_root")),
-                                                   ft_reg_dir(desc, st)), skipped)
+    from fizgig.dataset import detail_crops
+    try:
+        mp = float(st.get("megapixels") or st.get("DATASET_MEGAPIXELS") or 0)
+    except (TypeError, ValueError):
+        return []
+    if mp <= 0:
+        return []
+    d = detail_crops.size_dir(_s(st.get("image_folder")), mp)
+    try:
+        os.makedirs(d, exist_ok=True)            # a size not made yet: the Detail crops stage fills it before caching
+    except OSError:
+        pass
+    return [(f"{detail_crops.DIR}/{detail_crops.size_name(mp)}", d)]
+
+
+def detail_crop_sizes(desc, inputs):
+    """The sizes a run's detail crops are made at: its Target Megapixels, and Start at a smaller size's."""
+    if not detail_crops_on(desc, inputs):
+        return []
+    try:
+        out = [float(inputs.get("megapixels"))]
+    except (TypeError, ValueError):
+        return []
+    smp = stage_mp(desc, inputs)
+    return out + ([smp] if smp else [])
+
+
+def detail_crops_problem(desc, inputs):
+    """Detail crops that still need captions, with no captioner to write them: why it can't start, or ""."""
+    from fizgig.dataset import detail_crops
+    if _s(inputs.get("captioner")) and os.path.isfile(_s(inputs.get("captioner"))):
+        return ""
+    folder, ext = _s(inputs.get("image_folder")), _s(inputs.get("caption_ext")) or ".txt"
+    if not detail_crop_sizes(desc, inputs):
+        return ""
+    have = set()                         # a picture's crop captioned at any size: the Detail crops stage copies it
+    for _label, d in detail_crops.sizes(folder):
+        have |= {os.path.splitext(n)[0] for n in os.listdir(d) if n.endswith(ext)}
+    if any(os.path.splitext(n)[0] not in have for n in detail_crops.pictures(folder)):
+        return ("Detail crops need captions, written by the captioner: set the Krea 2 text encoder (or a secondary "
+                "captioning model) in Preferences, or switch Detail crops off for this folder in Image Prep.")
+    return ""
 
 
 def own_skipped_line(desc, st):
     """The run log's one line naming the Fizgig folders the sub-folder tick left out, or "" (none, or tick off)."""
     skipped = []
     run_subfolders(desc, st, skipped)
+    if detail_crops_on(desc, st):                # its detail crops train (as their own block): not "left out"
+        skipped = [s for s in skipped if s.split("/")[0] != "fizgig_detail_crops"]
     if not skipped:
         return ""
     return "[sub-folders] Not trained (Fizgig's own folders): " + ", ".join(skipped[:6]) + (
@@ -619,8 +707,12 @@ def _balance_repeats(folders):
     return {f: max(1, round(top / c)) for f, c in counts.items() if c}
 
 
-def dataset_media(folder):
-    """The media kinds in a training folder: {"photo", "clip", "voice"} (the dataset layer's extensions)."""
+def dataset_media(folder, include_subfolders=False):
+    """The media kinds in a training folder: {"photo", "clip", "voice"} (the dataset layer's extensions).
+
+    With `include_subfolders`: the media kinds in the sub-folders the dataset trains on (the TRAIN_SUBFOLDERS tick),
+    so a folder that holds its clips only under a sub-folder is still seen as mixed - the UI row for the clip size
+    doesn't vanish just because the clips sit one level down."""
     from fizgig.dataset.image_dataset import AUDIO_EXTENSIONS, IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
     kinds = set()
     try:
@@ -633,6 +725,9 @@ def dataset_media(folder):
         if is_mask_file(n):
             continue
         kinds |= {"photo"} if ext in img else {"clip"} if ext in vid else {"voice"} if ext in aud else set()
+    if include_subfolders:
+        for _rel, f in subfolders(folder):
+            kinds |= dataset_media(f)                 # subfolders() already goes to every depth
     return kinds
 
 
@@ -665,6 +760,8 @@ def option_tokens(desc, inputs, missing=None):
     vals = inputs.get("FAMILY_OPTIONS") or {}
     if multi_person_on(desc, inputs):   # checks that can't run beside Fizgig LoRA Isolation (H3 reference distillation)
         vals = {**vals, **{o.key: "" for o in desc.options if getattr(o, "isolation_off", False)}}
+    if batch_size(desc, inputs) > 1:    # checks that read one picture a step (H3 reference distillation)
+        vals = {**vals, **{o.key: "" for o in desc.options if getattr(o, "batch_off", False)}}
     models = inputs.get("models") or {}
 
     def path(v):
@@ -788,7 +885,7 @@ def train_command(desc, inputs, plan):
         cmd += ["--caption_dropout", f"{float(st['CAPTION_DROPOUT']):g}"]
     if masked_on(desc, st):
         cmd += ["--masked_training", "--mask_floor", f"{mask_floor(st):g}"]
-        if mask_prior(desc, st):
+        if mask_prior(desc, st) and batch_size(desc, st) <= 1:
             cmd += ["--mask_prior", f"{mask_prior(desc, st):g}"]
     if dop_on(desc, st) or mp_subs:
         trig, cls = dop_rules(st)
@@ -820,6 +917,8 @@ def train_command(desc, inputs, plan):
             cmd += ["--compile_blocks", cb]
     if st.get("keep_checkpointing"):
         cmd += ["--gradient_checkpointing", "on"]
+    if batch_auto(desc, st):
+        cmd += ["--batch_size_auto"]
     try:
         if int(float(str(st.get("GRADIENT_ACCUMULATION", "") or 1))) > 1:
             cmd += ["--gradient_accumulation_steps", str(int(float(st["GRADIENT_ACCUMULATION"])))]
@@ -831,10 +930,7 @@ def train_command(desc, inputs, plan):
     except ValueError:
         pass
     if len(desc.precisions) > 1:
-        lab = str(st.get("FAMILY_PRECISION", "") or "")
-        labels = {**PRECISION_LABELS, **desc.precision_labels}
-        prec = next((k for k, v in labels.items() if v == lab), "auto")
-        cmd += ["--precision", prec if prec == "auto" or prec in desc.precisions else "auto"]
+        cmd += ["--precision", precision_key(desc, st.get("FAMILY_PRECISION"))]
     if ft_on(desc, st):
         # the length and cadence in whole rotations; a continuation starts from the paused run's checkpoint
         cmd += ["--finetune", "--ft_rotations", str(_ft_int(st, "FAMILY_FT_ROTATIONS", 10)),
@@ -850,11 +946,8 @@ def train_command(desc, inputs, plan):
         if cont.get("checkpoint"):
             cmd += ["--ft_start_window", str(int(cont.get("start_window", 0))),
                     "--ft_epochs_done", str(int(cont.get("epochs_done", 0)))]
-    # per-image loss watch (families/loss_watch.py), batch size 1 only
-    try:
-        bs1 = int(str(st.get("batch_size", 1)).strip() or 1) <= 1
-    except ValueError:
-        bs1 = True
+    # per-image loss watch (families/loss_watch.py): at any Batch size, a batch's pictures weighed and recorded
+    # one by one
     lw = (st.get("loss_watch") or {}) if desc.loss_watch else {}
     if multi_person_on(desc, st):    # the side-by-sides are hard on purpose: no verdicts, per-image LR or look warm-up
         lw = {**lw, "detect": False, "per_image_lr": False, "warmup": False}
@@ -864,7 +957,7 @@ def train_command(desc, inputs, plan):
     can_recaption = can_recaption and not multi_person_on(desc, st)
     if can_recaption:
         watch.append(("recaption", "--auto_recaption"))
-    if bs1:
+    if lw:
         cmd += [flag for key, flag in watch if lw.get(key)]
         if can_recaption and lw.get("recaption"):
             cmd += ["--captioner", st.get("captioner", "")]
@@ -881,20 +974,14 @@ def train_command(desc, inputs, plan):
                                                       ("--recaption_instruction_detailed", "--recaption_task_detailed"))):
                 label, instr, edited = recaption_instruction(key, ovr, st.get("caption_concept") or "")
                 cmd += [flag, instr, task_flag, f'"{label}"' + (" (your edit)" if edited else " (as shipped)")]
-    elif any(lw.get(key) for key, _ in watch):
-        plan.console.append("[loss-watch] per-image features skipped - they need Batch Size 1.\n")
     if any(lw.get(key) for key, _ in watch) and "--text_encoder" not in cmd:
         cmd += ["--text_encoder", _model(st, desc, "text_encoder")]   # caption repair re-encodes
     if ("lokr" in desc.network_types and str(st.get("NETWORK_TYPE", "")).startswith("LoKR")
             and not slider_on(desc, st)):        # a slider is always a plain LoRA
         cmd += ["--network_type", "lokr", "--lokr_factor", str(st.get("LOKR_FACTOR", 8))]
-    raw_swap = str(st.get("blocks_swap") or "").strip()
-    if raw_swap.lower().startswith("auto"):
-        cmd += ["--blocks_to_swap", "-1"]            # the trainer sizes it for the precision that runs
-    else:
-        m = re.match(r"\d+", raw_swap)
-        if m and int(m.group()) > 0:
-            cmd += ["--blocks_to_swap", m.group()]
+    swap = swap_blocks(st.get("blocks_swap"))
+    if swap:
+        cmd += ["--blocks_to_swap", str(swap)]       # -1: the trainer sizes it for the precision that runs
     if desc.ema_default:
         ema = str(st.get("FAMILY_EMA", "") or desc.ema_default).split(" ")[0]
         if ema != "Off":
@@ -1146,6 +1233,81 @@ def cache_dir_for(cache_root, image_dir):
 STAGE_BLEND = 0.1      # the share of the run the change from the smaller size to the full one blends over
 
 
+BATCH_SIZES = ("1", "2", "3", "4", "6", "8")
+BATCH_AUTO = "Auto"
+
+
+def batch_choices(desc):
+    """The Batch size row's choices: Auto (after 1) for a family with a measured sweet spot (description batch_auto)."""
+    return (BATCH_SIZES[0], BATCH_AUTO) + BATCH_SIZES[1:] if desc.batch_auto else BATCH_SIZES
+
+
+def batch_auto(desc, inputs):
+    """Batch size Auto: the trainer picks the family's measured fastest batch on a 40 GB+ card (--batch_size_auto); the
+    dataset config says 1 (batch_size() reads Auto as 1) and the trainer raises it before the dataset is built."""
+    if str(_s(inputs.get("BATCH_SIZE")) or "").strip().lower() != "auto" or not (desc.batch_training and desc.batch_auto):
+        return False
+    return not (edit_on(desc, inputs) or slider_on(desc, inputs) or dop_on(desc, inputs)
+                or multi_person_on(desc, inputs))
+
+
+BATCH_AUTO_MIN_CARD_GB = 38.0   # quant.NOGC_MIN_CARD_GB (a 40 GB card reports ~39.4 GiB), without importing torch here
+
+
+def batch_auto_note(desc, megapixels, card_gb=None):
+    """What Auto picks at this size, for the row's note - on this card when its size is known (card_gb, GiB)."""
+    try:
+        mp = float(megapixels)
+        n = desc.auto_batch(mp)
+    except (TypeError, ValueError):
+        return ""
+    if n <= 1:
+        return f"Auto: 1 at {mp:g} MP - {desc.display_name} measured fastest a picture at a time there."
+    if card_gb and card_gb < BATCH_AUTO_MIN_CARD_GB:
+        return (f"Auto: 1 picture a step on this {card_gb:.0f} GB card. Auto batches on 40 GB+ cards, where "
+                f"{n} at {mp:g} MP measured fastest for {desc.display_name}.")
+    where = f"this {card_gb:.0f} GB card" if card_gb else "a 40 GB+ card"
+    return (f"Auto: {n} pictures a step at {mp:g} MP on {where} - the fastest measured for {desc.display_name}. "
+            f"1 when a setting reads one picture a step.")
+
+
+
+def precision_key(desc, label):
+    """The trainer's --precision for the Training tab's Base precision label ("auto" for anything it doesn't name)."""
+    labels = {**PRECISION_LABELS, **desc.precision_labels}
+    prec = next((k for k, v in labels.items() if v == str(label or "")), "auto")
+    return prec if prec == "auto" or prec in desc.precisions else "auto"
+
+
+def swap_blocks(text):
+    """The trainer's --blocks_to_swap for the Blocks Swap value: -1 for Auto, else the number (0 = none)."""
+    raw = str(text or "").strip()
+    if raw.lower().startswith("auto"):
+        return -1
+    m = re.match(r"\d+", raw)
+    return int(m.group()) if m else 0
+
+
+def train_side(mp):
+    """The square side the dataset TOML trains Target Megapixels at (that area on the 16-pixel grid)."""
+    return int((mp * 1_000_000) ** 0.5) // 16 * 16
+
+def batch_size(desc, inputs):
+    """Pictures a step (Other Options' Batch size): 1 unless the family trains batches (description batch_training)
+    and the run is a LoRA or a fine-tune - an edit, a slider, DOP and Fizgig LoRA Isolation read one picture a
+    step."""
+    try:
+        n = int(str(_s(inputs.get("BATCH_SIZE")) or 1).strip())
+    except ValueError:
+        return 1
+    if n <= 1 or not desc.batch_training:
+        return 1
+    if edit_on(desc, inputs) or slider_on(desc, inputs) or dop_on(desc, inputs) \
+            or multi_person_on(desc, inputs):
+        return 1
+    return n
+
+
 def stage_mp(desc, inputs):
     """Start at a smaller size: its Target Megapixels, or 0 (off, not below Target Megapixels, or a run it isn't for:
     an edit, a slider, a fine-tune, Fizgig LoRA Isolation)."""
@@ -1157,6 +1319,8 @@ def stage_mp(desc, inputs):
     if not (desc.resolution_stages and 0.25 <= smp < full):
         return 0.0
     if edit_on(desc, inputs) or slider_on(desc, inputs) or ft_on(desc, inputs) or multi_person_on(desc, inputs):
+        return 0.0
+    if batch_size(desc, inputs) > 1:
         return 0.0
     return smp
 
@@ -1172,12 +1336,12 @@ def stage_until(inputs):
 def dataset_toml(desc, inputs, cache_suffix=""):
     """The dataset TOML for the run: the training folder at Target Megapixels (a square of that area on the
     16-pixel grid), an edit's originals or a slider's -1 end as its control folder, and its own cache folder.
-    Raises ValueError on a Target Megapixels that is not a number. Batch size is always 1 (one image a step)."""
+    Raises ValueError on a Target Megapixels that is not a number. Batch size: batch_size()."""
     mp = float(inputs.get("megapixels"))
     if mp <= 0:
         raise ValueError(f"Target Megapixels {mp}")
-    side = int((mp * 1_000_000) ** 0.5) // 16 * 16
-    batch = 1           # every family trains one image at a time (families/train.py); Gradient Accumulation for more
+    side = train_side(mp)
+    batch = batch_size(desc, inputs)      # 1 unless Other Options' Batch size is up and the family trains batches
     folder = _s(inputs.get("image_folder"))
     extra = [_s(f) for f in (inputs.get("extra_folders") or []) if _s(f)] if desc.multi_concept else []
     lines = ["[general]", f"resolution = [{side}, {side}]",
@@ -1189,7 +1353,10 @@ def dataset_toml(desc, inputs, cache_suffix=""):
         cmp_ = float(inputs.get("clip_megapixels") or 0)
     except (TypeError, ValueError):
         cmp_ = 0.0
-    if cmp_ > 0 and "clip" in desc.media and any("clip" in dataset_media(f) for f in [folder] + extra):
+    # the clips counted wherever the dataset trains on them: a folder whose clips sit only in a sub-folder (the
+    # TRAIN_SUBFOLDERS tick) still gets its clip size - without it the sub-folder inherits the pictures' resolution
+    subs = run_subfolders(desc, inputs)
+    if cmp_ > 0 and "clip" in desc.media and any("clip" in dataset_media(f) for f in [folder] + extra + [f for _r, f in subs]):
         lines.append(f"clip_megapixels = {cmp_:g}")      # clips cache and train at their own size
     reps = _balance_repeats([folder] + extra) if extra and inputs.get("concept_balance") else {}
     mp = {f: (s, w) for f, s, _why, w in multi_person_subjects(desc, inputs) if s} \
@@ -1202,7 +1369,6 @@ def dataset_toml(desc, inputs, cache_suffix=""):
                 lines.append(f"caption_replace = {_json.dumps(mp[f][0]['rules'])}")
             if isolation_photos_only(desc):  # a clip / voice family trains Isolation's subjects from their stills
                 lines.append("photos_only = true")
-    subs = run_subfolders(desc, inputs)
     head = len(lines)
     lines += ["", "[[datasets]]", f'image_directory = "{folder.replace(chr(92), "/")}"']
     if reps.get(folder, 1) > 1:
@@ -1221,7 +1387,7 @@ def dataset_toml(desc, inputs, cache_suffix=""):
         del lines[head:]
     for rel, f in subs:                  # Also train on its sub-folders: each its own block and cache folder
         lines += ["", "[[datasets]]", f'image_directory = "{f.replace(chr(92), "/")}"',
-                  f'item_prefix = "{_toml_str(rel + "/")}"']
+                  f'item_prefix = "{_toml_str(item_prefix(rel))}"']
         if root:
             lines.append(f'cache_directory = "{(cache_dir_for(root, f) + cache_suffix).replace(chr(92), "/")}"')
     for n, f in enumerate(extra, start=2):   # Multi Concept: each subject its own block and cache folder
@@ -1276,7 +1442,11 @@ def multi_concept_problems(desc, inputs):
 
 
 def automagic(inputs):
-    return _s(inputs.get("OPTIMIZER_TYPE")).lower() == "automagic3"
+    return _s(inputs.get("OPTIMIZER_TYPE")).lower() in ("automagic3", "automagic4")
+
+
+def prodigy(inputs):
+    return _s(inputs.get("OPTIMIZER_TYPE")).lower() == "prodigy"
 
 
 def _dop_folders(st):
@@ -1486,6 +1656,8 @@ def start_problems(desc, inputs):
                                       check_captions=not slider_on(desc, inputs, "prompts"), media_exts=exts)
         out += clip_problems(desc, _s(v.get("image_folder")))
     for rel, f in subs:                  # Also train on its sub-folders: each one's captions and clips too
+        if rel.split("/")[0] == "fizgig_detail_crops":
+            continue                     # the Detail crops stage makes and captions them (detail_crops_problem)
         out += checks.training_folder(f, _s(v.get("caption_ext", ".txt")), media_exts=exts,
                                       label=f"the sub-folder {rel}")
         out += clip_problems(desc, f)
@@ -1540,7 +1712,14 @@ def plan(desc, inputs):
     if automagic(inputs):            # it owns the rate: Adaptive LR, per-image LR and the look warm-up are off
         inputs["ADAPTIVE_LR"] = False
         inputs["loss_watch"] = {**(inputs.get("loss_watch") or {}), "per_image_lr": False, "warmup": False}
+    if prodigy(inputs) and not ft_on(desc, inputs):    # it owns the rate (a fine-tune keeps its own optimizer)
+        inputs["ADAPTIVE_LR"] = False   # per-image LR stays: a weight on each picture's loss
+        inputs["loss_watch"] = {**(inputs.get("loss_watch") or {}), "warmup": False}
+        inputs["LEARNING_RATE"] = "1.0"            # a multiplier on the rate it finds
     p = LaunchPlan(problems=start_problems(desc, inputs))
+    _cp = detail_crops_problem(desc, inputs) if not p.problems else ""
+    if _cp:
+        p.problems.append(_cp)
     if not p.problems:
         try:
             p.dataset_toml = dataset_toml(desc, inputs)
@@ -1580,6 +1759,20 @@ def plan(desc, inputs):
         if n:                           # a resume expects its cache; deleted by hand, it's made again (only what's gone)
             inputs["recache"] = True
             p.console.append(f"[cache] {n} picture(s) have no cache - caching them before the run resumes.\n")
+    crop_sizes = detail_crop_sizes(desc, inputs)
+    if crop_sizes:                      # before caching: the crops (and their captions) the dataset blocks name
+        from fizgig.krea2.caption_text import recaption_instruction
+        instr = os.path.splitext(inputs["DATASET_CONFIG"])[0] + "_crops_instruction.txt"
+        p.files.append((instr, recaption_instruction("style", inputs.get("caption_overrides") or {})[1]))
+        cmd = [inputs["python"], os.path.join(inputs["repo_dir"], "src", "fizgig", "scripts", "detail_crops.py"),
+               "--folder", _s(inputs.get("image_folder")), "--captioner", _s(inputs.get("captioner")),
+               "--instruction_file", instr, "--ext", _s(inputs.get("caption_ext")) or ".txt"]
+        for mp in crop_sizes:
+            cmd += ["--mp", f"{mp:g}"]
+        trig = _s(inputs.get("caption_trigger"))
+        if trig and trig.lower() != "trigger_word":
+            cmd += ["--trigger", trig]
+        p.stages.append(Stage("Detail crops", cmd))
     if caches(desc, inputs):
         p.stages += [Stage("Cache Preparation", cache_command(desc, inputs, "latents")),
                      Stage("Text Encoder Caching", cache_command(desc, inputs, "text"))]

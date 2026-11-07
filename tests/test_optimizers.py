@@ -25,11 +25,14 @@ print("arg parsing ok")
 for name in available_optimizers():
     p = [nn.Parameter(torch.randn(8, 8, device=DEV))]
     before = p[0].detach().clone()
-    # Family-appropriate LR: Lion wants ~1/10 of AdamW's.
-    lr = 1e-5 if name == "lion8bit" else 1e-4
+    # Family-appropriate LR: Lion wants ~1/10 of AdamW's; Prodigy takes lr=1.0 as a multiplier on the rate it estimates
+    # (its d starts near 1e-6, so at AdamW's 1e-4 a first step is below fp32 resolution and moves nothing).
+    lr = 1e-5 if name == "lion8bit" else 1.0 if name == "prodigy" else 1e-4
     opt, label = create_optimizer(name, p, lr)
-    p[0].grad = torch.randn_like(p[0])
-    opt.step()
+    # Two steps: Automagic v4's first step only measures (its second moments and reference), by design.
+    for _ in range(2):
+        p[0].grad = torch.randn_like(p[0])
+        opt.step()
     assert not torch.equal(before, p[0].detach()), f"{name} did not move the parameter"
     print(f"  {name:20s} {type(opt).__name__:22s} {describe(name)}")
 

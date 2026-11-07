@@ -6,6 +6,7 @@ the model cards and pipeline_moss_image.py (huggingface.co/OpenMOSS-Team/MOSS-Im
 (huggingface.co/Comfy-Org/MOSS-Image) and ComfyUI's core support (Comfy-Org/ComfyUI PR #17095, merge e087d8f6cb).
 
 """
+from fizgig.training.optimizers import MUON_DEFAULT_ARGS
 from fizgig.families.description import (FamilyDescription, FamilyOption, LoRAFormat, ModelFile, SamplingSettings,
                                          SpeedLoRA, TextEncoderBuild)
 
@@ -33,14 +34,14 @@ _FT_SHARE = "11:4:30:8:2"
 
 def _preset(rank, lr=1e-4, adaptive=None, epochs=30, mp="1.0", slider=False, ft=False):
     # Not yet trained on MOSS-Image (the driver was built without a GPU): Flux 3's preset shape (Krea 2's values,
-    # families/flux3.py), at 1 MP (the last pretraining stage's area), with fused AdamW as CHECKLIST.md asks for LoRA presets. EMA 0.98, the
+    # families/flux3.py), at 1 MP (the last pretraining stage's area), on Muon (Peter, 6 Nov). EMA 0.98, the
     # per-image loss watch off, saved every epoch. adaptive=(min, max) turns Adaptive LR on.
     lo, hi = adaptive or ("1e-4", "4e-4")
     return {
         "NETWORK_DIM": rank, "NETWORK_ALPHA": rank, "NETWORK_TYPE": "LoRA (standard)", "LEARNING_RATE": lr,
         "MAX_TRAIN_EPOCHS": epochs, "SAVE_EVERY_N_EPOCHS": 1, "SEED": 42,
         "ADAPTIVE_LR": adaptive is not None, "ADAPTIVE_LR_MIN": lo, "ADAPTIVE_LR_MAX": hi,
-        "OPTIMIZER_TYPE": "adamw", "GRADIENT_ACCUMULATION": 1, "MAX_GRAD_NORM": 1.0,
+        "OPTIMIZER_TYPE": "muon", "OPTIMIZER_ARGS": MUON_DEFAULT_ARGS, "GRADIENT_ACCUMULATION": 1, "MAX_GRAD_NORM": 1.0,
         "DATASET_MEGAPIXELS": mp, "BLOCKS_SWAP": "Auto (detect from GPU)",
         "FAMILY_PRECISION": "Auto (fits your free VRAM)", "FAMILY_EMA": "0.98 (recommended)",
         "KREA2_LOSS_WATCH": False, "KREA2_PER_IMAGE_LR": False, "KREA2_AUTO_RECAPTION": False,
@@ -57,11 +58,12 @@ MOSS_IMAGE = FamilyDescription(
     key="moss_image",
     start_lr_bands=(("lora", 1.7e-5, 3e-4), ("finetune", 3e-6, 3e-5), ("slider", 7e-5, 6e-4)),
     masked_training=True,
+    batch_training=True,              # Batch size (Other Options): training_loss_batch, exact per picture
+    batch_gb=(0.45, 1.35),          # GB each extra picture takes: fixed, per MP (batch 1 vs 3)
     arch_id="mossimage",
     display_name="MOSS-Image",
     gui_label="MOSS-Image",
     lora_name_suffix="moss",
-    status_note="MOSS-Image support is new and improving daily: update Fizgig regularly to get the latest fixes.",
     aliases=("moss-image", "mossimage"),
 
     model_files=(
@@ -195,8 +197,21 @@ MOSS_IMAGE = FamilyDescription(
     # 13 s slower (compiling) = paid back in ~35 steps; 200 leaves room for runs with several bucket shapes.
     # INT8 / NF4 not measured yet: bf16's figure, and Klein's NF4 one, so Auto compiles the default INT8 base.
     compile_payback_steps={"bf16": 200, "int8": 200, "nf4": 400},
+    not_offered={"int8_attention": "routed through attend(), but the speed-up isn't measured yet"},
     # int8_attention left off: the model routes attention through int8_attention.attend(), but the speed-up isn't
     # measured yet (ABILITIES.md: keep it where it measures faster)
+    # Identity in blocks 24-35 (5 Nov 2026): Peter's eye on the Profiler's group renders of a character LoRA
+    # (Nicola, epoch 21), and its numbers - 24-29 alone changed the picture most (0.54, twice any other group) and
+    # 30-35 left out nearly as much (0.50); the largest weights sit in 29, 24, 30 and 28. Confirmed the same day: a Fast
+    # Identity Mode run (24-35 only) gave superb likeness (Peter). Used by Extract's identity mode, Fast Identity Mode
+    # and Studio's identity / look colours.
+    block_categories=tuple((f"block_{i}", "identity" if 24 <= i <= 35 else "look") for i in range(42)),
+    identity_blocks=tuple(f"block_{i}" for i in range(24, 36)),
+    repair_presets=(
+        ("✨Identity only", tuple((f"block_{i}", 1.0 if 24 <= i <= 35 else 0.0) for i in range(42))),
+        ("✨Look only (no identity)", tuple((f"block_{i}", 0.0) for i in range(24, 36))),
+        ("✨Identity ×0.5", tuple((f"block_{i}", 0.5) for i in range(24, 36))),
+    ),
     finetune=True,                    # driver.ft_spec: every block's six Linears on an NF4 trunk
     ft_learning_rate=1e-5,            # FINETUNE.md's default; the report's pretraining LR was 5e-5 (Muon + AdamW)
     kind_values=(("finetune", (("MOSS_LOWNOISE_PCT", _FT_SHARE),)), ("standard", (("MOSS_LOWNOISE_PCT", _LORA_SHARE),)),
@@ -207,7 +222,7 @@ MOSS_IMAGE = FamilyDescription(
     # ... reference-image variants"). The RoPE keeps a reference-index axis for a later release.
     workbench_follows_samples=True,
     workbench_checkpoint_follows_tick=True,   # Repair Studio / Royale render on SFT only while the Samples tick is on   # CFG 3 needs the Samples tab's negative (empty = the reference's default)
-    activation_cache=True,            # Turbo Preview: step-1 replay; generate calls on_step before every step
+    activation_cache=True,            # Reuse unchanged blocks: step-1 replay; generate calls on_step before every step
     repair_size=1024,                 # a 1 MP model (CHECKLIST.md Workbench)
 
     sampling=(
@@ -327,7 +342,8 @@ MOSS_IMAGE = FamilyDescription(
                      hint="A LoRA or a fine-tune trains only attention (q, k, v, o), not the feed-forward layers. "
                           "Recommended on MOSS-Image SFT or a fine-tune of it, where training the feed-forward "
                           "layers breaks anatomy. Uses less VRAM, so a fine-tune fits a smaller card, but on Base "
-                          "it may cost quality or slow convergence.",
+                          "it may cost quality or slow convergence. Training on SFT isn't recommended: train on Base "
+                          "and use the LoRA on SFT.",
                      section="after", summary="attention only"),
         FamilyOption("MOSS_LOWNOISE_PCT", "Clean-end share", kind="entry", tokens="lownoise_pct={}", default=_LORA_SHARE,
                      width=8, suffix="% of steps",

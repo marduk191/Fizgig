@@ -735,8 +735,31 @@ function blockPicker(r, wrap) {
   return wrap;
 }
 
+// Prodigy / Muon (#292): picking one fills its Optimizer Args (and Prodigy's 1.0); leaving one puts back what
+// was there before it. Switching between the other optimizers is untouched.
+const OPT_ARGS = {
+  prodigy: "decouple=True weight_decay=0.01 d_coef=1.0 use_bias_correction=True safeguard_warmup=True",
+  muon: "adjust_lr_fn=match_rms_adamw weight_decay=0.01 momentum=0.95 nesterov=True ns_steps=5"};
+const OPT_HELD = {};
+function optimizerPicked(prev, opt) {
+  const touched = [];
+  if (OPT_ARGS[prev] && !OPT_ARGS[opt]) {                       // leaving Prodigy / Muon
+    if (String(S.values.OPTIMIZER_ARGS || "").trim() === OPT_ARGS[prev]) {
+      S.values.OPTIMIZER_ARGS = OPT_HELD.args || ""; touched.push("OPTIMIZER_ARGS");
+    }
+    if (prev === "prodigy" && String(S.values.LEARNING_RATE) === "1.0" && OPT_HELD.lr) {
+      S.values.LEARNING_RATE = OPT_HELD.lr; touched.push("LEARNING_RATE");
+    }
+  } else if (OPT_ARGS[opt] && !OPT_ARGS[prev]) {                // arriving: keep what to put back
+    OPT_HELD.args = S.values.OPTIMIZER_ARGS || ""; OPT_HELD.lr = S.values.LEARNING_RATE;
+  }
+  if (touched.length) syncInputs(touched);
+}
+
 function onValue(r, val) {
+  const prev = S.values[r.key];
   S.values[r.key] = val;
+  if (r.key === "OPTIMIZER_TYPE" && prev !== val) optimizerPicked(String(prev || ""), String(val || ""));
   if (r.key === "__SAMPLE_LIVE" || (S.values.__SAMPLE_LIVE &&
       ["SAMPLE_PROMPT", "SAMPLE_SEED", "SAMPLE_WIDTH", "SAMPLE_HEIGHT", "SAMPLE_STEPS", "SAMPLE_CFG_SCALE",
        "FAMILY_TURBO_STRENGTH", "SAMPLE_EVERY_N_EPOCHS", "SAMPLE_LATER", "SAMPLE_UNTIL_EPOCH",
@@ -1149,6 +1172,28 @@ function paintFetch() {
   const st = S.fetch || {};
   const busy = st.state === "running";
   const gb = (n) => (n / 1024 ** 3).toFixed(1);
+  // Start pressed before the model was downloaded: the Training tab shows the download, and the run starts after it
+  if (busy && st.then_start) S.fetchStart = true;
+  if (S.fetchStart && $("problems")) {
+    const box = $("problems"), name = (S.schema?.families || []).find((f) => f.key === st.family)?.display_name || "The model";
+    box.classList.remove("ok");
+    if (busy && st.then_start) {
+      const pct = st.total ? Math.min(100, (100 * st.done) / st.total) : 0;
+      box.replaceChildren(
+        el("div", {text: `${name}'s model files aren't downloaded yet: downloading them now, then training starts by itself.`}),
+        el("div", {class: "fetch-msg", text: st.file ? `${st.file}: ${gb(st.done)} of ${gb(st.total)} GB` :
+          ((st.lines || []).slice(-1)[0] || "Starting…")}),
+        el("div", {class: "fetch-bar"}, el("div", {style: `width:${pct.toFixed(1)}%`})),
+        el("button", {class: "btn btn-sm", text: "Cancel download",
+          onclick: () => api("/api/fetch/cancel", {}).then(watchFetch)}));
+    } else {
+      S.fetchStart = false;
+      box.replaceChildren(...(st.state === "done" ? [] : [el("div", {text: st.state === "cancelled"
+        ? "Download cancelled, so the run didn't start. Press Start again to carry on downloading."
+        : "Some files didn't download, so the run didn't start. Press Start again to retry just those (Preferences " +
+          "shows what went wrong)."})]));
+    }
+  }
   for (const [key, r] of Object.entries(S.fetchRows || {})) {
     r.btn.disabled = busy;
     r.status.innerHTML = "";
@@ -1564,6 +1609,7 @@ async function start(path, body) {
   try {
     const r = await api(path, path === "/api/start" ? {...runBody(), ...(body || {})} : (body || {}));
     if (r.warnings && r.warnings.length) { showWarnings(r.warnings, body || {}); return; }
+    if (r.fetching) { S.fetchStart = true; watchFetch(); return; }    // the model isn't here yet: it downloads first
     showProblems(r.problems || (r.error ? [r.error] : []));    // stays up: the run line below refreshes itself
     // the form went to a run that started: it isn't the queued run being edited any more (Save to queue would have
     // put this run's settings in its place)
@@ -1624,6 +1670,14 @@ async function resumeClick() {
   box.style.display = "";
 }
 
+// Stop's two-click confirm (see the btnStop handler)
+const STOP_CONFIRM = {timer: null};
+function stopConfirmReset() {
+  if (STOP_CONFIRM.timer) clearTimeout(STOP_CONFIRM.timer);
+  STOP_CONFIRM.timer = null;
+  const b = $("btnStop");
+  if (b) { b.textContent = "Stop"; b.title = ""; }
+}
 const RUN_LABELS = {idle: "Idle", starting: "Starting", running: "Running", pausing: "Pausing", paused: "Paused",
                     completed: "Finished", failed: "Failed", stopped: "Stopped", moved: "Moved"};
 
@@ -1656,6 +1710,7 @@ async function pollRun() {
   const runFam = S.schema.families.find((f) => f.key === (r.family || S.family)) || {};
   $("btnPause").style.display = runFam.no_pause ? "none" : "";
   $("btnStop").disabled = !live;
+  if (!live) stopConfirmReset();                    // run ended: Stop goes back to one plain button
   $("btnResume").style.display = !live && r.resume && !moveBusy ? "" : "none";
   renderWebQueue(r.web_queue || {items: []});
   queueSummary(r.web_queue || {items: []}, r);
@@ -1708,8 +1763,8 @@ function renderChoiceDraw(id, L) {
         "previews are on your Base"),
     opt("samples", "Follow Samples tab settings", "Renders as the Samples tab's previews do: your Base" +
         (rc.look ? ", with the SFT look LoRA" : "") + ", at the Samples tab's steps and CFG"),
-    el("span", {class: "field-hint", text: "Applies from Studio's next Load, and the next Royale or Profiler render " +
-      "(the model reloads, so that one takes longer)"}));
+    el("span", {class: "field-hint", text: "Applies at Studio's next Start or Update, and the next Royale or Profiler " +
+      "render (the model reloads, so that one takes longer)"}));
 }
 
 // every tab's box (and Studio's note) after a change, or a tab's model changing
@@ -1749,7 +1804,8 @@ function moveDraw(mv) {
       rm.state === "away" ? `Training on ${mv.to} (it isn't answering just now).` :
       rm.state === "login" ? `On ${mv.to}: its login ran out, so this computer can't see it. Add it again on the Helpers tab.` :
       rm.state === "running" || rm.state === "starting" ?
-        `Training on ${mv.to}` + (rm.epoch ? `: epoch ${rm.epoch} of ${rm.epochs}` : rm.stage ? `: ${rm.stage}` : "") +
+        `Training on ${mv.to}` + (mv.batch > 1 ? `, ${mv.batch} pictures a step` : "") +
+        (rm.epoch ? `: epoch ${rm.epoch} of ${rm.epochs}` : rm.stage ? `: ${rm.stage}` : "") +
         (rm.eta ? ` · ${rm.eta} left` : "") : `On ${mv.to}.`;
     if (mv.error) say += ` (${mv.error})`;
     if (mv.home_text) say += ` Coming home as they're saved: ${mv.home_text}.`;
@@ -1800,9 +1856,14 @@ async function moveOpen() {
   const pick = el("select", {class: "w-combo"}, ...ready.map((h) => el("option", {value: h.id,
     text: `${h.name}${h.gpu ? ` (${h.gpu}${h.vram ? `, ${h.vram} GB` : ""})` : ""}`})));
   const home = el("input", {type: "checkbox", checked: true});
+  // Batch size there: as many pictures a step as that computer's card fits, worked out there; back here it trains
+  // at this run's own Batch size again. Shown for a model that batches; greyed, with why, when the run can't
+  const why = (S.run && S.run.move_batch) || ["no run"];
+  const batchable = !why.includes("this model trains one picture a step") && !why.includes("no run");
+  const batch = el("input", {type: "checkbox", ...(why.length ? {disabled: true} : {})});
   const send = (now) => async () => {
     try {
-      await api("/api/helpers/move", {id: pick.value, now, home: home.checked});
+      await api("/api/helpers/move", {id: pick.value, now, home: home.checked, batch: batch.checked});
       S.moveOpen = false;
     } catch (e) { showProblems([e.message]); }
     pollRun();
@@ -1821,7 +1882,12 @@ async function moveOpen() {
       el("button", {class: "btn btn-sm", text: "Cancel", onclick: close})),
     el("label", {class: "checkbox-label", title: "Each checkpoint and preview comes back to this run's folder here as " +
       "it's saved there, one after another (a slow link just queues them), so bringing the run back only has the " +
-      "last few to fetch."}, home, " Bring its checkpoints and previews back here as they're saved"));
+      "last few to fetch."}, home, " Bring its checkpoints and previews back here as they're saved"),
+    ...(batchable ? [el("label", {class: "checkbox-label", title: why.length ?
+      `Not for this run: ${why.join(", ")} trains one picture a step.` :
+      "As many pictures a step as its card fits without more block swap: quicker epochs on a big card, each " +
+      "step averaging the batch, as Gradient Accumulation does. Brought back, it trains as it does here again."},
+      batch, " Train several pictures a step there, as many as its memory allows")] : []));
 }
 
 // ---- a prompt slider's live prompts: edited here while it trains, taken by the trainer at its next epoch boundary
@@ -2008,8 +2074,15 @@ async function pollStats() {
     s.ram[1] && s.ram[0] / s.ram[1] > 0.95));
   // the drive LoRAs go to: checkpoints and saved states fill it fast (red under 5% or 20 GB free)
   const d = s.disk;
-  if (d && d.total) host.append(meter("Disk" + (d.where ? ` ${d.where}` : ""), `${gb(d.free)} GB free`,
-    d.used / d.total, d.free < Math.max(20 * 2 ** 30, d.total * 0.05)));
+  if (d && d.total) {
+    const free = d.free >= 2 ** 40 ? `${(d.free / 2 ** 40).toFixed(1)} TB free` : `${gb(d.free)} GB free`;
+    const m = meter("Disk" + (d.where && d.where !== "/" ? ` ${d.where}` : ""), free,
+      d.used / d.total, d.free < Math.max(20 * 2 ** 30, d.total * 0.05));
+    if (d.path) m.title = `LoRAs save to ${d.path}` + (S.onPod ? ". On a pod this is what the drive reports: a " +
+      "network volume reports the whole shared storage, so the free space shown may be far more than your " +
+      "volume's own size" : "");
+    host.append(m);
+  }
   // what's loaded on the GPU now, each a click to its tab
   for (const m of s.loaded || []) host.append(el("div", {class: "side-loaded", title: `Open the ${m.tab} tab`,
     onclick: () => showTab(m.tab)}, el("span", {class: "side-loaded-dot"}),
@@ -2336,7 +2409,7 @@ async function likenessPicker() {
 }
 // the 3-photo picker, for the Samples gallery (exactly 3, from the training images) or LoRA Royale (1-3, any folder)
 async function likGridShow(folder, picked) {
-  const royale = S.lik.mode === "royale";
+  const royale = S.lik.mode !== "gallery";     // Royale's or the Profiler's subject photos: any folder, up to 3
   S.lik.folder = folder; S.lik.paths = {};
   $("likTitle").textContent = `Likeness: pick ${royale ? "up to " : ""}3 photos of your subject`;
   $("likFrom").textContent = royale ? "this folder" : "the training images";
@@ -2350,7 +2423,7 @@ async function likGridShow(folder, picked) {
   $("likModal").classList.add("active");
   if (!folder) return;
   const r = await api(`/api/captions?folder=${encodeURIComponent(folder)}&ext=${encodeURIComponent(capExt())}&family=${encodeURIComponent(S.family || "")}`).catch(() => ({items: []}));
-  for (const it of r.items.filter((x) => LIK_PICS.test(x.name))) {
+  for (const it of r.items.filter((x) => !x.crop && LIK_PICS.test(x.name))) {   // not its Detail crops (same names)
     S.lik.paths[it.name] = it.path;
     const fig = el("figure", {title: it.name, onclick: () => {
       const i = S.lik.picked.indexOf(it.name);
@@ -2371,7 +2444,7 @@ function likenessMarks() {
     f.querySelector(".lik-num")?.remove();
     if (i >= 0) f.append(el("span", {class: "lik-num", text: String(i + 1)}));
   }
-  $("likStart").disabled = S.lik.mode === "royale" ? !S.lik.picked.length : S.lik.picked.length !== 3;
+  $("likStart").disabled = S.lik.mode !== "gallery" ? !S.lik.picked.length : S.lik.picked.length !== 3;
   $("likPickStatus").textContent = `${S.lik.picked.length}/3 selected`;
 }
 async function likenessSet(names) {
@@ -2440,6 +2513,7 @@ function rvDraw(g, im, fr, W, H) {
   // the video's own frames (shown here and exported): fixed colours, not the theme's
   g.fillStyle = "#000"; g.fillRect(0, 0, W, H);
   const sc = Math.min(W / im.naturalWidth, H / im.naturalHeight), dw = im.naturalWidth * sc, dh = im.naturalHeight * sc;
+  g.fillStyle = "#fff"; g.fillRect((W - dw) / 2, (H - dh) / 2, dw, dh);    // a transparent sample on white
   g.drawImage(im, (W - dw) / 2, (H - dh) / 2, dw, dh);
   if ($("rvTicker").checked) {
     const label = "Epoch " + fr.epoch;
@@ -3410,7 +3484,6 @@ function pfPhotosDraw() {
     el("img", {src: `/api/thumb?path=${encodeURIComponent(p)}&t=${encodeURIComponent(TOKEN)}`, alt: ""}),
     el("button", {class: "btn btn-sm", text: "×", onclick: () => { S.pf.photos.splice(i, 1); pfPhotosDraw(); pfRemember(); }}))));
   if (!S.pf.photos.length) $("pfPhotos").append(el("span", {class: "field-hint", text: "None (picture change only)"}));
-  $("pfPhotoBtns").style.display = S.pf.photos.length >= 3 ? "none" : "";
 }
 
 async function pfLora(p, fresh) {
@@ -3470,8 +3543,13 @@ function wireProfiler() {
     pick($("pfLora").value || loraStart(), false, (p) => pfLora(p, true))}), up.btn, up.status);
   const addPhoto = (p) => { if (S.pf.photos.length < 3 && !S.pf.photos.includes(p)) S.pf.photos.push(p); pfPhotosDraw(); pfRemember(); };
   const pup = uploadButton({kind: "path", key: "PROFILER_PHOTO"}, el("input", {type: "text"}), addPhoto);
-  $("pfPhotoBtns").replaceChildren(el("button", {class: "btn btn-sm", text: "Add photo…", onclick: () => pick(S.imageFolder, false, addPhoto)}),
-    pup.btn, pup.status);
+  $("pfPhotoBtns").replaceChildren(el("button", {class: "btn btn-sm", text: "Choose…", onclick: () => {
+    // the Samples gallery's picker (as LoRA Royale's), from the photos' folder; Choose folder… points it anywhere
+    const dir = (p) => p.replace(/[\\/][^\\/]*$/, "");
+    const folder = S.pf.photos.length ? dir(S.pf.photos[0]) : S.imageFolder || refStart() || "";
+    S.lik.mode = "profiler";
+    likGridShow(folder, S.pf.photos.filter((p) => dir(p) === folder).map((p) => p.split(/[\\/]/).pop()));
+  }}), pup.btn, pup.status);
   $("pfPhotosClear").addEventListener("click", () => { S.pf.photos = []; pfPhotosDraw(); pfRemember(); });
   $("pfRun").addEventListener("click", profilerRun);
   $("pfStop").addEventListener("click", () => api("/api/profile/stop", {}).then(profilerPoll));
@@ -3486,6 +3564,7 @@ function exRemember() {
   try { localStorage.setItem(EX_KEY, JSON.stringify({family: $("exFamily").value, source: $("exSource").value,
     rank: $("exRank").value, preset: $("exPreset").value, mode: S.ex.mode, ftBase: $("exFtBase").value,
     ftTuned: $("exFtTuned").value, ftName: $("exFtName").value, ftOut: $("exFtOut").value,
+    id: $("exId").checked, ftId: $("exFtId").checked,
     ftRanks: [...$("exFtRanks").querySelectorAll("input:checked")].map((c) => Number(c.value))})); } catch (e) { /* private */ }
 }
 function exMode(mode) {
@@ -3511,6 +3590,7 @@ async function extractOpen() {
     if (sv.source) $("exSource").value = sv.source;
     if (sv.rank) $("exRank").value = sv.rank;
     exRankShow();
+    $("exId").checked = !!sv.id; $("exFtId").checked = !!sv.ftId;
     const on = new Set(sv.ftRanks || [32, 64]);
     $("exFtRanks").replaceChildren(...EX_FT_RANKS.map((r) => { const c = el("input", {type: "checkbox", value: r, onchange: exRemember});
       c.checked = on.has(r); return el("label", {class: "checkbox-label"}, c, " " + r); }));
@@ -3531,6 +3611,10 @@ async function extractFamily(key, preset) {
   $("exFamily").replaceChildren(...r.families.map((f) => el("option", {value: f.key, text: f.name})));
   $("exFamily").value = r.family;
   $("exOutDir").value = r.out_dir;
+  // Identity mode: a model with identity blocks keeps 4x the rank there
+  $("exIdRow").style.display = r.identity ? "" : "none";
+  $("exIdHint").textContent = r.identity ? `For a person or character: ${r.identity} (the identity blocks) keep 4x ` +
+    "the target rank (up to the LoRA's own), so the likeness survives a small file. Saved with _id in the name." : "";
   const names = r.presets.map((p) => p.name).concat(r.presets.length ? ["Custom"] : []);
   $("exPresetCard").style.display = names.length ? "" : "none";
   $("exPreset").replaceChildren(...names.map((n) => el("option", {value: n, text: n})));
@@ -3565,7 +3649,8 @@ function extractName() {
   if (!src) return;
   const base = src.split(/[\\/]/).pop().replace(/\.safetensors$/i, "");
   const slug = ($("exPreset").value || "all_blocks").toLowerCase().replace(/\+/g, "_").replace(/ /g, "_");
-  $("exName").value = `${base}_${slug}_r${$("exRank").value}.safetensors`;
+  const id = S.ex.info && S.ex.info.identity && $("exId").checked ? "_id" : "";
+  $("exName").value = `${base}_${slug}_r${$("exRank").value}${id}.safetensors`;
 }
 
 async function extractSource(p) {
@@ -3583,7 +3668,7 @@ async function extractRun() {
     const ranks = [...$("exFtRanks").querySelectorAll("input:checked")].map((c) => Number(c.value));
     try {
       await api("/api/extract/finetune", {base: $("exFtBase").value.trim(), tuned: $("exFtTuned").value.trim(),
-        out_dir: $("exFtOut").value.trim(), name: $("exFtName").value.trim(), ranks});
+        out_dir: $("exFtOut").value.trim(), name: $("exFtName").value.trim(), ranks, identity: $("exFtId").checked});
       $("exStatus").textContent = "Extracting…";
       $("exDone").replaceChildren();
       exRemember();
@@ -3599,7 +3684,8 @@ async function extractRun() {
   try {
     const r = await api("/api/extract/run", {family: $("exFamily").value, source: $("exSource").value.trim(),
       name: $("exName").value.trim(), out_dir: $("exOutDir").value.trim(), rank,
-      preset: custom || !(S.ex.info.presets || []).length ? "" : $("exPreset").value, blocks});
+      preset: custom || !(S.ex.info.presets || []).length ? "" : $("exPreset").value, blocks,
+      identity: !!S.ex.info.identity && $("exId").checked});
     $("exStatus").textContent = `Extracting to ${r.output}…`;
     $("exDone").replaceChildren();
     extractPoll();
@@ -3636,6 +3722,8 @@ function wireExtract() {
   $("exFamily").addEventListener("change", () => { extractFamily($("exFamily").value, $("exPreset").value); exRemember(); });
   $("exPreset").addEventListener("change", extractPresetChanged);
   for (const ev of ["change", "input"]) $("exRank").addEventListener(ev, () => { extractName(); exRemember(); });
+  $("exId").addEventListener("change", () => { extractName(); exRemember(); });
+  $("exFtId").addEventListener("change", exRemember);
   $("exRankPick").addEventListener("change", () => {      // a listed rank, or Other… and a box for any number
     const other = $("exRankPick").value === "__other";
     if (!other) $("exRank").value = $("exRankPick").value;
@@ -3781,9 +3869,48 @@ function lossChart(curve) {
 // ---- the loss graph: a run's loss at every step (the trainer's .fizgig_loss_<name>.jsonl), with smoothing, a log
 // scale and outliers clipped - its settings kept in this browser
 const LG_KEY = "fizgig_lossgraph";
-const lgSet = () => { try { return {smooth: 0.9, log: false, clip: true, lr: true, ...JSON.parse(localStorage.getItem(LG_KEY) || "{}")}; } catch (e) { return {smooth: 0.9, log: false, clip: true, lr: true}; } };
+const LG_DEF = {smooth: 0.9, log: false, clip: true, lr: true, emean: false, ravg: false};
+const lgSet = () => { try { return {...LG_DEF, ...JSON.parse(localStorage.getItem(LG_KEY) || "{}")}; } catch (e) { return {...LG_DEF}; } };
 const lgSave = (s) => { try { localStorage.setItem(LG_KEY, JSON.stringify(s)); } catch (e) { /* private window */ } };
 
+// the loss graph's LR scale: 0 at the bottom, the run's start/peak rate at the top (the largest rate logged - a
+// cosine or constant run's first, after any warmup). A rate that grows past its start (Prodigy) gets 10% headroom.
+function lrAxis(lv) {
+  const v = lv.map(Number).filter((x) => isFinite(x) && x >= 0);
+  const peak = v.length ? Math.max(...v) : 0, first = v.length ? v[0] : 0;
+  const climbs = first > 0 && peak > first * 1.05 && v[v.length - 1] > first * 1.05;
+  const top = peak > 0 ? peak * (climbs ? 1.1 : 1) : 1;
+  const pct = (x) => { const p = 100 * x / peak; return p >= 99.95 && p < 100 ? "99.9" : p.toFixed(p >= 10 ? 1 : 2); };
+  return {top, peak, climbs, pct};
+}
+// the loss graph's right-hand scale, top label: the learning rate now, as 6.55e-5
+function lrNowLabel(x) {
+  return Number(x).toExponential(2);
+}
+
+// the loss graph's left scale in the Epoch average / Running avg views: fitted to the averages drawn (in the scale's
+// own units, log10 on a log scale), 10% padding each side; a near-constant series is shown at least 5% of its value
+// tall (0.02 decades on a log scale) so its last-digit noise doesn't fill the plot
+function trendRange(vals, log, minFrac = 0.05) {
+  const v = vals.map(Number).filter((x) => isFinite(x) && (!log || x > 0)).map((x) => (log ? Math.log10(x) : x));
+  if (!v.length) return null;
+  let lo = Math.min(...v), hi = Math.max(...v);
+  const mid = (lo + hi) / 2, minSpan = log ? 0.4 * minFrac : Math.max(Math.abs(mid) * minFrac, 1e-6);
+  if (hi - lo < minSpan) { lo = mid - minSpan / 2; hi = mid + minSpan / 2; }
+  const pad = (hi - lo) * 0.1;
+  return [lo - pad, hi + pad];
+}
+
+// the running avg points the trend views' scale fits: from the end of the first epoch on (before that it's the mean of
+// the few steps so far - it starts wherever the first step landed and would stretch the scale), all of them when the
+// run hasn't finished an epoch yet. data.epochs: [[epoch, its first step], ...]
+function raFit(ra, epochs) {
+  const e2 = (epochs || []).length > 1 ? epochs[1][1] : null;
+  const after = e2 == null ? ra : ra.filter((p) => p[0] >= e2);
+  return after.length ? after : ra;
+}
+
+let lgClipN = 0;
 function lossGraph(data) {
   const box = el("div", {class: "loss-graph"});
   const pts = (data && data.points || []).filter((p) => isFinite(p[2]));
@@ -3800,26 +3927,43 @@ function lossGraph(data) {
   const clip = el("input", {type: "checkbox"}); clip.checked = set.clip;
   const lrOn = el("input", {type: "checkbox"}); lrOn.checked = set.lr;
   const hasLr = pts.some((p) => p[3] != null);
+  // the trend views (each its own switch, kept with the others): worked out by the server from every step
+  const tog = (k) => { const i = el("input", {type: "checkbox"}); i.checked = !!set[k]; return i; };
+  const emOn = tog("emean"), raOn = tog("ravg");
+  const em = (data.epoch_mean || []).filter((p) => isFinite(p[2]));
+  const ra = (data.running_avg || []).filter((p) => isFinite(p[1]));
   const redraw = () => {
-    Object.assign(set, {smooth: Number(smooth.value), log: log.checked, clip: clip.checked, lr: lrOn.checked});
+    Object.assign(set, {smooth: Number(smooth.value), log: log.checked, clip: clip.checked, lr: lrOn.checked,
+      emean: emOn.checked, ravg: raOn.checked});
     lgSave(set);
+    legendFill();
     draw();
   };
-  for (const i of [smooth, log, clip, lrOn]) i.addEventListener("input", redraw);
+  for (const i of [smooth, log, clip, lrOn, emOn, raOn]) i.addEventListener("input", redraw);
   // what each line and mark is
   const key = (cls, text) => el("span", {class: "lg-key"}, el("i", {class: "lg-sw " + cls}), text);
-  const legend = el("div", {class: "lg-legend"},
+  const legend = el("div", {class: "lg-legend"});
+  const legendFill = () => legend.replaceChildren(...[
     key("lg-sw-raw", "loss at each step"), key("lg-sw-smooth", "smoothed loss"),
-    hasLr ? key("lg-sw-lr", "learning rate (right-hand scale)") : null,
-    key("lg-sw-best", "lowest smoothed loss"), key("lg-sw-epoch", "start of an epoch (e1, e2…)"));
+    hasLr && set.lr ? key("lg-sw-lr", "learning rate (right-hand scale)") : null,
+    set.emean && em.length ? key("lg-sw-emean", "average loss of each epoch") : null,
+    set.ravg && ra.length ? key("lg-sw-ravg", "running avg (kohya-style: drifts down by itself)") : null,
+    key("lg-sw-best", "lowest smoothed loss"), key("lg-sw-epoch", "start of an epoch (e1, e2…)")].filter(Boolean));
+  legendFill();
+  const tip = (node, text) => { node.title = text; return node; };
   box.append(el("div", {class: "field-row loss-graph-ctl"},
     el("span", {class: "field-label", text: "Smoothing:"}), smooth, ctl("Log scale", log), ctl("Clip outliers", clip),
-    hasLr ? ctl("Learning rate", lrOn) : null), svgHost, legend, read);
+    hasLr ? ctl("Learning rate", lrOn) : null),
+  el("div", {class: "field-row loss-graph-ctl"}, el("span", {class: "field-label", text: "Trends:"}),
+    tip(ctl("Epoch average", emOn), "One point an epoch: the mean loss of all its steps."),
+    tip(ctl("Running avg (kohya-style)", raOn), "What kohya-based trainers (and Anima Standalone) show as avr_loss: " +
+      "a mean from the start, then a window of one epoch. It drifts down even when nothing improves, so it's mostly for show.")),
+  svgHost, legend, read);
 
   function draw() {
     // drawn at the width it has, so the text stays its own size on a phone
     const W = Math.max(300, Math.round(svgHost.clientWidth || 800)), H = W < 600 ? 220 : 240;
-    const L = 54, R = hasLr && set.lr ? 54 : 12, T = 10, B = 26;
+    const L = 54, R = hasLr && set.lr ? 64 : 12, T = 10, B = 26;   // room for the live rate beside "LR"
     const xs = pts.map((p) => p[0]);
     const x0 = xs[0], x1 = xs[xs.length - 1];
     const tf = (v) => (set.log ? Math.log10(Math.max(v, 1e-8)) : v);
@@ -3832,10 +3976,23 @@ function lossGraph(data) {
       const s = pts.map((p) => p[2]).sort((u, v) => u - v);
       ys = [s[Math.floor(s.length * 0.01)], s[Math.ceil(s.length * 0.99) - 1]].concat(sm);
     }
-    let y0 = Math.min(...ys.map(tf)), y1 = Math.max(...ys.map(tf));
-    if (y1 - y0 < 1e-9) { y0 -= 0.5; y1 += 0.5; }
+    // the trend lines that are on stay inside the scale
+    if (set.emean) ys = ys.concat(em.map((p) => p[2]));
+    if (set.ravg) ys = ys.concat(ra.map((p) => p[1]));
+    // Epoch average / Running avg on: the scale fits those, so their trend shows; the step loss and its smoothed line
+    // run past it, cut at the plot's edges
+    const fit = (set.emean && em.length) || (set.ravg && ra.length) ? trendRange([
+      ...(set.emean ? em.map((p) => p[2]) : []), ...(set.ravg ? raFit(ra, data.epochs).map((p) => p[1]) : [])],
+      set.log) : null;
+    let y0, y1;
+    if (fit) [y0, y1] = fit;
+    else {
+      y0 = Math.min(...ys.map(tf)); y1 = Math.max(...ys.map(tf));
+      if (y1 - y0 < 1e-9) { y0 -= 0.5; y1 += 0.5; }
+    }
     const X = (x) => L + (W - L - R) * (x1 === x0 ? 0.5 : (x - x0) / (x1 - x0));
     const Y = (v) => T + (H - T - B) * (1 - (Math.min(Math.max(tf(v), y0), y1) - y0) / (y1 - y0));
+    const YS = fit ? (v) => T + (H - T - B) * (1 - (tf(v) - y0) / (y1 - y0)) : Y;   // unclamped: cut, not flattened
     const ns = "http://www.w3.org/2000/svg";
     const mk = (tag, attrs) => { const n = document.createElementNS(ns, tag); for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v); return n; };
     const svg = mk("svg", {viewBox: `0 0 ${W} ${H}`, class: "loss-graph-svg"});
@@ -3850,29 +4007,56 @@ function lossGraph(data) {
     for (const f of [0, 0.5, 1]) {
       const v = y0 + (y1 - y0) * f, yy = T + (H - T - B) * (1 - f);
       svg.append(mk("line", {x1: L, x2: W - R, y1: yy, y2: yy, class: "lg-grid"}));
-      const t = mk("text", {x: L - 6, y: yy + 4, class: "lg-axis", "text-anchor": "end"});
+      const ty = yy + 4;
+      const t = mk("text", {x: L - 6, y: ty, class: "lg-axis", "text-anchor": "end"});
       t.textContent = (set.log ? 10 ** v : v).toPrecision(3);
       svg.append(t);
     }
-    svg.append(mk("polyline", {class: "lg-raw", points: pts.map((p) => `${X(p[0]).toFixed(1)},${Y(p[2]).toFixed(1)}`).join(" ")}));
-    svg.append(mk("polyline", {class: "lg-smooth", points: pts.map((p, i) => `${X(p[0]).toFixed(1)},${Y(sm[i]).toFixed(1)}`).join(" ")}));
+    let steps = svg;
+    if (fit) {
+      const id = `lg-clip-${++lgClipN}`, cp = mk("clipPath", {id});
+      cp.append(mk("rect", {x: L, y: T, width: W - L - R, height: H - T - B}));
+      svg.append(cp);
+      steps = mk("g", {"clip-path": `url(#${id})`, class: "lg-steps-fit"});   // faded: the trends lead
+      svg.append(steps);
+    }
+    steps.append(mk("polyline", {class: "lg-raw", points: pts.map((p) => `${X(p[0]).toFixed(1)},${YS(p[2]).toFixed(1)}`).join(" ")}));
+    steps.append(mk("polyline", {class: "lg-smooth", points: pts.map((p, i) => `${X(p[0]).toFixed(1)},${YS(sm[i]).toFixed(1)}`).join(" ")}));
+    const line = (cls, sp, yi, y = Y) => { if (sp.length > 1) svg.append(mk("polyline", {class: cls,
+      points: sp.map((p) => `${X(p[0]).toFixed(1)},${y(p[yi]).toFixed(1)}`).join(" ")})); };
+    const dots = (cls, sp, yi, label, y = Y) => sp.forEach((p) => {
+      const c = mk("circle", {cx: X(p[0]), cy: y(p[yi]), r: 3.5, class: cls});
+      const tt = mk("title", {}); tt.textContent = label(p); c.append(tt); svg.append(c);
+    });
+    if (set.ravg) {                  // in the trend views its first-epoch start runs past the scale, cut at the edge
+      if (fit && ra.length > 1) steps.append(mk("polyline", {class: "lg-ravg",
+        points: ra.map((p) => `${X(p[0]).toFixed(1)},${YS(p[1]).toFixed(1)}`).join(" ")}));
+      else line("lg-ravg", ra, 1);
+    }
+    if (set.emean) { line("lg-emean", em, 2); dots("lg-emean-dot", em, 2, (p) => `Epoch ${p[1]} average: ${p[2].toFixed(4)}`); }
     // the learning rate, on its own scale at the right (adaptive LR moves it)
     const lrPts = pts.filter((p) => p[3] != null);
     if (hasLr && set.lr && lrPts.length > 1) {
-      const lv = lrPts.map((p) => p[3]), l0 = Math.min(...lv), l1 = Math.max(...lv);
-      const LY = (v) => T + (H - T - B) * (l1 === l0 ? 0.5 : 1 - (v - l0) / (l1 - l0));
+      // a linear scale from 0 up to the run's peak rate: a cosine run starts at the top and slides down, and a
+      // 0.01% change looks like 0.01%. A rate that climbs (Prodigy's d*lr, adaptive LR going up) gets headroom.
+      const ax = lrAxis(lrPts.map((p) => p[3]));
+      const LY = (v) => T + (H - T - B) * (1 - Math.min(Math.max(v, 0), ax.top) / ax.top);
       svg.append(mk("polyline", {class: "lg-lr", points: lrPts.map((p) => `${X(p[0]).toFixed(1)},${LY(p[3]).toFixed(1)}`).join(" ")}));
-      for (const [v, yy] of [[l1, T + 4], [l0, H - B]]) {
-        const t = mk("text", {x: W - R + 4, y: yy, class: "lg-axis lg-lr-axis"}); t.textContent = v.toExponential(1); svg.append(t);
+      // the scale's top label is live: the rate now (the last point drawn, Prodigy's d*lr when that's plotted); the
+      // line is still drawn on 0..peak, and the bottom stays 0. A dot marks where the line is now.
+      const lp = lrPts[lrPts.length - 1], lx = X(lp[0]), ly = LY(lp[3]);
+      for (const [text, yy, cls] of [[lrNowLabel(lp[3]), T + 14, " lg-lr-live"], ["0", H - B, ""]]) {
+        const t = mk("text", {x: W - R + 4, y: yy, class: "lg-axis lg-lr-axis" + cls}); t.textContent = text; svg.append(t);
       }
+      svg.append(mk("circle", {cx: lx, cy: ly, r: 3, class: "lg-lr-now"}));
     }
     // the lowest smoothed point
     let bi = 0;
     sm.forEach((v, i) => { if (v < sm[bi]) bi = i; });
-    const best = mk("circle", {cx: X(pts[bi][0]), cy: Y(sm[bi]), r: 4, class: "lg-best"});
+    const best = mk("circle", {cx: X(pts[bi][0]), cy: YS(sm[bi]), r: 4, class: "lg-best"});
     const bt = mk("title", {}); bt.textContent = `Lowest smoothed loss: ${sm[bi].toFixed(4)} at step ${pts[bi][0]}`;
     best.append(bt);
-    svg.append(best);
+    steps.append(best);
     const axisT = (x, text, cls, anchor) => { const t = mk("text", {x, y: T + 2, class: "lg-axis " + cls, "text-anchor": anchor,
       "dominant-baseline": "hanging"}); t.textContent = text; svg.append(t); };
     axisT(4, "loss", "lg-axis-title", "start");
@@ -4101,7 +4285,8 @@ const thumbOf = (p) => `/api/thumb?path=${encodeURIComponent(p)}&t=${encodeURICo
 const prepSettings = () => ({
   mode: (document.querySelector('input[name="prepMode"]:checked') || {}).value || "Auto Prep (Face Crops)",
   mp: $("prepMp").value || "1.0", face: $("prepFace").value || "Largest Face", padding: $("prepPadding").value || "20",
-  replace: (document.querySelector('input[name="prepReplace"]:checked') || {}).value === "1"});
+  replace: (document.querySelector('input[name="prepReplace"]:checked') || {}).value === "1",
+  crops_only: $("prepCropsOnly").checked});
 const savePrepSoon = debounce(() => { S.prepSaved = prepSettings(); api("/api/state", {prep: S.prepSaved}).catch(() => {}); }, 600);
 
 async function loadPrep() {
@@ -4116,6 +4301,7 @@ async function loadPrep() {
     const mode = saved.mode || "Auto Prep (Face Crops)";
     document.querySelectorAll('input[name="prepMode"]').forEach((r) => { r.checked = r.value === mode; });
     document.querySelectorAll('input[name="prepReplace"]').forEach((r) => { r.checked = r.value === (saved.replace ? "1" : "0"); });
+    $("prepCropsOnly").checked = !!saved.crops_only;
     $("prepNoFaces").style.display = o.face_tools ? "none" : "";
     faceSettingsShow(o.face_settings);
   }
@@ -4580,19 +4766,31 @@ function meTool(t) {
 }
 
 async function prepSummary() {
-  const p = prepSettings(), faceOn = p.mode !== "Resize Only";
+  const p = prepSettings(), faceOn = ["Auto Prep (Face Crops)", "Face Crop Only"].includes(p.mode);
   document.querySelectorAll(".prep-face select, .prep-face input").forEach((i) => { i.disabled = !faceOn || !S.prep.opts.face_tools; });
   $("prepTest").disabled = !faceOn || !S.prep.opts.face_tools;
+  // Detail crops leave the pictures alone and use no face: no face rows, no originals choice, the size is the crop's
+  const crops = p.mode === "Detail Crops (Style)";
+  for (const id of ["prepOriginals", "prepSizingNote", "prepChars"]) $(id).style.display = crops ? "none" : "";
+  for (const id of ["prepCropsOnlyRow", "prepCropsOnlyHint"]) $(id).style.display = crops ? "" : "none";
+  // the face row and the face test only for the modes that make face close-ups
+  $("prepTestRow").style.display = faceOn ? "" : "none";
+  document.querySelectorAll(".prep-face").forEach((r) => { r.style.display = faceOn ? "" : "none"; });
+  if (crops) $("prepNoFaces").style.display = "none";
+  else $("prepNoFaces").style.display = S.prep.opts.face_tools ? "none" : "";
+  $("prepMpHint").textContent = crops ? "MP" : "MP (larger images shrink to fit; smaller are left alone)";
+  $("prepRunTitle").textContent = crops ? "2 · Run it" : "3 · Run it";
   if (!S.imageFolder) { $("prepSummary").textContent = ""; return; }
   const r = await api(`/api/prep/summary?folder=${encodeURIComponent(S.imageFolder)}&mode=${encodeURIComponent(p.mode)}` +
-    `&mp=${p.mp}&replace=${p.replace ? 1 : 0}&train_mp=${encodeURIComponent(S.values.DATASET_MEGAPIXELS || "")}`).catch(() => null);
+    `&mp=${p.mp}&replace=${p.replace ? 1 : 0}&crops_only=${p.crops_only ? 1 : 0}` +
+    `&train_mp=${encodeURIComponent(S.values.DATASET_MEGAPIXELS || "")}`).catch(() => null);
   if (!r) return;
   $("prepAudioOnly").style.display = r.audio_only ? "" : "none";
   $("prepMain").style.display = r.audio_only ? "none" : "";
   $("prepSummary").replaceChildren(...r.lines.map((t) => el("div", {text: t})));
   $("prepMpWarn").textContent = r.warn || "";
-  if (!S.prep.running) $("prepRun").textContent = r.count ? `✨ Prepare ${r.count} Image${r.count === 1 ? "" : "s"} Now` :
-    "✨ Prepare Images Now";
+  if (!S.prep.running) $("prepRun").textContent = crops ? "✨ Make Detail Crops Now" :
+    r.count ? `✨ Prepare ${r.count} Image${r.count === 1 ? "" : "s"} Now` : "✨ Prepare Images Now";
 }
 
 async function pollPrep() {
@@ -4877,7 +5075,7 @@ function presetSaveOpen() {
 function wirePrep() {
   document.querySelectorAll('input[name="prepMode"], input[name="prepReplace"]').forEach((r) =>
     r.addEventListener("change", () => { prepSummary(); savePrepSoon(); }));
-  for (const id of ["prepMp", "prepFace", "prepPadding"]) $(id).addEventListener("change", () => { prepSummary(); savePrepSoon(); });
+  for (const id of ["prepMp", "prepFace", "prepPadding", "prepCropsOnly"]) $(id).addEventListener("change", () => { prepSummary(); savePrepSoon(); });
   $("prepRun").addEventListener("click", prepRun);
   $("maskRun").addEventListener("click", maskRun);
   meWire();
@@ -5035,36 +5233,57 @@ function studioKind(L, sv) {
   studioMixShow(L);
   studioMetricsShow();
   if (!video) return;
-  const V = L.video, h3 = sv.h3 || {};
+  // the clip row's values are remembered per model (H3's under the old "h3" key), each starting from its own defaults
+  const V = L.video, h3 = (sv.video || {})[L.key] || (L.key === "minimax" ? sv.h3 : null) || {};
   const fill = (id, opts, val) => { const s = $(id); s.innerHTML = ""; for (const o of opts) s.append(el("option", {value: o, text: o})); s.value = opts.includes(val) ? val : opts[0]; };
   fill("stH3Model", V.models, h3.model || V.models[0]);
   fill("stH3Base", V.bases, h3.base);
   fill("stH3Len", V.lengths, h3.len || V.length);
   fill("stH3W", V.dims, h3.w || V.size[0]);
   fill("stH3H", V.dims, h3.h || V.size[1]);
-  if (h3.steps) $("stH3Steps").value = h3.steps;
-  if (h3.turbo != null) $("stH3Turbo").value = h3.turbo;
+  $("stH3ModelRow").style.display = (V.models || []).length || (V.bases || []).length ? "" : "none";
+  $("stH3Steps").value = h3.steps || V.steps || $("stH3Steps").defaultValue;
+  $("stH3Turbo").value = h3.turbo != null ? h3.turbo : (V.speed_strength != null ? V.speed_strength
+    : $("stH3Turbo").defaultValue);
+  $("stH3TurboLabel").textContent = `${V.speed_label || "Turbo"} LoRA`;      // the speed LoRA's strength box
+  {   // the two boxes' tooltips, in this model's own terms
+    const sp = V.speed_label || "speed", fast = V.steps || $("stH3Steps").defaultValue, at = V.speed_strength != null ?
+      V.speed_strength : 1, full = V.base_steps ? `about ${V.base_steps}` : "many more";
+    $("stH3Steps").title = `Sampling steps for the clip. With ${sp} at ${at}, ${fast} steps is the fast loop; with ` +
+      `${sp} at 0 (the base model alone) it needs ${full}.`;
+    $("stH3Turbo").title = `Strength of the built-in ${sp} LoRA: ${at} for the fast previews. 0 switches it off - the ` +
+      `render is the base model plus your LoRAs at the steps set (raise Steps to ${full}). That is also how you edit a ` +
+      `${sp} LoRA: load it as the primary and set this to 0.`;
+  }
+  $("stH3TurboLabel").style.display = $("stH3Turbo").style.display = V.speed_label ? "" : "none";
   $("stH3Sound").checked = V.sound && h3.sound !== false;
   $("stH3Sound").disabled = !V.sound;
+  $("stH3SoundBox").style.display = V.sound ? "" : "none";       // a model with no sound has no sound to switch
+  $("stH3EarlyBox").style.display = V.show_early ? "" : "none";
   $("stH3Boost").checked = h3.boost !== false;           // on unless turned off
   $("stH3Boost").parentElement.style.display = V.speed_boost ? "" : "none";   // a family ability (H3 has it)
   $("stH3Early").checked = h3.early !== false;
   S.st.kf = h3.kf || {};
   S.st.kfRect = h3.kfRect || {};
+  studioClipNote();
   studioSlots();
 }
 
 function studioSlots() {
   const ref = !!S.st.layout.video.references[$("stH3Model").value];
-  $("stFramesTitle").textContent = ref ? "Reference Images" : "First / Last Frame";
+  const lastToo = (S.st.layout.video.frame_slots || ["first", "last"]).includes("last");
+  $("stFramesTitle").textContent = ref ? "Reference Images" : lastToo ? "First / Last Frame" : "Start Frame";
   $("stFramesDesc").textContent = ref ? "Optional: up to two photos the clip should look like (this checkpoint's " +
     "references), each cropped to the clip's shape - you place the crop when you pick one. Say <Picture 1> and " +
     "<Picture 2> in the prompt for them, e.g. \"the woman in <Picture 1> walks along the beach in <Picture 2>\"." :
-    "Optional: photos the clip starts and ends on (a still uses the first only), each cropped to the clip's shape - " +
-    "you place the crop when you pick one.";
+    lastToo ? "Optional: photos the clip starts and ends on (a still uses the first only), each cropped to the clip's " +
+    "shape - you place the crop when you pick one." : "Optional: a photo the clip starts on (image-to-video; a still " +
+    "ignores it), cropped to the clip's shape - you place the crop when you pick one.";
   const host = $("stFrameSlots");
   host.innerHTML = "";
-  const slots = ref ? [["ref1", "Reference 1"], ["ref2", "Reference 2"]] : [["first", "First frame"], ["last", "Last frame"]];
+  const fs = S.st.layout.video.frame_slots || ["first", "last"];
+  const slots = ref ? [["ref1", "Reference 1"], ["ref2", "Reference 2"]] :
+    [["first", "First frame"], ["last", "Last frame"]].filter(([s]) => fs.includes(s));
   for (const [slot, label] of slots) {
     const input = el("input", {type: "text", class: "w-path", value: (S.st.kf[slot] || ""), placeholder: "a photo (optional)"});
     const thumb = el("canvas", {width: 1, height: 1});
@@ -5077,9 +5296,9 @@ function studioSlots() {
     };
     // a new photo: place its crop (Cancel keeps what was there); Re-crop moves the box of the one there
     const set = (p) => {
-      if (!p) { delete S.st.kf[slot]; delete S.st.kfRect[slot]; show(); studioH3Remember(); studioSchedule(); return; }
+      if (!p) { delete S.st.kf[slot]; delete S.st.kfRect[slot]; show(); studioH3Remember(); studioPending(); return; }
       studioCrop(p, p === S.st.kf[slot] ? S.st.kfRect[slot] : null, (rect) => {
-        S.st.kf[slot] = p; S.st.kfRect[slot] = rect; show(); studioH3Remember(); studioSchedule();
+        S.st.kf[slot] = p; S.st.kfRect[slot] = rect; show(); studioH3Remember(); studioPending();
       }, show);
     };
     input.addEventListener("change", () => set(input.value.trim()));
@@ -5185,7 +5404,8 @@ function studioCrop(path, initial, ok, cancel) {
 function studioH3Remember() {
   try {
     const d = stSaved();
-    d.h3 = {model: $("stH3Model").value, base: $("stH3Base").value, len: $("stH3Len").value, w: $("stH3W").value,
+    d.video = d.video || {};
+    d.video[(S.st.layout || {}).key || "minimax"] = {model: $("stH3Model").value, base: $("stH3Base").value, len: $("stH3Len").value, w: $("stH3W").value,
       h: $("stH3H").value, steps: $("stH3Steps").value, turbo: $("stH3Turbo").value,
       sound: $("stH3Sound").checked, boost: $("stH3Boost").checked, early: $("stH3Early").checked, kf: S.st.kf,
       kfRect: S.st.kfRect};
@@ -5201,11 +5421,12 @@ function studioExtra() {
   const V = L.video;
   const w = Number($("stH3W").value) || 640, h = Number($("stH3H").value) || 768;     // the clip at its Width x Height
   const ref = !!V.references[$("stH3Model").value];
-  const slots = ref ? ["ref1", "ref2"] : ["first", "last"];
+  const slots = ref ? ["ref1", "ref2"] : (V.frame_slots || ["first", "last"]);
   return {video: {frames: V.length_frames[$("stH3Len").value] || 22, width: w, height: h,
     steps: Math.max(1, Math.min(40, parseInt($("stH3Steps").value, 10) || 4)),
     turbo: Math.max(0, Math.min(1.5, Number($("stH3Turbo").value) || 0)), sound: $("stH3Sound").checked,
-    speed_boost: !!V.speed_boost && $("stH3Boost").checked, early: $("stH3Early").checked},
+    speed_boost: !!V.speed_boost && $("stH3Boost").checked, early: $("stH3Early").checked,
+    negative: $("stNeg").value.trim()},
     keyframes: slots.filter((s) => S.st.kf[s]).map((s) => ({slot: s, path: S.st.kf[s], rect: S.st.kfRect[s] || null})),
     ref_mode: ref};
 }
@@ -5380,7 +5601,7 @@ function songRegion(r) {
   S.st.region = r;
   if (r) $("stSongLoop").checked = true;
   studioAceRemember();
-  if ($("stSrcOn").checked && $("stSrcMode").value === "repaint") studioSchedule();   // Repaint remakes the new section
+  if ($("stSrcOn").checked && $("stSrcMode").value === "repaint") studioPending();    // Repaint remakes it at Update
   if (songPlaying()) songPlay(S.song.side, r ? r[0] : undefined);
   else if (r) S.song.pos = r[0];
   for (const s of Object.keys(SONG_SIDES)) songPlayer(s).loop = $("stSongLoop").checked && !r;
@@ -5560,7 +5781,7 @@ function studioRecordButton(input, set) {
 }
 
 function wireStudioAce() {
-  const change = () => { studioAceLayout(); studioAceRemember(); studioRegionDraw(); studioSchedule(); };
+  const change = () => { studioAceLayout(); studioAceRemember(); studioRegionDraw(); studioPending(); };
   for (const id of ["stPbOn", "stSrcOn", "stSndOn", "stSrcMode", "stPbKeep", "stPbBlend", "stSrcFollow", "stSrcDenoise", "stSrcStrength"])
     $(id).addEventListener("change", change);
   for (const id of ["stPbBlend"]) $(id).addEventListener("input", studioAceLayout);
@@ -5568,7 +5789,7 @@ function wireStudioAce() {
   const typed = () => { studioAceRemember(); if (S.st.ready) $("stStart").textContent = "Update"; };
   for (const id of ["stPromptB", "stSrcPath", "stSndPath"]) $(id).addEventListener("input", typed);
   for (const [id, host] of [["stSrcPath", "stSrcBtns"], ["stSndPath", "stSndBtns"]]) {
-    const input = $(id), set = (p) => { input.value = p; studioAceRemember(); studioSchedule(); };
+    const input = $(id), set = (p) => { input.value = p; studioAceRemember(); studioPending(); };
     const up = uploadButton({kind: "path", key: "STUDIO_" + id}, input, set);
     $(host).replaceChildren(el("button", {class: "btn", text: "Choose…", onclick: () => pick(input.value || S.imageFolder, false, set)}),
       up.btn, studioRecordButton(input, set), up.status);
@@ -5585,7 +5806,7 @@ function wireStudioAce() {
       studioAceLayout(); studioAceRemember(); studioRegionDraw();
       $("stStatus").textContent = "The Tweaked song is now the source: drag across the waveform to choose the section to repaint" +
         (S.st.region ? " (or keep this one)." : ".");
-      if (S.st.region) studioSchedule();
+      if (S.st.region) studioPending();
     } catch (e) { $("stStatus").textContent = e.message; }
   });
 }
@@ -5637,7 +5858,7 @@ function studioEq(role, on, restore = true) {
     if (S.st.ready) $("stStart").textContent = "Update";
   } else {
     $(pathId).value = prev;
-    if (S.st.ready) api("/api/studio/donor", {path: prev}).then(() => { studioPoll(); studioSchedule(); });
+    if (S.st.ready) api("/api/studio/donor", {path: prev}).then(() => { studioPoll(); studioPending(); });
   }
   stRemember();
 }
@@ -5716,12 +5937,12 @@ function studioMixRows() {
     const val = el("span", {class: "field-hint", text: Number(amount).toFixed(2)});
     const range = el("input", {type: "range", min: "-1", max: "2", step: "0.05", value: String(amount)});
     range.addEventListener("input", () => { val.textContent = Number(range.value).toFixed(2); });
-    range.addEventListener("change", () => { S.st.mix.rows[i][1] = snap05(range.value); studioSchedule(); });
+    range.addEventListener("change", () => { S.st.mix.rows[i][1] = snap05(range.value); studioPending(); });
     host.append(el("div", {class: "field-row"}, el("span", {class: "field-label"}), el("div", {class: "st-mixrow"},
       el("span", {class: "st-mixname", title: path, text: (i === 0 ? "★ " : "") + name}), range, val,
       i === 0 ? el("span", {class: "field-hint", text: "(the primary)"}) :
         el("button", {class: "btn btn-sm", text: "✕", title: "Take it out of the mix", onclick: () => {
-          S.st.mix.rows.splice(i, 1); studioMixRows(); studioSchedule(); }}))));
+          S.st.mix.rows.splice(i, 1); studioMixRows(); studioPending(); }}))));
   });
 }
 
@@ -5743,7 +5964,7 @@ async function studioMixMode(mode) {
   }
   if (m.mode === "off") $("stMixInfo").textContent = "Off: the primary file alone.";
   studioMixLayout();
-  studioSchedule();
+  studioPending();
 }
 
 function studioMixExtra() {
@@ -5763,13 +5984,13 @@ function wireStudioMix() {
   document.querySelectorAll('input[name="stMixMode"]').forEach((r) => r.addEventListener("change", () => studioMixMode(r.value)));
   for (const p of ["stMix", "stDmix"]) for (const id of [p + "Upto", p + "Hist"]) {
     $(id).addEventListener("input", studioMixLayout);
-    $(id).addEventListener("change", () => { studioMixLayout(); studioSchedule(); });
+    $(id).addEventListener("change", () => { studioMixLayout(); studioPending(); });
   }
   $("stDmixOn").addEventListener("change", async () => {
     S.st.dmix.on = $("stDmixOn").checked;
     if (S.st.dmix.on && !(await studioMixEpochs("donor"))) { S.st.dmix.on = false; $("stDmixOn").checked = false; }
     if (!S.st.dmix.on) $("stDmixInfo").textContent = "Off: the donor file alone.";
-    studioMixLayout(); studioSchedule();
+    studioMixLayout(); studioPending();
   });
   $("stMixAdd").addEventListener("click", () => pick($("stPrimary").value.trim(), false, async (p) => {
     if (S.st.mix.rows.some((r) => r[0].toLowerCase() === p.toLowerCase())) return;
@@ -5780,7 +6001,7 @@ function wireStudioMix() {
         return;
       }
     } catch (e) { /* unreadable: the render says so */ }
-    S.st.mix.rows.push([p, 0.5]); studioMixRows(); studioSchedule();
+    S.st.mix.rows.push([p, 0.5]); studioMixRows(); studioPending();
   }));
 }
 
@@ -5903,6 +6124,10 @@ async function studioSetupLoad(name) {
   let d;
   try { d = await api(`/api/studio/setup?name=${encodeURIComponent(name)}`); }
   catch (e) { $("stSetupMsg").textContent = e.message; return; }
+  await studioSetupApply(d, name);
+}
+
+async function studioSetupApply(d, name) {        // a saved setup, or one read from a picture Download tweaked saved
   const fam = d.family && [...$("stFamily").options].some((o) => o.value === d.family) ? d.family : $("stFamily").value;
   if (fam !== $("stFamily").value) { $("stFamily").value = fam; await studioFamily(); stRemember(); }
   const v = d.values || {};
@@ -5963,10 +6188,48 @@ async function studioSetupMix() {
   studioSchedule();
 }
 
+// a PNG's fizgig_studio_setup text (Download tweaked writes it), or null
+function studioSetupFromPng(buf) {
+  const u = new Uint8Array(buf), dv = new DataView(buf);
+  if (u.length < 8 || u[0] !== 0x89 || u[1] !== 0x50) return null;
+  for (let i = 8; i + 8 <= u.length;) {
+    const n = dv.getUint32(i), type = String.fromCharCode(...u.subarray(i + 4, i + 8));
+    if (type === "IEND") break;
+    if (type === "iTXt" || type === "tEXt") {
+      const body = u.subarray(i + 8, i + 8 + n), z = body.indexOf(0);
+      if (z > 0 && new TextDecoder("latin1").decode(body.subarray(0, z)) === "fizgig_studio_setup") {
+        let k = z + 1;
+        if (type === "iTXt") { k += 2; for (let s = 0; s < 2; s++) k = body.indexOf(0, k) + 1; }   // flags, language, keyword
+        try { return JSON.parse(new TextDecoder().decode(body.subarray(k))); } catch (e) { return null; }
+      }
+    }
+    i += 12 + n;
+  }
+  return null;
+}
+
 function wireStudioSetups() {
   $("stSetupSave").addEventListener("click", () => studioSetupSave(false));
   $("stSetupList").addEventListener("change", () => { const n = $("stSetupList").value; $("stSetupList").value = ""; if (n) studioSetupLoad(n); });
   studioSetupList();
+  // Download tweaked (a still): the setup goes up first, so the server writes it into the PNG
+  $("stDlTweak").addEventListener("click", async (e) => {
+    if ($("stDlTweak").dataset.go || (S.st.layout && S.st.layout.kind !== "stills")) return;
+    e.preventDefault();
+    try { await api("/api/studio/download_setup", {data: studioSetupData()}); } catch (err) { /* the picture alone */ }
+    $("stDlTweak").dataset.go = "1"; $("stDlTweak").click(); delete $("stDlTweak").dataset.go;
+  });
+  // a picture Download tweaked saved, dropped anywhere on Studio: its LoRAs, sliders and settings back
+  const tab = $("tab-studio");
+  tab.addEventListener("dragover", (e) => { if ([...e.dataTransfer.types].includes("Files")) e.preventDefault(); });
+  tab.addEventListener("drop", async (e) => {
+    const f = [...e.dataTransfer.files].find((x) => /\.png$/i.test(x.name) || x.type === "image/png");
+    if (!f || e.defaultPrevented) return;
+    e.preventDefault();
+    const d = studioSetupFromPng(await f.arrayBuffer());
+    if (!d || !d.fizgig_repair_setup) { $("stSetupMsg").textContent = `${f.name} has no Studio settings in it (Download tweaked saves them).`; return; }
+    await studioSetupApply(d, f.name.replace(/\.png$/i, ""));
+  });
 }
 
 function studioCanvas() {
@@ -5976,11 +6239,26 @@ function studioCanvas() {
   return [x.video.width, x.video.height, x.video.frames, x.ref_mode ? 0 : n, x.ref_mode ? n : 0];
 }
 
+// the clip row's line under the boxes: what the Steps and speed-LoRA boxes give (a model with a speed LoRA)
+function studioClipNote() {
+  const L = S.st.layout, V = L && L.kind === "video" ? L.video : null, note = $("stH3Note");
+  if (!note) return;
+  if (!V || !V.speed_label || !V.clip_note) { note.textContent = ""; return; }
+  const steps = parseInt($("stH3Steps").value, 10) || 0, s = Number($("stH3Turbo").value), lora = `${V.speed_label} LoRA`;
+  note.textContent = !(s > 0) ? `${steps} steps on the base model, CFG ${L.cfg_full} with the Negative.` :
+    (steps === V.steps ? `${steps} steps on the ${lora}'s own schedule, no CFG.` :
+     `${steps} steps on the model's standard schedule, no CFG - the ${lora} is tuned for ${V.steps} steps on its own ` +
+     `schedule, so other counts are untested.`) +
+    (s < 1 ? ` At ${s} the ${lora} is part-way to the base model, which is meant to run with CFG - untested.` : "");
+}
+
 function studioNegRow() {
   const L = S.st.layout;
   if (!L) return;
   const fast = (document.querySelector('input[name="stDit"]:checked') || {}).value !== "full";
-  const cfg = L.follows_samples ? (L.follow_ck ? L.cfg_fast : L.follow_cfg) : fast && L.dit_fast ? L.cfg_fast : L.cfg_full;   // Samples-tab models: theirs
+  let cfg = L.follows_samples ? (L.follow_ck ? L.cfg_fast : L.follow_cfg) : fast && L.dit_fast ? L.cfg_fast : L.cfg_full;   // Samples-tab models: theirs
+  if (L.kind === "video" && L.video && L.video.speed_label)      // a clip runs with CFG when its speed LoRA box is 0
+    cfg = Number($("stH3Turbo").value) > 0 ? L.cfg_fast : L.cfg_full;
   $("stNegRow").style.display = L.negative_default != null && cfg > 1 ? "" : "none";
 }
 
@@ -6007,7 +6285,14 @@ function studioRow(b) {
       onchange: (e) => studioSet(b.id, en, e.target.checked)});
     const range = el("input", {type: "range", min: "-3", max: "3", step: "0.05",
       oninput: (e) => studioSet(b.id, sv, Number(e.target.value), true), onchange: () => studioCommit()});
-    const val = el("span", {class: "st-val"});
+    // the value: type one in (Enter or leaving the box sets it, -3 to 3), Esc puts the slider's back
+    const val = el("input", {type: "text", class: "st-val", title: "Type a value from -3 to 3, then Enter",
+      onkeydown: (e) => { if (e.key === "Enter") e.target.blur(); else if (e.key === "Escape") { row._sync(); e.target.blur(); } },
+      onchange: (e) => {
+        const v = Number(String(e.target.value).replace(",", ".").replace(/^\+/, ""));
+        if (!Number.isFinite(v)) { row._sync(); return; }
+        studioSet(b.id, sv, Math.max(-3, Math.min(3, Math.round(v * 100) / 100))); studioCommit();
+      }});
     const btn = (t, title, f) => el("button", {class: "btn btn-sm", text: t, title, onclick: () => { f(); studioCommit(); }});
     const label = side === "p" ? el("span", {class: "st-label", style: b.color ? `color:${b.color}` : ""},
       b.label, b.cat ? el("small", {text: `[${b.cat}]`}) : null) : el("span", {class: "st-label", text: "donor"});
@@ -6028,7 +6313,8 @@ function studioRow(b) {
           const o = side === "p" ? "ds" : "ps", v = st()[sv];
           if (S.st.donor && v >= 0 && v <= 1) { studioSet(b.id, o, Math.round((1 - v) * 100) / 100); studioSet(b.id, "de", true); }
         })));
-    row._sync = () => { tick.checked = st()[en]; range.value = st()[sv]; val.textContent = stFmt(st()[sv]);
+    row._sync = () => { tick.checked = st()[en]; range.value = st()[sv];
+      if (document.activeElement !== val) val.value = stFmt(st()[sv]);
       const on = locks().has(b.id); lock.textContent = on ? "🔒" : "🔓"; lock.classList.toggle("on", on); };
     row._sync();
     return row;
@@ -6322,6 +6608,14 @@ function studioState() {
     donor_scale: num("stDScale", 1)};
 }
 
+// a setting changed (size, length, steps, seed, a LoRA's strength, the negative, a reference...): nothing renders until
+// Update, so several can change first - only the block sliders render as they move
+function studioPending() {
+  if (!S.st.ready) return;
+  $("stStart").textContent = "Update";
+  $("stStatus").textContent = "Changed - press Update to render.";
+}
+
 function studioSchedule(live) {
   if (!S.st.ready) return;
   clearTimeout(S.st.timer);
@@ -6339,10 +6633,17 @@ async function studioStart() {
   const L = S.st.layout;
   try {
     const st = await api("/api/studio/status");
+    // what the model loads with as of now - Render with, the Samples tab's checkpoint tick, look LoRA and Turbo may have
+    // changed on another tab since Studio drew: any of them is a reload, not a re-render on the old model
+    const rc = await api("/api/studio/render_choice?family=" + encodeURIComponent(L.key)).catch(() => null);
+    if (rc && rc.key === L.key) Object.assign(L, rc);
     const fast = (document.querySelector('input[name="stDit"]:checked') || {}).value !== "full";
-    const key = [L.key, $("stPrimary").value.trim(), fast, L.kind === "video" ? $("stH3Model").value + $("stH3Base").value : ""].join("|");
+    const key = [L.key, $("stPrimary").value.trim(), fast, L.kind === "video" ? $("stH3Model").value + $("stH3Base").value : "",
+      (L.render_choice || {}).value || "", L.follow_ck || "", L.follow_look || "", L.follow_turbo || ""].join("|");
     if (st.state === "ready" && S.st.loadedKey === key) {     // the same LoRA: the donor may change, then a render
       if ($("stDonor").value.trim() !== (st.donor || "")) await api("/api/studio/donor", {path: $("stDonor").value.trim()});
+      // the Samples tab's steps and CFG (a model that follows it) apply without a reload: sent before each render
+      if (L.follows_samples) await api("/api/studio/settings", {family: L.key, negative: $("stNeg").value.trim()});
       studioRender();
       return;
     }
@@ -6394,6 +6695,16 @@ async function studioPoll() {
     const donorOn = st.donor && Object.values(S.st.blocks).some((b) => b.de);
     S.st.autoOut = $("stOut").value = stem(st.primary) + (donorOn ? "_with_" + stem(st.donor.split(/[\\/]/).pop()) : "_repaired") + ".safetensors";
   }
+  if (st.baseline_early && st.baseline_early !== S.st.baseEarlyShown && st.baseline_early !== S.st.shown) {
+    // the Baseline landed first: it shows (and plays) while the Tweaked one is still rendering
+    S.st.baseEarlyShown = st.baseline_early;
+    const q = (w) => `/api/studio/image?which=${w}&gen=${st.baseline_early}&t=${encodeURIComponent(TOKEN)}`;
+    const kind = S.st.layout && S.st.layout.kind, has = st.media && st.media.baseline;
+    $("stBase").src = q("baseline");
+    $("stBaseVid").style.display = kind === "video" && has ? "" : "none";
+    $("stBase").style.display = kind === "video" && has ? "none" : "";
+    if (kind === "video" && has) { $("stBaseVid").poster = q("baseline"); $("stBaseVid").src = q("baseline_media"); }
+  }
   if (st.early && st.early !== S.st.earlyShown) {        // H3 Show early: the unfinished look, until the clip lands
     S.st.earlyShown = st.early;
     $("stTweakVid").style.display = "none"; $("stTweak").style.display = "";
@@ -6402,10 +6713,13 @@ async function studioPoll() {
   if (st.shown && st.shown !== S.st.shown) {
     S.st.shown = st.shown;
     const q = (w) => `/api/studio/image?which=${w}&gen=${st.shown}&t=${encodeURIComponent(TOKEN)}`;
-    $("stBase").src = q("baseline"); $("stTweak").src = q("tweaked");
+    const keepBase = S.st.baseEarlyShown === st.shown;      // the Baseline already showed (and plays): left alone
+    if (!keepBase) $("stBase").src = q("baseline");
+    $("stTweak").src = q("tweaked");
     // a clip plays in its pane (the picture its poster); a song gets its player under the waveform
     const kind = S.st.layout && S.st.layout.kind;
     for (const [w, img, vid, aud] of [["baseline", "stBase", "stBaseVid", "stBaseAud"], ["tweaked", "stTweak", "stTweakVid", "stTweakAud"]]) {
+      if (w === "baseline" && keepBase) continue;
       const has = st.media && st.media[w];
       $(vid).style.display = kind === "video" && has ? "" : "none";
       $(aud).style.display = "none";
@@ -6630,9 +6944,9 @@ function wireStudio() {
   new MutationObserver(studioDockPlay).observe($("stPlayBoth"), {attributes: true, attributeFilter: ["style"]});
   window.addEventListener("resize", debounce(() => { const d = $("stDock"); if (d && d.classList.contains("floating")) studioDockClamp(d); }, 150));
   $("stFamily").addEventListener("change", () => { studioFamily(); stRemember(); });
-  // H3: a length / size / steps / sound change renders; Model and Base take effect at the next Start
+  // the clip row: length / size / steps / speed LoRA / sound wait for Update, as Model and Base do
   for (const id of ["stH3Len", "stH3W", "stH3H", "stH3Steps", "stH3Turbo", "stH3Sound", "stH3Boost"])
-    $(id).addEventListener("change", () => { studioH3Remember(); studioSchedule(); });
+    $(id).addEventListener("change", () => { studioH3Remember(); studioPending(); });
   $("stH3Early").addEventListener("change", studioH3Remember);
   $("stH3Model").addEventListener("change", () => { studioH3Remember(); studioSlots(); $("stStart").textContent = "Update"; });
   $("stH3Base").addEventListener("change", () => { studioH3Remember(); $("stStart").textContent = "Update"; });
@@ -6655,21 +6969,40 @@ function wireStudio() {
     studioDmixOff();
     if (S.st.ready) api("/api/studio/donor", {path: p}).then(studioPoll).catch((e) => { $("stStatus").textContent = e.message; }); }));
   $("stDonorUnload").addEventListener("click", () => { $("stDonor").value = ""; stRemember(); studioDmixOff();
-    if (S.st.ready) api("/api/studio/donor", {path: ""}).then(() => { studioPoll(); studioSchedule(); }); });
-  $("stRefPick").addEventListener("click", () => pick($("stRef").value || refStart(), false, (p) => { $("stRef").value = p; stRemember(); studioSchedule(); }));
-  $("stRefClear").addEventListener("click", () => { $("stRef").value = ""; stRemember(); studioSchedule(); });
-  $("stSeedNew").addEventListener("click", () => { $("stSeed").value = 1 + Math.floor(Math.random() * 99999); stRemember(); studioSchedule(); });
+    if (S.st.ready) api("/api/studio/donor", {path: ""}).then(() => { studioPoll(); studioPending(); }); });
+  $("stRefPick").addEventListener("click", () => pick($("stRef").value || refStart(), false, (p) => { $("stRef").value = p; stRemember(); studioPending(); }));
+  $("stRefClear").addEventListener("click", () => { $("stRef").value = ""; stRemember(); studioPending(); });
+  // ↻ New seed renders at once, as Update would (with any other change still waiting); typing a seed still waits
+  $("stSeedNew").addEventListener("click", () => {
+    $("stSeed").value = 1 + Math.floor(Math.random() * 99999); stRemember();
+    if (S.st.ready) studioStart();
+  });
   for (const id of ["stSeed", "stRes", "stW", "stH", "stRefMp", "stRefStr", "stPScale", "stDScale"])
-    $(id).addEventListener("change", () => { stRemember(); studioSchedule(); });
+    $(id).addEventListener("change", () => { stRemember(); studioPending(); });
   for (const id of ["stPrompt", "stPrimary", "stDonor", "stLuckyLo", "stLuckyHi"]) $(id).addEventListener("input", stRemember);
+  for (const id of ["stPrompt", "stPrimary", "stDonor"]) $(id).addEventListener("change", studioPending);
   $("stLuckyWho").addEventListener("change", () => { stRemember(); studioFreezeState(); });
   $("stLuckyCount").addEventListener("change", stRemember);
   $("stFreeze").addEventListener("click", () => studioFreeze(true));
   $("stUnfreeze").addEventListener("click", () => studioFreeze(false));
   $("stNeg").addEventListener("change", () => { stRemember();
-    if (S.st.ready) api("/api/studio/settings", {family: S.st.layout.key, negative: $("stNeg").value.trim()}).then(() => studioSchedule()); });
+    if (S.st.ready) api("/api/studio/settings", {family: S.st.layout.key, negative: $("stNeg").value.trim()}).then(studioPending); });
   $("stTurbo").addEventListener("change", () => { stRemember(); if (S.st.ready) api("/api/studio/settings", {family: S.st.layout.key, turbo: $("stTurbo").checked}); });
-  document.querySelectorAll('input[name="stDit"]').forEach((r) => r.addEventListener("change", studioNegRow));
+  $("stH3Turbo").addEventListener("input", () => { studioNegRow(); studioClipNote(); });
+  $("stH3Steps").addEventListener("input", studioClipNote);
+  document.querySelectorAll('input[name="stDit"]').forEach((r) => r.addEventListener("change", () => {
+    // a video model renders from the clip row's Steps and speed-LoRA boxes: Preview with sets them - the fast loop
+    // (its steps at its strength) or the full model (its own steps, the speed LoRA off, so CFG and the negative apply)
+    const L = S.st.layout, V = L && L.kind === "video" ? L.video : null;
+    if (V) {
+      const full = r.value === "full" && r.checked;
+      if (full && V.base_steps) { $("stH3Steps").value = V.base_steps; $("stH3Turbo").value = 0; }
+      else if (!full && V.steps) { $("stH3Steps").value = V.steps; $("stH3Turbo").value = V.speed_strength ?? 1; }
+      studioH3Remember();
+    }
+    studioNegRow();        // after the boxes: a clip's Negative shows when its speed LoRA box is 0 (CFG on)
+    studioClipNote();
+  }));
   document.querySelectorAll('input[name="stTarget"]').forEach((r) => r.addEventListener("change", studioMastersFollow));
   document.querySelectorAll("[data-bulk]").forEach((b) => b.addEventListener("click", () => studioBulk(b.dataset.bulk)));
   $("stPreset").addEventListener("change", () => { if ($("stPreset").value) studioPresetApply($("stPreset").value); });
@@ -6688,6 +7021,13 @@ function wireStudio() {
 // The desktop Captions tab's tools, run on the Fizgig machine (fizgig/web/captions.py). Settings are remembered.
 let CAP_PAGE = 12;                         // Per page (the desktop's sizes), remembered with the tab's settings
 S.cap = {page: 0, items: [], opts: null, lastState: ""};
+
+// the folder the Captions tab works on (its tools take the folder's largest detail crops in too, server side)
+function capFolder() {
+  return S.imageFolder;
+}
+// the folder one listed file is in: the training folder, or its largest detail crop folder
+const capItemFolder = (it) => it.path.slice(0, it.path.length - it.name.length - 1);
 
 function capSettings() {
   return {trigger: $("capTrigger").value, model: $("capModel").value, task: $("capTask").value,
@@ -6788,7 +7128,7 @@ const capExt = () => {                    // Training > Other Options > Caption 
 
 function capJobBody(extra = {}) {
   const t = qwenOn() && qwenTask();
-  return {family: S.family, folder: S.imageFolder, model: $("capModel").value, task: $("capTask").value, ext: capExt(),
+  return {family: S.family, folder: capFolder(), model: $("capModel").value, task: $("capTask").value, ext: capExt(),
     instruction: t ? t.instruction.split("{concept}").join($("capConcept").value.trim() || "the same concept") : "",
     max_tokens: Number($("capTokens").value) || 120,
     trigger: $("capTrigger").value, overwrite: $("capOverwrite").checked, ...extra};
@@ -6806,12 +7146,12 @@ async function capRun(path, body) {
 // while captioning runs: the captions written so far fill in every few seconds - never over one you're editing
 async function captionsLive() {
   if (!S.imageFolder || !document.querySelector("#tab-captions.active")) return;
-  const r = await api(`/api/captions?folder=${encodeURIComponent(S.imageFolder)}&ext=${encodeURIComponent(capExt())}&family=${encodeURIComponent(S.family || "")}`)
+  const r = await api(`/api/captions?folder=${encodeURIComponent(capFolder())}&ext=${encodeURIComponent(capExt())}&family=${encodeURIComponent(S.family || "")}`)
     .catch(() => null);
   if (!r || !r.items) return;
-  const now = new Map(r.items.map((i) => [i.name, i]));
+  const now = new Map(r.items.map((i) => [i.path, i]));
   for (const it of S.cap.items) {
-    const n = now.get(it.name);
+    const n = now.get(it.path);
     if (!n || (n.caption ?? "") === (it.caption ?? "")) continue;
     const ta = it._ta, untouched = !ta || (document.activeElement !== ta && ta.value === (it.caption ?? ""));
     if (!untouched) continue;
@@ -6874,8 +7214,9 @@ async function loadCaptions() {
     "Choose the training folder on the Start tab first.") + subfoldersHint();
   if (!S.imageFolder) { $("captionsSummary").textContent = "Choose the training folder on the Start tab."; return; }
   const ext = $("captionExt").value.trim() || ".txt";
-  const r = await api(`/api/captions?folder=${encodeURIComponent(S.imageFolder)}&ext=${encodeURIComponent(ext)}&family=${encodeURIComponent(S.family || "")}`);
-  S.cap.items = r.items;
+  const r = await api(`/api/captions?folder=${encodeURIComponent(capFolder())}` +
+    `&ext=${encodeURIComponent(ext)}&family=${encodeURIComponent(S.family || "")}`);
+  S.cap.items = r.items;                      // the pictures, then the largest detail crops (it.crop: their folder)
   renderCaptions();
 }
 
@@ -6911,9 +7252,9 @@ function renderCaptions() {
     it._ta = ta;                                 // for the live refresh while captioning runs
     const status = el("span", {class: "field-hint"});
     const saveCap = async () => {
-      await api("/api/captions/save", {folder: S.imageFolder, name: it.name, text: ta.value, ext});
+      await api("/api/captions/save", {folder: capItemFolder(it), name: it.name, text: ta.value, ext});
       it.caption = ta.value;
-      status.textContent = "Saved";
+      status.textContent = it.crop ? "Saved, at every crop size" : "Saved";
     };
     const save = el("button", {class: "btn btn-sm", text: "Save", onclick: saveCap});
     const kind = it.name.split(".").pop().toLowerCase();
@@ -6930,7 +7271,7 @@ function renderCaptions() {
     const speechRun = kind === "mp4" && !/_mute$/i.test(it.name.replace(/\.[^.]+$/, "")) ? async (say = (t) => { status.textContent = t; }) => {
       say("Transcribing… (the first time downloads Whisper, ~300 MB)");
       try {
-        const r = await api("/api/captions/transcribe", {family: S.family, folder: S.imageFolder, name: it.name});
+        const r = await api("/api/captions/transcribe", {family: S.family, folder: capItemFolder(it), name: it.name});
         if (!r.text) { say("Whisper heard no words in this clip."); return; }
         const cap = ta.value.trim().replace(/\.$/, "");
         ta.value = (cap ? cap + " " : "") + `saying "${r.text}"`;
@@ -6944,8 +7285,9 @@ function renderCaptions() {
     const media = mediaFor(it);
     const card = el("div", {class: "caption-card"});
     // the big view edits, saves, re-captions and removes the same caption
-    card._cap = {ta, it, save: saveCap, recap: recap ? recapRun : null, speech: speechRun, remove: () => capRemove(it, card, status)};
-    const remove = el("button", {class: "btn btn-sm", text: "Remove",
+    card._cap = {ta, it, save: saveCap, recap: recap ? recapRun : null, speech: speechRun,
+      remove: it.crop ? null : () => capRemove(it, card, status)};
+    const remove = it.crop ? null : el("button", {class: "btn btn-sm", text: "Remove",
       title: "Take it out of the training set: it and its caption move into the folder's removed subfolder (nothing is deleted).",
       onclick: () => capRemove(it, card, status)});
     const size = it.size ? `${it.size[0]}×${it.size[1]} · ${(it.size[0] * it.size[1] / 1e6).toFixed(1)} MP` : "";
@@ -6960,7 +7302,9 @@ function renderCaptions() {
         maskBtn.textContent = on ? "Show picture" : "Show mask";
       }}) : null;
     card.append(media, el("div", {class: "caption-card-body"},
-      el("div", {class: "caption-card-title", text: mediaLabel(it)}),
+      el("div", {class: "caption-card-title", text: mediaLabel(it) + (it.crop ? " · detail crop" : ""),
+        title: it.crop ? "This picture's detail crop (Image Prep's Detail crops), the largest size: its caption is " +
+          "copied to the crop at every other size" : ""}),
       size ? el("div", {class: "field-hint caption-card-size", text: size + (it.mask ? " · has a mask" : "")}) : null, ta,
       el("div", {class: "field-row"}, save, recap, speech, maskBtn, remove, status)));
     host.append(card);
@@ -6988,13 +7332,14 @@ function captionsTable(items, ext) {
     const words = el("td", {class: "cap-num", text: String(capWords(it))});
     ta.addEventListener("change", async () => {  // saved when you leave the box, as typed
       try {
-        await api("/api/captions/save", {folder: S.imageFolder, name: it.name, text: ta.value, ext});
+        await api("/api/captions/save", {folder: capItemFolder(it), name: it.name, text: ta.value, ext});
         it.caption = ta.value; words.textContent = String(capWords(it));
       } catch (e) { ta.title = e.message; }
     });
     const thumb = it.size ? el("img", {class: "cap-thumb", loading: "lazy",
       src: `/api/thumb?path=${encodeURIComponent(it.path)}&t=${encodeURIComponent(TOKEN)}`}) : el("span", {text: ""});
-    return el("tr", {}, el("td", {}, thumb), el("td", {class: "cap-name", text: mediaLabel(it), title: it.name}),
+    return el("tr", {}, el("td", {}, thumb), el("td", {class: "cap-name", text: mediaLabel(it) +
+      (it.crop ? " · detail crop" : ""), title: it.name}),
       el("td", {}, ta), words,
       el("td", {class: "cap-num", text: it.size ? `${it.size[0]}×${it.size[1]}` : ""}),
       el("td", {class: "cap-num", text: it.mask ? "yes" : ""}));
@@ -7005,7 +7350,7 @@ function captionsTable(items, ext) {
 async function addText(apply) {
   const host = $("frChanges");
   try {
-    const r = await api("/api/captions/add", {family: S.family, folder: S.imageFolder, start: $("frStart").value,
+    const r = await api("/api/captions/add", {family: S.family, folder: capFolder(), start: $("frStart").value,
       end: $("frEnd").value, trigger: $("capTrigger").value, apply, ext: capExt()});
     host.innerHTML = "";
     $("frStatus").textContent = r.changes.length ? (apply ? `Added to ${r.changes.length} captions.` :
@@ -7019,7 +7364,7 @@ async function addText(apply) {
 
 async function capRemove(it, card, status) {
   // out of the training set (into removed/), with an Undo on the spot
-  const folder = S.imageFolder;
+  const folder = capItemFolder(it);
   try {
     const r = await api("/api/captions/remove", {folder, name: it.name, ext: $("captionExt").value.trim() || ".txt"});
     S.cap.items = S.cap.items.filter((x) => x !== it);
@@ -7039,7 +7384,7 @@ async function capRemove(it, card, status) {
 async function findReplace(apply) {
   const host = $("frChanges");
   try {
-    const r = await api("/api/captions/replace", {family: S.family, folder: S.imageFolder, find: $("frFind").value,
+    const r = await api("/api/captions/replace", {family: S.family, folder: capFolder(), find: $("frFind").value,
       replace: $("frReplace").value, apply, ext: capExt()});
     host.innerHTML = "";
     $("frStatus").textContent = r.changes.length ? (apply ? `Replaced in ${r.changes.length} captions.` :
@@ -7773,7 +8118,22 @@ function fileManagerLinks(fm) {
     "Log in as admin with this pod's password" + (fm.login === "padded" ? ", with 0s added to make it 12 characters " +
     "(the file manager refused it as too common): abc123 → abc123000000. The pod's log shows it" : "");
   $("sideFiles").style.display = fm ? "" : "none";
+  $("sideFilesLogin").style.display = fm ? "" : "none";
   $("uploadFm").style.display = fm ? "" : "none";
+  // the login pill above the button: admin, and the password on Show (asked of the pod only then, never kept)
+  const pw = $("sideFilesPw"), show = $("sideFilesShow");
+  const hide = () => { pw.textContent = "••••••"; pw.classList.remove("fm-note"); show.textContent = "Show"; };
+  hide();
+  show.onclick = async () => {
+    if (show.textContent === "Hide") return hide();
+    try {
+      const d = await api("/api/pod/files_login");
+      pw.textContent = d.password || (d.login === "none" ? "not set up: see the pod's log on RunPod"
+        : "in the pod's log on RunPod");
+      pw.classList.toggle("fm-note", !d.password);
+    } catch (e) { pw.textContent = "in the pod's log on RunPod"; pw.classList.add("fm-note"); }
+    show.textContent = "Hide";
+  };
   for (const a of [$("sideFiles"), ...document.querySelectorAll(".fm-link")]) {
     if (fm) { a.href = fm.url; a.title = `Big files in and out, by drag and drop. ${how}.`; }
     else if (a.classList.contains("fm-text")) a.removeAttribute("href");
@@ -7781,10 +8141,29 @@ function fileManagerLinks(fm) {
 }
 
 // ---- Pods: rented GPUs running Fizgig, opened from here (the app window goes there; a browser opens a tab) -------
-S.pods = {list: [], timer: 0, waitFor: ""};
+S.pods = {list: [], timer: 0, waitFor: "", pending: {}};
+// Start or Stop pressed here: RunPod takes a few seconds to say so, and a reload in that gap would flick the row back
+// to what it was. Each press is held for 90 s (kept by pod, as reloads make fresh rows); one RunPod hasn't moved by
+// then didn't start (or stop)
+const POD_HOLD_MS = 90000;
+function podPending(p) {
+  const k = p.id || p.url, h = S.pods.pending[k];
+  if (!h) return "";
+  const done = h.kind === "start" ? p.running || p.state === "ready" : h.kind === "delete" ? !p.account
+    : !p.running && p.state !== "ready";
+  if (done) { delete S.pods.pending[k]; return ""; }
+  if (Date.now() - h.t < POD_HOLD_MS) return {start: "starting", stop: "stopping", delete: "deleting"}[h.kind];
+  delete S.pods.pending[k];
+  $("podsNote").textContent = h.kind === "start"
+    ? `${p.name || p.id} didn't start: RunPod still has it stopped. Often no GPU is free on its machine now; its page on RunPod says why.`
+    : `${p.name || p.id} hasn't ${h.kind === "delete" ? "gone" : "stopped"} yet: check it on RunPod.`;
+  if (h.kind === "start" && S.pods.waitFor === p.url) S.pods.waitFor = "";
+  return "";
+}
 const inApp = () => !!window.pywebview;
 const POD_STATE = {ready: ["Ready", "ok"], waiting: ["Starting - a pod can take a few minutes. If it isn't ready after that, check it on RunPod", "warn"],
   stopped: ["Stopped", "muted"], off: ["Not answering", "muted"], starting: ["Starting...", "warn"],
+  stopping: ["Stopping...", "muted"], deleting: ["Deleting...", "muted"],
   gone: ["Not on your RunPod account (another account's pod, or deleted there). Forget takes it off this list", "muted"],
   away: ["Not on your network now: is it on, awake and running Fizgig?", "muted"],
   blocked: ["Found, but it doesn't let this computer in yet: on it, Preferences > Web UI > Allow on my network", "warn"]};
@@ -7794,6 +8173,8 @@ async function podsLoad(quiet) {
   let r;
   try { r = await api("/api/pods"); } catch (e) { $("podsNote").textContent = e.message; return; }
   S.pods.list = r.pods || [];
+  for (const k of Object.keys(S.pods.pending))     // a deleted pod off the list altogether: its hold is done
+    if (!S.pods.list.some((p) => (p.id || p.url) === k)) delete S.pods.pending[k];
   S.pods.key = r.key_saved;
   $("podKeyNote").textContent = r.key_saved ? "Key saved: your Fizgig pods are listed above." : "";
   podsDraw();
@@ -7803,7 +8184,7 @@ async function podsLoad(quiet) {
   // keep checking while the tab is open: every 6 s while one is on its way up (and open it when it's ready if asked
   // to), else every 30 s with an API key saved (a pod started or stopped on RunPod shows up by itself)
   clearTimeout(S.pods.timer);
-  const starting = S.pods.list.some((p) => p.state === "waiting" || p._starting);
+  const starting = S.pods.list.some((p) => p.state === "waiting") || Object.keys(S.pods.pending).length > 0;
   S.pods.timer = setTimeout(() => {          // the network's Fizgigs come and go too: every 30 s regardless
     if ($("tab-pods").classList.contains("active")) podsLoad(true);
   }, starting ? 6000 : 30000);
@@ -7814,7 +8195,7 @@ async function podsLoad(quiet) {
 function podsDraw() {
   const box = $("podsList");
   box.replaceChildren(...S.pods.list.map((p) => {
-    const st = p._starting && p.state !== "ready" ? "starting" : p.state;
+    const hold = podPending(p), st = hold || p.state;
     const [label, tone] = POD_STATE[st] || [st, "muted"];
     const title = p.name || p.id || p.url;
     const build = {mine: "Newer Fizgig there: update this computer",
@@ -7826,21 +8207,31 @@ function podsDraw() {
       p.cost ? `$${p.cost.toFixed(2)}/hr` : "", p.id && p.id !== title ? p.id : "",
       !p.id && p.url !== title ? p.url.replace(/^https?:\/\/|\/$/g, "") : "", build].filter(Boolean).join(" · ");
     const btns = [];
-    if (p.state === "ready") btns.push(el("button", {class: "btn btn-primary btn-sm", text: inApp() ? "Open" : "Open ↗",
+    if (hold === "stopping" || hold === "deleting") { /* nothing to press while it goes */ }
+    else if (p.state === "ready") btns.push(el("button", {class: "btn btn-primary btn-sm", text: inApp() ? "Open" : "Open ↗",
       onclick: () => podOpen(p)}));
-    else if (p.state === "waiting" || p._starting) btns.push(el("button", {class: "btn btn-sm",
+    else if (p.state === "waiting" || hold === "starting") btns.push(el("button", {class: "btn btn-sm",
       text: S.pods.waitFor === p.url ? "Opens when ready..." : "Open when ready", onclick: () => {
         S.pods.waitFor = p.url; podsDraw(); }}));
-    if (p.account && !p.running && S.pods.key) btns.push(el("button", {class: "btn btn-primary btn-sm",
+    if (p.account && !p.running && !hold && S.pods.key) btns.push(el("button", {class: "btn btn-primary btn-sm",
       text: "Start and open", onclick: () => podStart(p)}));
-    if (p.account && p.running && S.pods.key) btns.push(el("button", {class: "btn btn-sm", text: "Stop",
+    if (p.account && p.running && !hold && S.pods.key) btns.push(el("button", {class: "btn btn-sm", text: "Stop",
       title: "Stop the pod (it stops billing for the GPU; its files stay on its volume)", onclick: () => podStop(p)}));
+    if (p.account && S.pods.key && hold !== "deleting") btns.push(el("button", {class: "btn btn-sm btn-danger",
+      text: "Delete pod", title: "Delete the pod on RunPod: it and its volume disk go for good",
+      onclick: () => { S.pods.confirmDel = S.pods.confirmDel === p.id ? null : p.id; podsDraw(); }}));
     if (p.saved) btns.push(el("button", {class: "btn btn-sm", text: "Forget", title: "Take it off this list (the pod itself is untouched)",
       onclick: async () => { await api("/api/pods/forget", {url: p.url}).catch(() => {}); podsLoad(true); }}));
     return el("div", {class: "pod-row"},
       el("span", {class: `pod-dot ${build ? "warn" : tone}`}),
       el("div", {class: "pod-main"}, el("div", {class: "pod-name", text: title}),
-        el("div", {class: "field-hint", text: `${label}${sub ? " · " + sub : ""}`})),
+        el("div", {class: "field-hint", text: `${label}${sub ? " · " + sub : ""}`}),
+        // a stopped pod still pays for its volume disk; RunPod's own page has the price (its API reads 0)
+        st === "stopped" && p.account ? el("div", {class: "field-hint"}, "Its cost while stopped (its disk) is on ",
+          el("a", {class: "inline-link", href: "https://console.runpod.io/pods", target: "_blank", rel: "noopener",
+            text: "your RunPod account"}), ".") : null,
+        // only this RunPod pod's row (a computer on your network has no id)
+        p.account && p.id && S.pods.confirmDel === p.id && hold !== "deleting" ? podDeleteConfirm(p) : null),
       el("div", {class: "pod-btns"}, ...btns));
   }));
 }
@@ -7854,16 +8245,44 @@ function podOpen(p) {
 async function podStart(p) {
   try {
     await api("/api/pods/start", {id: p.id, gpus: p.gpus || 1});
-    p._starting = true; S.pods.waitFor = p.url; podsDraw();
+    S.pods.pending[p.id || p.url] = {kind: "start", t: Date.now()}; S.pods.waitFor = p.url; podsDraw();
     $("podsNote").textContent = `Starting ${p.name || p.id}: it opens here when it's ready. A pod can take a few minutes to start; if it isn't ` +
       "ready after that, check it on RunPod (its Logs show what it's doing).";
     setTimeout(() => podsLoad(true), 4000);
   } catch (e) { $("podsNote").textContent = e.message; }
 }
 
+// Delete pod's confirm, in the row: what goes with it, then a second press
+function podDeleteConfirm(p) {
+  const name = p.name || p.id;
+  return el("div", {class: "pod-confirm"},
+    el("div", {}, el("b", {text: `Delete ${name}? `}), "The pod and everything on its volume disk (/workspace: LoRAs, " +
+      "checkpoints, datasets, outputs) go for good. A network volume is kept."),
+    p.busy ? el("div", {class: "tc-warn", text: `It's training ${p.busy}. To keep its checkpoints, use Bring back on ` +
+      "its run card first."}) : null,
+    el("div", {class: "pod-btns"},
+      el("button", {class: "btn btn-sm btn-danger", text: "Delete it", onclick: () => podDelete(p)}),
+      el("button", {class: "btn btn-sm", text: "Cancel", onclick: () => { S.pods.confirmDel = null; podsDraw(); }})));
+}
+
+async function podDelete(p) {
+  S.pods.confirmDel = null;
+  try {
+    await api("/api/pods/delete", {id: p.id});
+    S.pods.pending[p.id || p.url] = {kind: "delete", t: Date.now()};
+    if (S.pods.waitFor === p.url) S.pods.waitFor = "";
+    podsDraw();
+    $("podsNote").textContent = `${p.name || p.id} is being deleted on RunPod.`;
+    setTimeout(() => podsLoad(true), 4000);
+  } catch (e) { $("podsNote").textContent = e.message; podsDraw(); }
+}
+
 async function podStop(p) {
   try {
     await api("/api/pods/stop", {id: p.id});
+    S.pods.pending[p.id || p.url] = {kind: "stop", t: Date.now()};
+    if (S.pods.waitFor === p.url) S.pods.waitFor = "";
+    podsDraw();
     $("podsNote").textContent = `${p.name || p.id} is stopping. Its files stay on its volume for next time.`;
     setTimeout(() => podsLoad(true), 4000);
   } catch (e) { $("podsNote").textContent = e.message; }
@@ -8083,6 +8502,8 @@ function helpCard(h) {
       el("div", {class: "pod-main"},
         el("div", {class: "helper-name"}, h.name,
           ...(where ? [el("span", {class: `helper-tag ${cls}`, text: where})] : []),
+          ...(h.auto ? [el("span", {class: "helper-tag", text: "Added by itself",
+            title: "One of your RunPod pods: added once it started, and taken off the list when the pod is deleted. Tick a job to use it"})] : []),
           ...(h.inbound ? [el("span", {class: "helper-tag in", text: "Connected from its side",
             title: "It connected to this Fizgig (a pod can't reach a home computer, so the home computer does the connecting)"})] : [])),
         el("div", {class: "field-hint", text: sub})),
@@ -8430,6 +8851,7 @@ function showTab(name) {
   if (name === "samples") loadGallery();
   if (name === "training") loadCheckpoints();
   if (name === "outputs") { loadRuns(); if (S.outputsOpen) loadOutputs(); }
+  if (S.pods.confirmDel) { S.pods.confirmDel = null; podsDraw(); }   // a Delete pod left open: gone, not waiting
   if (name === "pods") { podsLoad(); pickLoad(); }
   if (name === "helpers") helpLoad();
   // the workbench's render choice follows the Samples tab, which may have changed since the tab last drew it
@@ -8654,6 +9076,10 @@ async function uploadFiles(picked, opts = {}) {
   const keepSubs = !!(S.values || {}).TRAIN_SUBFOLDERS;
   const sub = (f) => {
     const parts = String(f.webkitRelativePath || f.rel || "").split("/").slice(1, -1).map(tidyName).filter(Boolean);
+    // its detail crops keep their folders whatever the tick: each size's crops share their pictures' names
+    const i = parts.indexOf("fizgig_detail_crops");
+    if (i >= 0 && parts.length === i + 2) return parts.slice(i).join("/");
+    if (parts.length === 1 && parts[0] === "detail_masters") return "detail_masters";     // Train on the crops only: their source
     return keepSubs ? parts.join("/") : "";
   };
   const seen = new Map();
@@ -8815,6 +9241,28 @@ function fullPicture(src) {
   } catch (e) { /* not a URL: as it is */ }
   return src;
 }
+
+// a see-through picture (Qwen Image 2.1 draws them) sits on a checkerboard wherever it shows, so its transparency
+// reads as transparency, not as the page behind it; JPEGs (thumbnails of ordinary photos) are never looked at
+const ALPHA_PROBE = document.createElement("canvas");
+ALPHA_PROBE.width = ALPHA_PROBE.height = 48;
+document.addEventListener("load", (e) => {
+  const img = e.target;
+  if (!(img instanceof HTMLImageElement)) return;
+  let see = false;
+  let src = img.currentSrc || img.src || "";
+  try { src = decodeURIComponent(src); } catch (err) { /* as it is */ }
+  if (/\.png|\.webp|image\/png|image\/webp|^blob:/i.test(src)) {
+    try {
+      const c = ALPHA_PROBE.getContext("2d", {willReadFrequently: true});
+      c.clearRect(0, 0, 48, 48);
+      c.drawImage(img, 0, 0, 48, 48);
+      const d = c.getImageData(0, 0, 48, 48).data;
+      for (let i = 3; i < d.length; i += 4) if (d[i] < 250) { see = true; break; }
+    } catch (err) { /* a picture the page can't read back: as it is */ }
+  }
+  img.classList.toggle("see-through", see);
+}, true);
 
 function wireLightbox() {
   document.addEventListener("click", (e) => {
@@ -9075,9 +9523,10 @@ function wire() {
   new MutationObserver(() => { if (!$("rvModal").classList.contains("active")) rvStop(); })
     .observe($("rvModal"), {attributes: true, attributeFilter: ["class"]});
   $("likStart").addEventListener("click", held($("likStart"), async () => {
-    if (S.lik.mode !== "royale") return likenessSet(S.lik.picked);
-    S.ry.likeRefs = S.lik.picked.map((n) => S.lik.paths[n]).filter(Boolean);
-    ryLikeShow(); ryRemember();
+    if (S.lik.mode === "gallery") return likenessSet(S.lik.picked);
+    const refs = S.lik.picked.map((n) => S.lik.paths[n]).filter(Boolean);
+    if (S.lik.mode === "profiler") { S.pf.photos = refs; pfPhotosDraw(); pfRemember(); }
+    else { S.ry.likeRefs = refs; ryLikeShow(); ryRemember(); }
     $("likModal").classList.remove("active");
   }));
   $("likFolderPick").addEventListener("click", () => pick(S.lik.folder || refStart(), true, (p) => likGridShow(p, [])));
@@ -9139,7 +9588,18 @@ function wire() {
     api("/api/queue/start", {}).then(pollRun).catch((er) => showProblems([er.message]));
   });
   $("btnPause").addEventListener("click", () => start("/api/pause"));
-  $("btnStop").addEventListener("click", () => start("/api/stop"));
+  // Stop asks twice, like Pause's second press: the first turns it into "Confirm stop" for 30 s
+  $("btnStop").addEventListener("click", () => {
+    if (!STOP_CONFIRM.timer) {
+      const b = $("btnStop");
+      b.textContent = "Confirm stop";
+      b.title = "Click again within 30 s to stop the run now (it won't save a restore point; Pause does)";
+      STOP_CONFIRM.timer = setTimeout(stopConfirmReset, 30000);
+      return;
+    }
+    stopConfirmReset();
+    start("/api/stop");
+  });
   $("btnResume").addEventListener("click", resumeClick);
   $("btnMove").addEventListener("click", () => { if (S.moveOpen) { S.moveOpen = false; pollRun(); } else moveOpen(); });
   const now = (what, say) => api("/api/run/now", {what}).then(() => { $("runNowSay").textContent = say; })

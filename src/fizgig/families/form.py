@@ -70,7 +70,7 @@ DEFAULTS = {
     "NETWORK_TYPE": "LoRA (standard)", "LOKR_FACTOR": "8", "MAX_TRAIN_EPOCHS": "12", "SAVE_EVERY_N_EPOCHS": "1",
     "SAVE_LATER": False, "SAVE_UNTIL_EPOCH": "10", "SAVE_EVERY_AFTER": "1",
     "SEED": "42", "BLOCKS_SWAP": "Auto (detect from GPU)", "RESUME_TRAINING": "", "OPTIMIZER_TYPE": "adamw8bit",
-    "OPTIMIZER_ARGS": "", "GRADIENT_ACCUMULATION": "1", "MAX_GRAD_NORM": "1.0", "LR_SCHEDULER": "constant",
+    "OPTIMIZER_ARGS": "", "GRADIENT_ACCUMULATION": "1", "BATCH_SIZE": "1", "MAX_GRAD_NORM": "1.0", "LR_SCHEDULER": "constant",
     "LR_WARMUP_STEPS": "", "ADAPTIVE_LR": False, "ADAPTIVE_LR_MIN": "1e-5", "ADAPTIVE_LR_MAX": "4e-4",
     "CONTEXT_LORA_PATH": "", "CONTEXT_LORA_STRENGTH": "1.0", "FAMILY_DOP": False, "FAMILY_MULTI_PERSON": False, "FAMILY_DOP_TRIGGER": "",
     "FAMILY_DOP_CLASS": "", "FAMILY_DOP_TRIGGER2": "", "FAMILY_DOP_CLASS2": "",
@@ -102,6 +102,11 @@ DEFAULTS = {
     "SAMPLE_EVERY_AFTER": "1", "SAMPLE_AT_FIRST": True, "SAMPLE_CHECKPOINT": True, "CACHE_SAMPLE_MODEL": "auto",
 }
 
+
+BATCH_HINT = ("How many pictures train together each step. Faster when blocks are swapped, and on smaller models "
+              "like SDXL and Anima. Uses more memory (Auto allows for it). Settings that need 1 grey out. Auto (where "
+              "offered): the batch measured fastest for this model at your size, on a 40 GB+ card; 1 elsewhere.")
+BATCH_OFF = "Off while Batch size is above 1: it reads one picture a step."
 
 TRAINING_ORDER = ("model", "output", "params", "edit", "slider", "finetune", "memory", "optimizer", "other")
 # any other Training card (Masked training, Subjects) comes after these, under the Extras divider
@@ -270,8 +275,7 @@ def form(desc):
             sections.append({"id": sid, "title": title, "tab": tab, "rows": rows, "collapsed": collapsed,
                              **({"help": help} if help else {})})
 
-    add("model", "Base Model", "training",
-        by_section("model") + ([_row("_model_note", desc.model_note, "note")] if desc.model_note else []))
+    add("model", "Base Model", "training", by_section("model"))
     add("output", "Output", "training", [
         _row("LORA_OUTPUT_DIR", "Output Directory", "folder", "Where the LoRA, its checkpoints and the previews go. A folder picked here is kept for "
              "this model; empty (or Reset to default) uses the LoRA output folder in Preferences.",
@@ -642,6 +646,8 @@ def form(desc):
         _row("LR_WARMUP_STEPS", "Warmup steps"),
         _row("CAPTION_DROPOUT", "Caption dropout", "choice", CAPTION_DROPOUT_HINT, CAPTION_DROPOUTS,
              default=CAPTION_DROPOUTS[0]) if desc.caption_dropout and pictures else None,
+        _row("BATCH_SIZE", "Batch size", "choice", BATCH_HINT, launch.batch_choices(desc))
+        if desc.batch_training and pictures else None,
         *by_section("training", "other", "lora"),
         _row("METADATA_TITLE", "Title"), _row("METADATA_AUTHOR", "Author"),
         _row("METADATA_DESCRIPTION", "Description"), _row("METADATA_LICENSE", "License"),
@@ -879,6 +885,26 @@ def _kind(desc, values):
     return next((k for k, lab in kinds(desc) if lab == label or k == label), "standard")
 
 
+def batch_blockers(desc, values):
+    """What in a run's Training-tab values trains one picture a step (Batch size above 1 greys it out or keeps the run
+    at 1), in plain words; [] when the run can batch."""
+    if not desc.batch_training:
+        return ["this model trains one picture a step"]
+    kind = _kind(desc, values)
+    out = [w for on, w in ((kind == "edit", "an edit"), (kind == "slider", "a slider"),
+                           (values.get("FAMILY_DOP"), "DOP"), (values.get("FAMILY_MULTI_PERSON"), "Fizgig LoRA Isolation"),
+                           (str(values.get("STAGE_MP") or "Off") != "Off", "Start at a smaller size"),
+                           (values.get("MASKED_TRAINING") and str(values.get("MASK_PRIOR") or "Off") != "Off",
+                            "keeping the model's own picture outside the mask")) if on]
+    return out + [o.label.strip() for o in desc.options if getattr(o, "batch_off", False) and _on(values, o)]
+
+
+def _on(values, o):
+    """A family check's value in the Training-tab values, its default when unset."""
+    v = values.get(o.key, (values.get("FAMILY_OPTIONS") or {}).get(o.key, getattr(o, "default", "")))
+    return v not in (None, "", False, "0", 0)
+
+
 SUBFOLDERS_HINT = ("Off: only the pictures directly in the training folder are used.\nOn: the pictures in its "
                    "sub-folders are trained on too, at any depth, each sub-folder as its own set with its own captions "
                    "and cache, so a big dataset can stay organised. Every picture trains once an epoch, wherever it "
@@ -993,14 +1019,36 @@ def state(desc, values, image_folder="", captioner="", speed_file=False, checkpo
         hidden.add("LEARNING_RATE")          # Adaptive LR on: Min and Max in its place (the box is ignored)
     if kind == "finetune":       # a fine-tune trains at its own fixed rate: no Adaptive LR, on any model
         hidden.add("ADAPTIVE_LR")
-    if str(values.get("OPTIMIZER_TYPE", "")) == "automagic3":
+    opt = str(values.get("OPTIMIZER_TYPE", ""))
+    if opt in ("automagic3", "automagic4"):
         disabled |= {"ADAPTIVE_LR", "KREA2_PER_IMAGE_LR", "KREA2_WARMUP_LOOK"}
         force.update({k: False for k in ("ADAPTIVE_LR", "KREA2_PER_IMAGE_LR", "KREA2_WARMUP_LOOK") if values.get(k)})
         if values.get("ADAPTIVE_LR"):            # turned off now: as it shows with Adaptive LR off
             hidden.discard("LEARNING_RATE")
             hidden |= {"ADAPTIVE_LR_MIN", "ADAPTIVE_LR_MAX"}
-        notes["OPTIMIZER_TYPE"] = "automagic3 sets its own learning rate: Adaptive LR, per-image LR and the look " \
+        notes["OPTIMIZER_TYPE"] = f"{opt} sets its own learning rate: Adaptive LR, per-image LR and the look " \
                                   "warm-up are off."
+    elif opt in ("prodigy", "muon"):             # #292: its own Optimizer Args when the box is empty or the other's
+        from fizgig.training.optimizers import MUON_DEFAULT_ARGS, PRODIGY_DEFAULT_ARGS
+        mine, other = ((PRODIGY_DEFAULT_ARGS, MUON_DEFAULT_ARGS) if opt == "prodigy" else
+                       (MUON_DEFAULT_ARGS, PRODIGY_DEFAULT_ARGS))
+        if str(values.get("OPTIMIZER_ARGS") or "").strip() in ("", other):
+            force["OPTIMIZER_ARGS"] = mine
+        if opt == "muon":
+            notes["OPTIMIZER_TYPE"] = "muon matches AdamW's step size: the usual learning rates and Adaptive LR apply."
+        elif kind == "finetune":                 # a fine-tune keeps its own optimizer and rate (families/ft.py)
+            notes["OPTIMIZER_TYPE"] = "A fine-tune uses its own optimizer: prodigy applies to LoRAs."
+        else:
+            # per-image LR stays: with Prodigy it weights that image's loss, it never writes the group rate
+            disabled |= {"LEARNING_RATE", "ADAPTIVE_LR", "KREA2_WARMUP_LOOK"}
+            force.update({k: False for k in ("ADAPTIVE_LR", "KREA2_WARMUP_LOOK") if values.get(k)})
+            hidden |= {"ADAPTIVE_LR_MIN", "ADAPTIVE_LR_MAX"}
+            hidden.discard("LEARNING_RATE")
+            if str(values.get("LEARNING_RATE") or "").strip() != "1.0":
+                force["LEARNING_RATE"] = "1.0"
+            notes["OPTIMIZER_TYPE"] = ("prodigy finds its own learning rate: the Learning Rate box is a multiplier, "
+                                       "locked to 1.0, and Adaptive LR and the look warm-up are off. Per-image LR "
+                                       "still works, as a weight on each picture's loss.")
     hidden |= {s for s, k in (("edit", "edit"), ("slider", "slider"), ("finetune", "finetune")) if k != kind}
     if kind == "finetune":
         disabled |= {"MAX_TRAIN_EPOCHS", "SAVE_EVERY_N_EPOCHS"}
@@ -1133,7 +1181,10 @@ def state(desc, values, image_folder="", captioner="", speed_file=False, checkpo
     if pairs:
         notes["_slider_plus_dir"] = image_folder or "Not chosen yet - pick it on the Start tab"
     notes["_edit_edited_dir"] = image_folder or "Not chosen yet - pick it on the Start tab"
-    media = launch.dataset_media(image_folder) if image_folder else set()
+    # the folder's own media plus its sub-folders' when the run trains on them (the tick is shown and on): the clip
+    # size row doesn't vanish when the clips sit only under a sub-folder
+    subs_on = "TRAIN_SUBFOLDERS" not in hidden and bool(values.get("TRAIN_SUBFOLDERS"))
+    media = launch.dataset_media(image_folder, subs_on) if image_folder else set()
     if "clip" not in media:                          # clips' own size only when the folder holds clips
         hidden.add("CLIP_MEGAPIXELS")
     # what the run ignores (launch.plan): a slider or a fine-tune trains its own blocks (Model Area), and a
@@ -1232,6 +1283,21 @@ def state(desc, values, image_folder="", captioner="", speed_file=False, checkpo
                                                 "or download it from Preferences.")
             elif state == "done":
                 notes["FAMILY_PREVIEW_LOOK"] = "Downloaded: previews use it from the next one."
+    if desc.batch_training:
+        one_a_step = kind in ("edit", "slider") or values.get("FAMILY_DOP") or \
+            values.get("FAMILY_MULTI_PERSON")
+        if one_a_step:
+            disabled.add("BATCH_SIZE")
+            notes["BATCH_SIZE"] = ("Greyed out: sliders, edits, DOP and Fizgig LoRA Isolation train one picture a "
+                                   "step.")
+        elif str(values.get("BATCH_SIZE") or "").strip().lower() == "auto":
+            notes["BATCH_SIZE"] = launch.batch_auto_note(desc, values.get("DATASET_MEGAPIXELS") or 1.0)
+        elif str(values.get("BATCH_SIZE") or "1") not in ("", "1"):
+            off = {"STAGE_MP", "STAGE_UNTIL", "MASK_PRIOR"}
+            off |= {o.key for o in desc.options if getattr(o, "batch_off", False)}
+            disabled |= off
+            for k in off:
+                notes.setdefault(k, BATCH_OFF)
     return {"hidden": sorted(hidden), "disabled": sorted(disabled), "notes": notes, "kind": kind,
             "media": sorted(media), "turbo_file": bool(speed_file), "force": force, "actions": actions,
             "shown": shown, "checkpoint_file": bool(checkpoint_file), "labels": labels, "checkpoint_turbo": ck_turbo,
@@ -1327,6 +1393,8 @@ def _lr_hint(desc, values, kind, image_folder):
     the best point can fall between two saves. -> (the box it goes under, the text) or None."""
     hint = getattr(desc, "lr_hint", (2e-4, 125))
     if not hint or kind != "standard" or not image_folder:
+        return None
+    if str(values.get("OPTIMIZER_TYPE") or "") in ("prodigy", "automagic4"):    # they set their own rate
         return None
     adaptive = bool(values.get("ADAPTIVE_LR"))
     key = "ADAPTIVE_LR_MIN" if adaptive else "LEARNING_RATE"

@@ -23,7 +23,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from fizgig.families.driver import Block, BlockGroup, FamilyDriver, prior_base, weighted_loss, with_prior
+from fizgig.families.driver import Block, BlockGroup, FamilyDriver, picture_losses, prior_base, weighted_loss, with_prior
 from fizgig.moss_image import sampling as S
 
 logger = logging.getLogger(__name__)
@@ -146,9 +146,9 @@ class MOSSImageDriver(FamilyDriver):
         the free VRAM with room to run, else streamed layer-major from the CPU (embedder.MOSSTextEncoder) - still
         exact bf16, which OpenMOSS ask for (their text encoder is "much more unstable than DiT"), not 8-bit."""
         from fizgig.families.quant import free_vram_gb
-        from fizgig.moss_image.embedder import MOSSTextEncoder, TOKENIZER_REPO, from_file_wanted
+        from fizgig.moss_image.embedder import MOSSTextEncoder, TOKENIZER_REPO, ensure_chat_template, from_file_wanted
         from transformers import AutoTokenizer
-        tok = self.from_pretrained(AutoTokenizer, TOKENIZER_REPO, subfolder="tokenizer")
+        tok = ensure_chat_template(self.from_pretrained(AutoTokenizer, TOKENIZER_REPO, subfolder="tokenizer"))
         stream = free_vram_gb() < 18.0
         # streamed on a computer without the RAM to hold it (16 / 24 GB): read from the file, a layer at a time
         return MOSSTextEncoder(path, device=device, stream=stream, tokenizer=tok,
@@ -322,6 +322,33 @@ class MOSSImageDriver(FamilyDriver):
         if base is not None:
             loss = with_prior(loss, prior, base, (pred - base).pow(2).mean(dim=1), mw, wgt)
         return loss, {"t": t}
+
+    def stack_conds(self, conds):
+        """Batch Size above 1: the captions zero-padded to the longest with a mask of each one's real tokens; the
+        DiT's forward_batch drops the padded keys and positions each picture by its own caption length."""
+        hs = [c["hidden_states"][0] if c["hidden_states"].dim() == 3 else c["hidden_states"] for c in conds]
+        L = max(h.shape[0] for h in hs)
+        return {"hidden_states": torch.stack([torch.cat([h, h.new_zeros(L - h.shape[0], h.shape[1])]) for h in hs]),
+                "mask": torch.stack([torch.arange(L, device=h.device) < h.shape[0] for h in hs])}
+
+    def training_loss_batch(self, dit, latents, cond, generator, *, min_t=0.0, max_t=1.0, loss_mask=None):
+        """Batch Size above 1: each picture's noise and t drawn as training_loss draws them, picture by picture, one
+        forward_batch for them all; the MSE (and a mask's per-picture weights) is the pictures' mean."""
+        x0 = latents.float()
+        mu = self._t_mu()
+        noises, ts = [], []
+        for i in range(x0.shape[0]):
+            noises.append(torch.randn(x0[i:i + 1].shape, generator=generator))
+            ts.append(self._sample_t(generator, min_t, max_t, mu))
+        noise = torch.cat(noises).to(x0.device)
+        t = torch.tensor(ts, device=x0.device, dtype=torch.float32).view(-1, 1, 1, 1)
+        xt = (1 - t) * x0 + t * noise
+        tt = torch.tensor([v * S.TRAIN_STEPS for v in ts], device=x0.device)
+        pred = dit.forward_batch(xt, tt, cond["hidden_states"].to(x0.device), cond["mask"]).float()
+        target = noise - x0
+        mw = None if loss_mask is None else loss_mask.float().to(x0.device)[:, 0]
+        per = picture_losses((pred - target).pow(2).mean(dim=1), mw)
+        return per.mean(), {"t": sum(ts) / len(ts), "per": per, "ts": [float(v) for v in ts]}
 
     def noise_latents(self, latents, generator, *, min_t=0.0, max_t=1.0):
         x0 = latents.float()

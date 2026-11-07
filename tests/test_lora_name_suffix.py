@@ -62,9 +62,15 @@ for d in FAMS:
     ck(f"{d.key}: Samples width / height offer the shared list",
        tuple(r["SAMPLE_WIDTH"].get("choices") or ()) == tuple(FORM.SIZES)
        and tuple(r["SAMPLE_HEIGHT"].get("choices") or ()) == tuple(FORM.SIZES))
-    ck(f"  {d.key}: its default size is one of them",
-       str(r["SAMPLE_WIDTH"].get("default")) in FORM.SIZES and str(r["SAMPLE_HEIGHT"].get("default")) in FORM.SIZES,
-       (r["SAMPLE_WIDTH"].get("default"), r["SAMPLE_HEIGHT"].get("default")))
+    # A video model's default can sit off the shared list (Vimoo 1.0 Lite: 832 x 480, a 16:9-ish clip): the web UI
+    # puts an off-list value at the top of the dropdown and keeps it (checked below). It must still be a size the
+    # model can render, a positive multiple of 16.
+    _w, _h = str(r["SAMPLE_WIDTH"].get("default")), str(r["SAMPLE_HEIGHT"].get("default"))
+    ck(f"  {d.key}: its default size is a renderable size (on the list, or a multiple of 16 the UI keeps)",
+       all(v in FORM.SIZES or (v.isdigit() and int(v) > 0 and int(v) % 16 == 0) for v in (_w, _h)), (_w, _h))
+_JS = open(os.path.join(REPO, "src", "fizgig", "web", "static", "app.js"), encoding="utf-8").read()
+ck("the web UI keeps a value that isn't on a dropdown's list (it puts it first)",
+   'const opts = r.choices.includes(String(val)) || !val ? r.choices : [String(val), ...r.choices];' in _JS)
 
 print()
 print("ALL PASS" if not fails else f"{len(fails)} FAILED: {fails}")

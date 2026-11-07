@@ -17,7 +17,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from fizgig.families.driver import Block, BlockGroup, FamilyDriver, prior_base, weighted_loss, with_prior
+from fizgig.families.driver import Block, BlockGroup, FamilyDriver, picture_losses, prior_base, weighted_loss, with_prior
 
 CONFIG_REPO = "stabilityai/stable-diffusion-xl-base-1.0"
 DTYPE = torch.bfloat16
@@ -241,6 +241,35 @@ class SDXLDriver(FamilyDriver):
             snr = float(a / (1 - a))
             loss = loss * (min(snr, gamma) / ((snr + 1) if self._v_pred() else snr))
         return loss, {"t": st["t"] / 999.0}
+
+    def training_loss_batch(self, dit, latents, cond, generator, *, min_t=0.0, max_t=1.0, loss_mask=None):
+        """Batch Size above 1: each picture's timestep and noise drawn by noise_latents in turn (training_loss's
+        draws, picture by picture), one UNet call for them all, the loss each picture's own and their mean."""
+        sts = [self.noise_latents(latents[i:i + 1], generator, min_t=min_t, max_t=max_t)
+               for i in range(latents.shape[0])]
+        h, w = sts[0]["hw"]
+        xt = torch.cat([st["xt"] for st in sts])
+        ts = torch.tensor([st["t"] for st in sts], device=xt.device)
+        a = torch.stack([st["a"] for st in sts]).view(-1, 1, 1, 1)
+        x0, noise = torch.cat([st["x0"] for st in sts]), torch.cat([st["noise"] for st in sts])
+        pred = self._unet(dit, xt, ts, cond, h, w).float()
+        target = (a.sqrt() * noise - (1 - a).sqrt() * x0) if self._v_pred() else noise
+        se = (pred - target).pow(2)
+        losses = []
+        for i in range(len(sts)):
+            if loss_mask is None:
+                li = se[i:i + 1].mean()
+            else:
+                li = weighted_loss(se[i:i + 1].mean(dim=1).flatten(1), loss_mask[i:i + 1].float().to(se.device).flatten(1))
+            gamma = float(self.options.get("min_snr") or 0.0)
+            if gamma:
+                ai = sts[i]["a"]
+                snr = float(ai / (1 - ai))
+                li = li * (min(snr, gamma) / ((snr + 1) if self._v_pred() else snr))
+            losses.append(li)
+        per = torch.stack(losses)
+        return per.mean(), {"t": sum(st["t"] for st in sts) / len(sts) / 999.0, "per": per,
+                            "ts": [float(st["t"]) / 999.0 for st in sts]}
 
     # ---- sampling -------------------------------------------------------------------------------
     @torch.no_grad()
