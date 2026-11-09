@@ -1090,6 +1090,7 @@ class _FineTune:
 
 
 def train_family(family, dit_path, dataset_config, output_dir, output_name, *, network_dim=32, network_alpha=32,
+                 preview_small_card_cap=0,
                  learning_rate=1e-4, max_train_epochs=16, save_every_n_epochs=1, save_until_epoch=0,
                  save_every_n_epochs_after=0, save_state=False,
                  save_state_on_train_end=False, keep_last_n_states=2, seed=42, precision="bf16",
@@ -1137,6 +1138,10 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
     if speed_lora and speed_desc is None:
         logger.warning(f"[sample] {desc.display_name} declares no preview speed LoRA - ignoring --speed_lora")
         speed_lora = None
+    # no strength given = the family's preview strength (launch.py leaves the flag out at that default: MOSS-Image 0.6,
+    # Krea 2 0.7), not the speed LoRA's own (1.0) - which previews used to get
+    if speed_desc is not None and speed_lora_strength is None:
+        speed_lora_strength = (desc.preview_speed_defaults() or (0, 0))[1] or speed_desc.strength
     # strength 0: previews render without it, and it loads at the first preview a live change asks it for
     speed_idle = speed_desc is not None and speed_lora_strength is not None and speed_lora_strength <= 0
     if speed_idle:
@@ -1149,10 +1154,18 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
     sample_width = sample_width or desc.preview_width
     sample_height = sample_height or desc.preview_height
     lowmem = _small_card_previews()
-    if lowmem and max(sample_width, sample_height) > 768:
-        sample_width, sample_height = _cap_canvas(sample_width, sample_height)
+    # Krea 2 always (#123); another model only when its Faster, smaller previews tick asks (#309)
+    canvas_cap = int(getattr(desc, "preview_small_card_cap", 0) or preview_small_card_cap or 0) if lowmem else 0
+    small_from = None                 # the size asked for when the previews render smaller (the gallery says so)
+    if canvas_cap and max(sample_width, sample_height) > canvas_cap:
+        if not getattr(desc, "preview_small_card_cap", 0):    # the tick's choice (MOSS-Image), not Krea 2's own cap
+            small_from = (sample_width, sample_height)
+        sample_width, sample_height = _cap_canvas(sample_width, sample_height, canvas_cap)
         logger.info(f"[preview] card under 20 GB: preview canvas capped to {sample_width}x{sample_height} and the "
                     f"DiT parks on CPU for the decode (#123). FIZGIG_PREVIEW_LOWMEM=0 turns this off.")
+    elif lowmem:
+        logger.info("[preview] card under 20 GB: the DiT parks on CPU for the decode. FIZGIG_PREVIEW_LOWMEM=0 turns "
+                    "this off.")
     device = torch.device("cuda")
     quant.apply_vram_cap()          # FIZGIG_SIM_VRAM_GB: behave like a smaller card
     torch.manual_seed(seed)
@@ -2113,8 +2126,8 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                         strength_now = ov["turbo"]
                 if not ref_imgs:        # an edit keeps the reference's canvas: its latents are already encoded
                     w, h = ov["width"], ov["height"]
-                    if lowmem and max(w, h) > 768:
-                        w, h = _cap_canvas(w, h)
+                    if canvas_cap and max(w, h) > canvas_cap:
+                        w, h = _cap_canvas(w, h, canvas_cap)
             except Exception:
                 logger.exception("[sample override] could not encode the override prompt - using the configured ones")
                 conds = encoded
@@ -2296,6 +2309,7 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             rounds = {}
         if epoch is not None:
             rounds[str(epoch)] = {"checkpoint": bool(mode.get("model")), "look": bool(look),
+                                  **({"small": f"{sample_width} × {sample_height}"} if small_from else {}),
                                   "turbo": bool(mode.get("turbo")), **({"helper": helper} if helper else {})}
         mode = {**mode, "family": desc.key, "rounds": rounds}
         try:
@@ -2362,6 +2376,7 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
     for _w in ("sample", "save"):          # a request left from an earlier run is not this one's
         take_request(output_dir, _w)
     progress = tqdm(total=steps_per_epoch * max_train_epochs, initial=global_step, desc="steps", smoothing=0)
+    between = [None]          # when the last epoch's steps ended: the time until the next epoch's is left out of s/it
     dit.train()
     pending = 0                            # micro-batches backpropagated since the last optimizer step
     lr_acc = []                            # this window's per-step LR multipliers (driver.step_policy)
@@ -2476,10 +2491,48 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             ema.update()                   # after the clipped step, so the average tracks what was applied
         pending = 0
 
-    # Warm-up reassurance: the first two epochs of a run start slowly (first-sight kernel planning, cuBLAS picks,
-    # allocator and cache warm-up, and on a compiled run the blocks compiling for each new shape) - a crawling bar
-    # looks like a hang, so a gentle note repeats every ~30 s while it lasts.
-    warmup_note = [0.0]
+    # Warm-up reassurance: a run's first steps are slow (first-sight kernel planning, cuBLAS picks, allocator and
+    # cache warm-up, and on a compiled run the blocks compiling once for each picture size - every size comes up in
+    # the first epoch) and speed up step by step, so a crawling bar can look like a hang. Measured, not assumed: the
+    # note only appears once the warm-up has run 30 s (a quick one says nothing), repeats every ~30 s with the speed
+    # now against the first steps', and ends with "Up to speed" once steps stop getting faster - or with epoch 3.
+    _sizes = len({tuple(k[-2:]) for ds in getattr(group, "datasets", [])
+                  for k in getattr(getattr(ds, "batch_manager", None), "bucket_resos", ())}) or 1
+    warm = {"start": time.time(), "said": 0.0, "prev": None, "dts": [], "done": False}
+
+    def _warmup_tick(ep):
+        if warm["done"]:
+            return
+        now = time.time()
+        if warm["prev"] is not None:
+            warm["dts"].append(now - warm["prev"])
+        warm["prev"] = now
+        dts = warm["dts"]
+        med = lambda xs: sorted(xs)[len(xs) // 2]
+        # steady: the last 10 steps no faster than the 10 before (within 10%), once every picture size has been
+        # met (the first epoch done) where a new size could still compile
+        steady = (len(dts) >= 20 and med(dts[-10:]) >= 0.9 * med(dts[-20:-10])
+                  and (ep >= 1 or _sizes <= 1 or not do_compile))
+        if ep >= 2 or steady:
+            warm["done"] = True
+            if warm["said"]:
+                logger.info(f"[warm-up] Up to speed: {med(dts[-10:]):.2f} s/step"
+                            + (f", from {med(dts[:3]):.1f} s at the start." if len(dts) >= 3 else "."))
+            return
+        if now - warm["start"] < 30.0 or now - warm["said"] < 30.0:
+            return
+        first = not warm["said"]
+        warm["said"] = now
+        if first:
+            logger.info("[warm-up] Speeding up: the first steps are slow while the GPU plans its kernels"
+                        + (f", compiles the blocks once for each of the run's {_sizes} picture sizes"
+                           if do_compile and _sizes > 1 else ", compiles the blocks" if do_compile else "")
+                        + " and fills its caches. Each step is quicker than the last until it settles"
+                        + (" within the first epoch or two" if steps_per_epoch > 1 else "")
+                        + ". Nothing is stuck.")
+        elif len(dts) >= 6:
+            logger.info(f"[warm-up] Still speeding up: {med(dts[-5:]):.2f} s/step now, from {med(dts[:3]):.1f} s "
+                        "at the start.")
     share_now = [None]       # this epoch's training share: {frac, epoch, ...} or None (this GPU trains every image)
     _share_keys = sorted({str(it.item_key) for ds in getattr(group, "datasets", [])
                           for b in getattr(getattr(ds, "batch_manager", None), "buckets", {}).values() for it in b})
@@ -2668,16 +2721,16 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                 logger.info(f"[dop] fine-tune: {dop_ft_samples} of the original model's predictions for each of "
                             f"{len(dop_ft)} images ({mb:.0f} MB, {time.time() - _tp:.0f} s) - each DOP pass holds "
                             f"the model to one of them. Saved for a continued run: {os.path.basename(dop_ft_file)}")
+        if between[0] is not None:          # the last epoch's end work (saves, checks, previews, the next epoch's
+            progress.start_t += time.time() - between[0]   # set-up) out of the bar's s/it: training speed only
+            between[0] = None
         torch.cuda.reset_peak_memory_stats()
         t0 = time.time()
         _theirs = (_share_split(seed, epoch + 1, _share_keys, share_now[0]["frac"]) if share_now[0] is not None
                    else None)                       # the helper's images this epoch (both sides draw the same)
+        warm["prev"] = None                  # an epoch's first step isn't timed against the last one's end
         for i, batch, _only in _epoch_batches(epoch):
-            if epoch - start_epoch < 2 and time.time() - warmup_note[0] > 30.0:
-                warmup_note[0] = time.time()
-                logger.info("[warm-up] Warm-up phase — the first two epochs start slowly while the GPU plans kernels"
-                            + (", compiles the blocks" if do_compile else "")
-                            + " and fills its caches. Nothing is stuck; full speed arrives from epoch 3.")
+            _warmup_tick(epoch - start_epoch)
             if _only is not None:              # a catch-up: the helper's images this GPU trains after all
                 pass
             elif share_now[0] is not None:
@@ -2830,6 +2883,7 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
 
         if pending:                        # a partial group: settle the optimizer before the epoch-end work
             _update()
+        between[0] = time.time()          # the epoch-end work starts: left out of the bar's s/it (above)
         _off = ftr.epochs_done if ftr is not None else 0
         logger.info(f"epoch {epoch + 1 + _off}/{max_train_epochs + _off}  avr_loss={recorder.moving_average:.4f}  "
                     f"step={global_step}  {(time.time() - t0) / max(1, steps_per_epoch):.2f}s/step  "
@@ -2878,9 +2932,7 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                 n_ep = done + ftr.epochs_done
                 save_lora(os.path.join(output_dir, f"{output_name}-{n_ep:06d}.safetensors"), done)
                 if cadence and sample_every_n_epochs:
-                    _tp = time.time()
                     previews(n_ep)
-                    progress.start_t += time.time() - _tp
                 if os.path.exists(pause_flag):
                     logger.info(f"[pause] requested - rotation complete at epoch {n_ep}, checkpoint saved; exiting "
                                 f"cleanly (continue from {output_name}-{n_ep:06d}.safetensors)")
@@ -2895,9 +2947,7 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
             if state_saved:
                 prune_state_dirs(output_dir, output_name, keep_last_n_states)
         if sample_every_n_epochs and _preview_due(done):
-            _tp = time.time()
             previews(done)
-            progress.start_t += time.time() - _tp       # the bar's s/it is training speed, not previews
             # this epoch's checkpoint was saved before its preview existed, with the previous epoch's as its
             # thumbnail (#122): re-embed its own. An explicit --metadata_thumbnail (or "off") stays.
             if cadence and not (metadata_thumbnail or "").strip():
@@ -2918,9 +2968,7 @@ def train_family(family, dit_path, dataset_config, output_dir, output_name, *, n
                         f"over {len(anchor_losses)} steps")
             anchor_losses.clear()
         if slider_prompts and done < max_train_epochs:
-            _tp = time.time()
             slider_live(done)
-            progress.start_t += time.time() - _tp       # the bar's s/it is training speed
 
     if share_worker:                     # a helper's share: the lead keeps the LoRA
         progress.close()
@@ -3010,6 +3058,9 @@ def setup_parser():
     p.add_argument("--text_encoder", default=None)
     p.add_argument("--sample_prompts", default=None, help="One prompt per line")
     p.add_argument("--sample_every_n_epochs", type=int, default=0)
+    p.add_argument("--preview_small_card_cap", type=int, default=0,
+                   help="on a card under 20 GB, cap the previews' long side to this many px (the Faster, smaller "
+                        "previews tick)")
     p.add_argument("--sample_until_epoch", type=int, default=0,
                    help="With --sample_every_n_epochs_after: previews every --sample_every_n_epochs up to this epoch")
     p.add_argument("--sample_every_n_epochs_after", type=int, default=0,
@@ -3157,6 +3208,7 @@ def main():
         preview_lora_strength=a.preview_lora_strength,
         vae_path=a.vae, te_path=a.text_encoder,
         sample_prompts=prompts, sample_every_n_epochs=a.sample_every_n_epochs,
+        preview_small_card_cap=a.preview_small_card_cap,
         sample_until_epoch=a.sample_until_epoch, sample_every_n_epochs_after=a.sample_every_n_epochs_after,
         sample_width=a.sample_width,
         sample_height=a.sample_height, sample_steps=a.sample_steps, sample_cfg_scale=a.sample_cfg_scale,

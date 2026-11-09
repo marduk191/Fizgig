@@ -490,6 +490,7 @@ class FamilyDescription:
     # LoRA was on). Empty = no line (a family opts in)
     preview_labels: tuple = ()
     preview_look_strength: float = 1.0
+    preview_look_on: bool = False     # the Samples tab's look tick starts ticked
     # the workbench tabs' choice while the Samples tab previews on the training model (its preview-checkpoint tick
     # off): render on the preview checkpoint (the default: what most people generate with) or follow the Samples tab,
     # its preview look LoRA included. One choice per family, kept in prefs (workbench_render_<key>). Needs
@@ -600,6 +601,9 @@ class FamilyDescription:
     # the Samples tab's "Turbo preview: N steps at M% strength" row (MiniMax H3) instead of the Turbo strength box:
     # the Steps box is the plain-model count, the row the turbo's
     samples_turbo_pace: bool = False
+    # the Samples tab's Turbo as a "Use the Turbo LoRA" tick (on by default) with its strength box beside it, the
+    # box keeping its value while the tick is off (MOSS-Image). Off: the strength box alone (0 = off)
+    samples_turbo_tick: bool = False
     edit_training: bool = False       # Edit LoRA from before/after pairs (the driver's supports_references)
     edit_note: str = ""               # the Edit LoRA section's "What you need" line: pair count and photo size
     # the most before-images an edited photo may have (photo.png, then photo_1.png, photo_2.png ... in the Originals
@@ -649,6 +653,13 @@ class FamilyDescription:
     workbench_checkpoint_follows_tick: bool = False
     preview_cfg: float = 1.0
     preview_width: int = 1024
+    # on a card under 20 GB, the training previews' canvas is capped to this many px on its long side (Krea 2's
+    # memory, #123); 0 = never capped - a 1 MP model falls apart below its size (MOSS-Image, #309). The training
+    # DiT parks on CPU for the decode on every small card either way
+    preview_small_card_cap: int = 0
+    # an opt-in for cards under 20 GB: the Samples tab's "Faster, smaller previews" tick caps the training previews'
+    # long side to this many px (quicker, but a 1 MP model looks worse below its size: MOSS-Image). 0 = no tick
+    preview_small_card_option: int = 0
     preview_height: int = 1024
     repair_size: int = 768            # Repair Studio's starting preview size (its Res dropdown) for the family
     block_activity: bool = False      # Repair Studio lights each block's slider as the song plays (BlockMeter)

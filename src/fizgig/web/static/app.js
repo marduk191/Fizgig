@@ -401,20 +401,9 @@ function renderRow(r) {
     if (r.suffix) row.append(el("span", {class: "field-hint", text: r.suffix}));
     let actMsg = null;
     if (r.action === "write_captions") {          // the typed line as every photo's caption (Edit, Slider pairs)
-      actMsg = el("div", {class: "field-hint"});
-      const write = async (overwrite) => {
-        try {
-          const res = await api("/api/captions/write_all", {text: input.value, folder: S.imageFolder,
-            ext: S.values.DATASET_CAPTION_EXT || ".txt", overwrite});
-          if (res.exists) {
-            actMsg.replaceChildren(document.createTextNode(`${res.exists} of the ${res.total} photos already have a ` +
-              "caption. "), el("button", {class: "btn btn-sm btn-danger", text: "Replace them", onclick: () => write(true)}));
-            return;
-          }
-          actMsg.textContent = `Captions written for ${res.written} photos.`;
-        } catch (e) { actMsg.textContent = e.message; }
-      };
-      row.append(el("button", {class: "btn", text: "Write captions", onclick: () => write(false)}));
+      const w = writeCaptions(() => input.value);
+      actMsg = w.msg;
+      row.append(w.button);
     }
     wrap.append(row);
     if (actMsg) wrap.append(actMsg);
@@ -577,6 +566,27 @@ function splitRow(r, wrap) {
 }
 
 // a list of prompts, one numbered box each (the gallery's Prompt 1, 2, 3…), saved as the one-per-line text it always was
+// "Write captions": the box's first line saved as every photo's caption in the training folder (Edit, Slider pairs)
+function writeCaptions(getText) {
+  const msg = el("div", {class: "field-hint"});
+  const write = async (overwrite) => {
+    try {
+      const first = String(getText() || "").split("\n").map((t) => t.trim()).find(Boolean) || "";
+      const res = await api("/api/captions/write_all", {text: first, folder: S.imageFolder,
+        ext: S.values.DATASET_CAPTION_EXT || ".txt", overwrite});
+      if (res.exists) {
+        msg.replaceChildren(document.createTextNode(`${res.exists} of the ${res.total} photos already have a ` +
+          "caption. "), el("button", {class: "btn btn-sm btn-danger", text: "Replace them", onclick: () => write(true)}));
+        return;
+      }
+      msg.textContent = `Captions written for ${res.written} photos.`;
+    } catch (e) { msg.textContent = e.message; }
+  };
+  return {button: el("button", {class: "btn", text: "Write captions", onclick: () => write(false),
+    title: "Saves the first line above as the caption (.txt) of every photo in the training folder, so every pair "
+         + "trains on it. Photos that already have a caption are left alone unless you choose to replace them."}), msg};
+}
+
 function promptLines(r, wrap) {
   const list = el("div", {class: "prompt-lines"});
   const boxes = () => [...list.querySelectorAll("textarea")];
@@ -639,11 +649,18 @@ function promptLines(r, wrap) {
   }
   const sync = el("input", {type: "hidden", id: "f_" + r.key});    // syncInputs (a preset, Last Train) redraws it
   sync._sync = draw;
-  const add = el("button", {class: "btn btn-sm", text: "+ Add prompt", onclick: () => {
-    const last = list.lastElementChild;
-    line("", last).focus(); renumber(); save();
-  }});
-  wrap.append(el("span", {class: "field-label", text: r.label + ":"}), list, add, sync);
+  const add = el("button", {class: "btn btn-sm", text: r.key === "SAMPLE_PROMPT" ? "+ Add prompt" : "+ Add a line",
+    onclick: () => {
+      const last = list.lastElementChild;
+      line("", last).focus(); renumber(); save();
+    }});
+  const actions = el("div", {class: "prompt-actions"}, add);
+  wrap.append(el("span", {class: "field-label", text: r.label + ":"}), list, actions, sync);
+  if (r.action === "write_captions") {            // the Edit instruction: its first line as the photos' caption
+    const w = writeCaptions(() => String(S.values[r.key] ?? ""));
+    actions.append(w.button);
+    wrap.append(w.msg);
+  }
   if (r.key === "SAMPLE_PROMPT") wrap.append(promptSetsBar(r, draw));
   if (r.hint) wrap.append(el("div", {class: "field-hint", text: r.hint}));
   wrap.append(el("div", {class: "field-hint row-note", id: "note_" + r.key}));
@@ -759,10 +776,11 @@ function optimizerPicked(prev, opt) {
 function onValue(r, val) {
   const prev = S.values[r.key];
   S.values[r.key] = val;
+  if (r.key === "FAMILY_PREVIEW_SMALL") S.values._chosen_FAMILY_PREVIEW_SMALL = true;   // the person's own choice: kept
   if (r.key === "OPTIMIZER_TYPE" && prev !== val) optimizerPicked(String(prev || ""), String(val || ""));
   if (r.key === "__SAMPLE_LIVE" || (S.values.__SAMPLE_LIVE &&
       ["SAMPLE_PROMPT", "SAMPLE_SEED", "SAMPLE_WIDTH", "SAMPLE_HEIGHT", "SAMPLE_STEPS", "SAMPLE_CFG_SCALE",
-       "FAMILY_TURBO_STRENGTH", "SAMPLE_EVERY_N_EPOCHS", "SAMPLE_LATER", "SAMPLE_UNTIL_EPOCH",
+       "FAMILY_TURBO_STRENGTH", "FAMILY_TURBO_ON", "SAMPLE_EVERY_N_EPOCHS", "SAMPLE_LATER", "SAMPLE_UNTIL_EPOCH",
        "SAMPLE_EVERY_AFTER", "FAMILY_PREVIEW_LOOK", "SAMPLE_CHECKPOINT"].includes(r.key))) sampleLiveSoon();
   if (r.key === "CAPTION_TRIGGER_WORD") { S.trigger = String(val).trim(); $("capTrigger").value = S.trigger; saveTriggerSoon(S.trigger); }
   const extra = r.sets && r.sets[val];            // a kind of training that also sets others (Fine-tune's LR)
@@ -899,7 +917,7 @@ function turboFollow() {
     if (pass === "turbo") {
       const raw = S.values.FAMILY_TURBO_STRENGTH;
       const strength = parseFloat(raw === undefined || raw === "" ? row.default : raw);
-      live = !!S.state.turbo_file && strength > 0; flags.__turbo_live = live;
+      live = !!S.state.turbo_file && strength > 0 && S.values.FAMILY_TURBO_ON !== false; flags.__turbo_live = live;
     } else {
       const v = S.values[row.key];
       live = !!S.state.checkpoint_file && !!(v === undefined ? row.default : v); flags["__follow_" + row.key] = live;
@@ -1631,7 +1649,7 @@ async function start(path, body) {
 const SIZE_KEYS = {DATASET_MEGAPIXELS: "Target Megapixels", CLIP_MEGAPIXELS: "Clip Megapixels"};
 // what Resume takes from the form as it is now (server.py _RESUME_SAMPLE_KEYS); the rest trains on as the run began
 const RESUME_KEYS = ["SAMPLE_PROMPT", "SAMPLE_SEED", "SAMPLE_WIDTH", "SAMPLE_HEIGHT", "SAMPLE_STEPS", "SAMPLE_CFG_SCALE",
-  "FAMILY_TURBO_STRENGTH", "SAMPLE_CHECKPOINT", "BLOCKS_SWAP", "FAMILY_PREVIEW_LOOK",
+  "FAMILY_TURBO_STRENGTH", "FAMILY_TURBO_ON", "SAMPLE_CHECKPOINT", "BLOCKS_SWAP", "FAMILY_PREVIEW_LOOK",
   "SAMPLE_EVERY_N_EPOCHS", "SAMPLE_LATER", "SAMPLE_UNTIL_EPOCH", "SAMPLE_EVERY_AFTER",
   "SAVE_EVERY_N_EPOCHS", "SAVE_LATER", "SAVE_UNTIL_EPOCH", "SAVE_EVERY_AFTER",
   "LEARNING_RATE", "ADAPTIVE_LR_MIN", "ADAPTIVE_LR_MAX"];
@@ -2145,7 +2163,7 @@ function runSummary() {
     cell("Model", fam + (v.FAMILY_PRECISION ? ` · ${first(v.FAMILY_PRECISION)}` : "")),
     cell("Dataset", String(r.image_folder || "").split(/[\\/]/).filter(Boolean).pop()),
     cell("Training", [v.MAX_TRAIN_EPOCHS ? `${v.MAX_TRAIN_EPOCHS} epochs` : "", p.total_steps ? `${p.total_steps} steps` : "",
-      "batch 1", v.DATASET_MEGAPIXELS ? `${v.DATASET_MEGAPIXELS} MP` : "",
+      `batch ${v.BATCH_SIZE || 1}`, v.DATASET_MEGAPIXELS ? `${v.DATASET_MEGAPIXELS} MP` : "",
       v.STAGE_MP && v.STAGE_MP !== "Off" ? `${v.STAGE_MP} MP for the first ${v.STAGE_UNTIL || "30%"}` : ""].filter(Boolean).join(" · ")),
     cell("Optimizer", [v.OPTIMIZER_TYPE, yes("ADAPTIVE_LR") ? `Adaptive LR ${v.ADAPTIVE_LR_MIN} to ${v.ADAPTIVE_LR_MAX}` :
       v.LEARNING_RATE ? `from ${v.LEARNING_RATE}` : ""].filter(Boolean).join(" · ")),
@@ -2876,7 +2894,7 @@ async function loadRuns() {
       onclick: async () => {
         if (ilBox.style.display !== "none") { ilBox.style.display = "none"; return; }
         ilBox.style.display = ""; ilBox.textContent = "Loading…";
-        try { imageLossPanel(ilBox, await api("/api/runs/image_loss?id=" + encodeURIComponent(run.id)), run); }
+        try { const load = imageLossLoad(run.id); imageLossPanel(ilBox, await load(), run, load); }
         catch (e) { ilBox.replaceChildren(el("div", {class: "problems", text: e.message})); }
       }}) : null;
     host.append(el("div", {class: "run-row"},
@@ -2912,16 +2930,27 @@ const IL_ORDER = ["excluded", "stuck", "suspect", "watch", "warmup", "exhausted"
 const IL_PROBLEMS = new Set(["excluded", "stuck", "suspect", "watch"]);
 const IL_PAGE = 48;
 
-function imageLossPanel(box, d, run) {
-  const imgs = d.images || [], rep = d.report || {};
-  // one scale for every tile, so tiles compare: room for every image's recent level with a margin (a one-epoch
-  // spike past it is clipped; a consistently hard image keeps its shape)
-  const ymax = Math.max(1e-6, 1.25 * Math.max(...imgs.map((im) => Math.abs(im.recent)), 0));
-  const counts = {};
-  for (const im of imgs) counts[im.verdict || "mid"] = (counts[im.verdict || "mid"] || 0) + 1;
-  const tally = IL_ORDER.filter((v) => counts[v]).map((v) => `${counts[v]} ${v}`).join(" · ");
-  const head = [`${imgs.length} images · ${d.epochs.length} epochs`, rep.epoch ? `the watch's verdicts as of epoch ${rep.epoch}` : "",
-    tally].filter(Boolean).join(" · ");
+// the per-image loss of a run, fetched fresh each time (the panel's Refresh and its dropdowns call it again)
+const imageLossLoad = (id) => () => api("/api/runs/image_loss?id=" + encodeURIComponent(id));
+
+function imageLossPanel(box, d, run, load) {
+  let imgs, rep, ymax;
+  const headEl = el("div", {class: "field-hint"}), plateau = el("div", {class: "il-plateau"});
+  const take = (data) => {             // a fetch's results: the counts line, the plateau banner, the shared scale
+    d = data; imgs = d.images || []; rep = d.report || {};
+    // one scale for every tile, so tiles compare: room for every image's recent level with a margin (a one-epoch
+    // spike past it is clipped; a consistently hard image keeps its shape)
+    ymax = Math.max(1e-6, 1.25 * Math.max(...imgs.map((im) => Math.abs(im.recent)), 0));
+    const counts = {};
+    for (const im of imgs) counts[im.verdict || "mid"] = (counts[im.verdict || "mid"] || 0) + 1;
+    const tally = IL_ORDER.filter((v) => counts[v]).map((v) => `${counts[v]} ${v}`).join(" · ");
+    headEl.textContent = [`${imgs.length} images · ${d.epochs.length} epochs`,
+      rep.epoch ? `the watch's verdicts as of epoch ${rep.epoch}` : "", tally].filter(Boolean).join(" · ");
+    plateau.textContent = rep.plateaued && rep.best_epoch_estimate ? `The run plateaued: the best checkpoint is likely ` +
+      `around epoch ${rep.best_epoch_estimate} - compare a few epochs either side.` : "";
+    plateau.style.display = plateau.textContent ? "" : "none";
+  };
+  take(d);
   const sort = el("select", {class: "w-combo"}, ...[["hard", "Hardest now first"], ["easy", "Easiest now first"],
     ["verdict", "By verdict"], ["name", "By name"]].map(([v, t]) => el("option", {value: v, text: t})));
   const show = el("select", {class: "w-combo"}, el("option", {value: "all", text: "All images"}),
@@ -2943,17 +2972,26 @@ function imageLossPanel(box, d, run) {
       el("span", {class: "field-hint", text: `page ${page + 1} of ${pages}`}),
       el("button", {class: "btn btn-sm", text: "Next ›", disabled: page >= pages - 1, onclick: () => { page++; draw(); }})] : []));
   };
-  sort.addEventListener("change", () => { page = 0; draw(); });
-  show.addEventListener("change", () => { page = 0; draw(); });
+  // Refresh, and a change of either dropdown, fetch the latest results first (a run going on adds an epoch at a time)
+  const refreshBtn = el("button", {class: "btn btn-sm", text: "↻ Refresh", title: "Load the latest results"});
+  const refresh = async (keepPage) => {
+    if (!load) { if (!keepPage) page = 0; draw(); return; }
+    refreshBtn.disabled = true; refreshBtn.textContent = "Refreshing…";
+    try { take(await load()); } catch (e) { headEl.textContent = e.message; }
+    finally { refreshBtn.disabled = false; refreshBtn.textContent = "↻ Refresh"; }
+    if (!keepPage) page = 0;
+    draw();
+  };
+  refreshBtn.addEventListener("click", () => refresh(true));
+  sort.addEventListener("change", () => refresh(false));
+  show.addEventListener("change", () => refresh(false));
   box.replaceChildren(
-    el("div", {class: "field-hint", text: head}),
-    rep.plateaued && rep.best_epoch_estimate ? el("div", {class: "il-plateau",
-      text: `The run plateaued: the best checkpoint is likely around epoch ${rep.best_epoch_estimate} - compare a few epochs either side.`}) : "",      // (replaceChildren writes a null as the word)
+    headEl, plateau,
     el("div", {class: "field-hint", text: "Each line is one image's loss minus the dataset's average at the same noise level, " +
       "epoch by epoch. Above the dotted line it is harder than the rest; a line falling is the image being learned. " +
       "All tiles share one scale." + (d.live ? " Edit caption fixes one while the run goes: the trainer re-encodes it at " +
       "the next epoch and that image's history starts again - it should turn blue (learning) if the fix worked." : "")}),
-    el("div", {class: "field-row"}, el("span", {class: "field-label", text: "Sort:"}), sort, show), grid, pager);
+    el("div", {class: "field-row"}, el("span", {class: "field-label", text: "Sort:"}), sort, show, refreshBtn), grid, pager);
   draw();
 }
 
@@ -4113,7 +4151,8 @@ const sampleLiveSoon = debounce(async () => {
   try {
     const r = await api("/api/run/sample_override", {on: !!v.__SAMPLE_LIVE, prompts: v.SAMPLE_PROMPT || "",
       seed: v.SAMPLE_SEED, width: v.SAMPLE_WIDTH, height: v.SAMPLE_HEIGHT, steps: v.SAMPLE_STEPS,
-      cfg: v.SAMPLE_CFG_SCALE, turbo: v.FAMILY_TURBO_STRENGTH, every: v.SAMPLE_EVERY_N_EPOCHS,
+      cfg: v.SAMPLE_CFG_SCALE, turbo: v.FAMILY_TURBO_ON === false ? "0" : v.FAMILY_TURBO_STRENGTH,
+      every: v.SAMPLE_EVERY_N_EPOCHS,
       until: v.SAMPLE_LATER ? v.SAMPLE_UNTIL_EPOCH : 0, after: v.SAMPLE_LATER ? v.SAMPLE_EVERY_AFTER : 0,
       look: !!v.FAMILY_PREVIEW_LOOK, checkpoint: !!valueOrDefault("SAMPLE_CHECKPOINT")});
     if (note) note.textContent = r.on ? "Sent: the run's next previews use these." : "The run is back on its own prompts.";
@@ -9366,7 +9405,7 @@ function wire() {
     if (!id || $("btnImageLoss").classList.contains("is-off")) return;
     if (box.style.display !== "none") { box.style.display = "none"; return; }
     box.style.display = ""; box.textContent = "Loading…";
-    try { imageLossPanel(box, await api("/api/runs/image_loss?id=" + encodeURIComponent(id)), {...S.run, id}); }
+    try { const load = imageLossLoad(id); imageLossPanel(box, await load(), {...S.run, id}, load); }
     catch (e) { box.replaceChildren(el("div", {class: "problems", text: e.message})); }
   });
   document.querySelectorAll(".tab-item").forEach((b) => b.addEventListener("click", () => showTab(b.dataset.tab)));

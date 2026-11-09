@@ -131,9 +131,9 @@ Image.new("RGB", (8, 8)).save(os.path.join(e_dir, "a.png"))
 with open(os.path.join(e_dir, "a.txt"), "wb") as f:
     f.write("make it the girl’s style\nsecond line".encode("cp1252"))
 try:
-    got = LA.edit_instruction({"image_folder": e_dir, "caption_ext": ".txt"})
+    got = LA.edit_instructions({"image_folder": e_dir, "caption_ext": ".txt"})   # a list since #311 (one per line)
     ck("an edit run's preview instruction reads a cp1252 caption (Start used to fail)",
-       got == "make it the girl’s style", got)
+       got == ["make it the girl’s style"], got)
 except Exception as ex:
     ck("an edit run's preview instruction reads a cp1252 caption (Start used to fail)", False,
        f"{type(ex).__name__}: {ex}")
