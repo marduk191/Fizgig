@@ -73,6 +73,7 @@ async function boot() {
   const pr = await api("/api/prefs");
   S.prefs = pr.models || {};
   S.captioner = pr.captioner;              // the secondary captioning model's row
+  S.captioning = pr.captioning;            // the Captioning models card: the main model, the other captioners
   S.webPort = pr.web_port;
   S.portNow = pr.port_now;
   S.onPod = pr.on_pod;
@@ -117,12 +118,21 @@ async function boot() {
   phoneCard();
   podLocalInit();                                             // in the app window on a pod: this computer's folders
   welcomeShow(pr);
+  sysmemTipShow(pr);
   pollRun(); pollStats(); followLog();
-  setInterval(pollRun, 2000); setInterval(pollStats, 2000); setInterval(loadGallery, 15000);
+  setInterval(pollRun, 2000); setInterval(pollStats, 2000); setInterval(galleryRefresh, 15000);
+  // F5 / Ctrl+R reload the page in the app window as in a browser (the window has no reload of its own)
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "F5" || ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "r")) {
+      e.preventDefault(); location.reload(); }
+  });
   setInterval(loadCheckpoints, 15000);
 }
 
-async function chooseFamily(key) {
+// fresh (you picked another model at the top): the model's first preset goes over its saved values, so no setting
+// from earlier (an optimizer this model doesn't offer, say) carries over; paths and prompts the preset doesn't set stay.
+// Back on the model a run is training or paused on: that run's own settings instead
+async function chooseFamily(key, fresh = false) {
   try {                                     // the latest saved, in case another open page changed it
     const st = await api("/api/state");
     if (st && st.values && st.values[key]) S.all[key] = st.values[key];
@@ -130,10 +140,14 @@ async function chooseFamily(key) {
   S.family = key;
   S.fam = S.schema.families.find((f) => f.key === key);
   for (const sel of document.querySelectorAll(".family-pick")) sel.value = key;
-  if (S.all[key]) {
+  if (fresh) try { S.run = await api("/api/run"); } catch (e) { /* the last poll's */ }
+  const live = fresh && (training() || (S.run && S.run.state === "paused")) && S.run.family === key && S.run.values;
+  if (live) {
+    S.values = {...defaults(), ...(S.all[key] || {}), ...live};
+  } else if (S.all[key] && !fresh) {
     S.values = {...defaults(), ...S.all[key]};
-  } else {                              // a first visit takes the family's first preset, as the desktop does
-    S.values = defaults();
+  } else {                              // a first visit or a switch takes the family's first preset
+    S.values = {...defaults(), ...(S.all[key] || {})};
     const first = S.fam.form.presets[0];
     if (first) {
       S.values = (await api("/api/preset", {family: key, name: first.name, values: S.values})).values;
@@ -532,6 +546,10 @@ function splitRow(r, wrap) {
   const hintOne = el("div", {class: "field-hint", text: r.hint});
   const hintSplit = el("div", {class: "field-hint", text: r.split_hint || r.hint});
   const hintSlide = el("div", {class: "field-hint", text: r.slide_hint || r.hint});
+  // other known-good numbers, bracketed above the hint; the link puts them in the boxes
+  const altSlide = r.slide_alt ? el("div", {class: "field-hint"}, "(" + r.slide_alt[0] + " ",
+    el("a", {class: "inline-link", href: "#", text: "Click here to try them", onclick: (e) => {
+      e.preventDefault(); onValue(r, r.slide_alt[1]); show(); }}), ".)") : null;
   function show() {
     const m = modeOf();
     pills.querySelectorAll("input").forEach((rb) => { rb.checked = rb.value === m; });
@@ -548,7 +566,7 @@ function splitRow(r, wrap) {
     else { one.value = S.values[r.key] ?? ""; mem.single = one.value; }
     for (const [node, on] of [[lineOne, m === "Single"], [hintOne, m === "Single"], [lineSplit, m === "Split"],
                               [hintSplit, m === "Split"], [lineSlide, m === "Slide"], [lineRefresh, m === "Slide"],
-                              [hintSlide, m === "Slide"]]) {
+                              [altSlide, m === "Slide"], [hintSlide, m === "Slide"]]) {
       if (node) node.style.display = on ? "" : "none";
     }
   }
@@ -556,7 +574,7 @@ function splitRow(r, wrap) {
   sync._sync = show;
   sTick.addEventListener("change", () => { mem.slideTick = sTick.checked; });
   wrap.append(el("div", {class: "cad-title", text: r.label}), pills, lineOne, lineSplit, lineSlide, ...(lineRefresh ? [lineRefresh] : []),
-    hintOne, hintSplit,
+    hintOne, hintSplit, ...(altSlide ? [altSlide] : []),
     hintSlide, sync,
     el("div", {class: "field-hint row-note", id: "note_" + r.key}));
   if (r.warn) wrap.append(el("div", {class: "field-hint tc-warn"}, r.warn, r.warn_link ? el("a", {class: "inline-link",
@@ -784,7 +802,15 @@ function onValue(r, val) {
        "SAMPLE_EVERY_AFTER", "FAMILY_PREVIEW_LOOK", "SAMPLE_CHECKPOINT"].includes(r.key))) sampleLiveSoon();
   if (r.key === "CAPTION_TRIGGER_WORD") { S.trigger = String(val).trim(); $("capTrigger").value = S.trigger; saveTriggerSoon(S.trigger); }
   const extra = r.sets && r.sets[val];            // a kind of training that also sets others (Fine-tune's LR)
+  // Fine-tune sets Adafactor (#312): the LoRA optimizer is kept, and comes back when another kind is picked
+  const ftOpt = (k) => !!(r.sets && r.sets[k] && "OPTIMIZER_TYPE" in r.sets[k]);
+  if (r.sets && prev !== val && ftOpt(val) && !ftOpt(prev)) S.values._LORA_OPTIMIZER = S.values.OPTIMIZER_TYPE;
   if (extra) { Object.assign(S.values, extra); syncInputs(Object.keys(extra)); }
+  if (r.sets && prev !== val && ftOpt(prev) && !ftOpt(val) && S.values._LORA_OPTIMIZER) {
+    const back = S.values._LORA_OPTIMIZER;
+    delete S.values._LORA_OPTIMIZER;
+    S.values.OPTIMIZER_TYPE = back; optimizerPicked("adafactor", back); syncInputs(["OPTIMIZER_TYPE"]);
+  }
   if (r.timesteps && r.timesteps[val]) {           // a Model Area with its own timestep window
     [S.values.MIN_TIMESTEP, S.values.MAX_TIMESTEP] = r.timesteps[val];
     syncInputs(["MIN_TIMESTEP", "MAX_TIMESTEP"]);
@@ -1049,11 +1075,22 @@ function renderPrefs() {
   paintFetch();
 }
 
-// the secondary captioning model (#270): set, it captions everything (the Captions tab and auto-recaption);
-// empty, the Krea 2 text encoder does. Plain Hugging Face links to the builds Fizgig reads - nothing downloads itself
+// Preferences' Captioning models card: the main model (Krea 2's text encoder), the optional bigger Qwen3-VL (#270)
+// that takes its place everywhere, and the Captions tab's other models, each with a Download (or downloaded on first use)
 function captionerCard() {
   const c = S.captioner || {path: "", note: "", links: []};
-  const input = el("input", {type: "text", class: "w-path", value: c.path || "", placeholder: "Empty = the Krea 2 text encoder"});
+  const g = S.captioning || {main: "", main_ok: false, others: []};
+  const sub = (title, text) => [el("div", {class: "cap-pref-title", text: title}), el("div", {class: "field-hint", text})];
+
+  // 1. the main model
+  const main = el("div", {class: "pref-file"}, ...sub("Main captioning model",
+    "Krea 2's text encoder (Qwen3-VL 4B) writes captions on the Captions tab, and it's the model auto-recaption uses " +
+    "while training."),
+    el("div", {class: "field-hint cap-pref-state", text: g.main_ok ? `Set: ${g.main.split(/[\\/]/).pop()}` :
+      "Not set yet: set the Krea 2 text encoder under Krea 2 below, or press Download models for me."}));
+
+  // 2. the bigger Qwen3-VL, optional
+  const input = el("input", {type: "text", class: "w-path", value: c.path || "", placeholder: "Empty = the main model"});
   const note = el("div", {class: "field-hint", text: c.note || ""});
   const save = async () => {
     try {
@@ -1064,19 +1101,60 @@ function captionerCard() {
     } catch (e) { note.textContent = e.message; }
   };
   input.addEventListener("change", save);
-  const row = el("div", {class: "field-row"}, el("span", {class: "field-label", text: "Secondary captioning model:"}),
+  const row = el("div", {class: "field-row"}, el("span", {class: "field-label", text: "Bigger model:"}),
     input, el("button", {class: "btn", text: "Choose…", title: "Pick from what is on the machine running Fizgig",
       onclick: () => pick(input.value, false, (p) => { input.value = p; save(); })}),
     ...(c.links || []).map((l) => el("a", {class: "btn", target: "_blank", rel: "noopener", href: l.href,
       text: l.label.split(" (")[0], title: l.label})));
-  return el("div", {class: "section-card"}, el("div", {class: "card-title"}, el("span", {text: "Captioning model"})),
-    el("div", {class: "card-content"}, el("div", {class: "pref-file"}, row,
-      el("div", {class: "field-hint", text: "Optional. Qwen3-VL 8B, the bigger model of the family the Krea 2 text " +
-        "encoder belongs to (it's Qwen Image 2.1's text encoder): more detailed captions. Download a build from the " +
-        "links and choose it here; from then on it does all captioning - the Captions tab and auto-recaption. Empty " +
-        "the box to go back to the Krea 2 text encoder. " + (c.links || []).map((l) => l.label).join(" · ") +
-        ". On a card with less VRAM than it needs, it keeps what fits and streams the rest from system RAM (slower)."}),
-      note)));
+  const bigger = el("div", {class: "pref-file"}, ...sub("Bigger model (optional)",
+    "For more detailed captions, set Qwen3-VL 8B here (Qwen Image 2.1's text encoder), or another Qwen3-VL 4B. It " +
+    "takes the main model's place everywhere, auto-recaption included. Only Qwen3-VL files work, in bf16 or fp8 (not " +
+    "the int8 builds). Download a build from the links, choose it, and empty the box to go back to the main model. " +
+    "On a card with less memory than it needs, it keeps what fits and streams the rest from system RAM (slower)."),
+    row, note);
+
+  // 3. the Captions tab's other models
+  const list = el("div", {class: "cap-pref-list"});
+  const others = el("div", {class: "pref-file"}, ...sub("Other captioning models",
+    "For the Captions tab only: auto-recaption doesn't use them. Each downloads itself the first time you caption " +
+    "with it, or download it here first, to have it ready or to caption without internet."), list);
+  captionerOthersDraw(list, g.others || []);
+  return el("div", {class: "section-card"}, el("div", {class: "card-title"}, el("span", {text: "Captioning models"})),
+    el("div", {class: "card-content"}, main, bigger, others));
+}
+
+// a row per other captioner: what it's for, its size, and Download / its progress / Downloaded
+function captionerOthersDraw(list, others) {
+  list.replaceChildren(...others.map((o) => {
+    const state = o.state === "downloading" ? el("span", {class: "field-hint", text:
+        `Downloading… ${o.done_gb.toFixed(1)} of ${o.size_gb.toFixed(1)} GB`})
+      : o.downloaded ? el("span", {class: "cap-pref-done", text: "Downloaded ✓"})
+      : el("button", {class: "btn btn-sm", text: o.state === "failed" ? "Try again" : "Download",
+          onclick: async (ev) => {
+            ev.target.disabled = true;
+            try { await api("/api/captioners/download", {key: o.key}); captionerOthersPoll(list); }
+            catch (e) { ev.target.disabled = false; ev.target.title = e.message; }
+          }});
+    return el("div", {class: "cap-pref-row"},
+      el("span", {class: "cap-pref-name", text: o.label}),
+      el("span", {class: "field-hint", text: `${o.blurb} · ${o.size_gb < 1 ? Math.round(o.size_gb * 1000) + " MB" :
+        o.size_gb.toFixed(1) + " GB"}`}),
+      state,
+      o.state === "failed" ? el("div", {class: "field-hint cap-pref-err", text: `The download stopped: ${o.error}`}) : null);
+  }));
+}
+
+function captionerOthersPoll(list) {               // every 2 s while any is downloading
+  clearTimeout(S.capDlTimer);
+  S.capDlTimer = setTimeout(async () => {
+    try {
+      const r = await api("/api/captioners/status");
+      if (S.captioning) S.captioning.others = r.others;
+      if (!list.isConnected) return;
+      captionerOthersDraw(list, r.others);
+      if (r.others.some((o) => o.state === "downloading")) captionerOthersPoll(list);
+    } catch (e) { captionerOthersPoll(list); }
+  }, 2000);
 }
 
 // a folder setting the two apps share (prefs.json): a box, Choose…, saved when it changes
@@ -1165,6 +1243,9 @@ function fetchRow(f) {
   for (const p of picks) line.append(el("label", {class: "fetch-opt"}, p.label + ": ", p.sel));
   if (opt) line.append(el("label", {class: "fetch-opt"}, opt, " " + f.fetch_optional_label));
   box.append(line);
+  if ((f.licence_link || []).length === 2)       // the model's licence, a link only (description.licence_link)
+    box.append(el("div", {class: "field-hint licence-link"},
+      el("a", {target: "_blank", rel: "noopener", href: f.licence_link[1], text: f.licence_link[0]})));
   if (token) {
     const seen = new Set();
     const links = gated.filter((m) => !seen.has(m.repo) && seen.add(m.repo)).map((m) =>
@@ -1395,7 +1476,29 @@ function podCard() {
 
 // Fizgig 8's welcome, on this computer's own Fizgig (not a pod's or another computer's page): once a launch until
 // Don't show this again. The tour ships with Fizgig; if it won't play, the words stand on their own.
+// Off since 10 Nov 2026 (Peter): kept for a future release's welcome - new words and video, a new hidden pref
+// name (so Don't show this again from 8 doesn't hide it), then WELCOME_ON = true.
+const WELCOME_ON = false;
+// On Windows with an NVIDIA card: the tip to turn off CUDA Sysmem Fallback (a run spilling into system RAM trains
+// several times slower; driver and Windows updates turn it back on). Once a launch on this computer's own page, until
+// Don't show this again (pref sysmem_tip_hidden).
+function sysmemTipShow(pr) {
+  let seen = false;
+  try { seen = sessionStorage.getItem("fizgig.sysmemSeen") === "1"; } catch (e) { /* no storage */ }
+  if (!pr.sysmem_tip || seen || S.onPod || pageIsElsewhere()) return;
+  const m = $("sysmemModal");
+  const close = () => {
+    m.classList.remove("active");
+    try { sessionStorage.setItem("fizgig.sysmemSeen", "1"); } catch (e) { /* no storage */ }
+    if ($("sysmemNever").checked) api("/api/prefs", {changes: {sysmem_tip_hidden: "1"}}).catch(() => {});
+  };
+  $("sysmemClose").onclick = close; $("sysmemX").onclick = close;
+  m.onclick = (e) => { if (e.target === m) close(); };
+  m.classList.add("active");
+}
+
 function welcomeShow(pr) {
+  if (!WELCOME_ON) return;
   let seen = false;
   try { seen = sessionStorage.getItem("fizgig.welcomeSeen") === "1"; } catch (e) { /* no storage */ }
   if (pr.welcome_hidden || seen || S.onPod || pageIsElsewhere() || $("welcomeModal").classList.contains("active")) return;
@@ -1745,6 +1848,10 @@ async function pollRun() {
   ilb.setAttribute("aria-disabled", ilOn ? "false" : "true");
   ilb.title = ilOn ? IL_ON_TIP : IL_OFF_TIP;
   if (!ilOn) $("runImageLoss").style.display = "none";
+  // Training maps: the run going now made them (its Training tab tick)
+  const tmOn = live && r.history_id && [true, "true", "True", "1", 1].includes((r.values || {}).TRAINING_MAPS);
+  $("btnTrainMaps").style.display = tmOn ? "" : "none";
+  if (!tmOn) $("runTrainMaps").style.display = "none";
   // Sample now / Save now: while a LoRA trains (a fine-tune saves and previews at whole rotations)
   const runDesc = S.schema.families.find((f) => f.key === r.family);
   const ftRun = r.values && r.values.FAMILY_KIND && /fine-tune/i.test(String(r.values.FAMILY_KIND));
@@ -1975,8 +2082,8 @@ function queueSummary(q, r) {
     return;
   }
   const text = q.held ? `Queue held: ${q.reason || "press Start queue to carry on"}` :
-    q.waiting ? `Queue waiting: ${q.waiting}` : "";
-  const sig = JSON.stringify([text, q.held, q.reason, q.waiting, items.map((it) => [it.id, it.lora])]);
+    q.waiting ? `Queue waiting: ${q.waiting}` : q.failed || "";
+  const sig = JSON.stringify([text, q.held, q.reason, q.waiting, q.failed, items.map((it) => [it.id, it.lora])]);
   if (sig === S.queueSumSig) return;              // as renderWebQueue: a rebuild mid-click drops Start queue's click
   S.queueSumSig = sig;
   side.classList.toggle("held", !!q.held);
@@ -1986,7 +2093,7 @@ function queueSummary(q, r) {
   $("sideQueueList").replaceChildren(...items.slice(0, 3).map((it, i) => el("div", {class: "side-queue-row"},
     el("span", {class: "n", text: String(i + 1)}), el("span", {class: "name", text: it.lora, title: it.lora}))),
     ...(n > 3 ? [el("div", {class: "side-queue-more", text: `+${n - 3} more`})] : []));
-  $("sideQueueHeld").textContent = q.held ? q.reason || "Press Start queue to carry on." : q.waiting || "";
+  $("sideQueueHeld").textContent = q.held ? q.reason || "Press Start queue to carry on." : q.waiting || q.failed || "";
   $("sideQueueStart").style.display = q.held ? "" : "none";
   up.classList.toggle("held", !!q.held);
   up.replaceChildren(...[el("span", {text: q.held ? text : `Up next: ${items.slice(0, 3).map((it, i) => `${i + 1}. ${it.lora}`).join(" · ")}` +
@@ -2278,6 +2385,18 @@ function previewGrid(items, prompts, eager) {
     top.hidden = table.scrollWidth <= wrap.clientWidth;
   }).observe(table);
   return el("div", {}, top, wrap);
+}
+
+// the 15 s refresh: a refresh that fails says so under the previews (and in the console) instead of leaving the
+// gallery silently frozen at its last good draw - an app-window gallery once stopped at epoch 36 with no clue why
+async function galleryRefresh() {
+  try {
+    await loadGallery();
+    $("galleryError").textContent = "";
+  } catch (e) {
+    console.error("[gallery] refresh failed", e);
+    $("galleryError").textContent = `Previews couldn't refresh: ${e && e.message || e}. Press F5 to reload the page.`;
+  }
 }
 
 async function loadGallery() {
@@ -2897,6 +3016,15 @@ async function loadRuns() {
         try { const load = imageLossLoad(run.id); imageLossPanel(ilBox, await load(), run, load); }
         catch (e) { ilBox.replaceChildren(el("div", {class: "problems", text: e.message})); }
       }}) : null;
+    // training maps (training/train_maps.py), when the run made them
+    const tmBox = el("div", {class: "tm-box", style: "display:none"});
+    const tmBtn = run.train_maps ? el("button", {class: "btn btn-sm btn-lilac", text: "Training maps", title: TM_TIP,
+      onclick: async () => {
+        if (tmBox.style.display !== "none") { tmBox.style.display = "none"; return; }
+        tmBox.style.display = ""; tmBox.textContent = "Loading…";
+        try { const load = trainMapsLoad(run.id); trainMapsPanel(tmBox, await load(), run, load); }
+        catch (e) { tmBox.replaceChildren(el("div", {class: "problems", text: e.message})); }
+      }}) : null;
     host.append(el("div", {class: "run-row"},
       el("div", {class: "run-row-head"},
         el("span", {class: "run-badge", "data-state": RESULT_STATE[run.result] || "idle", text: RESULT_LABEL[run.result] || run.result}),
@@ -2906,9 +3034,9 @@ async function loadRuns() {
         `${new Date(run.started_at * 1000).toLocaleString()} · ${dur(run.started_at, run.ended_at)}`, figs]
         .filter(Boolean).join("  ·  ")}),
       lossChart(run.curve),
-      el("div", {class: "field-row"}, cont, contHint, showFiles, lgBtn, ilBtn, notesBtn, again, del), contBox, delBox,
+      el("div", {class: "field-row"}, cont, contHint, showFiles, lgBtn, ilBtn, tmBtn, notesBtn, again, del), contBox, delBox,
       alertRow, notesBox, files,
-      lgBox, ilBox));
+      lgBox, ilBox, tmBox));
   }
   if (!r.runs.length) host.append(el("div", {class: "field-hint", text: "No runs yet. Every run you start is listed here " +
     "with its results."}));
@@ -2931,6 +3059,334 @@ const IL_PROBLEMS = new Set(["excluded", "stuck", "suspect", "watch"]);
 const IL_PAGE = 48;
 
 // the per-image loss of a run, fetched fresh each time (the panel's Refresh and its dropdowns call it again)
+// ---- Training maps (training/train_maps.py): a few fixed pictures, epoch by epoch - where the model's prediction is
+// still wrong, where it has learned since the start, and where the LoRA is changing it. One colour scale per picture,
+// noise level and map across all the epochs (a scale per frame would hide the change), drawn over the picture
+const TM_LEVELS = {"0.25": "Low noise (detail)", "0.5": "Mid", "0.75": "High noise (layout)"};
+const TM_KINDS = [["loss", "Not learned yet", "Training covers your picture in noise and asks the model to recover it. This " +
+  "shows where its attempt still misses your picture: red = misses most, yellow = partly, blue = a little, no colour = " +
+  "nearly right. Fine detail (hair, edges, texture) always shows warmer, so watch one area cool from epoch to epoch rather than " +
+  "comparing it with the rest of the picture."],
+  ["learned", "Learned since the start", "Green = the model gets this part more right than before training: what the " +
+  "LoRA has learned so far. Magenta = this part got worse. No colour = little change. Each epoch is checked with the same " +
+  "noise, so only real learning shows."],
+  ["effect", "Where the LoRA acts", "Where the LoRA changes the picture. Red = changes it most, yellow = some, blue = a " +
+  "little, no colour = barely. For a person it should gather on the face and body; if it spreads over clothes or the background, " +
+  "the LoRA is learning those too."],
+  ["attn", "Trigger word", "Where the picture listens to your trigger word: how much of each area's attention goes to " +
+  "it inside the model. Red = most, yellow = some, blue = a little, no colour = barely. For a person it should " +
+  "settle on the face and body; if it sits on a hat, a jacket or the background, the trigger is tied to those too."]];
+const TM_TIP = "A few of your pictures, checked before training and after every epoch: where the model is still wrong, " +
+  "what it has learned, and where the LoRA is acting.";
+// the run's pictures and levels first; each picture + noise level's epochs fetched when shown (a ninth of the whole)
+const trainMapsLoad = (id) => (key, t) => api("/api/runs/train_maps?id=" + encodeURIComponent(id) +
+  (key ? `&key=${encodeURIComponent(key)}&t=${encodeURIComponent(t)}` : ""));
+
+const tmPref = (k, dflt) => { try { return localStorage.getItem("fizgig.tm." + k) || dflt; } catch (e) { return dflt; } };
+const tmSetPref = (k, v) => { try { localStorage.setItem("fizgig.tm." + k, v); } catch (e) { /* private window */ } };
+
+function trainMapsPanel(box, meta, run, load) {
+  const st = {key: meta.keys[0], t: "all", kind: "learned", trig: "",
+              i: Math.max(0, meta.epochs.length - 1), timer: null, img: null,
+              bands: tmPref("scale", "bands") === "bands", grey: tmPref("picture", "grey") === "grey",
+              // Learned since the start: "amount" (the loss removed), "share" (removed as a share of the cell's own
+              // start: how far along each part is), "fixed" (the share on one 0-20% scale for every run and epoch)
+              learnedAs: ["amount", "share", "fixed"].includes(tmPref("learned", "amount")) ? tmPref("learned", "amount") : "amount",
+              // the map's opacity, 1 = as designed; up to 1.5 stronger (capped at solid), down to 0 (hidden)
+              opacity: Math.max(0, Math.min(1.5, Number(tmPref("opacity", "1")) || 0))};
+  const d = {...meta, epochs: []};
+  const fetchOne = async () => {          // this picture + level's epochs (All levels: each level's, merged by epoch)
+    const ts = st.t === "all" ? d.timesteps.map(String) : [st.t];
+    const rs = await Promise.all(ts.map((t) => load(st.key, t)));
+    const by = new Map();
+    for (const r of rs) for (const e of r.epochs) {
+      const row = by.get(e.epoch) || {epoch: e.epoch, maps: {[st.key]: {}}};
+      Object.assign(row.maps[st.key], (e.maps || {})[st.key] || {});
+      by.set(e.epoch, row);
+    }
+    const atEnd = st.i >= d.epochs.length - 1;
+    d.epochs = [...by.values()].sort((a, b) => a.epoch - b.epoch); d.live = rs.some((r) => r.live);
+    scales.clear();
+    floors.clear();
+    scrub.max = String(Math.max(0, d.epochs.length - 1));
+    if (atEnd || st.i > d.epochs.length - 1) st.i = Math.max(0, d.epochs.length - 1);
+    scrub.value = String(st.i);
+    draw();
+  };
+  const tKey = (t) => `${Number(t)}`;          // "0.5", as the trainer writes it
+  const canvas = el("canvas"), epochTag = el("span", {class: "tm-epoch"});
+  const scrub = el("input", {type: "range", class: "tm-scrub", min: "0", max: String(Math.max(0, d.epochs.length - 1)),
+    value: String(st.i)});
+  const say = el("div", {class: "field-hint"}), legend = el("span", {class: "tm-legend"});
+  const legendLo = el("span", {class: "tm-legend-end"}), legendHi = el("span", {class: "tm-legend-end"});
+  const kindSay = el("div", {class: "tm-kind-say"});        // what the chosen map shows, above the picture
+  const bigHint = el("span", {class: "tm-big-hint", text: "← → step through the epochs · click or Esc to close"});
+  const rawAttn = (e, t) => {                  // the trigger map as stored: all triggers, or one subject's
+    const g = (((d.epochs[e] || {}).maps || {})[st.key] || {})[tKey(t)];
+    if (!g) return null;
+    return st.trig ? (g.attn_by || {})[st.trig] || null : g.attn || null;
+  };
+  // The trigger map's floor for this picture + level: its quietest share across every epoch (2nd percentile). Some
+  // models spread a new word's attention almost evenly (SDXL's start token takes most of every row; Klein, Flux 3,
+  // Fibo, Anima lean that way too), so scaled from zero the whole picture showed one colour; from the floor up, the
+  // map shows where attention is higher than the rest.
+  const floors = new Map();
+  const attnFloor = (t) => {
+    const memo = `${st.key}|${t}|${st.trig}`;
+    if (floors.has(memo)) return floors.get(memo);
+    let lo = Infinity;
+    for (let e = 0; e < d.epochs.length; e++) {
+      const g = rawAttn(e, t);
+      if (!g) continue;
+      const vs = [...g.v].sort((a, b) => a - b);
+      lo = Math.min(lo, vs[Math.floor(0.02 * (vs.length - 1))]);
+    }
+    floors.set(memo, Number.isFinite(lo) ? lo : 0);
+    return floors.get(memo);
+  };
+  const gridAt = (e, k, t) => {                // one level's map
+    const m = ((d.epochs[e] || {}).maps || {})[st.key];
+    const g = m && m[tKey(t)];
+    if (!g) return null;
+    if (k === "attn") {                        // one subject's trigger never shows as all of them
+      const a = rawAttn(e, t);
+      if (!a) return null;
+      const lo = attnFloor(t);
+      return {w: a.w, h: a.h, v: a.v.map((x) => Math.max(0, x - lo))};
+    }
+    if (k !== "learned") return g[k] || null;
+    const base = (((d.epochs[0] || {}).maps || {})[st.key] || {})[tKey(t)];
+    if (!base || !base.loss || !g.loss || base.loss.v.length !== g.loss.v.length) return null;
+    if (st.learnedAs !== "amount") {           // a share of the cell's own start; a nearly-clean cell's start is floored
+      const b = base.loss.v, lo = [...b].sort((x, y) => x - y)[Math.floor(0.1 * (b.length - 1))] || 1e-8;
+      return {w: g.loss.w, h: g.loss.h, signed: true, share: true,
+              v: g.loss.v.map((x, j) => (b[j] - x) / Math.max(b[j], lo, 1e-8))};
+    }
+    return {w: g.loss.w, h: g.loss.h, v: g.loss.v.map((x, j) => base.loss.v[j] - x), signed: true};
+  };
+  const scales = new Map();                    // the scales per picture + map + level, until the epochs change
+  const scaleOf = (k, t) => {                  // one scale for this picture + level + map, over every epoch
+    if (k === "learned" && st.learnedAs === "fixed") return 0.2;      // 20% of a cell's start = full colour, every run
+    const memo = `${st.key}|${k}|${t}|${k === "attn" ? st.trig : ""}|${k === "learned" ? st.learnedAs : ""}`;
+    if (scales.has(memo)) return scales.get(memo);
+    let mx = 0;
+    for (let e = 0; e < d.epochs.length; e++) {
+      const g = t === "all" ? grid(e, k) : gridAt(e, k, t);
+      if (!g) continue;
+      const vs = g.v.map((x) => (g.signed ? Math.abs(x) : x)).sort((a, b) => a - b);
+      mx = Math.max(mx, vs[Math.floor(0.98 * (vs.length - 1))] || 0);     // 98th percentile: one hot cell can't wash out the rest
+    }
+    scales.set(memo, mx || 1);
+    return mx || 1;
+  };
+  // All levels: each level over its own scale (heavy noise's error is bigger by nature, so a plain sum would be
+  // mostly it), then the mean, so every level counts the same
+  const grid = (e, k) => {
+    if (st.t !== "all") return gridAt(e, k, st.t);
+    let out = null, n = 0;
+    for (const t of d.timesteps) {
+      const g = gridAt(e, k, t);
+      if (!g || (out && g.v.length !== out.v.length)) continue;
+      const s = g.share ? 1 : scaleOf(k, t);  // shares already compare across levels: a plain mean
+      if (!out) out = {w: g.w, h: g.h, signed: g.signed, v: g.v.map((x) => x / s)};
+      else out.v = out.v.map((x, j) => x + g.v[j] / s);
+      n++;
+    }
+    if (out) out.v = out.v.map((x) => x / n);
+    return out;
+  };
+  const scale = () => scaleOf(st.kind, st.t === "all" ? "all" : st.t);
+  const rgb = (name) => { const m = /(\d+)\D+(\d+)\D+(\d+)/.exec(themeColor(name)); return m ? [+m[1], +m[2], +m[3]] : [0, 0, 0]; };
+  // a picture whose caption names several subjects' triggers (Multi Concept captions with two people): each trigger's
+  // map on its own, or all of them together
+  const trigRow = el("span", {class: "tm-row"});
+  let trigSig = null;
+  const fillTrig = () => {
+    const ws = (d.attn_words || {})[st.key] || [];
+    const sig = `${st.key}|${st.kind}|${ws.join(",")}`;
+    if (sig === trigSig) return;
+    trigSig = sig;
+    if (st.kind !== "attn" || ws.length < 2) { trigRow.replaceChildren(); return; }
+    if (!ws.includes(st.trig)) st.trig = "";
+    trigRow.replaceChildren(chips([["", "All triggers", "Every trigger word in this picture's caption together"],
+      ...ws.map((w) => [w, w, `Only ${w}: does it land on its own subject?`])], () => st.trig, (v) => { st.trig = v; }));
+  };
+  const draw = () => {
+    fillTrig();
+    learnedRow.style.display = st.kind === "learned" ? "" : "none";
+    const img = st.img;
+    if (!img || !img.naturalWidth) return;
+    // the part of the photo it trained on (the bucket's centre crop), so the map sits exactly on it
+    const c = (d.crops || {})[st.key] || [0, 0, 1, 1];
+    const sx = c[0] * img.naturalWidth, sy = c[1] * img.naturalHeight;
+    const sw = c[2] * img.naturalWidth, sh = c[3] * img.naturalHeight;
+    const W = Math.round(Math.min(st.big ? 2048 : 640, sw)), H = Math.round(W * sh / sw);
+    canvas.width = W; canvas.height = H;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(img, sx, sy, sw, sh, 0, 0, W, H);
+    if (st.grey) {                     // the photo in grey and dimmed, so the map's colours are the only colours
+      const im = ctx.getImageData(0, 0, W, H), p = im.data;
+      for (let j = 0; j < p.length; j += 4) {
+        const y = 0.55 * (0.299 * p[j] + 0.587 * p[j + 1] + 0.114 * p[j + 2]);
+        p[j] = p[j + 1] = p[j + 2] = y;
+      }
+      ctx.putImageData(im, 0, 0);
+    }
+    const g = grid(st.i, st.kind);
+    const kind = TM_KINDS.find((k) => k[0] === st.kind) || [];
+    kindSay.textContent = kind[2] || "";
+    epochTag.textContent = (st.big && kind[1] ? `${kind[1]} · ` : "") +
+      (d.epochs.length ? (d.epochs[st.i].epoch === 0 ? "Before training" : `Epoch ${d.epochs[st.i].epoch}`) : "");
+    if (!g) { say.textContent = st.kind === "effect" && d.epochs[st.i] && d.epochs[st.i].epoch === 0 ?
+      "Before training the LoRA does nothing yet." : st.kind === "attn" && !(d.attn || []).includes(st.key) ?
+      "This picture's caption doesn't have the trigger word." : "No map for this one."; return; }
+    say.textContent = "";
+    const mx = scale(), off = document.createElement("canvas");
+    off.width = g.w; off.height = g.h;
+    const oc = off.getContext("2d"), px = oc.createImageData(g.w, g.h);
+    const [c1, c2, c3] = [rgb("--pic-heat-1"), rgb("--pic-heat-2"), rgb("--pic-heat-3")];
+    const [gb, gw] = [rgb("--pic-better"), rgb("--pic-worse")];
+    const mixc = (a, b, f) => a.map((x, j) => Math.round(x + (b[j] - x) * f));
+    for (let j = 0; j < g.v.length; j++) {
+      let c, a;
+      if (g.signed) {
+        const f = Math.max(-1, Math.min(1, g.v[j] / mx));
+        c = f >= 0 ? gb : gw;
+        // bands: under a fifth no colour, then a light and a strong step; smooth: the size as the opacity
+        a = st.bands ? (Math.abs(f) < 0.2 ? 0 : Math.abs(f) < 0.5 ? 0.55 : 0.9) : Math.abs(f);
+      } else {
+        const f = Math.max(0, Math.min(1, g.v[j] / mx));
+        if (st.bands) { c = f < 0.5 ? c1 : f < 0.75 ? c2 : c3; a = f < 0.25 ? 0 : 0.85; }
+        else { c = f < 0.5 ? mixc(c1, c2, f * 2) : mixc(c2, c3, (f - 0.5) * 2); a = f < 0.15 ? 0 : 0.3 + 0.6 * f; }
+      }
+      px.data.set([c[0], c[1], c[2], Math.round(255 * Math.min(1, a * st.opacity))], j * 4);
+    }
+    oc.putImageData(px, 0, 0);
+    ctx.imageSmoothingEnabled = !st.bands;         // bands stay sharp cells: no in-between colours at their edges
+    ctx.drawImage(off, 0, 0, W, H);
+    legend.style.background = g.signed ?
+      (st.bands ? "linear-gradient(90deg, var(--pic-worse) 0 30%, transparent 30% 70%, var(--pic-better) 70% 100%)" :
+        "linear-gradient(90deg, var(--pic-worse), transparent, var(--pic-better))") :
+      (st.bands ? "linear-gradient(90deg, transparent 0 25%, var(--pic-heat-1) 25% 50%, var(--pic-heat-2) 50% 75%, " +
+        "var(--pic-heat-3) 75% 100%)" : "linear-gradient(90deg, transparent, var(--pic-heat-1), var(--pic-heat-2), var(--pic-heat-3))");
+    legendLo.textContent = g.signed ? (g.share && st.learnedAs === "fixed" ? "20% worse" : "worse") : "less";
+    legendHi.textContent = g.signed ? (g.share && st.learnedAs === "fixed" ? "20% better" : "better") : "more";
+  };
+  const showPic = () => {
+    const p = (d.images || {})[st.key];
+    st.img = null;
+    if (!p) { say.textContent = "The picture isn't in the training folder any more."; return; }
+    const im = new Image();
+    im.onload = () => { st.img = im; draw(); };
+    im.src = `/api/media?path=${encodeURIComponent(p)}&t=${encodeURIComponent(TOKEN)}`;
+  };
+  const chips = (items, cur, set) => el("span", {class: "tm-row"}, ...items.map(([v, label, tip]) =>
+    el("button", {class: "btn btn-sm" + (v === cur() ? " btn-primary" : ""), text: label, title: tip || "",
+      onclick: (e) => { set(v); e.target.parentElement.querySelectorAll("button").forEach((b) => b.classList.remove("btn-primary"));
+        e.target.classList.add("btn-primary"); draw(); }})));
+  // how Learned since the start is measured (optional; Amount is the default)
+  const learnedRow = chips([
+    ["amount", "Amount", "How much less wrong each part is than at the start. The part that learned most sets the scale, " +
+      "so a part with less to learn looks pale even when it's well learned"],
+    ["share", "Share of its own start", "How much of each part's own starting error has gone: how far along each part is, " +
+      "whatever it started at"],
+    ["fixed", "Share, same scale for every run", "The share on one scale (full colour = 20% of its start gone) for every run " +
+      "and epoch, so two runs' maps compare by eye"]],
+    () => st.learnedAs, (v) => { st.learnedAs = v; tmSetPref("learned", v); });
+  const probes = el("span", {class: "tm-row tm-probes"}, ...d.keys.map((k) => {
+    const p = (d.images || {})[k];
+    const im = el("img", {alt: k, title: k, class: k === st.key ? "on" : "",
+      src: p ? `/api/thumb?path=${encodeURIComponent(p)}&t=${encodeURIComponent(TOKEN)}` : ""});
+    im.addEventListener("click", () => { st.key = k; probes.querySelectorAll("img").forEach((x) => x.classList.toggle("on", x === im));
+      showPic(); fetchOne().catch((e) => { say.textContent = e.message; }); });
+    return im;
+  }));
+  scrub.addEventListener("input", () => { st.i = Number(scrub.value); draw(); });
+  // the map's opacity over the picture: 100% is the designed look; double-click puts it back
+  const opVal = el("span", {class: "tm-legend-end"});
+  const opacity = el("input", {type: "range", class: "tm-opacity", min: "0", max: "150", step: "5",
+    value: String(Math.round(st.opacity * 100)), title: "How strongly the map shows over the picture (double-click: 100%)"});
+  const showOp = () => { opVal.textContent = `${Math.round(st.opacity * 100)}%`; };
+  opacity.addEventListener("input", () => { st.opacity = Number(opacity.value) / 100; showOp(); draw(); });
+  opacity.addEventListener("change", () => tmSetPref("opacity", String(st.opacity)));
+  opacity.addEventListener("dblclick", () => { st.opacity = 1; opacity.value = "100"; showOp(); draw(); tmSetPref("opacity", "1"); });
+  showOp();
+  const opacityRow = el("label", {class: "tm-auto"}, "Map opacity ", opacity, opVal);
+  // click the picture for a big view over the page; arrows step the epochs, a click or Esc closes it
+  const stage = el("div", {class: "tm-stage", title: "Click to enlarge"}, canvas, epochTag, bigHint);
+  const step = (n) => { if (!d.epochs.length) return;
+    st.i = Math.max(0, Math.min(d.epochs.length - 1, st.i + n)); scrub.value = String(st.i); draw(); };
+  const onKey = (e) => {
+    if (!box.isConnected) { setBig(false); return; }
+    if (e.key === "Escape") { e.preventDefault(); setBig(false); }
+    else if (e.key === "ArrowLeft") { e.preventDefault(); step(-1); }
+    else if (e.key === "ArrowRight") { e.preventDefault(); step(1); }
+  };
+  const setBig = (on) => {
+    st.big = on;
+    stage.classList.toggle("tm-big", on);
+    stage.title = on ? "" : "Click to enlarge";
+    if (on) document.addEventListener("keydown", onKey); else document.removeEventListener("keydown", onKey);
+    draw();
+  };
+  stage.addEventListener("click", () => setBig(!st.big));
+  const play = el("button", {class: "btn btn-sm", text: "▶ Play", onclick: () => {
+    if (st.timer) { clearInterval(st.timer); st.timer = null; play.textContent = "▶ Play"; return; }
+    play.textContent = "❚❚ Pause";
+    if (st.i >= d.epochs.length - 1) st.i = 0;
+    st.timer = setInterval(() => {
+      if (!box.isConnected) { clearInterval(st.timer); st.timer = null; return; }
+      st.i = (st.i + 1) % Math.max(1, d.epochs.length); scrub.value = String(st.i); draw();
+    }, 700);
+  }});
+  const refresh = el("button", {class: "btn btn-sm", text: "Refresh", title: "Fetch the epochs trained since this opened",
+    onclick: () => fetchOne().catch((e) => { say.textContent = e.message; })});
+  // Auto-refresh while the run trains: every 10 s a small ask for the epoch count (no maps); a new epoch is fetched,
+  // and followed when you were on the newest. Stops when the run ends or the viewer closes. Remembered per browser.
+  const auto = el("input", {type: "checkbox"});
+  auto.checked = tmPref("auto", "1") === "1";
+  const autoLab = el("label", {class: "tm-auto", title: "Fetch each new epoch's maps as it lands"}, auto, " Auto-refresh");
+  let poll = null;
+  const stopPoll = () => { if (poll) { clearInterval(poll); poll = null; } };
+  const arm = () => {
+    stopPoll();
+    if (!auto.checked || !d.live) return;
+    poll = setInterval(async () => {
+      if (!box.isConnected) { stopPoll(); return; }
+      try {
+        const m = await load();
+        if ((m.epochs || []).length > d.epochs.length) await fetchOne();
+        if (!m.live) { stopPoll(); d.live = false; refresh.style.display = autoLab.style.display = "none"; }
+      } catch (e) { /* a missed poll: the next one tries again */ }
+    }, 10000);
+  };
+  auto.addEventListener("change", () => { tmSetPref("auto", auto.checked ? "1" : "0"); arm(); });
+  box.replaceChildren(
+    el("div", {class: "field-hint", text: TM_TIP}),
+    probes,
+    chips([["all", "All levels", "The three noise levels together, each counted equally: the overall picture"],
+           ...d.timesteps.map((t) => [String(t), TM_LEVELS[tKey(t)] || `Noise ${t}`])], () => st.t,
+      (v) => { st.t = v; fetchOne().catch((e) => { say.textContent = e.message; }); }),
+    chips(TM_KINDS.filter((k) => k[0] !== "attn" || (d.attn || []).length), () => st.kind, (v) => { st.kind = v; }),
+    trigRow,
+    learnedRow,
+    kindSay,
+    stage,
+    el("div", {class: "tm-row"}, play, scrub, d.live ? refresh : null, d.live ? autoLab : null, legendLo, legend, legendHi),
+    el("div", {class: "tm-row"},
+      chips([["bands", "Bands", "A few clear colours with sharp edges: easiest to tell apart"],
+             ["smooth", "Smooth", "A smooth blend of the same colours"]], () => (st.bands ? "bands" : "smooth"),
+        (v) => { st.bands = v === "bands"; tmSetPref("scale", v); }),
+      chips([["grey", "Grey picture", "The photo in grey under the map, so only the map is in colour"],
+             ["colour", "Colour picture", "The photo in its own colours under the map"]],
+        () => (st.grey ? "grey" : "colour"), (v) => { st.grey = v === "grey"; tmSetPref("picture", v); }),
+      opacityRow),
+    say);
+  showPic();
+  fetchOne().then(() => { if (!d.epochs.length) say.textContent = "No epochs yet: the first maps come before training starts."; arm(); })
+    .catch((e) => { say.textContent = e.message; });
+}
+
 const imageLossLoad = (id) => () => api("/api/runs/image_loss?id=" + encodeURIComponent(id));
 
 function imageLossPanel(box, d, run, load) {
@@ -5270,7 +5726,7 @@ function studioKind(L, sv) {
   studioAce(L, sv);
   studioEqButtons(L);
   studioMixShow(L);
-  studioMetricsShow();
+  studioMetricsShow(); studioMapsShow();
   if (!video) return;
   // the clip row's values are remembered per model (H3's under the old "h3" key), each starting from its own defaults
   const V = L.video, h3 = (sv.video || {})[L.key] || (L.key === "minimax" ? sv.h3 : null) || {};
@@ -6058,6 +6514,197 @@ function studioMetricsShow() {
   $("stMetRefName").textContent = ref ? ref.split(/[\\/]/).pop() : "(none)";
 }
 
+// ---- Studio maps: the training maps' heatmaps over the Tweaked picture, for any loaded LoRA -------------------------
+const ST_MAPS = [["", "Off", "No map"],
+  ["effect", "Where the LoRA acts", "Where the LoRA, as you've set it, changes the picture. Red = changes it most, " +
+    "yellow = some, blue = a little, no colour = barely. For a person LoRA it should gather on the face and body; if " +
+    "it spreads over clothes or the background, the LoRA changes those too."],
+  ["tweak", "What your tweaks change", "Move any slider (a block, a master slider or a LoRA's strength) and let the " +
+    "Tweaked picture render: this map then shows where your change acts, against the Baseline (every slider at 1.0). " +
+    "Red = your change moves that part most, yellow = some, blue = a little. It updates after every render."],
+  ["attn", "Trigger word", "How much of each area's attention goes to the trigger word inside the model, on the same " +
+    "colours. For a person it should settle on the face and body; on lettering (a logo, a watermark) or the background, " +
+    "the trigger is tied to those too. The prompt must contain the trigger word."],
+  ["blocks", "Blocks", "Where each group of the LoRA's blocks acts: the picture as tweaked against the same with that " +
+    "group switched off, at mid noise. Pick a group below. Red = it changes that part most; a group that lights up the " +
+    "background or clothes is the one to turn down there."]];
+const ST_MAP_LEVELS = [["all", "All levels"], ["0.25", "Low noise (detail)"], ["0.5", "Mid"], ["0.75", "High noise (layout)"]];
+
+function stMapPrefs() { try { return JSON.parse(localStorage.getItem("fizgig.stmap") || "{}"); } catch (e) { return {}; } }
+function stMapSave(p) { try { localStorage.setItem("fizgig.stmap", JSON.stringify({...stMapPrefs(), ...p})); } catch (e) { /* private */ } }
+
+function studioMapsShow() {
+  const L = S.st.layout, on = !!L && L.kind !== "audio" && L.kind !== "video";
+  $("stMaps").style.display = on ? "" : "none";
+  if (!on) { $("stMapCanvas").style.display = "none"; return; }
+  if (!S.st.map) {
+    const p = stMapPrefs();
+    S.st.map = {kind: "", level: p.level || "all", op: p.op != null ? p.op : 1, data: null, want: null, group: ""};
+    $("stMapOp").value = String(Math.round(S.st.map.op * 100));
+    $("stMapOp").addEventListener("input", () => { S.st.map.op = Number($("stMapOp").value) / 100; stMapDraw(); });
+    $("stMapOp").addEventListener("change", () => stMapSave({op: S.st.map.op}));
+    $("stMapOp").addEventListener("dblclick", () => { S.st.map.op = 1; $("stMapOp").value = "100"; stMapDraw(); stMapSave({op: 1}); });
+    // the trigger word: Show (or Enter) makes the map for it - never just leaving the box
+    $("stMapGo").addEventListener("click", () => { if (S.st.map.kind) studioMapRequest(); });
+    $("stMapTrig").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("stMapGo").click(); } });
+    $("stTweak").addEventListener("load", () => stMapDraw());
+    window.addEventListener("resize", () => stMapDraw());
+  }
+  stMapChips();
+}
+
+function stMapChips() {
+  const m = S.st.map;
+  const row = (items, cur, set) => items.map(([v, label, tip]) => el("button", {class: "btn btn-sm" + (v === cur ? " btn-primary" : ""),
+    text: label, title: tip || "", onclick: () => { set(v); stMapChips(); }}));
+  $("stMapKinds").replaceChildren(...row(ST_MAPS, m.kind, (v) => {
+    m.kind = v;
+    if (!v) { $("stMapCanvas").style.display = "none"; stMapNote(""); return; }
+    if (v === "tweak" && S.st.same) {            // nothing moved: nothing to calculate
+      $("stMapCanvas").style.display = "none";
+      stMapNote("Nothing to show yet: move a slider, and when the Tweaked picture has rendered, the map appears here.");
+      return;
+    }
+    if (!m.data || m.data.gen !== S.st.shown || (v === "blocks" && !m.data.with_blocks)) studioMapRequest(); else stMapDraw();
+  }));
+  const groups = (m.data && m.data.groups) || [];
+  if (m.kind === "blocks") {                    // a button per group, the first one chosen
+    if (!groups.includes(m.group)) m.group = groups[0] || "";
+    $("stMapLevels").replaceChildren(...row(groups.map((g) => [g, g, `Where ${g} acts`]), m.group, (v) => { m.group = v; stMapDraw(); }));
+  } else {
+    $("stMapLevels").replaceChildren(...row(ST_MAP_LEVELS, m.level, (v) => { m.level = v; stMapSave({level: v}); stMapDraw(); }));
+  }
+  $("stMapOpts").style.display = m.kind ? "" : "none";
+  // what the chosen map shows, right under its button, before the next row of controls
+  $("stMapKindSay").textContent = m.kind ? (ST_MAPS.find((k) => k[0] === m.kind) || [])[2] || "" : "";
+  $("stMapTrigRow").style.display = m.kind === "attn" ? "" : "none";
+}
+
+function stMapNote(text) {                     // the notice under the controls (empty: hidden)
+  $("stMapSay").textContent = text || "";
+  $("stMapSay").style.display = text ? "" : "none";
+}
+
+async function studioMapRequest() {
+  const m = S.st.map;
+  if (!m || !m.kind || !S.st.shown) return;
+  const state = studioState();
+  if (state.seed === 0 && S.st.seedUsed) state.seed = S.st.seedUsed;
+  const want = (m.want = (m.want || 0) + 1);
+  const busy = (on) => {                        // a pill by the title, a badge on the picture, the Show button
+    $("stMapGo").disabled = on;
+    $("stMapGo").textContent = on ? "Making the map…" : "Show";
+    $("stMapPill").style.display = $("stMapBadge").style.display = on ? "" : "none";
+  };
+  busy(true);
+  stMapNote("");
+  try {
+    const r = await api("/api/studio/map", {state, trigger: $("stMapTrig").value.trim(), blocks: m.kind === "blocks"});
+    if (r.error) { busy(false); stMapNote(r.error); return; }
+    if (!$("stMapTrig").value.trim() && r.trigger) $("stMapTrig").placeholder = r.trigger;
+    for (let i = 0; i < 240 && want === m.want; i++) {        // the worker answers in seconds; up to two minutes
+      await new Promise((ok) => setTimeout(ok, 500));
+      const d = await api("/api/studio/map");
+      if (d.rid === r.rid && !d.busy) {
+        if (want !== m.want) return;
+        busy(false);
+        if (d.error) { stMapNote(d.error); return; }
+        m.data = d;
+        stMapChips();
+        stMapDraw();
+        return;
+      }
+    }
+  } catch (e) { stMapNote(e.message); }
+  if (want === m.want) busy(false);
+}
+
+// a new Tweaked render: the map on screen belonged to the last one - made again when a map is chosen
+function studioMapsAfterRender(same) {
+  const m = S.st.map;
+  if (!m) return;
+  m.data = null;
+  $("stMapCanvas").style.display = "none";
+  // nothing moved (Reset All): What your tweaks change has nothing to show - the overlay goes, nothing is calculated
+  if (m.kind === "tweak" && same) {
+    stMapNote("Nothing to show yet: move a slider, and when the Tweaked picture has rendered, the map appears here.");
+    return;
+  }
+  if (m.kind) studioMapRequest();
+}
+
+function stMapGrid() {                          // the chosen kind at the chosen level, or every level together
+  const m = S.st.map, maps = (m.data && m.data.maps) || {};
+  // Blocks: the chosen group's map (mid noise), on the same footing as a one-level map
+  const byLevel = m.kind === "blocks" ? (((m.data && m.data.blocks) || {})[m.group] ? {"0.5": m.data.blocks[m.group]} : {})
+    : maps[m.kind] || {};
+  const level = m.kind === "blocks" ? "0.5" : m.level;
+  // from the picture's quietest area up (2nd percentile) to its 98th: a LoRA that changes the whole picture a little
+  // drew all of it yellow from zero; from the floor, what stands out is where it acts most
+  const norm = (g) => {
+    const vs = [...g.v].sort((a, b) => a - b);
+    const lo = vs[Math.floor(0.02 * (vs.length - 1))];
+    const hi = (vs[Math.floor(0.98 * (vs.length - 1))] - lo) || 1;
+    return g.v.map((x) => Math.max(0, x - lo) / hi);
+  };
+  const levels = level === "all" ? Object.keys(byLevel) : [level].filter((l) => byLevel[l]);
+  if (!levels.length) return null;
+  const g0 = byLevel[levels[0]], acc = new Array(g0.v.length).fill(0);
+  for (const l of levels) norm(byLevel[l]).forEach((x, j) => { acc[j] += x / levels.length; });
+  if (level === "all") {                        // the average back to 0-1
+    const vs = [...acc].sort((a, b) => a - b), hi = vs[Math.floor(0.98 * (vs.length - 1))] || 1;
+    return {w: g0.w, h: g0.h, v: acc.map((x) => x / hi)};
+  }
+  return {w: g0.w, h: g0.h, v: acc};
+}
+
+function stMapDraw() {
+  try { stMapDrawNow(); } catch (e) {          // never leave an old map on screen
+    $("stMapCanvas").style.display = "none";
+    stMapNote(`The map couldn't be drawn: ${e.message}`);
+  }
+}
+
+function stMapDrawNow() {
+  const m = S.st.map, img = $("stTweak"), cv = $("stMapCanvas");
+  if (!m || !m.kind || !m.data || m.data.gen !== S.st.shown || !img.naturalWidth) { cv.style.display = "none"; return; }
+  const g = stMapGrid();
+  if (!g) {
+    cv.style.display = "none";
+    stMapNote(m.kind === "blocks" ? "No block group to map: this LoRA touches none of them." :
+      m.kind === "tweak" ? "Nothing to show yet: move a slider, and when the Tweaked picture has rendered, the map appears here." :
+      m.kind === "attn" ? (m.data.trigger ? `"${m.data.trigger}" isn't in the prompt (or this model has no trigger map).` :
+        "Type the LoRA's trigger word: it isn't in the LoRA's own information.") : "No map for this one.");
+    return;
+  }
+  stMapNote("");                                 // the explanation sits under the buttons (stMapKindSay)
+  // the picture's box inside the pane (object-fit: contain)
+  const bw = img.clientWidth, bh = img.clientHeight, ar = img.naturalWidth / img.naturalHeight;
+  const w = Math.min(bw, bh * ar), h = w / ar, x0 = img.offsetLeft + (bw - w) / 2, y0 = img.offsetTop + (bh - h) / 2;
+  Object.assign(cv.style, {display: "", left: `${x0}px`, top: `${y0}px`, width: `${w}px`, height: `${h}px`});
+  const dpr = window.devicePixelRatio || 1, W = Math.max(1, Math.round(w * dpr)), H = Math.max(1, Math.round(h * dpr));
+  cv.width = W; cv.height = H;
+  const ctx = cv.getContext("2d");
+  ctx.drawImage(img, 0, 0, W, H);
+  const im = ctx.getImageData(0, 0, W, H), p = im.data;          // the picture grey and dimmed under the map
+  for (let j = 0; j < p.length; j += 4) { const y = 0.55 * (0.299 * p[j] + 0.587 * p[j + 1] + 0.114 * p[j + 2]); p[j] = p[j + 1] = p[j + 2] = y; }
+  ctx.putImageData(im, 0, 0);
+  const rgb = (name) => { const q = /(\d+)\D+(\d+)\D+(\d+)/.exec(themeColor(name)); return q ? [+q[1], +q[2], +q[3]] : [0, 0, 0]; };
+  const [c1, c2, c3] = [rgb("--pic-heat-1"), rgb("--pic-heat-2"), rgb("--pic-heat-3")];
+  const off = document.createElement("canvas");
+  off.width = g.w; off.height = g.h;
+  const oc = off.getContext("2d"), px = oc.createImageData(g.w, g.h);
+  for (let j = 0; j < g.v.length; j++) {
+    const f = Math.max(0, Math.min(1, g.v[j])), c = f < 0.5 ? c1 : f < 0.75 ? c2 : c3;
+    px.data.set([c[0], c[1], c[2], Math.round(255 * Math.min(1, (f < 0.25 ? 0 : 0.85) * m.op))], j * 4);
+  }
+  oc.putImageData(px, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(off, 0, 0, W, H);
+  $("stMapLegend").style.background = "linear-gradient(90deg, transparent 0 25%, var(--pic-heat-1) 25% 50%, " +
+    "var(--pic-heat-2) 50% 75%, var(--pic-heat-3) 75% 100%)";
+}
+
 async function studioMetrics() {
   const L = S.st.layout;
   if (!L || L.kind === "audio" || !S.st.shown) return;
@@ -6087,7 +6734,7 @@ async function studioMetrics() {
 function wireStudioMetrics() {
   const setRef = (p) => {
     try { const d = stSaved(); d.metricsRef = p || ""; localStorage.setItem(ST_KEY, JSON.stringify(d)); } catch (e) { /* private window */ }
-    studioMetricsShow(); studioMetrics();
+    studioMetricsShow(); studioMetrics(); studioMapsShow();
   };
   $("stMetRefPick").addEventListener("click", () => pick(stSaved().metricsRef || refStart(), false, setRef));
   $("stMetRefClear").addEventListener("click", () => setRef(""));
@@ -6192,7 +6839,7 @@ async function studioSetupApply(d, name) {        // a saved setup, or one read 
   if (S.st.layout && S.st.layout.kind === "video") studioSlots();
   S.st.region = w.region || null;
   studioEq("primary", false, false); studioEq("donor", false, false);
-  studioAceLayout(); studioAceRemember(); studioH3Remember(); stRemember(); studioMetricsShow(); studioNegRow();
+  studioAceLayout(); studioAceRemember(); studioH3Remember(); stRemember(); studioMetricsShow(); studioMapsShow(); studioNegRow();
   studioSync(); studioCommit();
   studioMixReset();
   S.st.pendingMix = w.mix || w.dmix ? w : null;          // the mix follows once its LoRAs are loaded
@@ -6529,13 +7176,33 @@ async function studioPresets() {
   const user = (await api("/api/studio/presets?family=" + encodeURIComponent(L.key)).catch(() => ({user: []}))).user;
   sel.innerHTML = "";
   sel.append(el("option", {value: "", text: "Presets…"}));
+  // every model's: the primary and the donor evenly, block by block (needs a donor loaded)
+  sel.append(el("option", {value: "x:even", text: "Primary + donor, 50/50", title: "Every block both LoRAs touch: " +
+    "each at 0.5. A block only one of them touches: that one at full strength. Needs a donor LoRA loaded."}));
   for (const p of L.presets) sel.append(el("option", {value: "b:" + p.name, text: p.name}));
   if (user.length) sel.append(el("optgroup", {label: "Your presets"}, ...user.map((n) => el("option", {value: "u:" + n, text: n}))));
 }
 
 async function studioPresetApply(v) {
   const L = S.st.layout;
-  if (v.startsWith("b:")) {
+  if (v === "x:even") {                          // Primary + donor, 50/50: each block by who touches it
+    if (!S.st.donor) {
+      $("stStatus").textContent = "Primary + donor, 50/50 needs a donor LoRA: load one under Donor first.";
+      $("stPreset").value = "";
+      return;
+    }
+    let both = 0, one = 0;
+    for (const [id, b] of Object.entries(S.st.blocks)) {
+      const p = S.st.primaryBlocks.has(id), d = S.st.donorBlocks.has(id);
+      if (!p && !d) continue;
+      const w = p && d ? 0.5 : 1;                // only one of them touches it: that one at full strength
+      if (p && !S.st.locks.has(id)) Object.assign(b, {pe: true, ps: w});
+      if (d && !S.st.dlocks.has(id)) Object.assign(b, {de: true, ds: w});
+      if (p && d) both++; else one++;
+    }
+    $("stStatus").textContent = `Primary + donor, 50/50: ${both} block(s) at 0.5 each, ${one} touched by one LoRA ` +
+      "at full strength" + (S.st.locks.size + S.st.dlocks.size ? "; locked sliders left alone." : ".");
+  } else if (v.startsWith("b:")) {
     const p = L.presets.find((x) => x.name === v.slice(2));
     for (const [id, b] of Object.entries(S.st.blocks)) {
       if (!S.st.dlocks.has(id)) Object.assign(b, {de: true, ds: 1});
@@ -6663,12 +7330,22 @@ function studioSchedule(live) {
 
 async function studioRender() {
   if (!$("stPrompt").value.trim()) { $("stStatus").textContent = "Enter a prompt (include the LoRA's trigger word) to see previews."; return; }
-  try { await api("/api/studio/render", {state: studioState(), ...studioExtra(), ...studioMixExtra()}); studioPoll(); }
+  // seed 0: random, rolled by Update / Start (studioStart) and kept while sliders and the other controls render, so
+  // a tweak is judged on the same picture; Baseline and Tweaked share it
+  const state = studioState();
+  if (state.seed === 0) {
+    if (!S.st.seedUsed) studioRollSeed();
+    state.seed = S.st.seedUsed;
+  }
+  try { await api("/api/studio/render", {state, ...studioExtra(), ...studioMixExtra()}); studioPoll(); }
   catch (e) { $("stStatus").textContent = e.message; }
 }
 
+function studioRollSeed() { S.st.seedUsed = 1 + Math.floor(Math.random() * (2 ** 31 - 2)); }
+
 async function studioStart() {
   stRemember();
+  if (seedOf("stSeed") === 0) studioRollSeed();      // Update with seed 0: a new random picture
   const L = S.st.layout;
   try {
     const st = await api("/api/studio/status");
@@ -6767,6 +7444,8 @@ async function studioPoll() {
       if (kind === "audio" && has) songLoad(w, q(w + "_media"), st.shown, st.act && st.act[w] ? q(w + "_act") : "");
     }
     studioMetrics();
+    S.st.same = !!st.same;
+    studioMapsAfterRender(S.st.same);
     studioDownloads(st, q);
     const ps = Number($("stPScale").value) || 1;
     $("stBaseCap").textContent = (ps === 1 ? "Baseline (LoRA at default 1.0)" : `Baseline (LoRA at ${ps})`) +
@@ -6802,7 +7481,7 @@ function studioDownloads(st, q) {
   row.style.display = on ? "" : "none";
   if (!on) return;
   const lora = ($("stPrimary").value.trim().split(/[\\/]/).pop() || "render").replace(/\.safetensors$/i, "");
-  const seed = ($("stSeed").value || "").trim();
+  const seed = String(seedOf("stSeed") === 0 && S.st.seedUsed ? S.st.seedUsed : ($("stSeed").value || "").trim());
   for (const [w, id, word] of [["baseline", "stDlBase", "original"], ["tweaked", "stDlTweak", "tweaked"]]) {
     const video = kind === "video" && st.media && st.media[w];
     const name = `${lora}_${word}${seed ? "_seed" + seed : ""}${video ? ".mp4" : ".png"}`;
@@ -7071,11 +7750,54 @@ const capItemFolder = (it) => it.path.slice(0, it.path.length - it.name.length -
 function capSettings() {
   return {trigger: $("capTrigger").value, model: $("capModel").value, task: $("capTask").value,
     tokens: $("capTokens").value, overwrite: $("capOverwrite").checked, songWords: $("capSongWords").value,
-    skipCjk: $("capSkipCjk").checked, perPage: $("capPerPage").value, concept: $("capConcept").value.trim()};
+    skipCjk: $("capSkipCjk").checked, perPage: $("capPerPage").value, concept: $("capConcept").value.trim(),
+    threshold: $("capThreshold").value, leaveOut: $("capLeaveOut").value, underscores: $("capUnderscores").checked,
+    extras: (S.capSaved || {}).extras || {}};
 }
 const saveCapSoon = debounce(() => { S.capSaved = capSettings(); api("/api/state", {captions: S.capSaved}).catch(() => {}); }, 600);
-const qwenOn = () => !!S.cap.opts && S.cap.opts.qwen_available && $("capModel").value === S.cap.opts.qwen_model;
-const qwenTask = () => (S.cap.opts.qwen_tasks || []).find((t) => t.label === $("capTask").value);
+// the chosen captioner's description (fizgig/captioners/registry.py), and whether it follows an instruction
+const capDesc = () => ((S.cap.opts && S.cap.opts.captioners) || []).find((c) => c.label === $("capModel").value);
+const qwenOn = () => !!(capDesc() || {}).instruction;
+const qwenTask = () => (S.cap.opts.instruction_tasks || []).find((t) => t.label === $("capTask").value);
+// the chosen captioner's own caption type (JoyCaption's Straightforward...), when one is picked in the task menu
+const capType = () => ((capDesc() || {}).prompt_types || []).find((t) => t[0] === $("capTask").value);
+
+// a caption type's text at the chosen length: "any", a word ("long") or a word count ("120")
+function capTypeText(t, length) {
+  if (!length || length === "any") return t[1];
+  return /^\d+$/.test(length) ? t[2].split("{word_count}").join(length) : t[3].split("{length}").join(length);
+}
+
+// the ticked extra options' sentences; {name} is the trigger word, and that sentence goes when there is none
+function capExtrasText() {
+  const d = capDesc() || {}, trig = $("capTrigger").value.trim().replace(/,+$/, "").trim();
+  const ticked = (d.prompt_extras || []).filter((x, i) => { const b = $("capExtra" + i); return b && b.checked; })
+    .filter((x) => !x.text.includes("{name}") || trig).map((x) => x.text.split("{name}").join(trig));
+  return capOwnText().concat(ticked).join(" ");        // your own first, straight after the main instruction
+}
+
+// the user's own extra instructions, straight after the main instruction (before the ticked ones): as typed, a full stop added when the last has none so it
+// can't run into what follows
+function capOwnText() {
+  const b = $("capExtraOwn");
+  if (!b || !((capDesc() || {}).prompt_extras || []).length) return [];
+  const t = b.value.replace(/\s+/g, " ").trim();
+  return t ? [/[.!?]["'\u201d)]?$/.test(t) ? t : t + "."] : [];
+}
+
+// what the captioner is told: Fizgig's task instruction (or its own caption type at the chosen length), then the ticks
+function capInstruction() {
+  const t = qwenOn() && qwenTask(), ty = capType();
+  const base = ty ? capTypeText(ty, $("capLength").value)
+    : t ? t.instruction.split("{concept}").join($("capConcept").value.trim() || "the same concept") : "";
+  return [base, capExtrasText()].filter(Boolean).join(" ");
+}
+
+function capSentShow() {                         // the line under the ticks: exactly what will be sent
+  const d = capDesc() || {};
+  if (!(d.prompt_extras || []).length) return;
+  $("capSent").textContent = "It's told: " + capInstruction();
+}
 
 async function loadCaptionOptions() {
   const o = S.cap.opts = await api("/api/captions/options?family=" + encodeURIComponent(S.family));
@@ -7084,7 +7806,7 @@ async function loadCaptionOptions() {
   model.innerHTML = "";
   for (const m of o.models) model.append(el("option", {value: m, text: m}));
   model.value = o.models.includes(saved.model) ? saved.model : o.default_model;
-  $("capModelHint").textContent = o.secondary ?
+  S.cap.hint = o.secondary ?
     `Qwen3-VL captions with your secondary captioning model (${o.secondary}, set in Preferences), following an ` +
     "instruction you can edit. Empty that row in Preferences to caption with the Krea 2 text encoder again. " +
     "Florence-2 downloads itself the first time." : o.qwen_available ?
@@ -7099,6 +7821,9 @@ async function loadCaptionOptions() {
   fillTasks(saved.task);
   if (saved.tokens) $("capTokens").value = saved.tokens;
   if (saved.concept !== undefined) $("capConcept").value = saved.concept;
+  if (saved.threshold) $("capThreshold").value = saved.threshold;
+  if (saved.leaveOut !== undefined) $("capLeaveOut").value = saved.leaveOut;
+  if (saved.underscores !== undefined) $("capUnderscores").checked = saved.underscores;
   capConceptShow();
   $("capSongCard").style.display = o.song_words ? "" : "none";
   // a model that trains on no pictures or clips (ACE-Step): the AI card has nothing to caption, the song card does
@@ -7109,15 +7834,77 @@ async function loadCaptionOptions() {
   $("capModelHint").style.display = pictures ? "" : "none";
   if (!pictures) $("capInstrBox").style.display = "none";
   $("capTaskHint").style.display = pictures && qwenOn() ? "" : "none";       // fillTasks ran while the row was hidden
+  capKindRows();
   if (o.song_words) { $("capSongWords").placeholder = "e.g. " + o.song_words; $("capSongWords").value = saved.songWords || ""; }
+}
+
+// the rows the chosen captioner uses: a task menu when it has one (or follows an instruction), Max tokens for
+// sentences, the tag rows (threshold, left-out tags, underscores) for a tagger; its own hint when it has one
+function capKindRows() {
+  const o = S.cap.opts, d = capDesc() || {kind: "sentences", tasks: []};
+  const media = (S.fam && S.fam.media) || ["photo"];
+  const pictures = media.includes("photo") || media.includes("clip");
+  const show = (id, on) => { $(id).closest(".field-row").style.display = pictures && on ? "" : "none"; };
+  show("capTask", d.instruction || d.tasks.length);
+  show("capTokens", d.kind !== "tags");
+  $("capTagRows").style.display = pictures && d.kind === "tags" ? "" : "none";
+  $("capModelHint").textContent = d.hint || S.cap.hint || "";
+  if (o && !qwenOn()) $("capTaskHint").style.display = "none";
+  capOwnRows();
+}
+
+// the captioner's Length menu and extra-option ticks (remembered per captioner), shown when it has them
+function capExtrasFill() {
+  const d = capDesc() || {}, saved = ((S.capSaved || {}).extras || {})[d.key] || {};
+  const lengths = d.prompt_lengths || [];
+  $("capLength").innerHTML = "";
+  for (const l of lengths) $("capLength").append(el("option", {value: l, text: l}));
+  $("capLength").value = lengths.includes(saved.length) ? saved.length : (d.default_length || lengths[0] || "");
+  $("capExtraOwn").value = saved.own || "";
+  const box = $("capExtras");
+  box.innerHTML = "";
+  (d.prompt_extras || []).forEach((x, i) => {
+    const b = el("input", {type: "checkbox", id: "capExtra" + i});
+    b.checked = saved.ticks ? saved.ticks.includes(x.label) : x.on;
+    b.addEventListener("change", () => { capExtrasSave(); capSentShow(); });
+    box.append(el("label", {class: "checkbox-label", title: x.text}, [b, " " + x.label]));
+  });
+  capOwnRows();
+}
+
+function capExtrasSave() {
+  const d = capDesc();
+  if (!d || !(d.prompt_extras || []).length) return;
+  const ticks = d.prompt_extras.filter((x, i) => $("capExtra" + i).checked).map((x) => x.label);
+  S.capSaved = S.capSaved || {};
+  S.capSaved.extras = {...(S.capSaved.extras || {}),
+    [d.key]: {ticks, length: $("capLength").value, own: $("capExtraOwn").value}};
+  saveCapSoon();
+}
+
+function capOwnRows() {                          // Length with the captioner's own types; the ticks with any task
+  const d = capDesc() || {}, on = $("capTask").closest(".field-row").style.display !== "none";
+  $("capLengthRow").style.display = on && capType() ? "" : "none";
+  $("capExtrasBox").style.display = on && (d.prompt_extras || []).length ? "" : "none";
+  // its own types aren't edited in place: Edit instructions copies one into Custom... to change it
+  $("capEditInstr").textContent = capType() ? "Edit as Custom…" : "Edit instructions…";
+  capSentShow();
 }
 
 function fillTasks(want) {
   const o = S.cap.opts, task = $("capTask");
   task.innerHTML = "";
-  const labels = qwenOn() ? o.qwen_tasks.map((t) => t.label) : o.florence_tasks;
+  const d = capDesc() || {tasks: [], default_task: ""};
+  const labels = qwenOn() ? o.instruction_tasks.map((t) => t.label) : d.tasks;
   for (const l of labels) task.append(el("option", {value: l, text: l}));
-  task.value = labels.includes(want) ? want : (qwenOn() ? o.default_qwen_task : "<DETAILED_CAPTION>");
+  const own = (d.prompt_types || []).map((t) => t[0]);       // the captioner's own types, under a divider
+  if (own.length) {
+    const g = el("optgroup", {label: `${d.label}'s own`});
+    for (const l of own) g.append(el("option", {value: l, text: l}));
+    task.append(g);
+  }
+  task.value = labels.concat(own).includes(want) ? want : (qwenOn() ? o.default_instruction_task : d.default_task);
+  capExtrasFill();
   $("capEditInstr").style.display = qwenOn() ? "" : "none";
   $("capTaskHint").style.display = qwenOn() && $("capTask").closest(".field-row").style.display !== "none" ? "" : "none";
   $("capInstrBox").style.display = "none";
@@ -7130,10 +7917,16 @@ function capConceptShow() {
   for (const id of ["capConceptRow", "capConceptHint"]) $(id).style.display = on ? "" : "none";
 }
 
+const CAP_LENGTH_TOKENS = {"any": 300, "very short": 60, "short": 120, "medium-length": 200, "long": 300, "very long": 400};
+
 function onCapTask() {
   capConceptShow();
-  const t = qwenOn() && qwenTask();
-  if (t) $("capTokens").value = t.tokens;            // each Qwen task suggests its own length
+  capOwnRows();
+  const t = qwenOn() && qwenTask(), ty = capType();
+  if (ty) {                                        // its own type: room for the length asked for
+    const l = $("capLength").value;
+    $("capTokens").value = /^\d+$/.test(l) ? Number(l) * 2 + 40 : CAP_LENGTH_TOKENS[l] || 300;
+  } else if (t) $("capTokens").value = t.tokens;     // each Qwen task suggests its own length
   if ($("capInstrBox").style.display !== "none") openInstr();
   saveCapSoon();
 }
@@ -7166,10 +7959,11 @@ const capExt = () => {                    // Training > Other Options > Caption 
 };
 
 function capJobBody(extra = {}) {
-  const t = qwenOn() && qwenTask();
   return {family: S.family, folder: capFolder(), model: $("capModel").value, task: $("capTask").value, ext: capExt(),
-    instruction: t ? t.instruction.split("{concept}").join($("capConcept").value.trim() || "the same concept") : "",
+    instruction: capInstruction(),
     max_tokens: Number($("capTokens").value) || 120,
+    threshold: Number($("capThreshold").value) || 0.35, leave_out: $("capLeaveOut").value,
+    underscores: $("capUnderscores").checked,
     trigger: $("capTrigger").value, overwrite: $("capOverwrite").checked, ...extra};
 }
 
@@ -7442,12 +8236,13 @@ function wireCaptions() {
     S.values.DATASET_CAPTION_EXT = $("captionExt").value.trim() || ".txt";
     syncInputs(["DATASET_CAPTION_EXT"]); saveStateSoon(); loadCaptions();
   });
-  $("capModel").addEventListener("change", () => { fillTasks(); onCapTask(); });
+  $("capModel").addEventListener("change", () => { fillTasks(); onCapTask(); capKindRows(); });
   $("capPerPage").addEventListener("change", () => {
     CAP_PAGE = Number($("capPerPage").value) || 12; S.cap.page = 0; renderCaptions(); saveCapSoon(); });
   $("capTask").addEventListener("change", onCapTask);
   $("capConcept").addEventListener("input", saveCapSoon);
-  for (const id of ["capTrigger", "capTokens", "capOverwrite", "capSongWords", "capSkipCjk"])
+  for (const id of ["capTrigger", "capTokens", "capOverwrite", "capSongWords", "capSkipCjk", "capThreshold", "capLeaveOut",
+                    "capUnderscores"])
     $(id).addEventListener("change", saveCapSoon);
   // a trigger word typed here fills auto-recaption's on the Training tab (an empty one leaves it alone)
   $("capTrigger").addEventListener("input", () => {
@@ -7457,8 +8252,22 @@ function wireCaptions() {
     saveTriggerSoon($("capTrigger").value.trim());
     saveStateSoon();
   });
-  $("capEditInstr").addEventListener("click", () =>
-    $("capInstrBox").style.display === "none" ? openInstr() : ($("capInstrBox").style.display = "none"));
+  $("capEditInstr").addEventListener("click", async () => {
+    const ty = capType();
+    if (ty) {                                      // its own type: copied into Custom..., which is editable
+      await api("/api/captions/instruction", {key: "custom", text: capTypeText(ty, $("capLength").value)});
+      await loadCaptionOptions();
+      $("capTask").value = (S.cap.opts.instruction_tasks.find((t) => t.key === "custom") || {}).label || $("capTask").value;
+      onCapTask();
+      openInstr();
+      return;
+    }
+    $("capInstrBox").style.display === "none" ? openInstr() : ($("capInstrBox").style.display = "none");
+  });
+  $("capLength").addEventListener("change", () => { capExtrasSave(); onCapTask(); });
+  $("capTrigger").addEventListener("input", capSentShow);
+  $("capExtraOwn").addEventListener("input", () => { capSentShow(); capExtrasSave(); });
+  $("capConcept").addEventListener("input", capSentShow);
   $("capInstrSave").addEventListener("click", () => saveInstr($("capInstr").value));
   $("capInstrReset").addEventListener("click", () => saveInstr(""));
   $("capAll").addEventListener("click", () => capRun("/api/captions/ai", capJobBody()));
@@ -8871,6 +9680,12 @@ function tabsMenu(open) {
 
 function showTab(name) {
   if (name !== "prep" && S.me && S.me.dirty) meSave();      // leaving Image Prep saves the mask being edited
+  // each tab keeps its own scroll place: back on Training, the loss chart is where you left it (the tabs share one
+  // scrolling pane; a phone scrolls the page itself). Read before anything below scrolls (the tab button's
+  // scrollIntoView can move a phone's page)
+  const pane = document.querySelector(".notebook-pane"), was = document.querySelector(".tab-panel.active");
+  S.tabScroll = S.tabScroll || {};
+  if (was && was.id !== "tab-" + name) S.tabScroll[was.id] = [pane ? pane.scrollTop : 0, window.scrollY];
   const tb = document.querySelector(`.tab-item[data-tab="${name}"] span`);
   if (tb) $("tabsToggleName").textContent = tb.textContent;
   tabsMenu(false);
@@ -8879,6 +9694,23 @@ function showTab(name) {
     if (b.dataset.tab === name) b.scrollIntoView({block: "nearest", inline: "nearest"});
   });
   document.querySelectorAll(".tab-panel").forEach((p) => p.classList.toggle("active", p.id === "tab-" + name));
+  if (!was || was.id !== "tab-" + name) {
+    const [py, wy] = S.tabScroll["tab-" + name] || [0, 0];
+    const put = () => { if (pane) pane.scrollTop = py; window.scrollTo(0, wy); };
+    // a tab that fills in as it opens (the gallery, the charts) may be too short for the place at first: tried again as
+    // it grows, for up to ~2.5 s, until it's there - and never once you've scrolled, or left the tab
+    const now = () => [pane ? pane.scrollTop : 0, window.scrollY];
+    put();
+    let at = now();
+    const again = (left) => setTimeout(() => {
+      const [p, w] = now();
+      if (p !== at[0] || w !== at[1] || !$("tab-" + name).classList.contains("active")) return;
+      if (Math.abs(p - py) < 2 && Math.abs(w - wy) < 2) return;
+      put(); at = now();
+      if (left > 1) again(left - 1);
+    }, 250);
+    again(10);
+  }
   if (name === "captions") loadCaptions();
   if (name === "prep") loadPrep();
   if (name === "studio") studioOpen();
@@ -9400,6 +10232,14 @@ function wire() {
   wireStudio();
   wirePrep();
   $("presetSave").addEventListener("click", presetSaveOpen);
+  $("btnTrainMaps").addEventListener("click", async () => {      // the same view as Runs & outputs, for the run going now
+    const box = $("runTrainMaps"), id = S.run && S.run.history_id;
+    if (!id) return;
+    if (box.style.display !== "none") { box.style.display = "none"; return; }
+    box.style.display = ""; box.textContent = "Loading…";
+    try { const load = trainMapsLoad(id); trainMapsPanel(box, await load(), {...S.run, id}, load); }
+    catch (e) { box.replaceChildren(el("div", {class: "problems", text: e.message})); }
+  });
   $("btnImageLoss").addEventListener("click", async () => {      // the same view as Runs & outputs, for the run going now
     const box = $("runImageLoss"), id = S.run && S.run.history_id;
     if (!id || $("btnImageLoss").classList.contains("is-off")) return;
@@ -9416,7 +10256,7 @@ function wire() {
   document.querySelectorAll("[data-close]").forEach((b) =>
     b.addEventListener("click", () => $(b.dataset.close).classList.remove("active")));
   for (const sel of document.querySelectorAll(".family-pick"))
-    sel.addEventListener("change", (e) => chooseFamily(e.target.value));
+    sel.addEventListener("change", (e) => chooseFamily(e.target.value, true));
   const folder = $("imageFolder");
   const setFolder = () => {
     const was = S.imageFolder;
@@ -9662,10 +10502,23 @@ const THEMES = [{key: "", swatch: "fizgig", name: "Fizgig", say: "dark, blue"},
   {key: "light-orange", swatch: "light-orange", name: "Light n’ Orange", say: "white, orange"},
   {key: "seventies", swatch: "seventies", name: "Seventies", say: "brown, orange"},
   {key: "synthwave", swatch: "synthwave", name: "Synthwave", say: "purple, pink"},
+  {key: "cosmic-pigeon", swatch: "cosmic-pigeon", name: "Cosmic Pigeon", say: "space, nebula purple"},
+  {key: "deep-space", swatch: "deep-space", name: "Deep Space", say: "near-black, nebula"},
   {key: "graphite", swatch: "graphite", name: "Graphite", say: "grey, teal"},
   {key: "colour-safe", swatch: "colour-safe", name: "Colour-blind safe", say: "red-green colour blindness: no red against green"},
   {key: "high-contrast", swatch: "high-contrast", name: "High contrast", say: "low vision: black, white, yellow"},
   {key: "dim", swatch: "dim", name: "Dim", say: "light sensitivity, migraine: low glare, soft warm greys"}];
+// the themed bar effects run on the page clock: a bar the status poll has just rebuilt picks up the same phase
+// (its animations start now, so a delay of minus the page time puts them where the old bar was)
+const FX_BARS = ".run-bar > span, .meter-bar > span, .fetch-bar > div";
+function fxSync(root) {
+  const t = -(document.timeline ? document.timeline.currentTime : performance.now()) + "ms";
+  if (root.matches && root.matches(FX_BARS)) root.style.setProperty("--fx-d", t);
+  if (root.querySelectorAll) for (const n of root.querySelectorAll(FX_BARS)) n.style.setProperty("--fx-d", t);
+}
+new MutationObserver((list) => { for (const m of list) for (const n of m.addedNodes) if (n.nodeType === 1) fxSync(n); })
+  .observe(document.documentElement, {childList: true, subtree: true});
+fxSync(document.documentElement);
 function applyTheme(key) {
   if (key) document.documentElement.dataset.theme = key;
   else delete document.documentElement.dataset.theme;

@@ -281,6 +281,9 @@ class FamilyOption:
     # with the tick ":N", after it the higher value with every Nth epoch at the lower; `slide_hint` replaces the hint
     slide: tuple = ()
     slide_hint: str = ""
+    # (note, value): a bracketed line above the Slide hint naming other known-good numbers, with "click here to try
+    # them", which puts `value` into the boxes. () = none
+    slide_alt: tuple = ()
     single: str = ""                  # Single's value to start with when the default is a Split or Slide value
 
     def choice_labels(self):
@@ -370,6 +373,9 @@ class FamilyDescription:
     prefs_note: str = ""
     fetch_note: str = ""
     fetch_optional_label: str = ""
+    # (label, url): one small link under the family's Download button in Preferences, opening the model's licence in a
+    # new tab. A link only - the licence's text and terms live in the family's guide (docs/drivers/CHECKLIST.md)
+    licence_link: tuple = ()
     # the "new model files" popup's opening line (the files themselves: ModelFile.announce)
     announce_intro: str = ""
 
@@ -557,6 +563,13 @@ class FamilyDescription:
     adaptive_lr_clip_signal: bool = False
     adaptive_lr: bool = True          # the Adaptive LR control (off: hidden, never sent - MiniMax H3)
     loss_watch: bool = True           # the per-image loss watch toggles (off: hidden, never sent - MiniMax H3)
+    # Training maps (training/train_maps.py): where a few fixed pictures are still wrong and where the LoRA acts, each
+    # epoch - through the driver's noise_latents / predict / map_target, stills (4-D latents) only
+    training_maps: bool = True
+    # ... plus the trigger word's attention map (training/attn_probe.py): the model calls attn_probe.layout / see in
+    # its forward and attention, and its driver says where the trigger sits in its text (driver.trigger_text).
+    # An experiment, on a few families first
+    trigger_attention: bool = False
     # Abilities this family leaves out, each with its reason: {field name: why}. checks/test_family_abilities.py
     # fails when a picture family lacks an ability most picture families have (masked training, sliders, fine-tune,
     # Reuse unchanged blocks, INT8 attention, Adaptive LR, the loss watch, caption dropout, batching, Detail crops, Start at
@@ -565,6 +578,10 @@ class FamilyDescription:
     # masked training (fizgig/dataset/masks.py): the driver's training_loss takes loss_mask; opt in, so a family added
     # later never gets a tick its driver can't honour
     masked_training: bool = False
+    # Element boost (an experiment, the loss weight of one part of each still early in a run; masks.face_box /
+    # element_map): tuned on MOSS-Image only, so only a family that opts in shows it (Peter, 10 Nov 2026). Needs
+    # masked_training too (the driver's training_loss takes loss_mask)
+    element_boost: bool = False
     # see-through pictures (an RGBA VAE: Qwen Image 2.1): the latent cache keeps a picture's alpha when some of it is
     # transparent, and the driver's decode returns RGBA when the render is; off: the alpha is dropped, as for RGB VAEs
     rgba: bool = False

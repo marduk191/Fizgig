@@ -329,8 +329,8 @@ def start_checks(desc, st, image_folder):
         if lack:
             out.append(f"{len(lack)} detail crop caption{'s' if len(lack) != 1 else ''} in {rel} don't contain the "
                        f"trigger word '{trig}': those crops train without it.")
-    if (not st.get("ADAPTIVE_LR") and "automagic" not in _s(st.get("OPTIMIZER_TYPE")).lower()
-            and not (prodigy(st) and not ft_on(desc, st))):           # Prodigy's 1.0 is a multiplier
+    if (not st.get("ADAPTIVE_LR") and (ft_on(desc, st) or not (automagic(st) or prodigy(st)))):
+        # Automagic sets its own rate, Prodigy's 1.0 is a multiplier; a fine-tune trains at the box's rate
         kind = "finetune" if ft_on(desc, st) else "slider" if slider_on(desc, st) else "lora"
         band = next(((lo, hi) for k, lo, hi in (desc.start_lr_bands or ()) if k == kind), None)
         try:
@@ -888,6 +888,9 @@ def train_command(desc, inputs, plan):
         cmd += ["--masked_training", "--mask_floor", f"{mask_floor(st):g}"]
         if mask_prior(desc, st) and batch_size(desc, st) <= 1:
             cmd += ["--mask_prior", f"{mask_prior(desc, st):g}"]
+    if face_weight(desc, st) is not None:
+        cmd += ["--face_weight", f"{face_weight(desc, st):g}", "--face_area", dict(FACE_AREA_KEYS).get(str(st.get("FACE_BOOST_AREA") or ""), "head"),
+                "--face_cycle", f"{FACE_CYCLE[0]}:{FACE_CYCLE[1]}", "--face_until", f"{FACE_STOP[0]}:{FACE_STOP[1]}"]
     if dop_on(desc, st) or mp_subs:
         trig, cls = dop_rules(st)
         if mp_subs:          # the captions are read fused: DOP swaps "zwxemwoman" for "a woman"
@@ -947,6 +950,8 @@ def train_command(desc, inputs, plan):
         if cont.get("checkpoint"):
             cmd += ["--ft_start_window", str(int(cont.get("start_window", 0))),
                     "--ft_epochs_done", str(int(cont.get("epochs_done", 0)))]
+    if st.get("TRAINING_MAPS") and desc.training_maps:     # training/train_maps.py: the Samples tab's Training maps
+        cmd += ["--training_maps"]
     # per-image loss watch (families/loss_watch.py): at any Batch size, a batch's pictures weighed and recorded
     # one by one
     lw = (st.get("loss_watch") or {}) if desc.loss_watch else {}
@@ -987,9 +992,14 @@ def train_command(desc, inputs, plan):
         ema = str(st.get("FAMILY_EMA", "") or desc.ema_default).split(" ")[0]
         if ema != "Off":
             cmd += ["--ema_decay", ema]
-    if str(st.get("OPTIMIZER_TYPE", "") or "").strip():
+    if ft_on(desc, st):                    # a fine-tune: its optimizer or Adafactor (optimizers.ft_optimizer, #312)
+        from fizgig.training.optimizers import ft_optimizer
+        cmd += ["--optimizer_type", ft_optimizer(st.get("OPTIMIZER_TYPE"))]
+    elif str(st.get("OPTIMIZER_TYPE", "") or "").strip():
         cmd += ["--optimizer_type", str(st["OPTIMIZER_TYPE"]).strip()]
-    if str(st.get("OPTIMIZER_ARGS", "") or "").strip():
+    if ft_on(desc, st):                    # its optimizers take no args here
+        pass
+    elif str(st.get("OPTIMIZER_ARGS", "") or "").strip():
         cmd += ["--optimizer_args", str(st["OPTIMIZER_ARGS"]).strip()]
     for key, flag in (("METADATA_TITLE", "--metadata_title"), ("METADATA_AUTHOR", "--metadata_author"),
                       ("METADATA_DESCRIPTION", "--metadata_description"),
@@ -1400,10 +1410,14 @@ def dataset_toml(desc, inputs, cache_suffix=""):
         _fuse(f)
         if root:
             lines.append(f'cache_directory = "{(cache_dir_for(root, f) + cache_suffix).replace(chr(92), "/")}"')
+    _subj = [_s(inputs.get("image_folder"))] + extra
     for f, (_s_, w) in mp.items():        # multi-person mode: each person's composites, already captioned fused
         if _s_["kind"] != "person":
             continue
-        lines += ["", "[[datasets]]", f'image_directory = "{w.replace(chr(92), "/")}"']
+        # keyed mp<n>: by subject - every subject's composites share file names (fizgig_mp_00..), so without it two
+        # subjects' pictures were one key, and nothing could find them (they live in the cache, not a training folder)
+        n = next((i + 1 for i, g in enumerate(_subj) if g == f), 1)
+        lines += ["", "[[datasets]]", f'image_directory = "{w.replace(chr(92), "/")}"', f'item_prefix = "mp{n}:"']
         if root:
             lines.append(f'cache_directory = "{(cache_dir_for(root, w) + cache_suffix).replace(chr(92), "/")}"')
     reg = ft_reg_dir(desc, inputs)
@@ -1515,6 +1529,29 @@ def mask_prior(desc, st):
         return max(0.0, float(str(st.get("MASK_PRIOR") or "Off").split()[0]))
     except ValueError:
         return 0.0
+
+
+# Boost the face (one tick, an experiment): the head (face and hair) at x9 in the loss, 3 boosted stretches then 1
+# normal, for the first 12 epochs or 600 steps, whichever is sooner - Peter's pick from the 10 Nov 2026 pixie runs
+FACE_BOOST = 9.0
+FACE_CYCLE = (3, 1)
+FACE_STOP = (12, 600)
+# What it boosts: --face_area. Face and hair / Face only: the face detector's oval; the rest: the Make masks
+# picker's person-finder kinds (their labels as on the masks card), its "Just the face and hair" left out
+FACE_AREA_KEYS = (("Face and hair", "head"), ("Face only", "face"), ("The person (hair to clothes)", "person"),
+                  ("The person, not their clothes", "no_clothes"),
+                  ("The body and clothes, not the face or hair", "body_clothes"),
+                  ("The body's skin, not the face, hair or clothes", "body"), ("Just the clothes", "clothes"),
+                  ("Everything but the faces", "not_faces"), ("Just the background, not the people", "background"))
+FACE_AREAS = tuple(k[0] for k in FACE_AREA_KEYS)
+
+
+def face_weight(desc, st):
+    """Boost the face: the face weight when ticked, else None. Stills of a family with masked training, not a
+    prompt slider (no photos)."""
+    if not (st.get("FACE_BOOST") and desc.element_boost and desc.masked_training) or slider_on(desc, st, "prompts"):
+        return None
+    return FACE_BOOST
 
 
 def mask_folders(desc, st):

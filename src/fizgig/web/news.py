@@ -5,6 +5,112 @@ _ARTICLE = "https://github.com/shootthesound/Fizgig/blob/master/docs/NEWS.md"
 
 NEWS = [
     {
+        "date": "11 Nov 2026",
+        "title": "Training suddenly slow on Windows? Turn off Sysmem Fallback",
+        "body": (
+            "If training is suddenly several times slower, especially after a driver or Windows update, NVIDIA's driver "
+            "is probably spilling part of the run into system RAM.\n\n"
+            "NVIDIA Control Panel > Manage 3D settings > Global Settings: set CUDA - Sysmem Fallback Policy to Prefer No "
+            "Sysmem Fallback, Apply, and restart Fizgig. Use Global Settings, not Program Settings."
+        ),
+        "links": [{"text": "Read more", "href": _ARTICLE + "#11-nov-2026-training-suddenly-slow-on-windows-turn-off-sysmem-fallback"},
+                  {"text": "Release notes", "href": "https://github.com/shootthesound/Fizgig/releases/tag/v9.6.3"}],
+    },
+    {
+        "date": "11 Nov 2026",
+        "title": "MiniMax H3 Image presets start at 2.8e-4",
+        "body": (
+            "Based on early user feedback, MiniMax H3 Image's presets now start Automagic v3 at 2.8e-4 (was 2e-4): better "
+            "previews at the presets' 0.5 MP. Load a preset to pick it up.\n\n"
+            "Element boost works best on pictures of 1 MP or more where the boosted part is small in the frame; on small "
+            "pictures it can teach the LoRA pixelation."
+        ),
+        "links": [{"text": "Read more", "href": _ARTICLE + "#11-nov-2026-minimax-h3-image-presets-start-at-28e-4"},
+                  {"text": "Release notes", "href": "https://github.com/shootthesound/Fizgig/releases/tag/v9.6.2"}],
+    },
+    {
+        "date": "11 Nov 2026",
+        "title": "MiniMax H3 Image presets, and Element boost to try",
+        "body": (
+            "MiniMax H3 Image's presets now train at 0.5 MP and start Automagic v3 at 2e-4: the model seems to prefer "
+            "0.5 MP or more, and Automagic was climbing to about 1.8e-4 from a 1e-4 start anyway. Load a preset to pick "
+            "these up.\n\n"
+            "Element boost is on H3 Image too, under Training Parameters, off in every preset: tick On to try it."
+        ),
+        "links": [{"text": "Read more", "href": _ARTICLE + "#11-nov-2026-minimax-h3-image-presets-and-element-boost-to-try"},
+                  {"text": "Release notes", "href": "https://github.com/shootthesound/Fizgig/releases/tag/v9.6.1"}],
+    },
+    {
+        "date": "11 Nov 2026",
+        "title": "MiniMax H3 Image, and out-of-memory recovery",
+        "body": (
+            "A new model, MiniMax H3 Image: train LoRAs, LoKRs, edit LoRAs and slider LoRAs from photo pairs, with "
+            "Fizgig's training adapter on by default for photographic skin and likeness. Press Download models for me "
+            "in Preferences.\n\n"
+            "For every model: a run that runs out of memory carries on by itself where it can, and a failed run no "
+            "longer holds the queue (from @Murf-Code's Fizgig Advanced). AMD installs use AMD's stable PyTorch "
+            "(thanks @scryptio)."
+        ),
+        "links": [{"text": "Read more", "href": _ARTICLE + "#11-nov-2026-minimax-h3-image-and-out-of-memory-recovery"},
+                  {"text": "Release notes", "href": "https://github.com/shootthesound/Fizgig/releases/tag/v9.6.0"}],
+    },
+    {
+        "date": "10 Nov 2026",
+        "title": "Element boost, and new MOSS-Image settings",
+        "body": (
+            "Element boost for MOSS-Image, under Training Parameters: early in a run, the face and hair (or another part you pick) "
+            "count much more than the rest, so likeness comes in faster. It works with or without masks, and it's on "
+            "in MOSS-Image's Fast, Standard and Turbo Train presets.\n\n"
+            "MOSS-Image's Clean-end share now starts at 11 (11:7:40:8:3): with Muon the sweet spot moved, and it was "
+            "tuned with Element boost on. Load a preset to pick it up."
+        ),
+        "links": [{"text": "Read more", "href": _ARTICLE + "#10-nov-2026-element-boost-and-new-moss-image-settings"},
+                  {"text": "Release notes", "href": "https://github.com/shootthesound/Fizgig/releases/tag/v9.5.1"}],
+    },
+    {
+        "date": "10 Nov 2026",
+        "title": "JoyCaption and booru tags on the Captions tab",
+        "body": (
+            "Two new captioners. JoyCaption Beta One writes detailed training captions, is good with people, mirrors "
+            "and every style, and follows the same instructions as Qwen3-VL, plus its own caption types and extra "
+            "options to tick. The WD EVA02 tagger writes booru tags for anime and illustration, as Anima and anime "
+            "SDXL models were trained on.\n\n"
+            "Each downloads itself the first time you use it, or ahead from Preferences' new Captioning models card. "
+            "Auto-recaption still uses Qwen3-VL, and training is unchanged."
+        ),
+        "links": [{"text": "Read more", "href": _ARTICLE + "#10-nov-2026-joycaption-and-booru-tags-on-the-captions-tab"},
+                  {"text": "Release notes", "href": "https://github.com/shootthesound/Fizgig/releases/tag/v9.5.0"}],
+    },
+    {
+        "date": "9 Nov 2026",
+        "title": "Maps in Studio, for any LoRA",
+        "body": (
+            "Studio can now draw heatmaps over its preview for any LoRA, one you didn't train included: where the LoRA "
+            "acts, what your slider changes do, where the trigger word's attention goes, and where each group of its "
+            "blocks acts. Pick a map under the preview.\n\n"
+            "Also two new themes from @Murf-Code, Cosmic Pigeon and Deep Space, under Preferences."
+        ),
+        "links": [{"text": "Read more", "href": _ARTICLE + "#9-nov-2026-maps-in-studio-for-any-lora"},
+                  {"text": "Studio guide", "href": "https://github.com/shootthesound/Fizgig/blob/master/docs/STUDIO.md#maps"},
+                  {"text": "Release notes", "href": "https://github.com/shootthesound/Fizgig/releases/tag/v9.4.0"}],
+    },
+    {
+        "date": "9 Nov 2026",
+        "title": "Training maps, and a much faster compile warm-up",
+        "body": (
+            "See what training does to your pictures, epoch by epoch. Tick Training maps under Training Parameters, "
+            "and the Training maps button on the run card shows three of your pictures with a heatmap over each: "
+            "what the LoRA has learned, what it hasn't yet, and where it's changing things it shouldn't, like the "
+            "background or clothes. On every still-picture model except SDXL, a fourth map shows where your trigger "
+            "word's attention goes.\n\n"
+            "Compiled runs reach full speed much sooner, most of all with Leave the rest of the model alone or Fizgig "
+            "LoRA Isolation. Full fine-tunes now train with the optimizer you pick, Adafactor by default."
+        ),
+        "links": [{"text": "Read more", "href": _ARTICLE + "#9-nov-2026-training-maps-and-a-much-faster-compile-warm-up"},
+                  {"text": "Training maps guide", "href": "https://github.com/shootthesound/Fizgig/blob/master/docs/TRAINING_MAPS.md"},
+                  {"text": "Release notes", "href": "https://github.com/shootthesound/Fizgig/releases/tag/v9.3.0"}],
+    },
+    {
         "date": "8 Nov 2026",
         "title": "Faster MOSS-Image training and previews, faster training on every model, and a faster Studio",
         "body": (

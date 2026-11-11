@@ -34,7 +34,7 @@ from urllib.parse import parse_qs, urlparse
 from fizgig.dataset.masks import is_mask_file, mask_for_stem
 from fizgig.families import form, launch
 from fizgig.families.registry import get as get_family, training_families
-from fizgig.web import captions, history
+from fizgig.web import captions, history, oom
 from fizgig.web import queue as webqueue
 from fizgig.web import prep_jobs
 from fizgig.families import refmod
@@ -126,6 +126,15 @@ def _amd_gpu_row():
                 "uuid": "", "util": None, "temp": None, "power": None, "power_limit": None}
     except Exception:
         return None
+
+
+def _has_nvidia():
+    """An NVIDIA card on this machine (nvidia-smi lists one; ROCm's AMD fallback rows don't count)."""
+    try:
+        return any("nvidia" in str(g.get("name") or "").lower() or str(g.get("uuid") or "").startswith("GPU-")
+                   for g in list_gpus())
+    except Exception:
+        return False
 
 
 def list_gpus():
@@ -809,6 +818,8 @@ def _studio_post(what, b):
         return {"ok": True}
     if what == "keep":
         return {"path": studio.keep_tweaked()}
+    if what == "map":                        # maps over the Tweaked render (where the LoRA acts, the tweaks, the trigger)
+        return studio.map_request(b.get("state") or {}, b.get("trigger") or "", bool(b.get("blocks")))
     if what == "render":
         return studio.render(b.get("state") or {}, extra={k: b.get(k) for k in ("video", "audio", "keyframes", "ref_mode", "mix")
                                                           if b.get(k) is not None})
@@ -1570,16 +1581,81 @@ def _continue_point(rec):
             "unit": "epoch"}
 
 
-def _oom_note(run_id):
-    """What to do after a run ran out of GPU memory: Continue from its newest save (fresh memory - memory that
-    fragments over hours is the usual cause late in a run), or, with nothing saved yet, a lighter setup."""
-    pt = _continue_point(history.get(run_id))
-    if pt:
-        return (f"\nThe GPU ran out of memory. The run is saved at {pt['unit']} {pt['done']}: press Continue on its "
-                f"card in Runs & outputs to carry on from there, with fresh memory. Closing other programs that use "
-                f"the GPU (a browser, a game) helps too.\n")
-    return ("\nThe GPU ran out of memory before the run saved anything. Try a smaller picture size or more block "
-            "swap (Memory & Precision, on the Training tab), and close other programs that use the GPU.\n")
+OOM_WAIT_S = 15                 # before an automatic retry: the failed process's memory is given back first
+
+
+def _oom_recover(kind, stage_name, plan):
+    """A run ran out of memory (oom.classify's kind): carry it on by itself when web/oom.py says so - a Continue from
+    its newest save, or a fresh restart a step lighter - logged plainly and kept on its record. False when it
+    stops here (the advice and what was tried are in the log); the caller then lets the queue move on."""
+    rid = _run.get("history_id")
+    rec = history.get(rid) or {}
+    tries = [t for t in (rec.get("oom") or []) if isinstance(t, dict)]
+    pt = _continue_point(rec)
+    try:            # only a save this run made: an earlier run with the same name and folder leaves its own behind
+        started = float(rec.get("started_at") or 0)        # the record's first start (a Continue keeps it)
+        if pt and os.path.getmtime(pt["path"]) < started - 5:
+            pt = None
+    except (OSError, TypeError, ValueError):
+        pass
+    desc = get_family(rec.get("family") or "")
+    values = {k: v for k, v in (rec.get("values") or {}).items() if not str(k).startswith("__")}
+    prog = rec.get("progress") or _run.get("progress") or {}
+    step = prog.get("step")
+    try:
+        per_epoch = int(prog.get("total_steps") or 0) // max(1, int(prog.get("total_epochs") or 1))
+    except (TypeError, ValueError):
+        per_epoch = 0
+    finetune = bool(desc is not None and desc.finetune and form._kind(desc, values) == "finetune")
+    done = f"{pt['unit']} {pt['done']}" if pt else ""
+
+    def lighter():
+        try:
+            max_swap = int(desc.load_driver().max_blocks_to_swap() or 0)
+        except Exception:
+            max_swap = 0
+        return oom.step_down(desc, values, plan, max_swap, launch.precision_key,
+                             {**launch.PRECISION_LABELS, **getattr(desc, "precision_labels", {})})
+
+    if stage_name != "Training" or desc is None or rec.get("source") != "web":
+        d = {"do": "stop", "why": ""}            # a cache stage, or a run this server didn't start: advice only
+    else:
+        d = oom.decide(kind, tries, pt is not None, step, per_epoch, finetune, lighter)
+    new_values, change = values, "same settings"
+    if d["do"] != "stop" and d.get("lighter"):
+        new_values, change = lighter()
+        if new_values is None:
+            d = {"do": "stop", "why": f"it can't go lighter ({change})"}
+    if d["do"] == "stop":
+        append_log(oom.summary(tries) + (f"Automatic recovery stopped: {d['why']}.\n" if tries and d["why"] else "")
+                   + oom.advice(kind, pt is not None, done))
+        return False
+    tries.append({"kind": kind, "step": step, "at": time.time(),
+                  "action": f"{'Continue from the newest save' if d['do'] == 'continue' else 'started again'} "
+                            f"({change})"})
+    history.set_field(rid, "oom", tries)
+    append_log(f"\n↻ Out-of-memory recovery ({len(tries)} of {oom.MAX_TRIES}): {d['why']} - "
+               f"{tries[-1]['action']}, in {OOM_WAIT_S} s.\n")
+    t = threading.Timer(OOM_WAIT_S, _oom_go, args=(rid, d["do"], new_values, tries))
+    t.daemon = True
+    t.start()
+    return True
+
+
+def _oom_go(rid, do, values, tries):
+    """The automatic Continue / restart _oom_recover scheduled; a run started meanwhile (Start, the queue) wins, and
+    the queue then carries on."""
+    rec = history.get(rid) or {}
+    if do == "continue":
+        r = _continue_run(rid, queue_ok=False, values=values)
+    else:
+        r = _start(rec.get("family") or "", values, rec.get("image_folder") or "")
+        if isinstance(r, dict) and not r.get("error") and not r.get("problems") and _run.get("history_id"):
+            history.set_field(_run["history_id"], "oom", tries)       # the new record carries the count on
+    if not isinstance(r, dict) or r.get("error") or r.get("problems"):
+        why = (r or {}).get("error") or "; ".join((r or {}).get("problems") or []) if isinstance(r, dict) else str(r)
+        append_log(f"\nOut-of-memory recovery couldn't start the run again: {why}\n")
+        webqueue.on_run_ended("failed", rec.get("lora"), _queue_starter)
 
 
 def _run_form(rec, values=None):
@@ -1874,10 +1950,10 @@ def _run_stages(stages, out_dir):
             return
         with _lock:
             _run["proc"] = proc
-        oom = False
+        mem = oom.Watch()                       # GPU / system-RAM messages, and the Auto plan the trainer chose
         for line in proc.stdout:
             append_log(line)
-            oom = oom or "out of memory" in line.lower()
+            mem.feed(line)
             try:
                 upd = tracker.consume(line)
             except Exception:
@@ -1907,12 +1983,14 @@ def _run_stages(stages, out_dir):
             webqueue.on_run_ended("stopped", _run.get("lora"), _queue_starter)
             return
         if ret != 0:
-            append_log(f"\n✖ {stage.name} failed (exit code {ret}).\n" + _log_where())
+            kind = oom.classify(ret, mem)
+            what = {"gpu": " - the GPU ran out of memory", "ram": " - system memory (RAM) ran out"}.get(kind, "")
+            append_log(f"\n✖ {stage.name} failed (exit code {ret}){what}.\n" + _log_where())
             with _lock:
                 _run.update(state="failed", proc=None, ended_at=time.time())
             history.end(_run.get("history_id"), "failed", _run.get("progress"))
-            if oom:
-                append_log(_oom_note(_run.get("history_id")))
+            if kind and _oom_recover(kind, stage.name, mem.plan):
+                return                           # it carries on by itself: the queue waits for that run
             webqueue.on_run_ended("failed", _run.get("lora"), _queue_starter)
             return
     paused = ((os.path.exists(os.path.join(out_dir, ".pause_requested")) or _run["pause"])
@@ -3012,6 +3090,10 @@ class Handler(BaseHTTPRequestHandler):
                                          for k in form.model_keys(d)},
                               "cache_dir": str(p.get("cache_dir") or ""),
                               "settings": {k: str(p.get(k) or "") for k in SETTING_PREFS},
+                              "captioning": {"main": pref_path(p, "krea2_text_encoder"),
+                                             "main_ok": bool(pref_path(p, "krea2_text_encoder")
+                                                             and os.path.isfile(pref_path(p, "krea2_text_encoder"))),
+                                             "others": captions.other_captioners()},
                               "captioner": {"path": str(p.get(captions.SECONDARY_PREF) or ""),
                                             "note": secondary_captioner_note(p),
                                             "links": [{"label": lab, "href": f"https://huggingface.co/{r}/blob/main/{f}"}
@@ -3022,6 +3104,10 @@ class Handler(BaseHTTPRequestHandler):
                               "password_on": bool(self.password),
                               "password_saved": bool(str(p.get("web_password") or "").strip()),
                               "welcome_hidden": str(p.get("welcome_v8_hidden") or "") == "1",
+                              # the launch tip to turn off CUDA Sysmem Fallback: Windows with an NVIDIA card (nvidia-smi
+                              # answers), until Don't show this again
+                              "sysmem_tip": sys.platform == "win32" and str(p.get("sysmem_tip_hidden") or "") != "1"
+                              and _has_nvidia(),
                               "password_env": bool(os.environ.get("FIZGIG_PASSWORD")) or getattr(self, "password_arg", False),
                               "lan_ip": __import__("fizgig.web.port", fromlist=["x"]).lan_ip(),
                               "cuda_device": str(p.get("cuda_device") or ""), "gpus": list_gpus(),
@@ -3084,6 +3170,8 @@ class Handler(BaseHTTPRequestHandler):
                                       "application/octet-stream")
             except (ValueError, OSError) as e:
                 return self.json({"error": str(e)}, 400)
+        if path == "/api/captioners/status":          # Preferences' Other captioning models, while one downloads
+            return self.json({"others": captions.other_captioners()})
         if path == "/api/captions/options":
             p = load_prefs()
             cap = captioner_for(p)
@@ -3246,6 +3334,8 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(d, dict) or not d.get("fizgig_repair_setup"):
                 return self.json({"error": "That file isn't a Studio setup."}, 404)
             return self.json(d)
+        if path == "/api/studio/map":                # the maps over the Tweaked render, once made
+            return self.json(studio.map_status())
         if path == "/api/studio/metrics":            # the pair on screen, measured (and likeness to a reference)
             return self.json(studio.metrics((qs.get("ref") or [""])[0]))
         if path == "/api/studio/epochs":             # the run a LoRA belongs to (the mix's Up to dial)
@@ -3342,6 +3432,7 @@ class Handler(BaseHTTPRequestHandler):
                 key = (os.path.normcase(os.path.abspath(r.get("output_dir") or ".")), (r.get("lora") or "").lower())
                 d = get_family(r.get("family") or "")
                 r["image_loss"] = bool(owners.get(r.get("id")) and d is not None and getattr(d, "loss_watch", False))
+                r["train_maps"] = key not in newest and _maps_has(r.get("output_dir"), r.get("lora"))
                 r["loss_graph"] = key not in newest and os.path.isfile(
                     step_log.loss_path(r.get("output_dir") or "", r.get("lora") or ""))
                 # Continue: the newest run with its name and folder owns its saves (an older one's are overwritten)
@@ -3378,6 +3469,21 @@ class Handler(BaseHTTPRequestHandler):
                               "images": [{**im, "path": pics.get(im["key"], ""), "queued": im["key"] in queued,
                                           "applied": (applied.get(im["key"]) or [{}])[-1].get("epoch")}
                                          for im in res["images"]]})
+        if path == "/api/runs/train_maps":           # one run's training maps (training/train_maps.py), by epoch
+            from fizgig.training import train_maps
+            from fizgig.web import image_loss
+            run = history.get((qs.get("id") or [""])[0])
+            k, t = (qs.get("key") or [None])[0], (qs.get("t") or [None])[0]
+            try:
+                res = train_maps.read(run.get("output_dir"), run.get("lora"), k, t) if run else None
+            except ValueError:
+                return self.json({"error": "bad noise level"}, 400)
+            if res is None:
+                return self.json({"error": "This run has no training maps."}, 404)
+            if k is None:                            # the first ask: the pictures and epochs, no maps yet
+                res["epochs"] = [{"epoch": e["epoch"], "maps": {}} for e in res["epochs"]]
+            return self.json({**res, "live": run.get("result") in ("running", "paused"),
+                              "images": image_loss.image_paths(run, res["keys"])})
         if path == "/api/runs/caption":              # one training image's caption, for the per-image editor
             from fizgig.web import image_loss
             run = history.get((qs.get("id") or [""])[0]) or {}
@@ -4278,7 +4384,7 @@ class Handler(BaseHTTPRequestHandler):
                 render_keys = {f"workbench_render_{d.key}" for d in training_families()
                                if getattr(d, "workbench_render_choice", False)}
                 allowed = {k for d in training_families() for k in form.model_keys(d)} | set(SETTING_PREFS) | {
-                    "input_dataset_dir", "welcome_v8_hidden", captions.SECONDARY_PREF} | render_keys
+                    "input_dataset_dir", "welcome_v8_hidden", "sysmem_tip_hidden", captions.SECONDARY_PREF} | render_keys
                 ch = b.get("changes") or {}
                 ch = {k: v for k, v in ch.items() if k not in render_keys or v in ("checkpoint", "samples")}
                 if b.get("reset"):                      # Reset to defaults: the settings, never the model files
@@ -4329,11 +4435,13 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/trigger":
                 set_folder_trigger(str(b.get("folder") or ""), str(b.get("word") or ""))
                 return self.json({"ok": True})
+            if path == "/api/captioners/download":    # one captioner's files now, rather than on first use
+                return self.json(captions.download_captioner(str(b.get("key") or ""), load_prefs()))
             if path == "/api/captions/ai":
                 prefs, folder, clips, photos, _ = _caption_args(b)
                 cap = captioner_for(prefs)
                 model = str(b.get("model") or "")
-                _caption_gpu_check(8.0 if model == captions.QWEN_MODEL else 2.5)
+                _caption_gpu_check(captions.need_gb(model))
                 from fizgig.dataset import detail_crops     # the folder's files, or its largest detail crops
                 inside = {os.path.abspath(f) for f in captions.with_crops(folder)}
                 only = [p for p in (b.get("only") or []) if os.path.dirname(os.path.abspath(p)) in inside]
@@ -4341,7 +4449,8 @@ class Handler(BaseHTTPRequestHandler):
                     prefs, cap if cap and os.path.isfile(cap) else "", folder, model, str(b.get("task") or ""),
                     str(b.get("instruction") or ""), int(b.get("max_tokens") or 120), str(b.get("trigger") or ""),
                     bool(b.get("overwrite")), clips, only=only or None, photos=photos,
-                    ext=captions.caption_ext(b.get("ext"))))
+                    ext=captions.caption_ext(b.get("ext")), threshold=float(b.get("threshold") or 0.35),
+                    leave_out=str(b.get("leave_out") or ""), underscores=bool(b.get("underscores"))))
             if path.startswith("/api/studio/"):
                 try:
                     return self.json(_studio_post(path[len("/api/studio/"):], b))
@@ -4459,6 +4568,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not where:
                     return self.json({"error": "SAM 3.1 isn't here yet: choose SAM 3.1 on this card and press "
                                                "Download first."}, 400)
+                captions.unload()                   # anything on the GPU frees the caption model first
                 try:
                     png = mask_edit.sam_click(str(b.get("folder") or ""), str(b.get("name") or ""),
                                               float(b.get("x") or 0), float(b.get("y") or 0), where)
@@ -4476,6 +4586,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not where:
                     return self.json({"error": "SAM 3.1 isn't here yet: press Download first."}, 400)
                 include, exclude = sammask.split_words(b.get("include")), sammask.split_words(b.get("exclude"))
+                captions.unload()
                 if not include:
                     return self.json({"error": "Type what the masks should show in Mask these (e.g. person)."}, 400)
                 try:
@@ -4508,11 +4619,13 @@ class Handler(BaseHTTPRequestHandler):
                                                          b.get("padding") or 20, bool(b.get("replace")),
                                                          bool(b.get("crops_only"))))
                     if path == "/api/look/scan":
+                        captions.unload()
                         return self.json(prep_jobs.look_scan(folder, b.get("baselines") or []))
                     if path == "/api/masks/edit/save":
                         from fizgig.web import mask_edit
                         return self.json(mask_edit.save(folder, str(b.get("name") or ""), str(b.get("png") or "")))
                     if path == "/api/masks/make":
+                        captions.unload()
                         sam = None
                         if b.get("sam"):
                             from fizgig.dataset import sammask
@@ -4833,6 +4946,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not name.lower().endswith(".safetensors"):
                     name += ".safetensors"
                 folder = str(b.get("out_dir") or "").strip() or default_output_dir()
+                captions.unload()                   # LoKR / LoHa sources SVD on the GPU
                 out = tools.run(desc, str(b.get("source") or "").strip(), os.path.join(folder, os.path.basename(name)),
                                 int(b.get("rank") or 4), str(b.get("preset") or ""), [str(x) for x in (b.get("blocks") or [])],
                                 identity=bool(b.get("identity")))
@@ -5027,6 +5141,11 @@ def run_server(host, port=None, password=None, password_arg=False, open_browser=
             logging.shutdown()
             os._exit(0)
 
+
+
+def _maps_has(output_dir, lora):
+    from fizgig.training import train_maps
+    return train_maps.has_maps(output_dir, lora)
 
 _RESTART = [False]
 _SWITCH = [False]

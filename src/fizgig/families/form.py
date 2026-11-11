@@ -33,7 +33,7 @@ EMA = ("Off", "0.98 (recommended)", "0.99 (stronger)", "0.995 (long runs only)")
 EMA_SHORT = "Short run (window = ¼ of the run)"
 EMA_HINT = ("Saves and previews a running average of the LoRA instead of its latest step: smoother, less overbaked. "
             "0.98 averages over roughly the last 50 steps.")
-SIZES = ("512", "640", "768", "1024", "1280", "1536")
+SIZES = ("512", "640", "768", "1024", "1280", "1536", "2048")
 KINDS = (("standard", "Standard LoRA"), ("edit", "Edit (original + edited photo pairs)"),
          ("slider", "Slider (a dial between two looks)"), ("finetune", "Fine-tune the whole model"))
 FT_REG_MULT = ("0.05", "0.1", "0.2", "0.3", "0.5", "0.75", "1.0")
@@ -46,6 +46,18 @@ ROW_GROUPS = (
     ("length", "Length", ("MAX_TRAIN_EPOCHS", "SEED")),
     ("size", "Picture size", ("DATASET_MEGAPIXELS", "CLIP_MEGAPIXELS", "STAGE_MP", "STAGE_UNTIL")),
     ("context", "Context LoRA", ("CONTEXT_LORA_PATH", "CONTEXT_LORA_STRENGTH")),
+    ("states", "Save state", ("SAVE_STATE", "SAVE_STATE_ON_TRAIN_END", "KEEP_LAST_N_STATES")),
+    ("gradients", "Gradients", ("GRADIENT_ACCUMULATION", "MAX_GRAD_NORM")),
+    ("schedule", "Learning-rate schedule", ("LR_SCHEDULER", "LR_WARMUP_STEPS")),
+    ("buckets", "Buckets", ("ENABLE_BUCKET", "BUCKET_NO_UPSCALE")),
+    ("metadata", "Metadata (saved in the LoRA)", ("METADATA_TITLE", "METADATA_AUTHOR", "METADATA_DESCRIPTION",
+                                                  "METADATA_LICENSE", "METADATA_TAGS", "METADATA_TRIGGER_PHRASE",
+                                                  "METADATA_THUMBNAIL")),
+    ("previewsize", "Preview size", ("SAMPLE_WIDTH", "SAMPLE_HEIGHT", "SAMPLE_STEPS", "SAMPLE_SEED")),
+    ("turbo", "Turbo LoRA", ("FAMILY_TURBO_ON", "FAMILY_TURBO_STRENGTH")),
+    ("rotations", "Rotations", ("FAMILY_FT_ROTATIONS", "FAMILY_FT_SAVE_EVERY", "FAMILY_FT_ROTATE_EVERY")),
+    ("reg", "Regularisation", ("FAMILY_FT_REG_DIR", "FAMILY_FT_REG_MULT")),
+    ("elementboost", "Element boost (experimental)", ("FACE_BOOST", "FACE_BOOST_AREA")),
 )
 STAGE_MPS = ("Off", "0.25", "0.37", "0.5", "0.75")
 STAGE_UNTILS = ("20%", "30%", "50%")
@@ -94,7 +106,7 @@ DEFAULTS = {
     "FAMILY_FT_ROTATIONS": "10", "FAMILY_FT_SAVE_EVERY": "1", "FAMILY_FT_ROTATE_EVERY": "1",
     "FAMILY_FT_FUSED": True, "FAMILY_FT_REG_DIR": "", "FAMILY_FT_REG_MULT": "0.2",
     "DATASET_MEGAPIXELS": "0.25", "DATASET_CAPTION_EXT": ".txt", "ENABLE_BUCKET": True, "BUCKET_NO_UPSCALE": True,
-    "ENABLE_CACHE": True, "MASKED_TRAINING": False, "MASK_FLOOR": "0.1 (recommended)", "MASK_PRIOR": "Off",
+    "ENABLE_CACHE": True, "MASKED_TRAINING": False, "MASK_FLOOR": "0.1 (recommended)", "MASK_PRIOR": "Off", "FACE_BOOST": False, "FACE_BOOST_AREA": "Face and hair",
     "METADATA_TITLE": "", "METADATA_AUTHOR": "", "METADATA_DESCRIPTION": "", "METADATA_LICENSE": "",
     "METADATA_TAGS": "", "METADATA_TRIGGER_PHRASE": "", "METADATA_THUMBNAIL": "",
     "SAMPLE_ENABLED": True, "SAMPLE_PROMPT": "A high quality photo", "SAMPLE_SEED": "1234",
@@ -163,7 +175,8 @@ def _option_row(opt):
                 **({"warn": opt.warn, "warn_link": opt.warn_link} if opt.warn else {}),
                 **({"featured": True} if opt.featured else {}),
                 **({"split": list(opt.split), "split_hint": opt.split_hint} if kind == "split" and opt.split else {}),
-                **({"slide": list(opt.slide), "slide_hint": opt.slide_hint} if kind == "split" and opt.slide else {}),
+                **({"slide": list(opt.slide), "slide_hint": opt.slide_hint,
+                    **({"slide_alt": list(opt.slide_alt)} if opt.slide_alt else {})} if kind == "split" and opt.slide else {}),
                 **({"single": opt.single} if kind == "split" and opt.single else {}))
 
 
@@ -187,8 +200,8 @@ def kind_sets(desc, kind):
     """What picking a kind of training also sets (the desktop's _family_kind_chosen): Fine-tune takes the family's
     fine-tune learning rate with Adaptive LR off; a family's kind_values come too."""
     out = dict(dict(getattr(desc, "kind_values", ()) or ()).get(kind, ()))
-    if kind == "finetune":
-        out.update(LEARNING_RATE=f"{desc.ft_learning_rate:g}", ADAPTIVE_LR=False)
+    if kind == "finetune":                   # Adafactor: what every fine-tune is tested on (#312)
+        out.update(LEARNING_RATE=f"{desc.ft_learning_rate:g}", ADAPTIVE_LR=False, OPTIMIZER_TYPE="adafactor")
     return out
 
 
@@ -359,7 +372,7 @@ def form(desc):
                  "picture. Each image's progress, with its thumbnail and its caption to edit, is under Per-image loss "
                  "on the run card while it trains, and in Runs & outputs."),
             _row("KREA2_PER_IMAGE_LR", "Per-image adaptive LR (throttle stuck images, boost healthy learned ones)",
-                 "check", "Images that stay hard without improving train more gently (x0.7, then x0.5 down to x0.1); "
+                 "check", "Images that stay hard without improving train more gently (x0.7, then x0.5 down to x0.25); "
                  "mined-out ones ease off (x0.6) and healthy learned ones get a gentle boost (x1.1). Batch size 1."),
             _row("KREA2_WARMUP_LOOK", "Warm up look outliers (unusual angles ease in at low LR - needs a Look "
                  "Filter scan)", "check", "Person LoRAs: images the Image Prep Look Filter scored as look outliers (tight angles, "
@@ -369,7 +382,9 @@ def form(desc):
             _row("KREA2_AUTO_RECAPTION", "Auto-recaption stuck images (Qwen3-VL rewrites the caption between "
                  "epochs)", "check", "A stuck image gets a new caption written from what is in it, and a fresh start; "
                  "a second try goes into more detail. Still stuck after that, it is left out of training - edit its "
-                 "caption to bring it back. Needs the Krea 2 text encoder set in Preferences."),
+                 "caption to bring it back. The new captions are written by Qwen3-VL: the Krea 2 text encoder, or "
+                 "Qwen3-VL 8B if you've set it as the secondary captioning model in Preferences. The other models on "
+                 "the Captions tab (Florence-2, JoyCaption, the WD tagger) aren't used for auto-recaption."),
             _row("RECAPTION_FIRST", "First try uses", "choice",
                  "The Captions tab's instruction for that task, as you've edited it there. The defaults are the "
                  "person or character versions: for an object or product, pick the (object or product) Training "
@@ -382,6 +397,32 @@ def form(desc):
                  [label for _key, label in _recaption_choices()]),
             _row("CAPTION_TRIGGER_WORD", "Trigger word", hint="Used by Auto-recaption (below): it adds this word at the "
                  "end of a new caption. The training folder's word, the same as the Captions tab's."),
+        ]
+    if desc.training_maps:
+        params.append(_row("TRAINING_MAPS", "Training maps (watch what your LoRA is learning)",
+                           "check", "Heatmaps over three of your own pictures, updated every epoch: which parts the "
+                           "LoRA has learned, which it hasn't yet, and where it's changing things it shouldn't, like "
+                           "the background or clothes. Open them with the Training maps button on the run card. Adds "
+                           "a few seconds an epoch."))
+    if desc.element_boost and desc.masked_training:   # Element boost: stills, with or without masks (a mask trims it)
+        params += [
+            _row("FACE_BOOST", "On", "check",
+                 "Early in the run, one part of each picture (the face and hair, unless you pick another below) "
+                 "counts much more than the rest, so it's learned faster - for a face, most of all when faces "
+                 "are small in the frame (medium and full-length shots). "
+                 "It runs 3 boosted stretches, then 1 normal, for the first 12 epochs or 600 steps, whichever "
+                 "is sooner; after that the run trains as normal, so the body and background catch up. Works "
+                 "with or without masks (a mask, if a picture has one, trims it). Pictures where it isn't found "
+                 "train as normal. Best on pictures of 1 MP or more where the boosted part (the face, the "
+                 "clothes and so on) is small in the frame: on small pictures, a small face or outfit is only a "
+                 "few pixels wide and the boost can teach the LoRA that pixelation. Smaller sizes (0.25 MP and "
+                 "so on) are fine when the boosted part is large in the frame."),
+            _row("FACE_BOOST_AREA", "What it boosts", "choice",
+                 "Face and hair (the default): the face and the hair around it. Face only: just the face, for when "
+                 "the hair changes from picture to picture or shouldn't be learned. These two use the face "
+                 "finder. The rest are the Make masks choices, found by its person finder: the clothes for an "
+                 "outfit LoRA, the background for a place, and so on.",
+                 launch.FACE_AREAS),
         ]
     params += by_section("training", "", "lora")
     if desc.identity_blocks:
@@ -639,14 +680,14 @@ def form(desc):
              "larger effective batch, raise this: the same averaged gradient as a bigger batch, at the memory of "
              "batch 1."),
         _row("MAX_GRAD_NORM", "Max Grad Norm"),
+        _row("LR_SCHEDULER", "LR Scheduler", "choice", choices=["constant", "constant_with_warmup", "cosine",
+                                                                 "cosine_with_restarts", "linear", "polynomial"]),
+        _row("LR_WARMUP_STEPS", "Warmup steps"),
     ], collapsed=True)
     add("other", "Other Options", "training", [
         _row("DATASET_CAPTION_EXT", "Caption Extension"),
         _row("ENABLE_BUCKET", "Enable Bucket", "check"),
         _row("BUCKET_NO_UPSCALE", "No Upscale (keep small images at native size)", "check"),
-        _row("LR_SCHEDULER", "LR Scheduler", "choice", choices=["constant", "constant_with_warmup", "cosine",
-                                                                 "cosine_with_restarts", "linear", "polynomial"]),
-        _row("LR_WARMUP_STEPS", "Warmup steps"),
         _row("CAPTION_DROPOUT", "Caption dropout", "choice", CAPTION_DROPOUT_HINT, CAPTION_DROPOUTS,
              default=CAPTION_DROPOUTS[0]) if desc.caption_dropout and pictures else None,
         _row("BATCH_SIZE", "Batch size", "choice", BATCH_HINT, launch.batch_choices(desc))
@@ -1034,12 +1075,15 @@ def state(desc, values, image_folder="", captioner="", speed_file=False, checkpo
         notes["TRAIN_SUBFOLDERS"], act = subfolders_note(desc, values, image_folder)
         if act:
             actions["TRAIN_SUBFOLDERS"] = act
+    if not values.get("FACE_BOOST"):
+        hidden.add("FACE_BOOST_AREA")
     if desc.masked_training:
         prompt_slider = kind == "slider" and launch.slider_on(desc, {"FAMILY_SLIDER": True, "FAMILY_SLIDER_SOURCE": (
             "prompts" if values.get("FAMILY_SLIDER_SOURCE") == "Prompts" else "pairs")}, "prompts")
         media = launch.dataset_media(image_folder) if image_folder else {"photo"}
         if prompt_slider or (media and "photo" not in media):
             hidden.add("masks")             # a prompt slider makes its own pictures; a folder of clips has none to mask
+            hidden |= {"FACE_BOOST", "FACE_BOOST_AREA"}   # nor anything for Element boost to find
         elif not values.get("MASKED_TRAINING"):
             hidden |= {"MASK_FLOOR", "MASK_PRIOR"}
         else:
@@ -1060,7 +1104,15 @@ def state(desc, values, image_folder="", captioner="", speed_file=False, checkpo
         hidden.add("LEARNING_RATE")          # Adaptive LR on: Min and Max in its place (the box is ignored)
     if kind == "finetune":       # a fine-tune trains at its own fixed rate: no Adaptive LR, on any model
         hidden.add("ADAPTIVE_LR")
-    opt = str(values.get("OPTIMIZER_TYPE", ""))
+    if kind == "finetune":       # its optimizers take no args; a LoRA optimizer is said, and trains as Adafactor (#312)
+        from fizgig.training.optimizers import FT_OPTIMIZERS
+        hidden.add("OPTIMIZER_ARGS")
+        ft_opt = str(values.get("OPTIMIZER_TYPE", "") or "").strip().lower()
+        if ft_opt and ft_opt not in FT_OPTIMIZERS:
+            notes["OPTIMIZER_TYPE"] = (f"{ft_opt} is a LoRA optimizer - a fine-tune can't use it, so it would train "
+                                       f"with Adafactor. Pick Adafactor (recommended: what every Fizgig fine-tune is "
+                                       f"tested on), or AdamW8bit, AdamW, AdEMAMix8bit or Lion8bit.")
+    opt = str(values.get("OPTIMIZER_TYPE", "")) if kind != "finetune" else ""
     if opt in ("automagic3", "automagic4"):
         disabled |= {"ADAPTIVE_LR", "KREA2_PER_IMAGE_LR", "KREA2_WARMUP_LOOK"}
         force.update({k: False for k in ("ADAPTIVE_LR", "KREA2_PER_IMAGE_LR", "KREA2_WARMUP_LOOK") if values.get(k)})
@@ -1077,8 +1129,6 @@ def state(desc, values, image_folder="", captioner="", speed_file=False, checkpo
             force["OPTIMIZER_ARGS"] = mine
         if opt == "muon":
             notes["OPTIMIZER_TYPE"] = "muon matches AdamW's step size: the usual learning rates and Adaptive LR apply."
-        elif kind == "finetune":                 # a fine-tune keeps its own optimizer and rate (families/ft.py)
-            notes["OPTIMIZER_TYPE"] = "A fine-tune uses its own optimizer: prodigy applies to LoRAs."
         else:
             # per-image LR stays: with Prodigy it weights that image's loss, it never writes the group rate
             disabled |= {"LEARNING_RATE", "ADAPTIVE_LR", "KREA2_WARMUP_LOOK"}
@@ -1090,7 +1140,7 @@ def state(desc, values, image_folder="", captioner="", speed_file=False, checkpo
             notes["OPTIMIZER_TYPE"] = ("prodigy finds its own learning rate: the Learning Rate box is a multiplier, "
                                        "locked to 1.0, and Adaptive LR and the look warm-up are off. Per-image LR "
                                        "still works, as a weight on each picture's loss.")
-    if opt not in ("prodigy", "muon"):
+    if kind != "finetune" and opt not in ("prodigy", "muon"):
         # switched away from Muon / Prodigy (every picture preset is on Muon): their default args left in the box made
         # AdamW / AdamW8bit fail to build and fall back to plain, unfused AdamW, with only a log warning. Exactly their
         # defaults are cleared; anything typed by hand stays.
@@ -1512,6 +1562,7 @@ def inputs(desc, values, *, models, python, repo_dir, image_folder, cache_root, 
         FAMILY_SLIDER_SOURCE=(("prompts" if s("FAMILY_SLIDER_SOURCE") == "Prompts" else "pairs")
                               if len(slider_sources(desc)) > 1 else slider_sources(desc)[0]),
         ADAPTIVE_LR=b("ADAPTIVE_LR") and desc.adaptive_lr, SAVE_STATE=b("SAVE_STATE"),
+        TRAINING_MAPS=b("TRAINING_MAPS") and desc.training_maps,
         SAVE_STATE_ON_TRAIN_END=b("SAVE_STATE_ON_TRAIN_END"), FAMILY_FT_FUSED=b("FAMILY_FT_FUSED"),
         FAMILY_SLIDER_ULTRA=b("FAMILY_SLIDER_ULTRA"),
         FAMILY_FAST_ID=b("FAMILY_FAST_ID") and kind == "standard" and bool(desc.identity_blocks),
@@ -1524,7 +1575,7 @@ def inputs(desc, values, *, models, python, repo_dir, image_folder, cache_root, 
         FAMILY_TURBO_PACE=s("FAMILY_TURBO_PACE"), FAMILY_PREVIEW_LOOK=b("FAMILY_PREVIEW_LOOK"), FAMILY_PREVIEW_SMALL=b("FAMILY_PREVIEW_SMALL"),
         CAPTION_DROPOUT=caption_dropout_share(s("CAPTION_DROPOUT")) if desc.caption_dropout else 0.0,
         MASKED_TRAINING=b("MASKED_TRAINING") and desc.masked_training, MASK_FLOOR=s("MASK_FLOOR"),
-        MASK_PRIOR=s("MASK_PRIOR"),
+        MASK_PRIOR=s("MASK_PRIOR"), FACE_BOOST=b("FACE_BOOST") and desc.element_boost, FACE_BOOST_AREA=s("FACE_BOOST_AREA"),
         python=python, repo_dir=repo_dir, models=models, image_folder=image_folder,
         caption_ext=s("DATASET_CAPTION_EXT") or ".txt", batch_size=1, megapixels=s("DATASET_MEGAPIXELS"),
         STAGE_MP=s("STAGE_MP") if desc.resolution_stages else "", STAGE_UNTIL=s("STAGE_UNTIL"),

@@ -20,6 +20,11 @@ sys.path.insert(0, os.path.join(REPO, "src"))
 from fizgig.krea2.caption_text import (CAPTION_TASKS, DEFAULT_CAPTION_TASK,  # noqa: E402
                                        ENCODE_SYSTEM_DESCRIPTOR, SUBJECT_RULE)
 from fizgig.web import captions as CAP  # noqa: E402
+# Upstream (19c4f91e) made captioners a registry, as drivers are: each a description in fizgig.captioners (key,
+# label, files, tasks), run in the Captions worker. The checks below find Qwen3-VL and Florence-2 there.
+from fizgig import captioners as CAPS  # noqa: E402
+QWEN = CAPS.get(CAP.QWEN_KEY)
+FLORENCE = CAPS.get("florence2_promptgen")
 
 fails = []
 
@@ -36,28 +41,33 @@ open(FAKE_TE, "wb").write(b"0")
 
 
 def tasks(prefs=None, captioner=FAKE_TE):
-    return {t["key"]: t for t in CAP.options(prefs or {}, captioner)["qwen_tasks"]}
+    return {t["key"]: t for t in CAP.options(prefs or {}, captioner)["instruction_tasks"]}
 
 
 # --- 1. gating on the file, not on model family -----------------------------------------
 o = CAP.options({}, "")
-ck("no text encoder set -> Florence models only, Qwen not offered",
-   CAP.QWEN_MODEL not in o["models"] and o["qwen_available"] is False, o["models"])
+ck("no text encoder set -> Qwen3-VL not offered (the captioners that download themselves are)",
+   QWEN.label not in o["models"] and o["qwen_available"] is False and FLORENCE.label in o["models"], o["models"])
+ck("  ...and the default is one that is offered", o["default_model"] in o["models"], o["default_model"])
 o = CAP.options({}, FAKE_TE)
-ck("text encoder set -> Qwen3-VL is offered", CAP.QWEN_MODEL in o["models"] and o["qwen_available"] is True)
-ck("  ...and is the default model then", o["default_model"] == CAP.QWEN_MODEL, o["default_model"])
+ck("text encoder set -> Qwen3-VL is offered", QWEN.label in o["models"] and o["qwen_available"] is True)
+ck("  ...and is the default model then", o["default_model"] == QWEN.label, o["default_model"])
+ck("  Qwen3-VL is the captioner whose file is Preferences' text encoder (no download of its own)",
+   isinstance(QWEN.files, CAPS.PrefFile) and QWEN.files.pref == "captioner" and QWEN.instruction)
 # options() takes no family at all: the captioner is offered whatever model family is being trained.
 
 # --- 2. the task lists -------------------------------------------------------------------
 t = tasks()
 ck("Qwen -> every shipped preset + Custom", set(t) == set(CAPTION_TASKS) | {"custom"}, sorted(t))
-ck("  Custom is last", CAP.options({}, FAKE_TE)["qwen_tasks"][-1]["key"] == "custom")
+ck("  Custom is last", CAP.options({}, FAKE_TE)["instruction_tasks"][-1]["key"] == "custom")
 ck("  the style preset is offered", "style" in t)
 ck("  default task is the doctrine one",
-   CAP.options({}, FAKE_TE)["default_qwen_task"] == CAPTION_TASKS[DEFAULT_CAPTION_TASK][0])
+   CAP.options({}, FAKE_TE)["default_instruction_task"] == CAPTION_TASKS[DEFAULT_CAPTION_TASK][0])
 ck("  each preset carries its suggested length",
    all(t[k]["tokens"] == CAPTION_TASKS[k][2] for k in CAPTION_TASKS))
-ck("Florence keeps its own task tokens", list(CAP.options({}, FAKE_TE)["florence_tasks"]) == list(CAP.FLORENCE_TASKS))
+_fl = next(c for c in CAP.options({}, FAKE_TE)["captioners"] if c["key"] == FLORENCE.key)
+ck("Florence keeps its own task tokens", _fl["tasks"] == ["<CAPTION>", "<DETAILED_CAPTION>", "<MORE_DETAILED_CAPTION>"]
+   and not _fl["instruction"], _fl["tasks"])
 
 # --- 3. instruction resolution -----------------------------------------------------------
 for key, (label, instr, tok) in CAPTION_TASKS.items():
@@ -167,16 +177,18 @@ else:
     ck("auto-recaption reaches the command (Batch 1, captioner set)", False, "no --captioner in command")
 
 # --- 4. the model choice reaches the captioning worker ------------------------------------
-cq = CAP._worker_config(CAP.QWEN_MODEL, FAKE_TE, clips=False)
-ck("worker config: Qwen -> backend qwen + its text encoder",
-   cq.get("backend") == "qwen" and cq.get("text_encoder") == FAKE_TE, cq)
-cf = CAP._worker_config(CAP.FLORENCE_MODELS[0], FAKE_TE, clips=True)
-ck("worker config: Florence -> backend florence, names the model, clips on",
-   cf.get("backend") == "florence" and cf.get("florence_model") == CAP.FLORENCE_MODELS[0]
-   and cf.get("include_video") is True, cf)
-if CAP.FLORENCE_REVISIONS.get(CAP.FLORENCE_MODELS[0]):
-    ck("  ...pinned to its revision (trust_remote_code runs what it downloads)",
-       cf.get("florence_revision") == CAP.FLORENCE_REVISIONS[CAP.FLORENCE_MODELS[0]])
+cq = CAP._worker_config(QWEN, FAKE_TE, clips=False)
+ck("worker config: Qwen -> captioner qwen3vl + its text encoder, clips off",
+   cq.get("captioner") == "qwen3vl" and cq.get("files") == {"path": FAKE_TE} and cq.get("include_video") is False, cq)
+cf = CAP._worker_config(FLORENCE, FAKE_TE, clips=True)
+ck("worker config: Florence -> names its captioner, no Preferences file (it downloads itself), clips on",
+   cf.get("captioner") == FLORENCE.key and cf.get("files") == {} and cf.get("include_video") is True, cf)
+ck("  ...pinned to a revision, its remote code too (trust_remote_code runs what it downloads)",
+   len(FLORENCE.files.revision or "") == 40 and len(FLORENCE.files.code_revision or "") == 40,
+   (FLORENCE.files.revision, FLORENCE.files.code_revision))
+ck("every captioner that downloads itself is pinned to a full commit",
+   all(len(d.files.revision or "") == 40 for d in CAPS.CAPTIONERS if isinstance(d.files, CAPS.HFRepo)),
+   [d.key for d in CAPS.CAPTIONERS if isinstance(d.files, CAPS.HFRepo) and len(d.files.revision or "") != 40])
 
 # --- 5. the trigger word, across the subprocess boundary ----------------------------------
 # GUI half: ai_captions writes the trigger into the worker's job. JOB_DIR is redirected away from the real
@@ -199,21 +211,32 @@ class _FakeWorker:
 
 CAP._popen = lambda cmd, prefs, stdin=False: _FakeWorker()
 try:
-    CAP.ai_captions({}, FAKE_TE, imgdir, CAP.QWEN_MODEL, "", "an instruction", 120, "zwxbsp", True, False)
+    CAP.ai_captions({}, FAKE_TE, imgdir, QWEN.label, "", "an instruction", 120, "zwxbsp", True, False)
     job = json.load(open(os.path.join(CAP.JOB_DIR, "job.json"), encoding="utf-8"))
     ck("GUI half: the trigger reaches the worker job", job.get("trigger") == "zwxbsp", job.get("trigger"))
 except Exception as e:
     ck("GUI half: the trigger reaches the worker job", False, f"{type(e).__name__}: {e}")
 
-from fizgig.scripts.batch_caption import _write_caption as _wc  # noqa: E402
+from fizgig.scripts import batch_caption as BC  # noqa: E402
+
+
+class _FakeCaptioner:
+    """Stands in for the loaded model: whatever it's shown, it says this."""
+
+    def caption(self, picture, request):
+        return CAPS.CaptionResult(text="a woman viewed from behind")
+
 
 img = os.path.join(imgdir, "a.png")
-_wc(img, "a woman viewed from behind", "zwxbsp")
-txt = open(os.path.splitext(img)[0] + ".txt", encoding="utf-8").read()
-ck("worker half: trigger prepended", txt == "zwxbsp, a woman viewed from behind", txt)
-_wc(img, "a woman viewed from behind", "")
-txt = open(os.path.splitext(img)[0] + ".txt", encoding="utf-8").read()
-ck("  no trigger -> no stray leading comma", txt == "a woman viewed from behind", txt)
+_state = BC.CaptionState(QWEN, _FakeCaptioner(), False)
+_req, _ = BC.request_for(QWEN, {"instruction": "an instruction"})
+for trig, want, label in (("zwxbsp", "zwxbsp, a woman viewed from behind", "worker half: trigger prepended"),
+                          ("", "a woman viewed from behind", "  no trigger -> no stray leading comma")):
+    BC._write_caption(img, BC.caption_file(_state, img, _req, {"trigger": trig}))
+    txt = open(os.path.splitext(img)[0] + ".txt", encoding="utf-8").read()
+    ck(label, txt == want, txt)
+ck("  an instruction captioner given no instruction is refused, not run blind",
+   BC.request_for(QWEN, {})[0] is None)
 
 # --- 6. captioning beside a training run --------------------------------------------------
 from fizgig.web import server as S  # noqa: E402

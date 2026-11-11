@@ -202,6 +202,10 @@ Apache-2.0, and each carries a header saying so:
 - `src/fizgig/minimax/sampling.py` — the `_res_multistep_coeffs` function only,
   ported from `comfy/k_diffusion/sampling.py` (`res_multistep`). The rest of
   that file is Fizgig's own and Apache-2.0.
+- `src/fizgig/minimax_image/vae.py` — the MiniMax-H3-Image VAE's tiling, its 2D
+  decoder settings and its encode / decode steps, ported from
+  `comfy/ldm/minimax/vae.py` (`split_tiles`, `blend`, `tiled_encode`,
+  `tiled_decode`, `H3ImageVAE`, `MiniMaxH3ImageVAE`).
 
 Fizgig's SAM 3.1 masks (Image Prep's Make masks from words) are ported from
 ComfyUI's SAM 3 support at commit 2035799. These files are **GPL-3.0** too, each
@@ -235,8 +239,8 @@ community bitsandbytes wheel from:
 https://github.com/0xDELUXA/bitsandbytes_win_rocm
 
 That wheel is **not** built by AMD or Fizgig; it is only fetched on the AMD
-install path. Official ROCm PyTorch wheels similarly come from AMD's nightly
-index (`https://rocm.nightlies.amd.com/whl-multi-arch/`), also disclosed by the
+install path. Official ROCm PyTorch wheels similarly come from AMD's stable
+index (`https://stable.repo.amd.com/rocm/whl-next/`), also disclosed by the
 installer before download.
 
 ---

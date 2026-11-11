@@ -26,8 +26,11 @@ NEW = ("prodigy", "muon", "automagic4")
 
 
 def test_new_optimizers_listed():
+    import importlib.util
     opts = available_optimizers()
-    for name in NEW + ("automagic3", "adamw", "adamw8bit"):
+    # adamw8bit needs bitsandbytes, which the public CPU checks don't install (it's listed only where it loads)
+    want = NEW + ("automagic3", "adamw") + (("adamw8bit",) if importlib.util.find_spec("bitsandbytes") else ())
+    for name in want:
         assert name in opts
 
 
@@ -38,11 +41,13 @@ CHOSEN = {k: "muon" for k in ("qwen_image21", "krea2", "moss_image", "vimoo", "z
 
 def test_no_preset_picks_a_new_optimizer():
     """No preset picks a new optimizer, except the families in CHOSEN, whose presets all use their chosen one with
-    its default arguments."""
+    its default arguments. A Fine-tune preset trains with Adafactor (#312)."""
     for desc in registry.training_families():
         for name, p in desc.presets or ():
             opt = str(p.get("OPTIMIZER_TYPE") or "").lower()
-            if desc.key in CHOSEN:
+            if p.get("FAMILY_FT"):
+                assert opt == "adafactor", (desc.key, name)
+            elif desc.key in CHOSEN:
                 assert opt == CHOSEN[desc.key], (desc.key, name)
                 if opt == "muon":
                     assert p.get("OPTIMIZER_ARGS") == MUON_DEFAULT_ARGS, (desc.key, name)
