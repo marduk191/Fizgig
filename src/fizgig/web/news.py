@@ -5,6 +5,30 @@ _ARTICLE = "https://github.com/shootthesound/Fizgig/blob/master/docs/NEWS.md"
 
 NEWS = [
     {
+        "date": "12 Nov 2026",
+        "title": "Top-end likeness for MiniMax H3 Image",
+        "body": (
+            "MiniMax H3 Image now trains likeness at the very top end: on our hardest test dataset the best previews "
+            "look more like the person than all but two of their own 45 photos, and that held on two more datasets. "
+            "Load the Standard preset (0.25 MP) and train with its settings as they are.\n\n"
+            "Likeness scores now come from AdaFace ViT instead of ArcFace, and the Samples gallery's chart shows your "
+            "own photos' range: the realistic top, since real photos never score 100%."
+        ),
+        "links": [{"text": "Read more", "href": _ARTICLE + "#12-nov-2026-top-end-likeness-for-minimax-h3-image"},
+                  {"text": "Release notes", "href": "https://github.com/shootthesound/Fizgig/releases/tag/v9.7.0"}],
+    },
+    {
+        "date": "11 Nov 2026",
+        "title": "Likeness optimization for MiniMax H3 Image",
+        "body": (
+            "MiniMax H3 Image has a new Likeness optimization, and in our tests it improves likeness dramatically. It's on "
+            "in the Standard preset: load it to pick it up. It replaces H3 Image's Clean-end share box.\n\n"
+            "It will be updated over the coming days with more ways to customise it."
+        ),
+        "links": [{"text": "Read more", "href": _ARTICLE + "#11-nov-2026-likeness-optimization-for-minimax-h3-image"},
+                  {"text": "Release notes", "href": "https://github.com/shootthesound/Fizgig/releases/tag/v9.6.4"}],
+    },
+    {
         "date": "11 Nov 2026",
         "title": "Training suddenly slow on Windows? Turn off Sysmem Fallback",
         "body": (

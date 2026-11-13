@@ -266,6 +266,8 @@ class FamilyOption:
     batch_off: bool = False           # a check that reads one picture a step: off and greyed while Batch size is above 1
     requires: str = ""                # shown (and sent) only while this check is ticked ("KEY") or this choice is
     #                                   picked ("KEY=LABEL", matched as pick() matches)
+    advanced: bool = False            # web: drawn inside the row it `requires`, behind that row's Advanced toggle
+    #                                   (closed by default) - a tuned default whose numbers most people leave alone
     suggestions: tuple = ()           # entry: ready-made values offered in an editable dropdown ("6-49 · why")
     mode: str = ""                    # "finetune": shown and sent for a fine-tune only; "lora": for a LoRA only
     # a queued run's one-line summary shows this while the option is away from its default ("{}" = its value;
@@ -440,6 +442,10 @@ class FamilyDescription:
     # breaks rather than degrade quietly.
     compile_payback_steps: dict = field(default_factory=dict)
     compile_boundary: str = "inside"
+    # "inside" only from this PyTorch (e.g. "2.15"): older ones keep the checkpoint outside - MOSS-Image's inside
+    # placement keeps 7-10 full-width activations a block on torch 2.10 against 2 on 2.15 (#324: an install pulled
+    # without updating PyTorch spilled into system RAM). "" = any version.
+    compile_inside_min_torch: str = ""
     compile_fullgraph: bool = True
     # measured peak GB when compiled: {precision: {"inside" | "outside": ((megapixels, GB), ...)}}. With it the compile
     # plan checks free VRAM: the family's boundary if it fits, else the checkpoint outside the graph, else uncompiled.
